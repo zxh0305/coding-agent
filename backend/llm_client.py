@@ -232,6 +232,12 @@ class OpenAIChatClient:
                     if not choices:
                         continue
                     delta = choices[0].get("delta") or {}
+                    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                    if reasoning:
+                        # 思考模型的推理过程先于正文流出。不透传的话，整个思考阶段
+                        # 界面毫无动静（socket 读被心跳/思考流喂着不会触发超时），
+                        # 用户只能看着光标闪、误以为卡死。推理内容只做实时展示，不进历史。
+                        yield "reasoning_delta", reasoning
                     if delta.get("content"):
                         content_parts.append(delta["content"])
                         yield "delta", delta["content"]
@@ -445,6 +451,11 @@ class AnthropicMessagesClient:
                             blk["type"] = "text"
                             blk["text"] += d.get("text", "")
                             yield "delta", d.get("text", "")
+                        elif d.get("type") == "thinking_delta":
+                            # 思考块的 delta 只透传给前端实时显示；不并入 text，
+                            # 最终 message（进历史的内容）不带思考过程
+                            blk["type"] = "thinking"
+                            yield "reasoning_delta", d.get("thinking", "")
                         elif d.get("type") == "input_json_delta":  # 工具参数也是分片到达的
                             blk["type"] = "tool_use"
                             blk["json"] += d.get("partial_json", "")

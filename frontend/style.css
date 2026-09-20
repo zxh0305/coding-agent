@@ -124,6 +124,16 @@ body {
   color: var(--text-3);
 }
 
+/* 思考模型的推理流：暗灰小字，限高滚动，避免长思考把时间线撑爆 */
+.think-line {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px; line-height: 1.5;
+  padding: 4px 0 4px 10px; border-left: 2px solid #e4e9f5;
+  margin: 6px 0 0 2px; white-space: pre-wrap; word-break: break-all;
+  color: var(--text-3);
+  max-height: 180px; overflow-y: auto;
+}
+
 /* 工具调用/结果行：一行摘要，点开看完整内容 */
 .tl { margin-top: 6px; }
 .tl summary {

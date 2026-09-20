@@ -129,12 +129,13 @@ class Agent:
         数组）。不传则用 user_input 包装成纯文本消息——CLI 走这条路。
 
         事件序列（kind, payload)：
-          ("round",        {"round": n})                  开始第 n 轮
-          ("answer_delta", {"delta": "..."})              LLM 正在输出的文字片段
-          ("tool_call",    {"name", "arguments"})         模型请求调用工具
-          ("tool_result",  {"name", "result"})            工具执行结果
-          ("done",         {"answer": "...", "stopped"?}) 最终回答，循环结束；
-                                                          用户中途停止时带 stopped=True
+          ("round",           {"round": n})                  开始第 n 轮
+          ("reasoning_delta", {"delta": "..."})              思考模型的推理片段（仅实时展示，不进历史）
+          ("answer_delta",    {"delta": "..."})              LLM 正在输出的文字片段
+          ("tool_call",       {"name", "arguments"})         模型请求调用工具
+          ("tool_result",     {"name", "result"})            工具执行结果
+          ("done",            {"answer": "...", "stopped"?}) 最终回答，循环结束；
+                                                              用户中途停止时带 stopped=True
         """
         # 停止开关：每次提问配一个新 Event，stop() 置位后循环尽快带部分结果收尾；
         # 结束（或生成器被关闭）时也置位，让 llm_client 里的看护线程退出。
@@ -188,6 +189,8 @@ class Agent:
                                                       cancel=self.cancel_event):
                 if kind == "delta":
                     yield "answer_delta", {"delta": payload}
+                elif kind == "reasoning_delta":  # 思考过程只往前端推，不落历史（部分服务商拒收回传的推理内容）
+                    yield "reasoning_delta", {"delta": payload}
                 elif kind == "usage":  # 本轮 token 用量 → 累计后实时推给前端
                     for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
                         usage_total[key] += payload.get(key) or 0

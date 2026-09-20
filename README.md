@@ -136,7 +136,13 @@ Agent 的工作区是项目根目录的 `workspace/`（首次运行会自动生�
 
 ## 日志
 
-终端输出之外，所有事件完整写入项目根目录的 **`agent.log`**（Web 版和 CLI 版共用）：你的每次提问、每轮发给 LLM 的完整 payload、LLM 原始返回、工具调用、错误堆栈。`.env` 里可用 `LOG_FILE` 换路径、`LOG_LEVEL=INFO` 关掉 payload 全量记录。日志包含对话内容，别原样贴到公开场合；已加入 `.gitignore`。
+终端输出之外，所有事件完整写入 **`logs/agent.log`**（Web 版和 CLI 版共用）：你的每次提问、每轮发给 LLM 的完整 payload、LLM 原始返回、工具调用、错误堆栈。
+
+- **按天切分**：每天零点自动归档为 `logs/agent.log.2026-09-19` 这样的日期文件，当天日志始终在 `logs/agent.log`；
+- **自动清理**：默认保留最近 14 天（`.env` 里 `LOG_KEEP_DAYS` 可调）；
+- **可调项**：`LOG_DIR` 换文件夹、`LOG_LEVEL=INFO` 关掉 payload 全量记录。
+
+日志包含对话内容，别原样贴到公开场合；`logs/` 已加入 `.gitignore`。实时追看：`tail -f logs/agent.log`。
 
 ## 常见问题
 
@@ -174,7 +180,7 @@ agent_demo/
 │   ├── code_tools.py # ★ coding 工具集：工作区 + 读写/patch/grep/bash
 │   ├── llm_client.py # LLM API 客户端（OpenAI 兼容）+ .env 读写
 │   ├── tools.py      # 工具注册与统一执行器（合并通用工具和 coding 工具）
-│   ├── logger.py     # 日志配置（写入项目根 agent.log）
+│   ├── logger.py     # 日志配置（logs/ 文件夹，按天切分，自动清理）
 │   └── ui.py         # 终端彩色输出（CLI 用）
 ├── frontend/
 │   ├── index.html    # 页面结构：对话区 + 配置面板
@@ -183,7 +189,7 @@ agent_demo/
 ├── workspace/        # Agent 的工作区（自动生成，前端可切换到任意本地文件夹）
 ├── agent_data.db     # SQLite 数据库：任务、消息历史、供应商与模型配置
 ├── docs/             # 调研笔记（coding agent 选型报告）
-├── agent.log         # 运行日志（自动生成）
+├── logs/             # 运行日志（按天切分：agent.log + agent.log.日期）
 ├── .env              # 你的私密配置（不进 git）
 ├── .env.example      # 配置模板
 └── .gitignore

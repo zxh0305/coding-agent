@@ -806,6 +806,7 @@ function renderCtxPop() {
 
 // ---------- 流式渲染：执行过程时间线 + 打字机回答 ----------
 let liveBubble = null, metaEl = null, metaTimer = null, qStart = 0;
+let thinkEl = null;  // 当前轮次的思考流块（思考模型的 reasoning_delta 实时显示用）
 let traceEl = null, traceSteps = 0;
 let pendingCalls = [];  // 已发出但未见结果的工具调用（算持续时长用）
 
@@ -928,8 +929,21 @@ function handleStreamEvent(evt) {
     loadSessions();
   } else if (evt.type === "round") {
     traceLine(`🧠 思考 · 第 ${evt.round} 轮`);
+    thinkEl = null;  // 新一轮的思考流开一个新块
     retireLiveBubble();
     newLiveBubble();
+  } else if (evt.type === "reasoning_delta") {
+    // 思考模型的推理过程实时流进「执行过程」面板当前轮次下方：
+    // 思考阶段再长界面也有动静，不会再像假死；面板收起后不占聊天区
+    if (!thinkEl) {
+      ensureTrace();
+      thinkEl = document.createElement("div");
+      thinkEl.className = "think-line";
+      traceEl.appendChild(thinkEl);  // 不走 appendTrace：思考流不算一步
+    }
+    thinkEl.textContent += evt.delta;
+    thinkEl.scrollTop = thinkEl.scrollHeight;
+    chatEl.scrollTop = chatEl.scrollHeight;
   } else if (evt.type === "answer_delta") {
     liveBubble.textContent += evt.delta;
     chatEl.scrollTop = chatEl.scrollHeight;

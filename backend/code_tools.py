@@ -150,36 +150,40 @@ def list_dir(path: str = ".") -> str:
 
 
 def grep(pattern: str, path: str = ".") -> str:
-    """在工作区内做正则搜索（简化版 ripgrep）：返回 文件:行号: 内容。"""
+    """在工作区内做正则搜索（简化版 ripgrep）：返回 文件:行号: 内容。path 可为目录或单个文件。"""
     try:
         rx = re.compile(pattern)
     except re.error as e:
         return _err(f"正则表达式不合法: {e}")
     root = _resolve(path)
     ws = get_workspace()
+    if root.is_file():
+        files = [root]  # os.walk 对文件路径一次都不迭代，直接传会静默返回 0 匹配
+    else:
+        files = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
+            files.extend(Path(dirpath) / name for name in filenames)
     matches = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
-        for name in filenames:
-            fp = Path(dirpath) / name
-            try:
-                if fp.stat().st_size > 1_000_000:
-                    continue
-                with open(fp, "rb") as probe:  # 二进制文件（含 \0）跳过
-                    if b"\0" in probe.read(1024):
-                        continue
-                with open(fp, encoding="utf-8", errors="replace") as f:
-                    for lineno, line in enumerate(f, 1):
-                        if rx.search(line):
-                            matches.append({
-                                "file": str(fp.relative_to(ws)),
-                                "line": lineno,
-                                "text": line.strip()[:200],
-                            })
-                            if len(matches) >= MAX_GREP_MATCHES:
-                                return json.dumps({"matches": matches, "note": f"已达 {MAX_GREP_MATCHES} 条上限，请缩小范围"}, ensure_ascii=False)
-            except OSError:
+    for fp in files:
+        try:
+            if fp.stat().st_size > 1_000_000:
                 continue
+            with open(fp, "rb") as probe:  # 二进制文件（含 \0）跳过
+                if b"\0" in probe.read(1024):
+                    continue
+            with open(fp, encoding="utf-8", errors="replace") as f:
+                for lineno, line in enumerate(f, 1):
+                    if rx.search(line):
+                        matches.append({
+                            "file": str(fp.relative_to(ws)),
+                            "line": lineno,
+                            "text": line.strip()[:200],
+                        })
+                        if len(matches) >= MAX_GREP_MATCHES:
+                            return json.dumps({"matches": matches, "note": f"已达 {MAX_GREP_MATCHES} 条上限，请缩小范围"}, ensure_ascii=False)
+        except OSError:
+            continue
     return json.dumps({"matches": matches, "total": len(matches)}, ensure_ascii=False)
 
 
@@ -269,7 +273,7 @@ CODE_TOOL_SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "正则表达式"},
-                    "path": {"type": "string", "description": "限定搜索的子目录，默认整个工作区"},
+                    "path": {"type": "string", "description": "限定搜索的目录或文件（可精确到单个文件），默认整个工作区"},
                 },
                 "required": ["pattern"],
             },
