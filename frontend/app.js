@@ -1,0 +1,1257 @@
+/* 前端逻辑：任务列表、流式对话、执行过程时间线、模型/工作区/上下文工具栏。
+   原生 JS，无框架、无构建步骤。 */
+
+const $ = (id) => document.getElementById(id);
+const chatEl = $("chat");
+const inputEl = $("input");
+
+let currentSession = null;   // 当前任务（会话）id；null = 将开新任务
+let streaming = false;       // 正在生成回答：此时发送按钮变身停止按钮
+let contextWindow = 262144;  // 上下文容量显示上限（/api/config 提供）
+let usageNow = null;         // 最近一次 usage 事件（含上下文构成）
+
+// ---------- 登录状态 ----------
+// token 放 localStorage：刷新不掉线；后端把它存进 agent_data.db，服务重启也不掉线。
+let authToken = localStorage.getItem("auth_token") || "";
+let who = localStorage.getItem("auth_username") || "";
+let loginMode = "login";    // "login" | "register"
+
+function authHeaders() {
+  return authToken ? { Authorization: `Bearer ${authToken}` } : {};
+}
+
+function setWho(name) {
+  // 左下角头像取用户名首字符；设置面板同步
+  who = name || "";
+  const initial = (who || "牛").slice(0, 1);
+  $("user-avatar").textContent = initial;
+  $("user-name").textContent = who || "—";
+  $("pop-avatar").textContent = initial;
+  $("pop-name").textContent = who || "—";
+}
+
+function showLogin() {
+  authToken = "";
+  who = "";
+  currentSession = null;      // 下一个登录者不能沿用上一个用户的任务 id
+  chatEl.innerHTML = "";
+  pendingQueue = [];          // 排队消息也作废（它们属于上一个用户的任务）
+  localStorage.removeItem("auth_token");
+  localStorage.removeItem("auth_username");
+  $("login-error").textContent = "";
+  $("layout").classList.add("hidden");     // 隐藏对话页
+  $("login-page").classList.remove("hidden");  // 显示独立登录页
+  setStreaming(false);
+  $("login-user").focus();
+}
+
+function setLoginMode(mode) {
+  loginMode = mode;
+  $("login-mode").textContent = mode === "login" ? "没有账号？点此注册" : "已有账号？点此登录";
+  $("login-submit").textContent = mode === "login" ? "登录" : "注册并进入";
+  $("login-error").textContent = "";
+}
+
+async function submitLogin() {
+  const username = $("login-user").value.trim();
+  const password = $("login-pass").value;
+  const errEl = $("login-error");
+  errEl.textContent = "";
+  $("login-submit").disabled = true;
+  try {
+    const data = await api(`/api/auth/${loginMode}`, {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+    authToken = data.token;
+    who = data.username;
+    localStorage.setItem("auth_token", authToken);
+    localStorage.setItem("auth_username", who);
+    $("login-page").classList.add("hidden");
+    $("login-pass").value = "";
+    boot();
+  } catch (e) {
+    errEl.textContent = e.message;
+  } finally {
+    $("login-submit").disabled = false;
+  }
+}
+
+// ---------- 后端 API 封装 ----------
+async function api(path, options = {}) {
+  let resp;
+  try {
+    resp = await fetch(path, {
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders(),
+      },
+      ...options,
+    });
+  } catch (e) {
+    // fetch 抛错基本只有一种情况：后端没启动或地址不通
+    throw new Error("无法连接后端服务，请先运行 python3 backend/app.py 再刷新页面");
+  }
+  // 401 = 未登录/掉线：弹登录层（auth 接口自身除外，那里 401 是密码错误）
+  if (resp.status === 401 && !path.startsWith("/api/auth/")) {
+    showLogin();
+    throw new Error("未登录或登录已失效");
+  }
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+  return data;
+}
+
+// ---------- 小工具 ----------
+function bubble(className, text) {
+  const div = document.createElement("div");
+  div.className = `bubble ${className}`;
+  div.textContent = text;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return div;
+}
+
+function summarize(s, n) {
+  s = (s || "").replace(/\s+/g, " ").trim();
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+function prettyJson(s) {
+  try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
+}
+
+function fmtWan(n) {
+  if (n == null) return "—";
+  if (n >= 10000) return (n / 10000).toFixed(n >= 100000 ? 0 : 1) + "万";
+  return String(n);
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts * 1000), now = new Date();
+  const pad = (x) => String(x).padStart(2, "0");
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  if (d.toDateString() === now.toDateString()) return hm;
+  const days = Math.floor((now - d) / 86400000);
+  if (days >= 0 && days < 7) return `${days}天前`;
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
+}
+
+function toast(text) {
+  const t = $("toast");
+  t.textContent = text;
+  t.classList.remove("hidden");
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => t.classList.add("hidden"), 2500);
+}
+
+// ---------- 任务（会话）列表 ----------
+let confirmingDelete = null;  // 正处于"确认删除"状态的任务 id（二次确认，防误触）
+
+async function loadSessions() {
+  try {
+    const list = await api("/api/sessions");
+    renderSessions(Array.isArray(list) ? list : []);
+  } catch (e) { /* 启动时后端未就绪不打扰 */ }
+}
+
+function renderSessions(list) {
+  const ul = $("task-list");
+  ul.innerHTML = "";
+  if (!list.length) {
+    const li = document.createElement("li");
+    li.className = "task empty";
+    li.textContent = "（还没有任务，发一条消息即创建）";
+    ul.appendChild(li);
+    return;
+  }
+  for (const s of list) {
+    const li = document.createElement("li");
+    li.className = "task" + (s.id === currentSession ? " active" : "");
+
+    // 二次确认状态：这一行变成"确认删除？[删除][取消]"，不做弹窗
+    if (s.id === confirmingDelete) {
+      li.classList.add("confirming");
+      const q = document.createElement("div");
+      q.className = "t-question";
+      q.textContent = "确认删除？";
+      const yes = document.createElement("button");
+      yes.className = "t-yes";
+      yes.textContent = "删除";
+      yes.addEventListener("click", (e) => {
+        e.stopPropagation();
+        confirmingDelete = null;
+        doDeleteSession(s.id);
+      });
+      const no = document.createElement("button");
+      no.className = "t-no";
+      no.textContent = "取消";
+      no.addEventListener("click", (e) => {
+        e.stopPropagation();
+        confirmingDelete = null;
+        renderSessions(list);
+      });
+      li.append(q, yes, no);
+      ul.appendChild(li);
+      continue;
+    }
+
+    const title = document.createElement("div");
+    title.className = "t-title";
+    title.textContent = s.title || "新任务";
+    const time = document.createElement("span");
+    time.className = "t-time";
+    time.textContent = fmtTime(s.updated);
+    const del = document.createElement("button");
+    del.className = "t-del";
+    del.textContent = "🗑";
+    del.title = "删除任务";
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      confirmingDelete = s.id;   // 第一次点：只进入确认状态，不真删
+      renderSessions(list);
+    });
+    li.append(title, time, del);
+    li.title = s.title || "";
+    li.addEventListener("click", () => {
+      confirmingDelete = null;
+      switchSession(s.id);
+    });
+    ul.appendChild(li);
+  }
+}
+
+async function doDeleteSession(id) {
+  try { await api(`/api/sessions?session_id=${encodeURIComponent(id)}`, { method: "DELETE" }); } catch (e) {}
+  if (currentSession === id) {
+    // 删的是当前打开的任务：清空对话区，回到待新建状态
+    currentSession = null;
+    chatEl.innerHTML = "";
+    welcome();
+    refreshCtx();
+  }
+  await loadSessions();
+}
+
+async function newTask() {
+  currentSession = null;
+  confirmingDelete = null;
+  chatEl.innerHTML = "";
+  welcome();
+  usageNow = null;
+  updateCtxChip();
+  await loadSessions();  // 重新拉取列表：旧任务仍显示，只是没有选中项；首条消息后新任务才出现
+}
+
+async function switchSession(id) {
+  if (id === currentSession) return;
+  currentSession = id;
+  chatEl.innerHTML = "";
+  welcome();
+  try {
+    const msgs = await api(`/api/sessions/${encodeURIComponent(id)}/messages`);
+    for (const m of msgs) {
+      // 用户消息可能是多部分数组（文本 + 图片附件）
+      if (m.role === "user" && Array.isArray(m.content)) {
+        const text = m.content
+          .filter(p => p.type === "text")
+          .map(p => (p.text || "").length > 600 ? p.text.slice(0, 600) + "…[附件内容已折叠]" : p.text)
+          .join("\n");
+        const imgs = m.content
+          .filter(p => p.type === "image_url")
+          .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
+        userBubble(text, imgs);
+      } else {
+        bubble(m.role === "user" ? "user" : "assistant", m.content || "");
+        // 历史消息也带回当时的耗时/token 统计（新版本起随消息落盘）
+        if (m.role === "assistant" && m.stats) {
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.textContent = metaText(m.stats.elapsed_s, m.stats.usage);
+          chatEl.appendChild(meta);
+        }
+      }
+    }
+  } catch (e) { /* 历史拉取失败不阻塞 */ }
+  await loadSessions();
+  await refreshCtx();
+  dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
+}
+
+function welcome() {
+  bubble("assistant", "你好！我是 Agent 助手。可以问我：「北京今天天气怎么样」「37*89+100 等于多少」，或让我在工作区里写代码、修 bug。");
+}
+
+// ---------- 附件（图片 / 文本文件）----------
+// 图片以 base64 作为视觉输入发给模型；文本文件解码后注入上下文。
+// 都只存在数据库的消息里，不另外落盘。
+let attachments = [];  // {kind: "image"|"text", name, mime, data(base64), preview}
+
+const MAX_ATTACH = 6;
+
+function renderAttachTray() {
+  const tray = $("attach-tray");
+  if (!attachments.length) {
+    tray.classList.add("hidden");
+    tray.innerHTML = "";
+    return;
+  }
+  tray.classList.remove("hidden");
+  tray.innerHTML = "";
+  attachments.forEach((a, i) => {
+    const card = document.createElement("div");
+    card.className = "att-card";
+    card.title = a.name;
+    if (a.kind === "image" && a.preview) {
+      const img = document.createElement("img");
+      img.src = a.preview;
+      img.alt = a.name;
+      card.appendChild(img);
+    } else {
+      const icon = document.createElement("div");
+      icon.className = "att-file";
+      icon.textContent = "📄 " + summarize(a.name, 14);
+      card.appendChild(icon);
+    }
+    const x = document.createElement("button");
+    x.className = "att-del";
+    x.textContent = "✕";
+    x.title = "移除";
+    x.addEventListener("click", () => {
+      attachments.splice(i, 1);
+      renderAttachTray();
+    });
+    card.appendChild(x);
+    tray.appendChild(card);
+  });
+}
+
+function addFileToAttachments(file) {
+  if (!file) return;
+  if (attachments.length >= MAX_ATTACH) { toast(`一次最多 ${MAX_ATTACH} 个附件`); return; }
+  const isImage = file.type.startsWith("image/");
+  if (isImage && file.size > 4 * 1024 * 1024) { toast(`图片超过 4MB`); return; }
+  if (!isImage && file.size > 300 * 1024) { toast(`文件超过 300KB（文本附件限制）`); return; }
+  if (isImage && !activeModelVision) {
+    toast("当前模型未标注视觉能力，发送后将由 analyze_image 工具代为识别");
+  }
+  const slot = attachments.length;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const dataUrl = String(reader.result);
+    const data = dataUrl.slice(dataUrl.indexOf(",") + 1);  // 去掉 data:...;base64, 前缀
+    const ext = (file.type.split("/")[1] || "bin").replace("+xml", "");
+    attachments[slot] = isImage
+      ? { kind: "image", name: file.name || `clipboard.${ext}`, mime: file.type, data, preview: dataUrl }
+      : { kind: "text", name: file.name || "clipboard.txt", mime: "text/plain", data, preview: "" };
+    renderAttachTray();
+  };
+  reader.readAsDataURL(file);
+}
+
+function onFilesChosen() {
+  for (const file of $("file-input").files) addFileToAttachments(file);
+  $("file-input").value = "";  // 允许重复选择同一个文件
+}
+
+// 粘贴：截图后直接 Ctrl/⌘+V 到输入框；只拦截文件类内容，纯文本粘贴不受影响
+function onPaste(e) {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  let hasFile = false;
+  for (const item of items) {
+    if (item.kind === "file") {
+      const file = item.getAsFile();
+      if (file) { hasFile = true; addFileToAttachments(file); }
+    }
+  }
+  if (hasFile) e.preventDefault();  // 阻止图片二进制被当文本粘进输入框
+}
+
+// 拖拽：把文件拖到输入框区域即可添加
+function bindDragAndDrop(el) {
+  ["dragover", "dragenter"].forEach(ev =>
+    el.addEventListener(ev, (e) => { e.preventDefault(); el.classList.add("dragging"); }));
+  ["dragleave", "drop"].forEach(ev =>
+    el.addEventListener(ev, (e) => { e.preventDefault(); el.classList.remove("dragging"); }));
+  el.addEventListener("drop", (e) => {
+    for (const file of e.dataTransfer?.files || []) addFileToAttachments(file);
+  });
+}
+
+// 带附件的用户气泡：文字 + 图片缩略图/文件名
+function userBubble(text, atts) {
+  const div = document.createElement("div");
+  div.className = "bubble user";
+  if (text) {
+    const t = document.createElement("div");
+    t.textContent = text;
+    div.appendChild(t);
+  }
+  for (const a of atts || []) {
+    if (a.kind === "image" && a.preview) {
+      const img = document.createElement("img");
+      img.src = a.preview;
+      img.className = "msg-img";
+      div.appendChild(img);
+    } else {
+      const f = document.createElement("div");
+      f.className = "att-file";
+      f.textContent = "📄 " + a.name;
+      div.appendChild(f);
+    }
+  }
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+// ---------- 模型：激活切换（工具栏气泡）+ 供应商管理（弹窗） ----------
+let providers = [];        // 供应商列表缓存（含各自模型）
+let activeModel = { provider_id: "", model: "" };
+let activeModelVision = true;  // 激活模型是否支持看图（/api/config 提供）
+let editingProvId = null;  // 管理面板当前打开的供应商（null = 新供应商未保存）
+let editorModels = [];     // 管理面板里正在编辑的模型行
+
+async function loadConfig() {
+  try {
+    const cfg = await api("/api/config");
+    activeModel = { provider_id: cfg.provider_id, model: cfg.model };
+    contextWindow = cfg.context_window || contextWindow;
+    activeModelVision = !!cfg.vision;   // 激活模型能否看图（决定附件上传时的提示）
+    lastCfg = cfg;                      // 设置面板展示用
+    $("model-label").textContent = `${cfg.provider_name || "模型"} / ${cfg.model || "—"}`;
+    updateCtxChip();
+  } catch (e) {
+    $("model-label").textContent = "模型未配置";
+  }
+}
+
+async function loadModelPop() {
+  const data = await api("/api/models");
+  const list = $("model-pop-list");
+  list.innerHTML = "";
+  let lastProv = null;
+  for (const m of data.models) {
+    if (m.provider_id !== lastProv) {  // 按供应商分组显示
+      lastProv = m.provider_id;
+      const head = document.createElement("div");
+      head.className = "mp-head";
+      head.textContent = m.provider_name;
+      list.appendChild(head);
+    }
+    const isActive = m.provider_id === activeModel.provider_id && m.model === activeModel.model;
+    const row = document.createElement("div");
+    row.className = "mp-row" + (isActive ? " active" : "");
+    const name = document.createElement("span");
+    name.textContent = m.model;
+    const win = document.createElement("span");
+    win.className = "mp-win";
+    win.textContent = fmtWan(m.context_window);
+    const check = document.createElement("span");
+    check.className = "mp-check";
+    check.textContent = isActive ? "✓" : "";
+    row.append(name, win, check);
+    row.addEventListener("click", async () => {
+      try {
+        const cfg = await api("/api/active-model", {
+          method: "POST",
+          body: JSON.stringify({ provider_id: m.provider_id, model: m.model }),
+        });
+        activeModel = { provider_id: cfg.provider_id, model: cfg.model };
+        contextWindow = cfg.context_window || contextWindow;
+        $("model-label").textContent = `${cfg.provider_name} / ${cfg.model}`;
+        $("model-pop").classList.add("hidden");
+        updateCtxChip();
+        toast(`已切换到 ${cfg.provider_name} / ${cfg.model}`);
+      } catch (e) {
+        toast("切换失败：" + e.message);
+      }
+    });
+    list.appendChild(row);
+  }
+  if (!data.models.length) {
+    const empty = document.createElement("div");
+    empty.className = "mp-empty";
+    empty.textContent = "还没有可用模型，点下方「管理模型」添加";
+    list.appendChild(empty);
+  }
+}
+
+function toggleModelPop() {
+  const pop = $("model-pop");
+  if (!pop.classList.contains("hidden")) { pop.classList.add("hidden"); return; }
+  loadModelPop().then(() => {
+    const rect = $("model-chip").getBoundingClientRect();
+    pop.style.left = Math.max(8, rect.left) + "px";
+    pop.style.bottom = (innerHeight - rect.top + 8) + "px";
+    pop.classList.remove("hidden");
+  }).catch((e) => toast(e.message));
+}
+
+// ---------- 管理模型（供应商 CRUD + 模型列表 + 测试链接） ----------
+async function openProvModal() {
+  $("model-pop").classList.add("hidden");
+  $("prov-modal").classList.remove("hidden");
+  providers = await api("/api/providers").catch(() => []);
+  const valid = providers.some(p => p.id === editingProvId);
+  openProvEditor(valid ? editingProvId : (providers[0]?.id ?? null));
+}
+
+function renderProvList() {
+  const ul = $("prov-list");
+  ul.innerHTML = "";
+  for (const p of providers) {
+    const li = document.createElement("li");
+    li.className = "prov-item" + (p.id === editingProvId ? " active" : "");
+    const dot = document.createElement("span");
+    dot.className = "prov-dot " + (p.enabled ? "on" : "off");
+    const name = document.createElement("span");
+    name.textContent = p.name;
+    li.append(dot, name);
+    li.addEventListener("click", () => openProvEditor(p.id));
+    ul.appendChild(li);
+  }
+}
+
+function openProvEditor(pid) {
+  editingProvId = pid;
+  renderProvList();
+  const p = providers.find(x => x.id === pid);
+  $("p-name").value = p?.name || "";
+  $("p-url").value = p?.base_url || "";
+  $("p-format").value = p?.api_format || "openai";
+  $("p-key").value = "";
+  $("p-key").placeholder = p?.api_key_masked ? `已保存（${p.api_key_masked}），留空不变` : "输入 API Key";
+  $("p-enabled").checked = p ? p.enabled : true;
+  $("p-test-result").textContent = "";
+  $("p-delete").style.display = pid === "default" ? "none" : "";
+  editorModels = p ? p.models.map(m => ({ ...m })) : [{ name: "", context_window: 262144, enabled: true }];
+  renderModelRows();
+}
+
+function renderModelRows() {
+  const box = $("p-models");
+  box.innerHTML = "";
+  editorModels.forEach((m, i) => {
+    const row = document.createElement("div");
+    row.className = "pm-row";
+    const name = document.createElement("input");
+    name.className = "mono pm-name";
+    name.placeholder = "模型名";
+    name.value = m.name;
+    name.addEventListener("input", () => (editorModels[i].name = name.value));
+    const win = document.createElement("input");
+    win.className = "mono pm-win-input";
+    win.placeholder = "窗口";
+    win.title = "上下文窗口（token），用于容量显示";
+    win.value = m.context_window;
+    win.addEventListener("input", () => (editorModels[i].context_window = parseInt(win.value) || 262144));
+    const en = document.createElement("input");
+    en.type = "checkbox";
+    en.checked = m.enabled;
+    en.title = "启用（出现在聊天工具栏）";
+    en.addEventListener("change", () => (editorModels[i].enabled = en.checked));
+    const vision = document.createElement("input");
+    vision.type = "checkbox";
+    vision.checked = !!m.vision;
+    vision.title = "视觉：该模型支持看图（非视觉模型发图时，由它代为识别）";
+    vision.addEventListener("change", () => (editorModels[i].vision = vision.checked));
+    const test = document.createElement("button");
+    test.className = "pm-test";
+    test.textContent = "⚡";
+    test.title = "测试该模型是否连通";
+    test.addEventListener("click", async () => {
+      if (!editorModels[i].name.trim()) return toast("先填写模型名再测试");
+      test.textContent = "…";
+      test.className = "pm-test";
+      try {
+    const r = await api("/api/providers/test", {
+      method: "POST",
+      body: JSON.stringify({
+        provider_id: editingProvId,
+        base_url: $("p-url").value.trim(),
+        api_format: $("p-format").value,
+        api_key: $("p-key").value.trim(),  // 留空 = 用已保存的 Key
+        model: editorModels[i].name.trim(),
+      }),
+    });
+        test.textContent = r.ok ? "✓" : "✗";
+        test.classList.add(r.ok ? "ok" : "err");
+        test.title = r.ok ? `连通（${r.latency_ms}ms）` : summarize(r.error, 120);
+      } catch (e) {
+        test.textContent = "✗";
+        test.classList.add("err");
+        test.title = e.message;
+      }
+    });
+    const del = document.createElement("button");
+    del.className = "t-del big";
+    del.textContent = "🗑";
+    del.title = "删除模型";
+    del.addEventListener("click", async () => {
+      if (editingProvId && m.name) {
+        try {
+          await api("/api/providers/models/delete", {
+            method: "POST",
+            body: JSON.stringify({ provider_id: editingProvId, name: m.name }),
+          });
+        } catch (e) { /* 模型还没保存过，静默 */ }
+      }
+      editorModels.splice(i, 1);
+      renderModelRows();
+    });
+    row.append(name, win, test, vision, en, del);
+    box.appendChild(row);
+  });
+  if (!editorModels.length) {
+    const empty = document.createElement("div");
+    empty.className = "pm-empty";
+    empty.textContent = "（还没有模型）";
+    box.appendChild(empty);
+  }
+  // 列表底部的"添加模型"入口（动态重建，所以在这里挂事件）
+  const addBtn = document.createElement("button");
+  addBtn.id = "p-model-add";
+  addBtn.className = "add-row";
+  addBtn.textContent = "＋ 添加模型";
+  addBtn.addEventListener("click", () => {
+    editorModels.push({ name: "", context_window: 262144, enabled: true });
+    renderModelRows();
+  });
+  box.appendChild(addBtn);
+}
+
+async function saveProv() {
+  const name = $("p-name").value.trim();
+  const base = $("p-url").value.trim();
+  if (!name) { $("p-name").focus(); return toast("请填写供应商名称"); }
+  if (!base) { $("p-url").focus(); return toast("请填写 Base URL"); }
+  try {
+    const r = await api("/api/providers/save", {
+      method: "POST",
+      body: JSON.stringify({
+        id: editingProvId,
+        name, base_url: base,
+        api_format: $("p-format").value,
+        api_key: $("p-key").value.trim(),   // 留空 = 保持已保存的 Key
+        enabled: $("p-enabled").checked,
+        models: editorModels.filter(m => m.name.trim()),
+      }),
+    });
+    toast("已保存");
+    editingProvId = r.id;
+    providers = await api("/api/providers");
+    renderProvList();
+    openProvEditor(editingProvId);
+    loadConfig();  // 若改的是激活模型，刷新工具栏显示
+  } catch (e) {
+    toast("保存失败：" + e.message);
+  }
+}
+
+async function deleteProv() {
+  if (!editingProvId) return;
+  if (editingProvId === "default") return toast("默认供应商不可删除");
+  try {
+    await api("/api/providers/delete", { method: "POST", body: JSON.stringify({ id: editingProvId }) });
+  } catch (e) {
+    return toast(e.message);
+  }
+  toast("已删除供应商");
+  providers = await api("/api/providers");
+  editingProvId = providers[0]?.id ?? null;
+  openProvEditor(editingProvId);
+}
+
+async function testProv() {
+  const result = $("p-test-result");
+  result.textContent = "测试中…";
+  result.className = "status";
+  try {
+    const r = await api("/api/providers/test", {
+      method: "POST",
+      body: JSON.stringify({
+        provider_id: editingProvId,
+        base_url: $("p-url").value.trim(),
+        api_format: $("p-format").value,
+        api_key: $("p-key").value.trim(),  // 留空 = 用已保存的 Key
+        model: (editorModels.find(m => m.name.trim()) || {}).name || "",
+      }),
+    });
+    if (r.ok) {
+      result.textContent = `✅ 连接成功（${r.latency_ms}ms）`;
+      result.classList.add("ok");
+    } else {
+      result.textContent = "❌ " + summarize(r.error, 90);
+      result.classList.add("err");
+    }
+  } catch (e) {
+    result.textContent = "❌ " + e.message;
+  }
+}
+
+// ---------- 工作区 ----------
+async function loadWorkspace() {
+  try {
+    const w = await api("/api/workspace");
+    setWsLabel(w.path);
+  } catch (e) { /* 忽略 */ }
+}
+
+function setWsLabel(path) {
+  const seg = (path || "").replace(/\/+$/, "").split("/").pop() || path;
+  $("ws-short").textContent = seg || "工作区";
+  $("ws-pick").title = path || "";
+}
+
+let mCwd = "", mParent = null, mHome = "";
+
+async function navTo(path) {
+  const qs = path ? `?path=${encodeURIComponent(path)}` : "";
+  const info = await api("/api/fs/dirs" + qs);
+  mCwd = info.path;
+  mParent = info.parent;
+  mHome = info.home;
+  $("m-path").textContent = info.path;
+  const ul = $("m-list");
+  ul.innerHTML = "";
+  for (const name of info.dirs) {
+    const li = document.createElement("li");
+    li.textContent = "📁 " + name;
+    li.addEventListener("click", () => navTo((mCwd.endsWith("/") ? mCwd : mCwd + "/") + name));
+    ul.appendChild(li);
+  }
+  if (!info.dirs.length) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "（没有子目录了）";
+    ul.appendChild(li);
+  }
+  $("m-up").disabled = !info.parent;
+}
+
+async function openPicker() {
+  $("modal").classList.remove("hidden");
+  try {
+    const cur = $("ws-pick").title;
+    const parent = cur ? cur.replace(/\/[^/]+\/?$/, "") : "";
+    await navTo(parent || undefined);
+  } catch (e) {
+    await navTo(undefined);
+  }
+}
+
+async function chooseWorkspace() {
+  try {
+    const w = await api("/api/workspace", { method: "POST", body: JSON.stringify({ path: mCwd }) });
+    setWsLabel(w.path);
+    $("modal").classList.add("hidden");
+    bubble("assistant", `（工作区已切换到 ${w.path}，之后我的文件操作和命令都在这个目录里进行）`);
+  } catch (e) {
+    $("m-path").textContent = "切换失败：" + e.message;
+  }
+}
+
+// ---------- 上下文容量 ----------
+function updateCtxChip() {
+  const chip = $("ctx-chip");
+  if (!usageNow) { chip.textContent = "⛁ —"; return; }
+  chip.textContent = `⛁ ${fmtWan(usageNow.prompt_tokens)} / ${fmtWan(contextWindow)}`;
+}
+
+async function refreshCtx() {
+  if (!currentSession) { usageNow = null; updateCtxChip(); return; }
+  try {
+    const c = await api(`/api/context?session_id=${encodeURIComponent(currentSession)}`);
+    contextWindow = c.window || contextWindow;
+    usageNow = { prompt_tokens: c.tokens, context: c.breakdown, cache_hit_rate: c.cache_hit_rate };
+    updateCtxChip();
+  } catch (e) { /* 忽略 */ }
+}
+
+function toggleCtxPop() {
+  const pop = $("ctx-pop");
+  if (!pop.classList.contains("hidden")) { pop.classList.add("hidden"); return; }
+  renderCtxPop();
+  const rect = $("ctx-chip").getBoundingClientRect();
+  pop.style.left = Math.max(8, rect.left) + "px";
+  pop.style.bottom = (innerHeight - rect.top + 8) + "px";
+  pop.classList.remove("hidden");
+}
+
+function renderCtxPop() {
+  const nums = $("ctx-nums"), fill = $("ctx-fill"), bd = $("ctx-breakdown");
+  const tokens = usageNow ? usageNow.prompt_tokens : 0;
+  const pct = Math.min(100, (tokens / contextWindow) * 100);
+  nums.textContent = `${fmtWan(tokens)} / ${fmtWan(contextWindow)}（${pct.toFixed(1)}%）`;
+  fill.style.width = pct + "%";
+  fill.classList.toggle("warn", pct > 80);
+
+  const labels = { system: "系统提示词", tools: "工具定义", user: "用户消息", assistant: "助手回复", tool_results: "工具结果" };
+  bd.innerHTML = "";
+  const b = (usageNow && usageNow.context) || {};
+  const total = Math.max(1, Object.values(b).reduce((x, y) => x + (y || 0), 0));
+  for (const [key, label] of Object.entries(labels)) {
+    const row = document.createElement("div");
+    row.className = "ctx-row";
+    const name = document.createElement("span");
+    name.textContent = label;
+    const val = document.createElement("b");
+    val.textContent = ((b[key] || 0) / total * 100).toFixed(1) + "%";
+    row.append(name, val);
+    bd.appendChild(row);
+  }
+  $("ctx-cache").textContent = usageNow && usageNow.cache_hit_rate != null ? usageNow.cache_hit_rate + "%" : "—";
+}
+
+// ---------- 流式渲染：执行过程时间线 + 打字机回答 ----------
+let liveBubble = null, metaEl = null, metaTimer = null, qStart = 0;
+let traceEl = null, traceSteps = 0;
+let pendingCalls = [];  // 已发出但未见结果的工具调用（算持续时长用）
+
+const TOOL_ICONS = {
+  write_file: "✏️", apply_patch: "✏️",
+  read_file: "🔍", grep: "🔍", list_dir: "📂",
+  run_bash: "▶️", calculator: "🧮", current_time: "🕐", get_weather: "🌤️",
+};
+
+function ensureTrace() {
+  if (traceEl) return;
+  traceEl = document.createElement("details");
+  traceEl.className = "trace";
+  traceEl.open = true;  // 执行期间展开，实时看过程
+  const summary = document.createElement("summary");
+  summary.textContent = "执行过程";
+  traceEl.appendChild(summary);
+  chatEl.appendChild(traceEl);
+}
+
+function appendTrace(el) {
+  ensureTrace();
+  traceEl.appendChild(el);
+  traceSteps += 1;
+  traceEl.querySelector("summary").textContent = `执行过程（${traceSteps} 步）`;
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function traceLine(text) {
+  const div = document.createElement("div");
+  div.className = "trace-line";
+  div.textContent = text;
+  appendTrace(div);
+}
+
+function toolCallLine(name, argsStr) {
+  let a = {};
+  try { a = JSON.parse(argsStr); } catch { /* 参数不是 JSON */ }
+  const main = summarize(a.command || a.path || a.expression || a.pattern || a.city || "", 46);
+  const d = document.createElement("details");
+  d.className = "tl";
+  const summary = document.createElement("summary");
+  summary.textContent = `${TOOL_ICONS[name] || "🔧"} ${name}${main ? " · " + main : ""}`;
+  const pre = document.createElement("pre");
+  pre.textContent = prettyJson(argsStr);
+  d.append(summary, pre);
+  appendTrace(d);
+  pendingCalls.push({ name, el: d, t: Date.now() });
+}
+
+function toolResultLine(name, resultStr) {
+  // 持续时长：配对最近一次同名调用
+  let dur = "";
+  const idx = pendingCalls.map(c => c.name).lastIndexOf(name);
+  if (idx >= 0) {
+    const call = pendingCalls.splice(idx, 1)[0];
+    dur = ` · ${((Date.now() - call.t) / 1000).toFixed(1)}s`;
+  }
+  const d = document.createElement("details");
+  d.className = "tl result";
+  const summary = document.createElement("summary");
+  const pre = document.createElement("pre");
+  let parsed = null;
+  try { parsed = JSON.parse(resultStr); } catch { /* 纯文本 */ }
+
+  if (parsed && typeof parsed === "object" && "exit_code" in parsed) {
+    summary.textContent = `↩ ${dur.replace(" · ", "") || "0s"} · exit ${parsed.exit_code}`;
+    if (parsed.exit_code !== 0) summary.classList.add("err");
+    pre.textContent = [parsed.stdout, parsed.stderr].filter(Boolean).join("\n[stderr]\n") || "(无输出)";
+  } else if (parsed && typeof parsed === "object" && "error" in parsed) {
+    summary.textContent = `↩ 出错${dur}`;
+    summary.classList.add("err");
+    pre.textContent = parsed.error;
+  } else if (parsed && typeof parsed === "object" && "added" in parsed) {
+    summary.textContent = `↩ +${parsed.added} −${parsed.removed}${dur}`;
+  } else if (parsed && typeof parsed === "object" && "lines" in parsed) {
+    summary.textContent = `↩ 新建 ${parsed.lines} 行${dur}`;
+  } else if (parsed) {
+    summary.textContent = `↩ ${summarize(resultStr, 60)}${dur}`;
+    pre.textContent = JSON.stringify(parsed, null, 2);
+  } else {
+    summary.textContent = `↩ ${summarize(resultStr, 60)}${dur}`;
+    pre.textContent = resultStr;
+  }
+  d.append(summary, pre);
+  appendTrace(d);
+}
+
+// ⏱ 耗时 + token 统计行（跟随当前回答气泡）
+function metaText(elapsed, u) {
+  let t = `⏱ ${elapsed}s`;
+  if (u && u.total_tokens) t += ` · ↑${u.prompt_tokens} ↓${u.completion_tokens} tokens`;
+  return t;
+}
+
+function newLiveBubble() {
+  liveBubble = document.createElement("div");
+  liveBubble.className = "bubble assistant streaming";
+  chatEl.appendChild(liveBubble);
+  if (!metaEl) {
+    metaEl = document.createElement("div");
+    metaEl.className = "meta";
+  }
+  metaEl.textContent = metaText(((Date.now() - qStart) / 1000).toFixed(1), usageNow);
+  chatEl.appendChild(metaEl);  // 已存在则移动到当前气泡后
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+// SSE 事件 → 页面更新（事件类型见 backend/app.py 的 _handle_chat_stream）
+function retireLiveBubble() {
+  // 当前气泡"退役"：去掉打字机光标（否则中间轮次的气泡会一直闪），空的直接移除
+  if (!liveBubble) return;
+  liveBubble.classList.remove("streaming");
+  if (!liveBubble.textContent) liveBubble.remove();
+}
+
+function handleStreamEvent(evt) {
+  if (evt.type === "session") {
+    currentSession = evt.id;   // 后端告知本条消息归属的任务，后续追问带上它
+    loadSessions();
+  } else if (evt.type === "round") {
+    traceLine(`🧠 思考 · 第 ${evt.round} 轮`);
+    retireLiveBubble();
+    newLiveBubble();
+  } else if (evt.type === "answer_delta") {
+    liveBubble.textContent += evt.delta;
+    chatEl.scrollTop = chatEl.scrollHeight;
+  } else if (evt.type === "tool_call") {
+    retireLiveBubble();
+    toolCallLine(evt.name, evt.arguments);
+  } else if (evt.type === "tool_result") {
+    toolResultLine(evt.name, evt.result);
+  } else if (evt.type === "usage") {
+    usageNow = evt;   // 供上下文气泡与统计行使用
+    updateCtxChip();
+    if (metaEl) metaEl.textContent = metaText(evt.elapsed_s, usageNow);
+  } else if (evt.type === "done") {
+    if (!liveBubble) newLiveBubble();
+    liveBubble.classList.remove("streaming");
+    liveBubble.textContent = evt.answer;
+    clearInterval(metaTimer);
+    metaEl.textContent = metaText(evt.elapsed_s, evt.usage);
+    if (traceEl) {
+      traceEl.open = false;  // 执行完收起，保持对话清爽；点开可回看全过程
+      traceEl.querySelector("summary").textContent = `执行过程（${traceSteps} 步 · ${evt.elapsed_s}s）`;
+    }
+    chatEl.scrollTop = chatEl.scrollHeight;
+    loadSessions();  // 任务时间/排序刷新
+  } else if (evt.type === "error") {
+    retireLiveBubble();
+    clearInterval(metaTimer);
+    if (traceEl) traceEl.querySelector("summary").textContent = `执行过程（${traceSteps} 步 · 出错）`;
+    bubble("assistant error", "❌ " + evt.message);
+  }
+}
+
+// 生成期间「发送」变身「停止」：点它请求服务端掐断当前生成。
+// 按钮复位不在点击处——等 SSE 流送来 done/error 后，在 send() 的 finally 里。
+function setStreaming(on) {
+  streaming = on;
+  const btn = $("send");
+  btn.disabled = false;  // 生成中也要保持可点（此时点 = 停止）
+  btn.textContent = on ? "■ 停止" : "发送";
+  btn.classList.toggle("stop", on);
+  inputEl.placeholder = on
+    ? "生成中：现在输入将排队，回答完成后自动发送"
+    : "输入问题或任务，Enter 发送（Shift+Enter 换行）";
+}
+
+async function stopGeneration() {
+  $("send").textContent = "停止中…";
+  try {
+    await api("/api/chat/stop", { method: "POST", body: JSON.stringify({ session_id: currentSession }) });
+  } catch (e) {
+    // 停止指令没送到（比如服务刚重启）：不必处理，断流后 finally 会复位按钮
+  }
+}
+
+// ---------- 发送与排队 ----------
+// 生成期间再发消息：默认【排队】（当前回答完成后自动接着发），
+// 队列卡片上可「⬆ 立即」（停止当前生成、马上执行这一条）/「✏ 编辑」/「🗑 删除」。
+let pendingQueue = [];  // {text, payloadAtts, sessionId, el, immediate}
+
+function send() {
+  const text = inputEl.value.trim();
+  if (!text && !attachments.length) return;
+  const payloadAtts = attachments.map(a => ({ kind: a.kind, name: a.name, mime: a.mime, data: a.data }));
+  const outAtts = attachments.map(a => ({ kind: a.kind, name: a.name, preview: a.preview }));
+  inputEl.value = "";
+  attachments = [];
+  renderAttachTray();
+
+  if (streaming) {
+    // 排队：只显示队列卡片，正式气泡等派发执行时再渲染（否则会出现两条重复消息）
+    queueMessage(text, payloadAtts);
+    return;
+  }
+  userBubble(text, outAtts);
+  performSend({ text, payloadAtts, sessionId: currentSession });
+}
+
+function queueMessage(text, payloadAtts) {
+  const item = { text, payloadAtts, sessionId: currentSession, immediate: false, el: null };
+  const wrap = document.createElement("div");
+  wrap.className = "bubble user queued";
+  const t = document.createElement("div");
+  t.textContent = text || "（仅附件）";
+  wrap.appendChild(t);
+  for (const a of payloadAtts) {
+    if (a.kind === "image") {
+      const img = document.createElement("img");
+      img.className = "msg-img";
+      img.src = `data:${a.mime};base64,${a.data}`;
+      wrap.appendChild(img);
+    }
+  }
+  const actions = document.createElement("div");
+  actions.className = "queue-actions";
+  const mk = (label, fn, cls) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.className = "q-btn" + (cls ? " " + cls : "");
+    b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+    actions.appendChild(b);
+  };
+  mk("⬆ 立即", () => {
+    item.immediate = true;
+    const i = pendingQueue.indexOf(item);
+    if (i > 0) { pendingQueue.splice(i, 1); pendingQueue.unshift(item); }  // 提到队首
+    item.el?.remove();
+    stopGeneration();  // 停掉当前生成；流结束后队列自动从队首开始发
+  }, "q-immediate");
+  mk("✏ 编辑", () => {
+    pendingQueue.splice(pendingQueue.indexOf(item), 1);
+    item.el?.remove();
+    inputEl.value = item.text;
+    for (const a of item.payloadAtts) {
+      attachments.push({ kind: a.kind, name: a.name, mime: a.mime, data: a.data,
+                         preview: a.kind === "image" ? `data:${a.mime};base64,${a.data}` : "" });
+    }
+    renderAttachTray();
+    inputEl.focus();
+  });
+  mk("🗑 删除", () => {
+    pendingQueue.splice(pendingQueue.indexOf(item), 1);
+    item.el?.remove();
+  });
+  wrap.appendChild(actions);
+  chatEl.appendChild(wrap);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  item.el = wrap;
+  pendingQueue.push(item);
+}
+
+function dispatchNextQueued() {
+  if (streaming || !pendingQueue.length) return;
+  const item = pendingQueue[0];
+  // 用户已切到其他任务：先不发，切回来时再发（避免渲染混进别的对话视图）
+  if (item.sessionId !== currentSession) return;
+  pendingQueue.shift();
+  item.el?.remove();  // 队列卡片退场，换成正式的已发送气泡
+  const outAtts = item.payloadAtts.map(a => ({
+    kind: a.kind, name: a.name,
+    preview: a.kind === "image" ? `data:${a.mime};base64,${a.data}` : "",
+  }));
+  userBubble(item.text, outAtts);
+  performSend(item);
+}
+
+async function performSend(item) {
+  setStreaming(true);
+  // 注意：用户气泡由调用方渲染（直接发送在 send()，排队消息在 dispatchNextQueued），
+  // 这里不再画一遍——否则每条排队的消息会出现两个重复气泡。
+  liveBubble = null; traceEl = null; traceSteps = 0;
+  metaEl = null; usageNow = null; qStart = Date.now();
+  clearInterval(metaTimer);
+  metaTimer = setInterval(() => {
+    if (metaEl) metaEl.textContent = metaText(((Date.now() - qStart) / 1000).toFixed(1), usageNow);
+  }, 100);
+
+  try {
+    const resp = await fetch("/api/chat/stream", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders(),
+      },
+      body: JSON.stringify({
+        message: item.text,
+        session_id: item.sessionId ?? currentSession,
+        attachments: item.payloadAtts,
+      }),
+    });
+    if (resp.status === 401) {
+      showLogin();
+      throw new Error("登录已失效，请重新登录");
+    }
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${resp.status}`);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const rawEvent = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        for (const line of rawEvent.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          handleStreamEvent(JSON.parse(line.slice(5)));
+        }
+      }
+    }
+  } catch (e) {
+    bubble("assistant error", "❌ " + e.message);
+  } finally {
+    if (liveBubble) liveBubble.classList.remove("streaming");
+    setStreaming(false);
+    inputEl.focus();
+    setTimeout(dispatchNextQueued, 60);  // 队列里还有排队的就接着发
+  }
+}
+
+// ---------- 事件绑定 ----------
+// bind 带防崩保护：某个元素缺失（比如浏览器缓存了旧页面）只报一条 console 错误，
+// 不再中断后面的绑定——否则一个 null 就能让所有按钮集体失灵。
+function bind(id, event, fn) {
+  const el = $(id);
+  if (!el) {
+    console.error(`[app.js] 页面上没有 #${id}，很可能是缓存了旧页面，请强制刷新（Cmd+Shift+R）`);
+    return;
+  }
+  el.addEventListener(event, fn);
+}
+
+bind("input", "keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+bind("attach-btn", "click", () => $("file-input").click());
+bind("file-input", "change", onFilesChosen);
+bind("input", "paste", onPaste);
+bindDragAndDrop(document.querySelector(".composer"));
+bind("send", "click", () => (streaming ? stopGeneration() : send()));
+bind("new-task", "click", newTask);
+bind("model-chip", "click", toggleModelPop);
+bind("manage-models", "click", openProvModal);
+bind("prov-add", "click", addProv);
+bind("prov-close", "click", () => $("prov-modal").classList.add("hidden"));
+bind("p-save", "click", saveProv);
+bind("p-test", "click", testProv);
+bind("p-delete", "click", deleteProv);
+bind("ws-pick", "click", openPicker);
+bind("m-cancel", "click", () => $("modal").classList.add("hidden"));
+bind("m-up", "click", () => mParent && navTo(mParent));
+bind("m-home", "click", () => navTo(mHome || undefined));
+bind("m-choose", "click", chooseWorkspace);
+bind("ctx-chip", "click", toggleCtxPop);
+bind("user-btn", "click", toggleUserPop);
+bind("pop-logout", "click", logoutNow);
+bind("up-manage", "click", () => {
+  $("user-pop").classList.add("hidden");
+  openProvModal();
+});
+bind("login-submit", "click", submitLogin);
+bind("login-mode", "click", () => setLoginMode(loginMode === "login" ? "register" : "login"));
+bind("login-user", "keydown", (e) => {
+  if (e.key === "Enter") $("login-pass").focus();
+});
+bind("login-pass", "keydown", (e) => {
+  if (e.key === "Enter") submitLogin();
+});
+// ---------- 左下角用户设置面板 ----------
+let lastCfg = null;  // loadConfig 缓存，供设置面板展示模型信息
+
+function toggleUserPop() {
+  const pop = $("user-pop");
+  if (!pop.classList.contains("hidden")) { pop.classList.add("hidden"); return; }
+  $("pop-name").textContent = who || "—";
+  $("pop-avatar").textContent = (who || "牛").slice(0, 1);
+  if (lastCfg) {
+    $("up-model").textContent = lastCfg.model || "—";
+    $("up-provider").textContent = lastCfg.provider_name || "—";
+    $("up-window").textContent = fmtWan(lastCfg.context_window) + " tokens";
+  }
+  const rect = $("user-btn").getBoundingClientRect();
+  pop.style.left = "10px";
+  pop.style.bottom = (innerHeight - rect.top + 8) + "px";
+  pop.classList.remove("hidden");
+}
+
+async function logoutNow() {
+  try { await api("/api/auth/logout", { method: "POST" }); } catch { /* 掉线也继续本地登出 */ }
+  $("user-pop").classList.add("hidden");
+  showLogin();
+}
+document.addEventListener("click", (e) => {
+  // 点弹窗外空白处关闭浮动层
+  for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"]]) {
+    const el = $(pop);
+    if (!el.classList.contains("hidden") && !el.contains(e.target) && !e.target.closest?.("#" + btn)) {
+      el.classList.add("hidden");
+    }
+  }
+});
+
+function addProv() {
+  editingProvId = null;  // null = 新供应商，保存时后端生成 id
+  renderProvList();
+  $("p-name").value = "";
+  $("p-url").value = "";
+  $("p-key").value = "";
+  $("p-key").placeholder = "输入 API Key";
+  $("p-enabled").checked = true;
+  $("p-test-result").textContent = "";
+  $("p-delete").style.display = "none";
+  editorModels = [{ name: "", context_window: 262144, enabled: true }];
+  renderModelRows();
+  $("p-name").focus();
+}
+
+// ---------- 启动 ----------
+function boot() {
+  // 登录成功（或刷新后 token 仍有效）后的页面初始化；切用户时先清现场
+  currentSession = null;
+  chatEl.innerHTML = "";
+  $("login-page").classList.add("hidden");   // 离开登录页
+  $("layout").classList.remove("hidden");    // 进入对话页
+  setWho(who);
+  welcome();
+  loadConfig();
+  loadWorkspace();
+  loadSessions();
+}
+
+(async () => {
+  if (!authToken) return showLogin();
+  try {
+    await api("/api/auth/me");   // 校验本地 token 是否仍有效
+  } catch {
+    return;   // 失效：api() 已把登录层弹出来
+  }
+  boot();
+})();
+refreshCtx();

@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>小牛coding</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- 登录页：未登录时的唯一界面，登录/注册成功才进入对话页 -->
+  <div id="login-page" class="login-page hidden">
+    <div class="login-card">
+      <div class="login-brand">🐄 小牛coding</div>
+      <p class="login-sub" id="login-tip">登录后开始使用；所有用户共用服务端配置的模型。</p>
+      <label class="field">用户名
+        <input id="login-user" autocomplete="username" placeholder="1-24 位字母/数字/中文">
+      </label>
+      <label class="field">密码
+        <input id="login-pass" type="password" autocomplete="current-password" placeholder="至少 4 位">
+      </label>
+      <div id="login-error" class="login-error"></div>
+      <button id="login-submit" class="primary login-submit">登录</button>
+      <button id="login-mode" class="link-btn">没有账号？点此注册</button>
+    </div>
+    <p class="login-foot">💾 任务与对话保存在本机 agent_data.db（SQLite），重启不丢</p>
+  </div>
+
+  <div class="layout hidden" id="layout">
+
+    <!-- 左侧：任务列表 + 配置 -->
+    <aside class="sidebar">
+      <div class="side-head">
+        <span class="brand">小牛coding</span>
+        <button id="new-task" class="new-task" title="新建任务">＋ 新任务</button>
+      </div>
+      <div class="task-label">任务</div>
+      <ul id="task-list" class="task-list"></ul>
+
+      <!-- 左下角：头像 + 用户名，点击打开设置面板 -->
+      <button id="user-btn" class="user-btn">
+        <span id="user-avatar" class="user-avatar">牛</span>
+        <span id="user-name" class="user-name">—</span>
+        <span class="user-caret">▴</span>
+      </button>
+    </aside>
+
+    <!-- 主区：对话 + 输入框工具栏 -->
+    <main class="main">
+      <div id="chat" class="chat"></div>
+
+      <div class="composer">
+        <div id="attach-tray" class="attach-tray hidden"></div>
+        <textarea id="input" rows="2" placeholder="输入问题或任务，Enter 发送（Shift+Enter 换行）"></textarea>
+        <div class="toolbar">
+          <button id="attach-btn" class="chip" title="添加图片或文本文件">📎</button>
+          <input type="file" id="file-input" multiple hidden
+                 accept="image/png,image/jpeg,image/webp,image/gif,.txt,.md,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.html,.css,.csv,.log,.xml,.sh,.sql,.java,.c,.cpp,.go,.rs">
+          <button id="ctx-chip" class="chip" title="上下文容量">⛁ —</button>
+          <button id="ws-pick" class="chip" title="选择工作区文件夹">📁 <span id="ws-short">工作区</span></button>
+          <button id="model-chip" class="chip" title="切换模型 / 管理模型">⚙️ <span id="model-label">模型</span></button>
+          <span class="grow"></span>
+          <button id="send" class="primary send-btn">发送</button>
+        </div>
+      </div>
+    </main>
+
+  </div>
+
+  <!-- 模型切换气泡：按供应商分组列出已启用模型 -->
+  <div id="model-pop" class="model-pop hidden">
+    <div id="model-pop-list"></div>
+    <div class="model-pop-foot">
+      <button id="manage-models" class="link-btn">⚙️ 管理模型</button>
+    </div>
+  </div>
+
+  <!-- 上下文容量气泡 -->
+  <div id="ctx-pop" class="ctx-pop hidden">
+    <div class="ctx-head"><b>上下文容量</b><span id="ctx-nums" class="mono"></span></div>
+    <div class="ctx-bar"><div id="ctx-fill" class="ctx-fill"></div></div>
+    <div id="ctx-breakdown"></div>
+    <div class="ctx-foot"><span>平均缓存命中率</span><b id="ctx-cache">—</b></div>
+  </div>
+
+  <!-- 管理模型弹窗：供应商列表 + 编辑器（Base URL / Key / 模型列表 / 测试链接） -->
+  <div id="prov-modal" class="modal hidden">
+    <div class="prov-box">
+      <div class="prov-head">
+        <b>模型设置</b>
+        <span class="hint">管理自定义模型供应商，配置后可在聊天时选择使用。</span>
+        <button id="prov-close" class="t-del big">✕</button>
+      </div>
+      <div class="prov-body">
+        <div class="prov-left">
+          <ul id="prov-list" class="prov-list"></ul>
+          <button id="prov-add" class="add-row">＋ 添加供应商</button>
+        </div>
+        <div class="prov-right">
+          <div class="prov-title">
+            <label class="field prov-name-field">名称
+              <input id="p-name" class="p-name" placeholder="例如：智谱GLM">
+            </label>
+            <label class="switch" title="启用/停用">
+              <input type="checkbox" id="p-enabled" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+          <label class="field">Base URL
+            <input id="p-url" class="mono" placeholder="https://api.deepseek.com/v1">
+          </label>
+          <label class="field">API 格式
+            <select id="p-format">
+              <option value="openai">OpenAI 兼容（/chat/completions）</option>
+              <option value="anthropic">Anthropic Messages（/v1/messages）</option>
+            </select>
+          </label>
+          <label class="field">API Key
+            <input type="password" id="p-key" autocomplete="off" placeholder="留空保持已保存的 Key 不变">
+          </label>
+          <div class="prov-actions">
+            <button id="p-test">🔌 测试链接</button>
+            <span id="p-test-result" class="status"></span>
+            <span class="grow"></span>
+            <button id="p-delete" class="danger-btn">删除供应商</button>
+            <button id="p-save" class="primary choose-btn">保存</button>
+          </div>
+          <div class="models-head">模型列表</div>
+          <div id="p-models" class="p-models"></div>
+          <p class="hint">上下文窗口用于网页顶部的容量显示，按模型实际窗口填写；勾选表示启用（会出现在聊天工具栏）。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 选择工作区的弹窗：逐级浏览本地文件夹 -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-box">
+      <h3>选择工作区文件夹</h3>
+      <div id="m-path" class="m-path mono"></div>
+      <ul id="m-list" class="m-list"></ul>
+      <div class="m-actions">
+        <button id="m-up">← 上级</button>
+        <button id="m-home">🏠 主目录</button>
+        <span class="grow"></span>
+        <button id="m-cancel">取消</button>
+        <button id="m-choose" class="primary choose-btn">选择此目录</button>
+      </div>
+      <p class="hint">Agent 将获得该文件夹内完整的读写与命令执行权限，请勿选择系统目录。</p>
+    </div>
+  </div>
+
+  <!-- 左下角用户设置面板：账号信息 + 模型概览 + 退出 -->
+  <div id="user-pop" class="user-pop hidden">
+    <div class="up-row up-head">
+      <span id="pop-avatar" class="user-avatar">牛</span>
+      <div class="up-who">
+        <b id="pop-name">—</b>
+        <span class="hint">已登录</span>
+      </div>
+    </div>
+    <div class="up-sec">模型配置</div>
+    <div class="up-row"><span>当前模型</span><b id="up-model" class="mono">—</b></div>
+    <div class="up-row"><span>供应商</span><b id="up-provider">—</b></div>
+    <div class="up-row"><span>上下文窗口</span><b id="up-window" class="mono">—</b></div>
+    <button id="up-manage" class="up-btn">⚙️ 管理模型</button>
+    <div class="up-sec">数据</div>
+    <p class="hint up-hint">任务与对话保存在本机 agent_data.db（SQLite），重启不丢。</p>
+    <button id="pop-logout" class="up-btn danger">⎋ 退出登录</button>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>
