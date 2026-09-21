@@ -374,23 +374,38 @@ function historyNode(m) {
 }
 
 // 外置归档消息卡片：head 预览 + 归档标记；点开懒加载全文（1MB 级内容
-// 不随时间线整页带回，用户要看时才走 artifact 接口取）
+// 不随时间线整页带回，用户要看时才走 artifact 接口取）。
+// 带图片的用户消息（base64 多模态 content 必然超 64KB 行内上限）点开后
+// 还原成正常的用户气泡——图片渲染出来，而不是把 base64 JSON 摆在 <pre> 里。
 function artifactCard(m) {
   const d = document.createElement("details");
   d.className = "bubble assistant artifact";
   const s = document.createElement("summary");
   s.textContent = `📦 内容过大已归档（${fmtBytes(m.bytes)}）· 点开加载全文`;
+  const box = document.createElement("div");
   const pre = document.createElement("pre");
   pre.className = "artifact-preview";
   pre.textContent = m.head || "（无预览）";
-  d.append(s, pre);
+  box.appendChild(pre);
+  d.append(s, box);
   d.addEventListener("toggle", async () => {
     if (!d.open || d.dataset.loaded) return;
     d.dataset.loaded = "1";
     try {
       const r = await api(`/api/sessions/${encodeURIComponent(currentSession)}` +
         `/artifact?path=${encodeURIComponent(m.path)}`);
-      pre.textContent = prettyJson(JSON.stringify(r.message));
+      const msg = r.message;
+      const parts = Array.isArray(msg.content) ? msg.content : null;
+      if (msg.role === "user" && parts) {
+        const text = parts.filter(p => p.type === "text")
+          .map(p => p.text || "").join("\n");
+        const imgs = parts.filter(p => p.type === "image_url")
+          .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
+        box.innerHTML = "";
+        box.appendChild(buildUserBubble(text, imgs));  // data URI 直接进 <img src>
+      } else {
+        pre.textContent = prettyJson(JSON.stringify(msg));
+      }
     } catch (e) {
       pre.textContent = "全文读取失败：" + e.message;
     }
