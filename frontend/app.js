@@ -385,6 +385,9 @@ function artifactCard(m) {
     try { headText = (JSON.parse(m.head).content || [])
       .filter(p => p.type === "text").map(p => p.text || "").join("\n"); } catch { /* head 截断处非法 JSON */ }
     const holder = document.createElement("div");
+    // 不占布局（display:contents）：气泡要直接成为 #chat（flex 容器）的子项，
+    // align-self 才能让它靠右——包普通 div 会复现"用户消息挤到左侧"的 bug
+    holder.style.display = "contents";
     holder.appendChild(placeholder(headText));
     api(`/api/sessions/${encodeURIComponent(currentSession)}` +
         `/artifact?path=${encodeURIComponent(m.path)}`).then((r) => {
