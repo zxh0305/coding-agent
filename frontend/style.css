@@ -102,6 +102,12 @@ body {
 }
 .bubble.error { background: #fdecec; border: 1px solid #f2b8b5; color: #b3261e; }
 
+/* 空会话占位：居中浅色提示，不占对话气泡的视觉重量 */
+.empty-hint {
+  align-self: center; margin-top: 18vh;
+  color: var(--text-3); font-size: 13.5px;
+}
+
 /* 辅助提示条（如"已把 xx 设为默认工作区"）：小字、灰底灰字、无边框，
    与正常的回答气泡拉开层级——它是系统告知，不是对话内容。 */
 .bubble.note {

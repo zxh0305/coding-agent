@@ -512,8 +512,12 @@ function artifactCard(m) {
   return d;
 }
 
+// 空会话占位：居中的浅色提示（不是气泡——没有"AI 先开口"的对话假象）
 function welcome() {
-  bubble("assistant", "你好！我是 Agent 助手。可以问我：「北京今天天气怎么样」「37*89+100 等于多少」，或让我在工作区里写代码、修 bug。");
+  const div = document.createElement("div");
+  div.className = "empty-hint";
+  div.textContent = "发一条消息开始对话；可附图片或文件，让助手读代码、写代码、跑命令。";
+  chatEl.appendChild(div);
 }
 
 // ---------- 附件（图片 / 文本文件）----------
