@@ -747,7 +747,11 @@ class Agent:
                         est_before, self.context_window, COMPACT_THRESHOLD * 100)
             return None
 
-        transcript = self._transcript(view[head:cut])
+        # 总结输入必须带上旧摘要（视图下标 1，不在 head 起的活区映射里）：再压缩
+        # 时"最早一段"的原文只剩旧摘要这一份转述，不并入新摘要就会随旧边界失效
+        # 凭空消失（_compact_split docstring 承诺的"旧摘要并入新摘要"在这里兑现；
+        # 切点与插入位置仍按 head 算，视图下标映射不受影响）。
+        transcript = self._transcript(view[(1 if has_boundary else head):cut])
         request = [{"role": "user",
                     "content": f"{SUMMARIZE_PROMPT}\n\n===== 待压缩的对话记录开始 =====\n"
                                f"{transcript}\n===== 待压缩的对话记录结束 =====\n请输出摘要："}]
