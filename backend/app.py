@@ -183,6 +183,9 @@ def _persist_trace(sid: str, mid: str, trace: list) -> None:
         a = e.get("arguments")
         if isinstance(a, str) and len(a) > 2000:
             e["arguments"] = a[:2000] + "…[截断]"
+        t = e.get("text")  # reasoning 条目的思考文本：可很长，回放不必全文
+        if isinstance(t, str) and len(t) > 4000:
+            e["text"] = t[:4000] + f"…[思考截断，共 {len(t)} 字符]"
         entries.append(e)
     db.set_trace(sid, mid, json.dumps(entries, ensure_ascii=False))
 

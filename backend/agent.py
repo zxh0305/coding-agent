@@ -431,7 +431,8 @@ class Agent:
             # 流式拿模型回复：文字片段实时往外 yield，最后拿到完整 message。
             # 消费逻辑提取成 _consume_stream——收尾轮复用同一份，防止两处漂移。
             assistant_msg = yield from self._consume_stream(messages, TOOL_SCHEMAS,
-                                                            usage_total, metrics)
+                                                            usage_total, metrics,
+                                                            round_no)
             log.debug("LLM 原始返回: %s", json.dumps(assistant_msg, ensure_ascii=False))
 
             if self.cancel_event.is_set():
@@ -485,7 +486,7 @@ class Agent:
     # ------------------------------------------------------------------
 
     def _consume_stream(self, messages: list[dict], tools: list | None,
-                        usage_total: dict, metrics: dict):
+                        usage_total: dict, metrics: dict, round_no: int = 0):
         """消费一次 LLM 流式回复。
 
         产出与 run() 同名的事件：answer_delta / reasoning_delta 实时透传；usage
@@ -494,13 +495,19 @@ class Agent:
         assistant 消息——调用方用
             assistant_msg = yield from self._consume_stream(...)
         事件转发与返回值一步到位。
+
+        推理文本（reasoning_delta）累积成本轮的一条 trace 条目落库，供切换会话/
+        刷新后的历史回放展示——但【绝不进 self.history】：部分服务商拒收回传的
+        推理内容，回填给模型会 400。round_no 用于把该条目归到对应轮次下方。
         """
         assistant_msg = None
+        reasoning_parts: list[str] = []
         for kind, payload in self.llm.chat_stream(messages=messages, tools=tools,
                                                   cancel=self.cancel_event):
             if kind == "delta":
                 yield "answer_delta", {"delta": payload}
-            elif kind == "reasoning_delta":  # 思考过程只往前端推，不落历史（部分服务商拒收回传的推理内容）
+            elif kind == "reasoning_delta":
+                reasoning_parts.append(payload)
                 yield "reasoning_delta", {"delta": payload}
             elif kind == "usage":  # 本轮 token 用量 → 累计后实时推给前端
                 for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
@@ -515,6 +522,11 @@ class Agent:
                                 "context": metrics["context"]}
             else:
                 assistant_msg = payload
+        # 本轮推理文本收尾后整段入 trace（放流结束而非每个 delta 追加：一条条目
+        # 一个轮次，回放时渲染成一个思考块）。空串不入，避免无思考模型多出空块。
+        text = "".join(reasoning_parts)
+        if text:
+            self.trace.append({"type": "reasoning", "round": round_no, "text": text})
         return assistant_msg
 
     def _tail_stopped(self, assistant_msg, usage_total: dict, metrics: dict):
@@ -585,7 +597,8 @@ class Agent:
         messages = [{"role": "system", "content": self._system_content()},
                     *self._messages_for_model()]
         log.debug("收尾轮请求 payload:\n%s", json.dumps(messages, ensure_ascii=False, indent=2))
-        assistant_msg = yield from self._consume_stream(messages, None, usage_total, metrics)
+        assistant_msg = yield from self._consume_stream(messages, None, usage_total, metrics,
+                                                        round_no)
         log.debug("LLM 原始返回: %s", json.dumps(assistant_msg, ensure_ascii=False))
         if self.cancel_event.is_set():
             yield from self._tail_stopped(assistant_msg, usage_total, metrics)

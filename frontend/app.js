@@ -788,6 +788,14 @@ function traceFromHistory(entries, elapsed) {
       steps += 1;
     } else if (e.type === "tool_result") {
       d.appendChild(makeToolResultLine(e.name, e.result || ""));
+    } else if (e.type === "reasoning") {
+      // 落库的思考过程：与实时流同一套 .think-line 渲染（纯文本，pre-wrap）
+      if (e.text) {
+        const div = document.createElement("div");
+        div.className = "think-line";
+        div.textContent = e.text;
+        d.appendChild(div);
+      }
     } else if (e.type === "system_reminder") {
       const div = document.createElement("div");
       div.className = "trace-line";

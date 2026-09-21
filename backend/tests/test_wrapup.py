@@ -352,5 +352,55 @@ class TestAnthropicSyntheticMerge(unittest.TestCase):
         self.assertNotIn("tool_choice", body)
 
 
+# ---------------------------------------------------------------------------
+# 五、推理文本（reasoning）落 trace：切换会话/刷新后可回放，但绝不进历史
+# ---------------------------------------------------------------------------
+
+class ReasoningLLM:
+    """每轮先吐若干 reasoning_delta，再吐 assistant 消息（模拟思考模型）。"""
+
+    def __init__(self, script):
+        self.script = list(script)  # 每项 = (reasoning_text, assistant_msg)
+        self.requests = []
+
+    def chat_stream(self, messages, tools=None, cancel=None):
+        self.requests.append({"messages": messages, "tools": tools})
+        reasoning, msg = self.script.pop(0)
+        for chunk in ([reasoning[i:i + 3] for i in range(0, len(reasoning), 3)]):
+            yield "reasoning_delta", chunk  # 分片吐，验证累积拼接
+        yield "message", msg
+
+
+class TestReasoningTrace(WrapupTestBase):
+
+    def test_reasoning_accumulated_into_trace_by_round(self):
+        """两轮推理各自聚成一条 trace 条目，round 号对应、分片拼回原文。"""
+        llm = ReasoningLLM([
+            ("先看目录结构", tool_call_message(call("c1", "list_dir", path="."))),
+            ("证据齐了给出答案", asst("最终回答")),
+        ])
+        agent = self.make_agent(llm=llm)
+        list(agent.run("问题"))
+        rs = [e for e in agent.trace if e["type"] == "reasoning"]
+        self.assertEqual([e["round"] for e in rs], [1, 2])
+        self.assertEqual(rs[0]["text"], "先看目录结构")
+        self.assertEqual(rs[1]["text"], "证据齐了给出答案")
+
+    def test_reasoning_never_enters_history(self):
+        """推理只进 trace 供展示，绝不进 history——回填给模型会被部分服务商拒收。"""
+        llm = ReasoningLLM([("内部推理不应外泄", asst("回答"))])
+        agent = self.make_agent(llm=llm)
+        list(agent.run("问"))
+        blob = json.dumps(agent.history, ensure_ascii=False)
+        self.assertNotIn("内部推理不应外泄", blob)
+
+    def test_no_reasoning_no_trace_entry(self):
+        """无思考模型（不吐 reasoning_delta）不留空思考条目。"""
+        llm = RecordingLLM([asst("直接回答")])
+        agent = self.make_agent(llm=llm)
+        list(agent.run("问"))
+        self.assertEqual([e for e in agent.trace if e["type"] == "reasoning"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
