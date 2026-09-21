@@ -131,11 +131,14 @@ def _resolve_client() -> tuple[object, str, str, bool]:
 
 
 def _active_window() -> int:
-    """激活模型的上下文窗口（供应商配置里每个模型可单独设）。"""
+    """激活模型的上下文窗口。解析链：模型自填 → 供应商默认列 → .env/全局默认。
+    窗口既是前端容量显示的分母，也是自动压缩触发线（估算超 80% 即压缩）的基准。"""
     prov, model = _resolve_active()
     for m in prov["models"]:
         if m["name"] == model and m["context_window"]:
             return m["context_window"]
+    if prov.get("context_window"):
+        return prov["context_window"]
     return _context_window_fallback()
 
 
@@ -263,7 +266,8 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
     with _lock:
         if sid not in _agents or _sigs.get(sid) != sig:
             agent = Agent(llm=client, verbose=False, vision_supported=vision,
-                          workspace=workspace, vision_backend=_vision_backend)
+                          workspace=workspace, vision_backend=_vision_backend,
+                          context_window=_active_window())  # 压缩触发线的基准（切换模型后重建实例即更新）
             agent.history = db.get_messages(sid)  # 重启/换模型后从库里恢复对话
             _agents[sid] = agent
             _sigs[sid] = sig
@@ -391,10 +395,12 @@ class Handler(SimpleHTTPRequestHandler):
             sid = self.path.split("/")[3]
             if db.session_owner(sid) != self.user["id"]:
                 return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+            # compact = 上下文压缩边界（role="compact"）：前端渲染"以上已压缩"分隔
+            # 卡片用，不作为普通对话气泡；summary 原文随消息带回，点开可查。
             msgs = [{"role": m["role"], "content": m.get("content") or "",
                      "stats": m.get("_stats")}  # 助手消息带回耗时/token 统计（回放渲染用）
                     for m in db.get_messages(sid)
-                    if m.get("role") in ("user", "assistant") and m.get("content")]
+                    if m.get("role") in ("user", "assistant", "compact") and m.get("content")]
             self._json(msgs)
         elif self.path.startswith("/api/context"):
             sid = (self._query().get("session_id") or [""])[0]
@@ -565,6 +571,8 @@ class Handler(SimpleHTTPRequestHandler):
                     send_event({"type": kind, **payload})
                     if kind == "usage":  # 记录最新上下文容量，供 /api/context 查询
                         _ctx[sid] = payload
+                    if kind == "compacted":  # 回答后的自动压缩：容量骤降，同步刷新缓存
+                        _ctx[sid] = payload
                     if kind == "done":
                         log.info("[会话 %s] 最终回答: %s", sid, payload["answer"])
             except RuntimeError as e:
@@ -624,7 +632,13 @@ class Handler(SimpleHTTPRequestHandler):
         pid = (b.get("id") or "").strip() or uuid.uuid4().hex[:6]
         exists = db.get_provider(pid) is not None
         api_key = (b.get("api_key") or "").strip() or None  # None/空 = 保持原 key
-        db.upsert_provider(pid, name, base_url, api_key, bool(b.get("enabled", True)), api_format)
+        # 供应商级默认窗口：不传（None）= 保持原值；窗口解析链"模型自填 → 这里 → .env"
+        try:
+            prov_window = int(b.get("context_window")) if b.get("context_window") else None
+        except (TypeError, ValueError):
+            return self._json({"error": "上下文窗口须为整数（token 数）"}, 400)
+        db.upsert_provider(pid, name, base_url, api_key, bool(b.get("enabled", True)),
+                           api_format, context_window=prov_window)
         for m in b.get("models") or []:  # 可选：创建时一并带模型列表
             if (m.get("name") or "").strip():
                 db.upsert_model(pid, m["name"].strip(), int(m.get("context_window") or 262144),

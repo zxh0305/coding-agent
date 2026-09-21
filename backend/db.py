@@ -9,7 +9,7 @@ agent_data.db（SQLite 单文件数据库，可直接用任何 SQLite 工具打�
   auth_tokens      登录令牌：随机 token -> 用户，重启不失效
   sessions         任务（会话）：标题、创建/更新时间、归属用户、各自的工作区
   messages         每个任务的完整消息历史（OpenAI 消息格式的 JSON，按顺序）
-  providers        模型供应商：名称 / Base URL / API 格式 / API Key / 启用状态
+  providers        模型供应商：名称 / Base URL / API 格式 / API Key / 启用状态 / 默认窗口
   provider_models  供应商下的模型：模型名 / 上下文窗口 / 启用 / 是否支持视觉
   settings         键值设置（当前激活的模型等）
 
@@ -117,6 +117,14 @@ def init_db() -> None:
         # 用户一切换、所有会话立即跟着变，并发生成的 Agent 会互相踩目录。
         try:
             conn.execute("ALTER TABLE sessions ADD COLUMN workspace TEXT")
+        except sqlite3.OperationalError:
+            pass
+        # 旧库升级：给 providers 补 context_window 列（供应商级默认窗口，作为
+        # 上下文压缩触发线的基准）。窗口解析链是"模型自填 → 供应商默认 → .env"：
+        # 模型粒度已有一列，但要求"每家新模型都得手填窗口"太烦，漏填时退到这里。
+        # 默认 128000 而非 262144：宁可早点触发压缩，也不要等真爆窗口了才动手。
+        try:
+            conn.execute("ALTER TABLE providers ADD COLUMN context_window INTEGER DEFAULT 128000")
         except sqlite3.OperationalError:
             pass
         # 播种：没有供应商时，把 .env 的配置导入为"默认"供应商
@@ -310,6 +318,7 @@ def list_providers() -> list[dict]:
             "id": p["id"], "name": p["name"], "base_url": p["base_url"],
             "api_format": p["api_format"] or "openai",
             "api_key": p["api_key"], "enabled": bool(p["enabled"]),
+            "context_window": p["context_window"] or 128000,  # 供应商级默认窗口（ALTER 补列，旧行也有值）
             "models": [{"name": m["name"], "context_window": m["context_window"],
                         "enabled": bool(m["enabled"]), "vision": bool(m["vision"])}
                        for m in models if m["provider_id"] == p["id"]],
@@ -325,7 +334,8 @@ def get_provider(pid: str) -> dict | None:
 
 
 def upsert_provider(pid: str, name: str, base_url: str, api_key: str | None, enabled: bool,
-                    api_format: str | None = None) -> None:
+                    api_format: str | None = None, context_window: int | None = None) -> None:
+    # context_window：None = 保持原值不变（前端编辑时不填窗口就不动它）
     with _conn() as conn:
         exists = conn.execute("SELECT 1 FROM providers WHERE id=?", (pid,)).fetchone()
         fmt = api_format if api_format in ("openai", "anthropic") else None
@@ -336,10 +346,13 @@ def upsert_provider(pid: str, name: str, base_url: str, api_key: str | None, ena
                 conn.execute("UPDATE providers SET api_key=? WHERE id=?", (api_key, pid))
             if fmt is not None:
                 conn.execute("UPDATE providers SET api_format=? WHERE id=?", (fmt, pid))
+            if context_window is not None:
+                conn.execute("UPDATE providers SET context_window=? WHERE id=?", (context_window, pid))
         else:
-            conn.execute("INSERT INTO providers(id, name, base_url, api_format, api_key, enabled, created) "
-                         "VALUES(?,?,?,?,?,?,?)",
-                         (pid, name, base_url, fmt or "openai", api_key or "", int(enabled), time.time()))
+            conn.execute("INSERT INTO providers(id, name, base_url, api_format, api_key, enabled, "
+                         "context_window, created) VALUES(?,?,?,?,?,?,?,?)",
+                         (pid, name, base_url, fmt or "openai", api_key or "", int(enabled),
+                          context_window if context_window is not None else 128000, time.time()))
 
 
 def delete_provider(pid: str) -> None:

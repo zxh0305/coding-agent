@@ -268,6 +268,11 @@ async function switchSession(id) {
   try {
     const msgs = await api(`/api/sessions/${encodeURIComponent(id)}/messages`);
     for (const m of msgs) {
+      // 压缩边界：渲染分隔卡片（可展开摘要），不作为普通对话
+      if (m.role === "compact") {
+        chatEl.appendChild(compactCard(m.content));
+        continue;
+      }
       // 用户消息可能是多部分数组（文本 + 图片附件）
       if (m.role === "user" && Array.isArray(m.content)) {
         const text = m.content
@@ -395,6 +400,21 @@ function bindDragAndDrop(el) {
   el.addEventListener("drop", (e) => {
     for (const file of e.dataTransfer?.files || []) addFileToAttachments(file);
   });
+}
+
+// 压缩分隔卡片：早期消息已被总结为摘要（完整历史仍在数据库，只是不再发给模型）。
+// 不渲染成普通对话气泡——它不是谁说的话；点击可展开摘要原文，
+// 用户需要时仍能查到"被压缩掉了什么"。
+function compactCard(summary) {
+  const d = document.createElement("details");
+  d.className = "compact-divider";
+  const s = document.createElement("summary");
+  s.textContent = "⇕ 以上较早的对话已压缩为摘要";
+  const pre = document.createElement("pre");
+  pre.className = "compact-summary";
+  pre.textContent = summary || "（摘要内容为空）";
+  d.append(s, pre);
+  return d;
 }
 
 // 带附件的用户气泡：文字 + 图片缩略图/文件名
@@ -538,6 +558,7 @@ function openProvEditor(pid) {
   $("p-name").value = p?.name || "";
   $("p-url").value = p?.base_url || "";
   $("p-format").value = p?.api_format || "openai";
+  $("p-win").value = p?.context_window || 128000;
   $("p-key").value = "";
   $("p-key").placeholder = p?.api_key_masked ? `已保存（${p.api_key_masked}），留空不变` : "输入 API Key";
   $("p-enabled").checked = p ? p.enabled : true;
@@ -652,6 +673,7 @@ async function saveProv() {
         name, base_url: base,
         api_format: $("p-format").value,
         api_key: $("p-key").value.trim(),   // 留空 = 保持已保存的 Key
+        context_window: parseInt($("p-win").value) || undefined,  // 不填/非法 = 保持原值
         enabled: $("p-enabled").checked,
         models: editorModels.filter(m => m.name.trim()),
       }),
@@ -1021,6 +1043,14 @@ function handleStreamEvent(evt) {
     }
     chatEl.scrollTop = chatEl.scrollHeight;
     loadSessions();  // 任务时间/排序刷新
+  } else if (evt.type === "compacted") {
+    // 回答结束后的自动压缩（不产生回答流）：补一张分隔卡片并刷新容量显示。
+    // 到达顺序在 done 之后——回答气泡已定稿，卡片插在对话流末尾即正确位置。
+    chatEl.appendChild(compactCard(evt.summary));
+    chatEl.scrollTop = chatEl.scrollHeight;
+    usageNow = { prompt_tokens: evt.prompt_tokens, context: evt.context, cache_hit_rate: null };
+    updateCtxChip();
+    toast("早期对话已压缩为摘要，上下文占用已下降");
   } else if (evt.type === "error") {
     flushStreamBuffers();  // 已生成的部分内容留在气泡里，再显示错误
     retireLiveBubble();
@@ -1289,6 +1319,8 @@ function addProv() {
   renderProvList();
   $("p-name").value = "";
   $("p-url").value = "";
+  $("p-format").value = "openai";
+  $("p-win").value = 128000;
   $("p-key").value = "";
   $("p-key").placeholder = "输入 API Key";
   $("p-enabled").checked = true;

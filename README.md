@@ -52,7 +52,7 @@ Agent 的工作区默认是项目根目录的 `workspace/`（首次运行会自�
 | `backend/code_tools.py` | ★ coding agent 的核心工具集：工作区边界防护、apply_patch 锚定编辑、bash 黑名单/超时 |
 | `backend/llm_client.py` | OpenAI 兼容 API 的请求格式；.env 的读写；为什么任意一家都能接 |
 | `backend/llm_client.py`（AnthropicMessagesClient） | ★ 协议适配层：Anthropic Messages 的双向转换（system 顶层、tool_use/tool_result 块、input_json_delta 分片），对外暴露同样的接口，agent.py 零改动 |
-| `backend/agent.py` | ★ **核心循环**：消息历史管理、工具调用回合、过程轨迹、防死循环 |
+| `backend/agent.py` | ★ **核心循环**：消息历史管理、工具调用回合、过程轨迹、防死循环；上下文压缩（`_visible_history` 模型视图 + `_maybe_compact`） |
 | `backend/app.py` | 不用框架怎么写 Web 服务：路由、JSON API、SSE 流式、静态托管、并发锁 |
 | `frontend/app.js` | 原生 JS 怎么调 API：fetch、DOM 渲染、textContent 防 XSS、ReadableStream 手动解析 SSE |
 
@@ -77,7 +77,7 @@ Agent 的工作区默认是项目根目录的 `workspace/`（首次运行会自�
 ② 请求不会被自动执行！是我们的 `execute_tool` 在本地跑完，把结果作为 `role=tool` 消息塞回历史（`tool_call_id` 必须与请求配对）。
 ③ 模型看到工具结果后，产出最终文字回答，循环结束。
 
-每轮请求都会把**从 system 开始的完整历史**发给 API——LLM 无状态，"记忆"完全靠客户端重发历史实现。
+每轮请求都会把**从 system 开始的完整历史**发给 API——LLM 无状态，"记忆"完全靠客户端重发历史实现。唯一的例外是**上下文压缩**：历史过长时，中段会被摘要替代（见下文关键设计点 12），但数据库里的完整历史一条不丢。
 
 ## 数据存储在哪
 
@@ -86,8 +86,8 @@ Agent 的工作区默认是项目根目录的 `workspace/`（首次运行会自�
 | 表 | 存什么 |
 |---|---|
 | `sessions` | 任务列表：标题、创建/更新时间、归属用户、各自的工作区 |
-| `messages` | 每个任务的完整消息历史（OpenAI 消息格式的 JSON，含工具调用） |
-| `providers` | 模型供应商：名称 / Base URL / API Key / 启用状态 |
+| `messages` | 每个任务的完整消息历史（OpenAI 消息格式的 JSON，含工具调用；压缩后额外含 `role=compact` 的边界标记消息，被压缩的原文仍在，不删） |
+| `providers` | 模型供应商：名称 / Base URL / API Key / 启用状态 / 默认上下文窗口（模型级自填优先） |
 | `provider_models` | 供应商下的模型：模型名 / 上下文窗口 / 启用状态 |
 | `settings` | 键值设置（当前激活的模型等） |
 
@@ -97,7 +97,7 @@ Agent 的工作区默认是项目根目录的 `workspace/`（首次运行会自�
 
 | 接口 | 方法 | 说明 |
 |---|---|---|
-| `/api/chat/stream` | POST | **流式问答（SSE）**：`session` 事件先行（返回任务 id），之后逐个推送 `round` / `answer_delta` / `tool_call` / `tool_result` / `usage`（token、耗时、上下文构成、缓存命中率）/ `done` / `error` |
+| `/api/chat/stream` | POST | **流式问答（SSE）**：`session` 事件先行（返回任务 id），之后逐个推送 `round` / `answer_delta` / `tool_call` / `tool_result` / `usage`（token、耗时、上下文构成、缓存命中率）/ `done` / `compacted`（回答结束后若自动压缩了早期对话，携带摘要与压缩后的容量） / `error` |
 | `/api/sessions` | GET / DELETE | 任务列表（id/标题/更新时间）；`?session_id=` 删除任务 |
 | `/api/sessions/<id>/messages` | GET | 某任务的历史消息（切回任务时回放；助手消息附带当时的耗时/token 统计） |
 | `/api/context` | GET | `?session_id=` 当前上下文容量（token 数 + 构成占比 + 缓存命中率） |
@@ -133,6 +133,7 @@ Agent 的工作区默认是项目根目录的 `workspace/`（首次运行会自�
 9. **工作区按任务隔离 + ToolContext 注入**——每个任务的工作区解析链是"任务自选 → 用户默认 → `.env` 的 `WORKSPACE_DIR` / 项目 `workspace/`"，结果不进全局环境变量，而是随 `ToolContext`（工作区、本轮图片、看图后端）注入到每次工具调用——切换某个任务的工作区不影响其他正在跑的任务，并发会话也不会串图片数据。选目录的接口只做最小校验（存在、非根目录），因为它的前提是"本机信任圈工具"。
 10. **上下文容量估算**——没有本地分词器，用"服务商返回的真实 prompt_tokens ÷ 上次请求总字符数"校准出每字符 token 系数，再按 系统提示词/工具定义/用户消息/助手回复/工具结果 的字符占比分摊——估算值，但量级和占比可信；缓存命中率直接用 DeepSeek 返回的 `prompt_cache_hit_tokens / prompt_cache_miss_tokens`。
 11. **任务（多会话）**——每个任务一个独立 Agent 实例（独立对话历史），标题取第一条提问；模型配置变更后按需重建实例但保留历史。任务、消息（含每条助手消息的耗时/token 统计，存在消息的 `_stats` 内部字段里）都落盘 SQLite，重启不丢；发给模型前会剥离 `_` 前缀的内部字段（部分服务商会拒绝未知字段）。
+12. **上下文压缩（两套视图一个真相）**——一轮回答完全结束后，若估算的 prompt tokens 超过窗口 80%（窗口解析链：模型自填 → 供应商默认列 → `.env`，供应商列由幂等 `ALTER TABLE` 补上、默认 128000），就把"除首条用户消息外的中段历史"交给同一个 LLM 压成一条中文摘要（必保任务目标/已完成改动/关键文件路径/未完成事项/用户偏好五要素），保留最近 6 条不总结。**数据库和前端时间线永远保留完整历史**——压缩只在 `_messages_for_model()` 构建的模型视图里生效：往历史插入一条 `role=compact` 的边界标记（`is_compact_boundary` + `_stats.compacted` 元数据），构建视图时遇边界就用摘要替代之前的段落；首条用户消息（原始需求）逐字保留，连续压缩只认最后一条边界（旧摘要并入新摘要）。两个暗坑都有防护：①切点必须落在完整对话回合之间（保留段不能以悬空 `tool` 结果开头、被压缩段不能以带 `tool_calls` 的 assistant 结尾，否则 400），`_compact_split` 会左移到合法位置；②压缩后缓存的每字符 token 校准系数作废（摘要的 token 密度与原始历史完全不同），退回粗略系数、等下一轮真实 usage 重校准。压缩那次 LLM 调用不产生回答流（前端只收到 `compacted` 事件渲染"以上已压缩"分隔卡片，点开可查摘要原文）；失败（网络错误）跳过、下一轮自动重试，用户中途停止的回答不压缩。纯函数测试见 `backend/test_compact.py`。
 
 ## 日志
 
@@ -181,6 +182,7 @@ agent_demo/
 │   ├── llm_client.py # LLM API 客户端（OpenAI 兼容）+ .env 读写
 │   ├── tools.py      # 工具注册与统一执行器（合并通用工具和 coding 工具）
 │   ├── logger.py     # 日志配置（logs/ 文件夹，按天切分，自动清理）
+│   ├── test_compact.py # 上下文压缩单元测试（cd backend && python3 -m unittest test_compact）
 │   └── ui.py         # 终端彩色输出（CLI 用）
 ├── frontend/
 │   ├── index.html    # 页面结构：对话区 + 配置面板

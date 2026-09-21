@@ -109,6 +109,27 @@ body {
 }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* ---------- 上下文压缩分隔卡片 ---------- */
+/* 居中虚线小卡片：标记"此前的消息已总结为摘要"；点击展开摘要原文。
+   历史消息区（#chat）是 flex 纵向容器，align-self: center 才能真正居中。 */
+.compact-divider {
+  align-self: center; max-width: 62%;
+  font-size: 11px; color: var(--text-3);
+  border: 1px dashed #c8d2e6; border-radius: 999px;
+  background: #f8fafd; padding: 3px 14px;
+  cursor: pointer; user-select: none;
+}
+.compact-divider summary { list-style: none; text-align: center; }
+.compact-divider summary::-webkit-details-marker { display: none; }
+.compact-divider:hover { border-color: var(--accent); color: var(--text-2); }
+.compact-divider[open] { border-radius: 10px; max-width: 86%; }
+.compact-divider .compact-summary {
+  font-size: 12px; line-height: 1.6; color: var(--text-2); text-align: left;
+  white-space: pre-wrap; max-height: 260px; overflow-y: auto;
+  margin: 8px 2px 4px; padding: 8px 10px;
+  background: #fff; border: 1px solid var(--border); border-radius: 6px;
+}
+
 /* ---------- 执行过程时间线 ---------- */
 .trace {
   align-self: flex-start; max-width: 76%;

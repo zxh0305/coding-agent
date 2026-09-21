@@ -115,6 +115,10 @@
               <option value="anthropic">Anthropic Messages（/v1/messages）</option>
             </select>
           </label>
+          <label class="field">默认上下文窗口（token）
+            <input id="p-win" class="mono" type="number" min="4096" step="1024" placeholder="128000"
+                   title="该供应商下模型的默认上下文窗口（留空保持不变）；单个模型可在下方列表单独覆盖。上下文估算超过它的 80% 会自动压缩早期对话">
+          </label>
           <label class="field">API Key
             <input type="password" id="p-key" autocomplete="off" placeholder="留空保持已保存的 Key 不变">
           </label>

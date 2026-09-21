@@ -12,6 +12,7 @@
 """
 
 import logging
+import os
 import sys
 
 from agent import Agent
@@ -26,7 +27,10 @@ log = logging.getLogger("cli")
 def build_agent(verbose: bool) -> Agent:
     llm = create_llm_client()   # 先加载 .env，LOG_FILE / LOG_LEVEL 才能生效
     log_file = setup_logging()
-    agent = Agent(llm=llm, verbose=verbose)
+    # CLI 没有网页版的管理面板，窗口从 .env 读（CONTEXT_WINDOW），默认 128k——
+    # 自动压缩的触发线以它为基准，宁可保守早点压
+    agent = Agent(llm=llm, verbose=verbose,
+                  context_window=int(os.environ.get("CONTEXT_WINDOW", "128000")))
     log.info("会话开始 model=%s api=%s verbose=%s", llm.model, llm.api_url, verbose)
     print(colored("═" * 56, "blue"))
     print(colored("  🤖 Agent 问答 Demo（命令行版）", "bold"))

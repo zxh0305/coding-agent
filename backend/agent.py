@@ -44,6 +44,39 @@ DEFAULT_SYSTEM_PROMPT = """\
 5. 最终用简洁中文总结：改了哪些文件、如何验证的。常识性问答直接回答，不必调用工具。
 """
 
+# ---------------------------------------------------------------------------
+# 上下文压缩（auto-compaction）
+#
+# 历史越长，每轮请求越贵、越慢，最终撑爆模型窗口。做法：一轮回答结束后，
+# 若估算的 prompt tokens 超过窗口 80%，就把"除首条用户消息外的中段历史"交给
+# 同一个 LLM 总结成一条摘要，之后发给模型的消息列表里用摘要【替代】被压缩段。
+#
+# 核心原则——两套视图一个真相：数据库和前端时间线永远保留完整历史（真相），
+# 压缩只发生在 _messages_for_model() 构建的"模型视图"里。物理上不删任何消息，
+# 只往历史里插入一条 role="compact" 的边界标记；构建视图时遇到边界，就跳过
+# 它之前的消息、换入标记里的摘要。想"撤销"或换种压缩策略，历史原封不动还在。
+# ---------------------------------------------------------------------------
+
+COMPACT_THRESHOLD = 0.8   # 估算 prompt tokens 占窗口的比例超过它 → 触发压缩。
+                          # 不设 0.9+：估算本身有误差（字符反推），还得给输出留余量。
+COMPACT_KEEP_TAIL = 6     # 压缩时原样保留最近几条消息：模型的"工作记忆"，
+                          # 正在进行的修改细节不能靠摘要转述（转述必有损）。
+COMPACT_MIN_SEGMENT = 4   # 可压缩段最少几条消息：太短说明刚压完又触发（窗口太小），
+                          # 硬压会陷入"压不出空间→再压"的死循环，不如放弃。
+
+COMPACT_SUMMARY_NOTE = "【早期对话已压缩】以下是更早历史的摘要，替代原始消息（原文仍存于数据库）："
+
+SUMMARIZE_PROMPT = """\
+你是对话压缩器。下面是本任务较早的对话记录（含工具调用与结果）。请把它压缩成一份 \
+给"之后继续这个任务的助手"看的中文备忘，它会替代原始历史发给模型。必须保留：
+1. 任务目标：用户最初要求做什么，后续追加或修改过哪些要求；
+2. 已完成的改动清单：创建/修改过哪些文件、执行过哪些关键命令及其结论；
+3. 关键文件路径、函数/变量名、重要事实（报错原因、验证是否通过等）；
+4. 未完成事项与下一步计划；
+5. 用户的重要偏好（沟通语言、代码风格、明确禁止的做法等）。
+用简洁的条目式中文输出，不要复述本提示，不要寒暄。细节可以有损，但上述五类信息一条都不能漏。\
+"""
+
 
 class Agent:
     """一个带工具调用能力的对话 Agent。
@@ -57,19 +90,27 @@ class Agent:
                         互不共享——这是多会话隔离的关键。
         vision_backend: fn(image_parts, question) -> str，analyze_image 工具的"看图"
                         后端，由 app.py 按当前模型配置提供；命令行版不传（无图可看）。
+        context_window: 当前模型的上下文窗口（token）。非零时启用自动压缩：
+                        回答结束后估算超 80% 就把中段历史总结成摘要（0 = 不压缩）。
     """
 
     def __init__(self, llm, system_prompt: str = DEFAULT_SYSTEM_PROMPT,
                  max_rounds: int = 16, verbose: bool = True, vision_supported: bool = True,
-                 workspace=None, vision_backend=None):
+                 workspace=None, vision_backend=None, context_window: int = 0):
         # max_rounds=16：coding 任务一轮提问往往要 读代码→改→跑验证→再修 好几个来回
         self.llm = llm
         self.system_prompt = system_prompt
         self.max_rounds = max_rounds
         self.verbose = verbose
         self.vision_supported = vision_supported  # 激活模型能否直接看图（决定是否剥离图片输入）
+        self.context_window = int(context_window or 0)  # 压缩触发线的基准（providers 表解析链提供）
         self.history: list[dict] = []  # 不含 system 的完整对话历史，跨提问持续累积
         self.trace: list[dict] = []    # 最近一次提问的过程轨迹（轮次/工具调用），供前端展示
+        # 每字符 token 校准系数（真实 prompt_tokens ÷ 当次请求总字符数）。跨轮缓存：
+        # 压缩判断发生在回答结束后，那时没有新 usage，只能靠上一轮校准的系数估算。
+        # 压缩后置回 None——摘要的 token 密度与原始日志完全不同，旧系数必然失真，
+        # 等下一轮真实 usage 重新校准（见 context_stats / _maybe_compact）。
+        self._token_ratio: float | None = None
         # 工具执行上下文：工作区 + 看图后端随 Agent 实例走；images 每轮提问时更新。
         # 状态挂在实例上而不是模块级全局，两个会话并发执行工具才不会串数据。
         self.ctx = ToolContext(workspace=prepare_workspace(workspace), vision_backend=vision_backend)
@@ -80,13 +121,42 @@ class Agent:
         """发给模型前剥离内部字段（_stats 等下划线前缀），部分服务商会拒绝未知字段。"""
         return {k: v for k, v in m.items() if not k.startswith("_")}
 
+    def _visible_history(self) -> list[dict]:
+        """模型视图的"该看哪些消息"——压缩的唯一生效点（纯函数，测试覆盖）。
+
+        规则：history 里最后一条 role="compact" 的边界标记定义压缩段；
+        视图 = [最初一条用户消息（原始需求，逐字保留）] + [边界里的摘要（以
+        user 身份注入）] + [边界之后的所有消息]。边界之前的历史（含旧边界
+        和已被旧摘要吸收的段落）对模型不可见，但物理上一条都没删。
+
+        两个不能破坏的点（违反哪个，任务都会"失忆"或直接报错）：
+        1. 最初一条用户消息逐字保留——它是整个任务的锚点，总结必有损，原件不能丢；
+        2. 只认【最后一条】边界——连续压缩时，新摘要是把"旧摘要+其后的消息"
+           一起再总结的产物，旧摘要已被吸收，旧边界自然失效。
+        """
+        last_boundary, first_user = -1, -1
+        for i, m in enumerate(self.history):
+            if m.get("role") == "compact":
+                last_boundary = i  # 取最后一条：循环结束时留的就是最靠后的边界
+            elif first_user < 0 and m.get("role") == "user":
+                first_user = i
+        if last_boundary < 0 or first_user < 0 or last_boundary <= first_user:
+            # 从未压缩过（或历史异常，比如边界跑到首条消息前面）→ 原样全量返回
+            return self.history
+        summary = self.history[last_boundary].get("content") or ""
+        view = [self.history[first_user],
+                {"role": "user", "content": f"{COMPACT_SUMMARY_NOTE}\n{summary}"}]
+        view.extend(self.history[last_boundary + 1:])
+        return view
+
     def _messages_for_model(self) -> list[dict]:
-        """发给 LLM 的消息列表。两件事：
-        1. 剥离内部字段（_stats 等下划线前缀），部分服务商会拒绝未知字段；
-        2. 主模型不支持视觉时，把用户消息里的图片部分替换成文字提示——
+        """发给 LLM 的消息列表。三件事：
+        1. 换入压缩视图：被压缩的段落用摘要替代（见 _visible_history，DB 原文不动）；
+        2. 剥离内部字段（_stats 等下划线前缀），部分服务商会拒绝未知字段；
+        3. 主模型不支持视觉时，把用户消息里的图片部分替换成文字提示——
            否则不支持视觉的服务商会对图片输入直接报 400。"""
         sanitized = []
-        for m in self.history:
+        for m in self._visible_history():
             content = m.get("content")
             if m.get("role") == "user" and isinstance(content, list) and not self.vision_supported:
                 texts, has_image = [], False
@@ -109,17 +179,27 @@ class Agent:
 
         有服务商返回的真实 prompt_tokens 时，先用 它/总字符数 校准出每字符 token 系数，
         再按各部分字符数分摊 —— 估算值，但量级和占比是可信的。
+
+        两处与压缩相关的口径：
+        1. 字数统计基于【模型视图】而非原始 history——压缩后模型看到的已是摘要，
+           按原始历史估算会永远超阈值、反复触发无意义的压缩；
+        2. 校准系数缓存在 self._token_ratio（回答结束后的压缩判断靠它），压缩后作废。
         """
+        view = self._messages_for_model()
         sys_chars = len(self.system_prompt)
         tool_chars = len(json.dumps(TOOL_SCHEMAS, ensure_ascii=False))
         buckets = {"user": 0, "assistant": 0, "tool": 0}
-        for m in self.history:
+        for m in view:
             size = len(str(m.get("content") or ""))
             size += len(json.dumps(m.get("tool_calls") or "", ensure_ascii=False))
             if m["role"] in buckets:
                 buckets[m["role"]] += size
         total_chars = max(1, sys_chars + tool_chars + sum(buckets.values()))
-        ratio = (prompt_tokens / total_chars) if prompt_tokens else 0.4  # 无实测值时的粗略系数
+        if prompt_tokens:
+            ratio = prompt_tokens / total_chars
+            self._token_ratio = ratio  # 缓存：本轮之后的压缩判断用它估算
+        else:
+            ratio = self._token_ratio if self._token_ratio else 0.4  # 无实测值时的粗略系数
         est = lambda chars: round(chars * ratio)
         return {
             "system": est(sys_chars),
@@ -143,14 +223,31 @@ class Agent:
           ("answer_delta",    {"delta": "..."})              LLM 正在输出的文字片段
           ("tool_call",       {"name", "arguments"})         模型请求调用工具
           ("tool_result",     {"name", "result"})            工具执行结果
+          ("usage",           {...})                         token 用量 / 上下文构成 / 缓存命中
           ("done",            {"answer": "...", "stopped"?}) 最终回答，循环结束；
                                                               用户中途停止时带 stopped=True
+          ("compacted",       {"summary", "prompt_tokens",   done 之后可能跟上：回答结束、
+                               "context"})                   上下文超阈值已自动压缩（不产生
+                                                              回答流，前端渲染分隔卡片）
         """
         # 停止开关：每次提问配一个新 Event，stop() 置位后循环尽快带部分结果收尾；
         # 结束（或生成器被关闭）时也置位，让 llm_client 里的看护线程退出。
         self.cancel_event = threading.Event()
+        stopped = False
         try:
-            yield from self._run(user_input, user_message)
+            for kind, payload in self._run(user_input, user_message):
+                if kind == "done":
+                    stopped = bool(payload.get("stopped"))  # 记下结局，循环外决定是否压缩
+                yield kind, payload
+            # 压缩时机：一轮回答【完全结束】之后（done 已产出、不在流式过程中）——
+            # 用户已拿到回答，此刻多花一次 LLM 调用不影响体验；也绝不能在循环内做，
+            # 否则"正在打字的回答"会被一次几十秒的静默总结卡住。
+            # 用户主动停止时不压缩：他刚表达"想停下"，别再让他等一次隐性调用，
+            # 超阈值状态留着，下一轮回答结束后自然重试。
+            if not stopped and not self.cancel_event.is_set():
+                compacted = self._maybe_compact()
+                if compacted:
+                    yield "compacted", compacted
         finally:
             self.cancel_event.set()
 
@@ -294,6 +391,136 @@ class Agent:
     def reset(self) -> None:
         """清空对话历史，开始新会话。"""
         self.history.clear()
+
+    # ------------------------------------------------------------------
+    # 上下文压缩
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compact_split(view: list[dict], head: int,
+                       keep: int = COMPACT_KEEP_TAIL, min_segment: int = COMPACT_MIN_SEGMENT) -> int | None:
+        """在模型视图里选压缩切点：返回 cut，view[head:cut] 将被总结、view[cut:] 原样保留。
+
+        切点必须落在"完整的对话回合之间"，两条规则（违反任意一条，之后的请求
+        直接被服务商 400 拒收，这是压缩实现里最经典的暗坑）：
+        1. view[cut] 不能是 role=tool——否则保留段以"没有对应调用的工具结果"开头；
+        2. view[cut-1] 不能是带 tool_calls 的 assistant——否则被压缩段以
+           "悬空的工具调用请求"结尾。两条都不满足就左移切点再试。
+
+        head 是视图中第一条"可压缩"消息的下标（首条用户消息之后；之前压缩过
+        再压时，旧摘要也在可压缩段内，会被并入新摘要）。
+        中段凑不够 min_segment 条返回 None：刚压完又触发说明窗口实在太小，
+        硬压只会死循环，放弃更安全（调用方打日志后跳过，下轮再看）。
+        """
+        cut = len(view) - keep
+        while cut >= head + min_segment:
+            m, prev = view[cut], view[cut - 1]
+            if m.get("role") != "tool" and not (prev.get("role") == "assistant" and prev.get("tool_calls")):
+                return cut
+            cut -= 1
+        return None
+
+    @staticmethod
+    def _transcript(messages: list[dict]) -> str:
+        """把一段消息序列转成纯文本记录，供总结调用使用。
+
+        为什么不把消息原样发给总结模型：中段的开头/结尾是随意截断的边界，
+        原样发出去稍不留神就撞上 tool_call/tool_result 配对校验；拍平成带
+        角色标签的文本则对任何服务商都合法，模型读"会议纪要"的能力也足够好。
+        图片部分无法（也不该）进纯文本，跳过。
+        """
+        lines = []
+        for m in messages:
+            label = {"user": "用户", "assistant": "助手"}.get(m.get("role"), "工具结果")
+            parts = []
+            content = m.get("content")
+            if isinstance(content, list):  # 多部分消息（带图附件）：只留文字
+                content = "\n".join(str(p.get("text") or "") for p in content
+                                    if isinstance(p, dict) and p.get("type") == "text")
+            if content:
+                parts.append(str(content))
+            for call in m.get("tool_calls") or []:  # 工具调用请求是历史的骨架，必须进纪要
+                fn = call.get("function") or {}
+                parts.append(f"[调用工具 {fn.get('name')} 参数 {fn.get('arguments')}]")
+            lines.append(f"—— {label} ——\n" + ("\n".join(parts) if parts else "（无正文）"))
+        return "\n\n".join(lines)
+
+    def _maybe_compact(self) -> dict | None:
+        """回答结束后调用：估算超阈值就把中段历史压缩成一条边界标记。
+
+        返回给前端的事件载荷（未触发/失败返回 None）。任何异常都不往外抛——
+        压缩是"锦上添花"，绝不能让它打断会话；失败就跳过，下一轮回答结束后
+        阈值依然超着，自然会重试。
+        """
+        if not self.context_window:
+            return None
+        stats = self.context_stats()  # 用上一轮真实 usage 校准过的系数估算（无则粗略 0.4）
+        est_before = sum(stats.values())
+        if est_before <= self.context_window * COMPACT_THRESHOLD:
+            return None
+
+        view = self._messages_for_model()
+        first_user, last_boundary = -1, -1
+        for i, m in enumerate(self.history):
+            if m.get("role") == "compact":
+                last_boundary = i
+            elif first_user < 0 and m.get("role") == "user":
+                first_user = i
+        if first_user < 0:
+            return None
+        # 视图结构：[首条用户消息] + [旧摘要(若有)] + [活区消息]。
+        # head = 活区在视图里的起始下标（第一条"可压缩"消息）；无边界时视图就是
+        # 原始 history 本身，活区从首条用户消息之后开始。
+        has_boundary = last_boundary >= 0
+        head = 2 if has_boundary else first_user + 1
+        cut = self._compact_split(view, head)
+        if cut is None:
+            log.warning("上下文估算 %d tokens 超过窗口 %d 的 %.0f%%，但没有可安全压缩的段落，跳过",
+                        est_before, self.context_window, COMPACT_THRESHOLD * 100)
+            return None
+
+        transcript = self._transcript(view[head:cut])
+        request = [{"role": "user",
+                    "content": f"{SUMMARIZE_PROMPT}\n\n===== 待压缩的对话记录开始 =====\n"
+                               f"{transcript}\n===== 待压缩的对话记录结束 =====\n请输出摘要："}]
+        log.info("上下文压缩：估算 %d tokens 超阈值，总结 %d 条消息（视图下标 %d..%d）…",
+                 est_before, cut - head, head, cut - 1)
+        reply = None
+        try:
+            # 复用会话同一个 LLM 与停止开关（chat_stream 带看护线程，用户等不及点
+            # 停止也能掐断这次总结）；delta 片段直接丢弃——压缩不产生回答流。
+            for kind, payload in self.llm.chat_stream(messages=request, cancel=self.cancel_event):
+                if kind == "message":
+                    reply = payload
+        except Exception as e:  # 网络/服务商错误：跳过本轮，下轮重试，绝不打断会话
+            log.warning("上下文压缩失败（%s），将在下一轮回答结束后重试", e)
+            return None
+        summary = ((reply or {}).get("content") or "").strip()
+        if not summary or self.cancel_event.is_set():
+            return None  # 被停止掐断的半截总结不可信，作废重来
+
+        marker = {
+            # 特殊 role：DB/前端按普通消息存取和回放；模型视图里被 _visible_history
+            # 替换成上面的摘要 user 消息，永远不会原样发给模型。
+            "role": "compact",
+            "content": summary,
+            "is_compact_boundary": True,  # 边界标记元数据（前端据此渲染分隔卡片）
+            "_stats": {"compacted": True, "est_tokens": est_before},
+        }
+        # 视图下标 → 原始历史下标：活区在视图里从 head 起、在 history 里从 live_start
+        # 起（同一段对象一一对应），边界插到"被压缩段的最后一条"与"保留段的第一条"之间。
+        live_start = (last_boundary + 1) if has_boundary else (first_user + 1)
+        insert_at = live_start + (cut - head)
+        self.history.insert(insert_at, marker)
+        # 校准系数作废：它是在"原始历史"的字符总量上校准的，压缩后请求里换成
+        # 了摘要（token 密度完全不同），旧系数会把估算带偏；置回 None 让
+        # context_stats 退回粗略系数，等下一轮真实 usage 到达再重新校准。
+        self._token_ratio = None
+
+        stats_after = self.context_stats()
+        log.info("上下文压缩完成：估算 %d → %d tokens（保留最近 %d 条，摘要 %d 字）",
+                 est_before, sum(stats_after.values()), len(view) - cut, len(summary))
+        return {"summary": summary, "prompt_tokens": sum(stats_after.values()), "context": stats_after}
 
     # ------------------------------------------------------------------
 
