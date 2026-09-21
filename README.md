@@ -169,7 +169,7 @@ schema 升级用 `PRAGMA user_version` + 有序迁移列表（`db.MIGRATIONS`）
 ## 动手练习（由易到难）
 
 1. **加一个新工具**：在 `code_tools.py` 照抄三段式（实现 → schema → 注册表），比如 `run_python(code)` 直接执行一段代码，或 `tree(path)` 递归打印目录树。
-2. **改系统提示词**：修改 `backend/agent.py` 的 `DEFAULT_SYSTEM_PROMPT`，比如要求"每次修改前必须先说明计划"，感受 prompt 对 agent 行为的塑造。
+2. **改系统提示词**：修改 `backend/system_prompt.py` 的 `SYSTEM_PROMPT`（记忆契约由它 import `memory.MEMORY_CONTRACT` 拼接，改一处即同步），比如要求"每次修改前必须先说明计划"，感受 prompt 对 agent 行为的塑造。
 3. **审批门**：给 `run_bash` 加人工审批——Web 端先返回"待批准"状态，前端弹卡片，点同意后真执行（参考 Cline/Codex 的 approval 模型）。
 4. **repo map**：用 `tree_sitter`（需要 pip 装包）抽取工作区所有函数/类签名，按引用频率排序，在 Agent 读文件前先给它"全库骨架"（Aider 的核心思路）。
 5. **Docker 隔离**：把 `run_bash` 的执行从本机换成 `docker run` 容器内，体会真正的执行隔离。
@@ -190,6 +190,7 @@ coding-agent/
 │   ├── db.py         # SQLite 存储层（data/agent_data.db，超大正文外置）
 │   ├── events.py     # 每会话事件总线（SSE 常驻事件流 + 断线补发）
 │   ├── memory.py     # 持久记忆（<workspace>/.agent-memory/，索引/正文分离）
+│   ├── system_prompt.py # ★ 系统提示词（末尾 import 拼接记忆契约，改提示词只动这里）
 │   ├── permissions.py # 最小权限闸门（allow/deny/ask 三态规则）
 │   ├── logger.py     # 日志配置（data/logs/，按天切分，自动清理）
 │   ├── ui.py         # 终端彩色输出（CLI 用）

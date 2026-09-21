@@ -6,3 +6,6 @@ __pycache__/
 data/
 # agent 记忆目录（WORKSPACE_DIR 指向项目根时会出现在项目根）
 .agent-memory/
+
+# 真机评估脚本的一次性结果
+backend/manual/eval_patch_*.json

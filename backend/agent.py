@@ -31,22 +31,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from code_tools import prepare_workspace
-from memory import memory_dir, system_memory_block
+from memory import memory_dir, memory_index_block
 from permissions import ALLOW, ASK, DENY, PermissionGate, Verdict, rejection_result
-from tools import TOOL_SCHEMAS, ToolContext, execute_tool, is_read_only
+from system_prompt import SYSTEM_PROMPT
+from tools import TOOL_SCHEMAS, ToolContext, error_result, execute_tool, is_read_only
 from ui import colored
 
 log = logging.getLogger("agent")  # 输出目的地由 logger.py 统一配置（写入 agent.log）
-
-DEFAULT_SYSTEM_PROMPT = """\
-你是一个在本地工作区里工作的编程助手，所有文件操作都限定在工作区内。
-工作守则：
-1. 动手前先调查：用 list_dir / grep / read_file 了解代码现状，不要凭空猜测文件内容；
-2. 修改已有文件用 apply_patch：search 必须与文件原文逐字符一致（含缩进）且唯一；新建文件用 write_file；
-3. 改完要用 run_bash 验证（运行程序或测试），根据输出继续修正，没有验证过不要说"已完成"；
-4. 工具或命令失败时，错误信息会原样返回给你——据此调整方案，不要重复同一个失败操作；
-5. 最终用简洁中文总结：改了哪些文件、如何验证的。常识性问答直接回答，不必调用工具。
-"""
 
 # ---------------------------------------------------------------------------
 # 上下文压缩（auto-compaction）
@@ -146,7 +137,7 @@ class Agent:
                         规则加载器、可等待用户决定的正式闸门。
     """
 
-    def __init__(self, llm, system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    def __init__(self, llm, system_prompt: str = SYSTEM_PROMPT,
                  max_rounds: int = 40, verbose: bool = True, vision_supported: bool = True,
                  workspace=None, vision_backend=None, context_window: int = 0,
                  artifact_reader=None, permission_gate=None):
@@ -189,19 +180,24 @@ class Agent:
         return {k: v for k, v in m.items() if not k.startswith("_")}
 
     def _system_content(self) -> str:
-        """实际发给模型的 system 内容 = 基础提示 + 持久记忆段（memory.py）。
+        """实际发给模型的 system 内容 = 系统提示词 + 持久记忆索引段。
+
+        提示词正文与记忆契约都在 SYSTEM_PROMPT（system_prompt.py）：契约以
+        import 方式拼在其末尾而非复制副本，memory.py 改契约常量两边自动同步。
+        这里只补【动态】的索引段（memory_index_block）——索引每次组装从磁盘
+        现读，模型/提取线程刚写的记忆下一轮立即可见，读失败由 memory 层降级
+        为空，绝不阻塞主循环；契约由此在 system 里恰好出现一次（既不在块里
+        重复，也不会漏掉）。
 
         关键不变式：记忆只进 system 消息，绝不进消息历史——上下文压缩只重写
         消息历史的模型视图（_visible_history）、从不修改 system，因此 compact
-        之后记忆原样保留，也不会被重复注入；这也是零改动压缩逻辑的原因。
-        索引每次组装时从磁盘现读（模型/提取线程刚写的记忆下一轮立即可见），
-        读失败由 memory 层降级为空，绝不阻塞主循环。
-        CLI（cli.py）构造 Agent 走同一个方法，注入自动生效；轮末【自动提取】
-        目前只挂在 Web worker（app.py _run_round 收尾处），CLI 不触发——CLI
-        没有回合收尾时机，后续要挂时调 memory.run_extraction_async 即可，
-        是同一个钩子。
+        之后记忆原样保留，也不会被重复注入。
+        CLI（cli.py）与 Web（app.py）都不传 system_prompt，默认值即
+        SYSTEM_PROMPT，注入自动生效；轮末【自动提取】目前只挂 Web worker
+        （app.py _run_round 收尾处），CLI 不触发——后续要挂时调
+        memory.run_extraction_async 即可，是同一个钩子。
         """
-        return self.system_prompt + system_memory_block(memory_dir(self.ctx.workspace))
+        return self.system_prompt + memory_index_block(memory_dir(self.ctx.workspace))
 
     def _visible_history(self) -> list[dict]:
         """模型视图的"该看哪些消息"——压缩的唯一生效点（纯函数，测试覆盖）。
@@ -939,8 +935,7 @@ class Agent:
                 except Exception as e:
                     # 双保险：_run_tool 承诺不抛（见其 docstring），万一真抛了，
                     # 也只把这一个调用转成 error 回填，绝不让整组连坐
-                    results.append(json.dumps(
-                        {"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False))
+                    results.append(error_result(f"{type(e).__name__}: {e}", "工具内部异常，可换用其它工具或稍后重试"))
             return results
 
     def _run_tool(self, call: dict) -> str:
@@ -963,7 +958,7 @@ class Agent:
         try:
             result = execute_tool(name, arguments, self.ctx)
         except Exception as e:  # execute_tool 已兜底一次；这里再兜一层，守住"绝不抛"的承诺
-            result = json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+            result = error_result(f"{type(e).__name__}: {e}", "工具内部异常，可换用其它工具或稍后重试")
         if '"error"' in result:
             log.warning("工具 %s 执行出错: %s", name, result)
         return result

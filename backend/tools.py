@@ -54,16 +54,22 @@ def _safe_eval(node):
 
 def calculator(expression: str) -> str:
     """计算四则运算表达式，如 '37*89+100'。"""
-    value = _safe_eval(ast.parse(expression.strip(), mode="eval"))
+    try:
+        value = _safe_eval(ast.parse(expression.strip(), mode="eval"))
+    except ZeroDivisionError:
+        return error_result("除数为 0", "改写表达式避开除零，或先算分母确认非零")
+    except (SyntaxError, ValueError) as e:
+        return error_result(f"表达式不合法: {e}", "只允许数字、四则运算符（+ - * / // % **）和括号，检查后再试")
     # 演示约定：工具返回值统一是 JSON 字符串（LLM 读起来最稳定）
-    return json.dumps({"expression": expression, "result": value}, ensure_ascii=False)
+    return json.dumps({"ok": True, "result": f"{expression} = {value}"}, ensure_ascii=False)
 
 
 def current_time() -> str:
     """返回当前本地时间。"""
     now = datetime.datetime.now()
     return json.dumps(
-        {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "weekday": "周" + "一二三四五六日"[now.weekday()]},
+        {"ok": True,
+         "result": f"{now.strftime('%Y-%m-%d %H:%M:%S')} 周{'一二三四五六日'[now.weekday()]}"},
         ensure_ascii=False,
     )
 
@@ -81,12 +87,27 @@ _FAKE_WEATHER = {
 def get_weather(city: str) -> str:
     """查询某城市天气（本 demo 返回模拟数据）。"""
     if city not in _FAKE_WEATHER:
-        return json.dumps({"error": f"没有 {city} 的天气数据（模拟库只收录：{'、'.join(_FAKE_WEATHER)}）"}, ensure_ascii=False)
+        return error_result(f"没有 {city} 的天气数据",
+                            f"模拟库只收录：{'、'.join(_FAKE_WEATHER)}，请换这些城市之一")
     sky, temp, wind = _FAKE_WEATHER[city]
     return json.dumps(
-        {"city": city, "weather": sky, "temperature": f"{temp}℃", "wind": wind, "note": "模拟数据"},
+        {"ok": True, "result": f"{city}：{sky}，{temp}℃，{wind}（模拟数据）"},
         ensure_ascii=False,
     )
+
+
+def error_result(error: str, hint: str = "") -> str:
+    """统一失败信封：{ok:false, error, hint?}。
+
+    所有工具的失败（参数错误/执行异常/权限拒绝 permissions.rejection_result）
+    共用这一个结构，模型只需要学一次「ok:false → 读 error 与 hint 改道」。
+    error 说明为什么失败；hint 给下一步建议（换路径/换工具/先侦察），
+    让模型改道而不是原样重试。
+    """
+    payload = {"ok": False, "error": error}
+    if hint:
+        payload["hint"] = hint
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +119,9 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "calculator",
-            "description": "计算四则运算表达式。任何数学计算都必须使用本工具，不要自己心算。",
+            "description": "精确计算四则运算（+ - * / // % ** 与括号）。任何算术都必须用它，禁止心算——多位数、小数、"
+                           "大数的心算必错。什么时候不用：一眼可判的比较（3 和 5 谁大）不必调用。"
+                           "示例：{\"expression\": \"(1024*768)/8/1024\"}。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -112,7 +135,8 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "current_time",
-            "description": "获取当前的日期和时间。凡是涉及'现在几点'、'今天几号'的问题都用它。",
+            "description": "获取当前本地日期、时间与星期。凡涉及「现在几点 / 今天几号 / 截止日期还有几天」一律用它，"
+                           "不要凭感觉报时间。无参数。",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -120,7 +144,8 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_weather",
-            "description": "查询指定城市今天的天气。",
+            "description": "查询指定城市今天的天气（演示用模拟数据，非真实天气，回复用户时须说明）。"
+                           "只支持：北京、上海、广州、深圳、杭州。示例：{\"city\": \"北京\"}。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -175,7 +200,7 @@ TOOL_REGISTRY.update(CODE_TOOL_REGISTRY)
 def analyze_image(image_id: str = "", question: str = "请详细描述这张图片的内容", ctx: ToolContext = None) -> str:
     images = ctx.images if ctx is not None else []
     if not images:
-        return json.dumps({"error": "当前这条消息没有附带图片。请让用户重新上传图片后重试。"}, ensure_ascii=False)
+        return error_result("当前这条消息没有附带图片", "请让用户重新上传图片后再试，不要凭空描述图片内容")
     # image_id：'1'/'2'/... 按用户消息中图片出现顺序；空值默认第一张
     digits = "".join(ch for ch in str(image_id) if ch.isdigit())
     index = (int(digits) - 1) if digits else 0
@@ -183,24 +208,26 @@ def analyze_image(image_id: str = "", question: str = "请详细描述这张图�
         index = 0
     backend = ctx.vision_backend if ctx is not None else None
     if backend is None:
-        return json.dumps({"error": "图片识别后端未配置（系统内部问题，请联系服务部署者）"}, ensure_ascii=False)
+        return error_result("图片识别后端未配置（系统内部问题，请联系服务部署者）")
     try:
         description = backend([images[index]], question)
     except RuntimeError as e:
         # 视觉模型调用失败：把原因交回主模型，让它告知用户怎么办
-        return json.dumps({
-            "error": f"视觉模型调用失败：{e}",
-            "hint": "请在「管理模型」里给某个模型勾选'视觉'并确保其 Key 可用，然后重试。",
-        }, ensure_ascii=False)
-    return json.dumps({"image_id": str(index + 1), "description": description}, ensure_ascii=False)
+        return error_result(f"视觉模型调用失败：{e}",
+                            "请在「管理模型」里给某个模型勾选'视觉'并确保其 Key 可用，然后重试")
+    return json.dumps({"ok": True, "image_id": str(index + 1), "result": description}, ensure_ascii=False)
 
 
 TOOL_SCHEMAS.append({
     "type": "function",
     "function": {
         "name": "analyze_image",
-        "description": "识别/分析用户消息中附带的图片。当你（主模型）不支持视觉输入、看不清图片细节，"
-                       "或需要读取图片中的文字时，调用此工具获取图片的文字描述。",
+        "description": "识别/分析用户消息中附带的图片：描述内容、定位细节或读出图中文字。"
+                       "你（主模型）看不到图片像素，凡需要看图都必须调它；当前消息没带图片时会返回错误，"
+                       "此时直接告诉用户重新上传即可。"
+                       "image_id 按图片在消息中的顺序（'1' 是第一张，留空默认第一张）；"
+                       "question 写具体想了解什么，问得越准答案越有用。"
+                       "示例：{\"image_id\": \"1\", \"question\": \"图中的报错文字是什么\"}。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -243,8 +270,9 @@ def is_read_only(name: str) -> bool:
 def execute_tool(name: str, arguments: dict, ctx: ToolContext | None = None) -> str:
     """按名字执行工具。
 
-    注意：工具报错时【不抛异常】，而是把错误信息作为字符串返回给 LLM ——
-    这样模型有机会看到错误并自行纠正（换参数重试 / 换个工具 / 直接告知用户）。
+    注意：工具报错时【不抛异常】，而是按统一失败信封 {ok:false, error, hint?}
+    返回给 LLM——模型看到原因与建议才能自行纠正（换参数重试 / 换个工具 /
+    直接告知用户），绝不静默失败。
 
     ctx：本次调用的执行上下文（工作区、图片、看图后端），由 Agent 注入。
     声明了 ctx 形参的工具（文件/命令/看图类）才拿到它；calculator 这类
@@ -253,13 +281,15 @@ def execute_tool(name: str, arguments: dict, ctx: ToolContext | None = None) -> 
     """
     func = TOOL_REGISTRY.get(name)
     if func is None:
-        return json.dumps({"error": f"未知工具：{name}"}, ensure_ascii=False)
+        return error_result(f"未知工具：{name}", "确认工具名是否在系统提供的工具清单里（区分大小写）")
     try:
         if "ctx" in inspect.signature(func).parameters:
             return func(**arguments, ctx=ctx)
         return func(**arguments)
-    except Exception as e:  # 参数缺失、类型不对、算式非法……都统一吞掉转成 error
-        return json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+    except TypeError as e:  # 参数缺失/多传/类型不对：execute_tool 统一转成信封
+        return error_result(f"参数不匹配: {e}", "对照本工具 schema 核对参数名与类型后重试")
+    except Exception as e:
+        return error_result(f"{type(e).__name__}: {e}", "执行失败，可调整参数重试或换用其它工具")
 
 
 def describe_tools() -> str:

@@ -256,8 +256,13 @@ def _read_text(path: Path) -> str:
 # 注入：契约 + 索引 → system 尾段
 # ---------------------------------------------------------------------------
 
-def system_memory_block(mem_dir: Path) -> str:
-    """拼进 system 消息末尾的记忆段（返回值以空行开头，调用方直接拼接）。
+def memory_index_block(mem_dir: Path) -> str:
+    """拼进 system 消息末尾的【动态索引段】（返回值以空行开头，调用方直接拼接）。
+
+    使用契约不在这里——它已由 system_prompt.py 在 import 时拼进 SYSTEM_PROMPT
+    末尾（import 而非副本，改契约常量两边自动同步）。Agent 的 _system_content
+    因此只需补上这份动态索引，避免契约在 system 里出现两份；需要完整
+    「契约 + 索引」段的调用方用 system_memory_block（单一来源组合，永不漂移）。
 
     关键不变式：记忆只进 system 消息，绝不进消息历史——上下文压缩只重写
     消息历史的模型视图、从不修改 system（见 agent.py 压缩注释），因此
@@ -267,7 +272,15 @@ def system_memory_block(mem_dir: Path) -> str:
     """
     index = truncate_index(read_index_text(mem_dir))
     body = index if index else "（暂无记忆）"
-    return f"\n\n{MEMORY_CONTRACT}\n\n{INDEX_HEADING}\n\n{body}"
+    return f"\n\n{INDEX_HEADING}\n\n{body}"
+
+
+def system_memory_block(mem_dir: Path) -> str:
+    """完整记忆段 = 使用契约 + 索引（对两者做单一来源的组合，两段永不漂移）。
+
+    Agent 的新链路只用 memory_index_block（契约已内置于 SYSTEM_PROMPT 末尾）；
+    本函数保留为兼容入口。"""
+    return f"\n\n{MEMORY_CONTRACT}" + memory_index_block(mem_dir)
 
 
 # ---------------------------------------------------------------------------
