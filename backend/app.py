@@ -128,6 +128,27 @@ def _event_bus(sid: str) -> SessionEvents:
         return bus
 
 
+def _session_state(sid: str) -> str:
+    """任务的运行状态（供列表展示），动态算、不落库——它是内存态事实，
+    进程重启后所有回合都已不存在，本就该归零。
+
+      running  回合进行中（turn_start 已发、turn_end 未到）
+      waiting  回合进行中且卡在权限闸门等用户确认（比 running 更该提醒）
+      idle     无进行中的回合（含从未打开过、没有 bus 的任务）
+
+    没有 bus 的会话必然 idle：bus 惰性创建，此处只读不建——为列表展示
+    凭空造 bus 会白占内存、还会把 last_seq 从库里读出来。
+    """
+    with _lock:
+        bus = _buses.get(sid)
+        agent = _agents.get(sid)
+    if bus is None or not bus.running:
+        return "idle"
+    if agent is not None and agent.permissions.pending_count > 0:
+        return "waiting"
+    return "running"
+
+
 # ask 等待用户决定的上限（秒）。超时不是安全边界——超时按拒绝处理，本来就
 # 站在安全侧；这里只是防挂死：别让 worker 线程为一张再没人看的卡片等一辈子。
 PERMISSION_ASK_TIMEOUT = 300
@@ -629,7 +650,10 @@ class Handler(SimpleHTTPRequestHandler):
                 for t in TOOL_SCHEMAS
             ]})
         elif self.path == "/api/sessions":
-            self._json(db.list_sessions(self.user["id"]))
+            rows = db.list_sessions(self.user["id"])
+            for r in rows:  # state 是内存态，db 层不掺和，在这里现算后随列表带回
+                r["state"] = _session_state(r["id"])
+            self._json(rows)
         elif re.fullmatch(r"/api/sessions/[^/]+/perm_mode", path):
             # 会话的权限模式（前端输入框下拉）：闸门 mode_loader 每次判定现读
             sid = path.split("/")[3]

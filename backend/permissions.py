@@ -340,6 +340,16 @@ class PermissionGate:
                 return "confirm"
         return self._mode
 
+    @property
+    def pending_count(self) -> int:
+        """当前有多少 ask 请求正等用户确认（0 = 没卡在闸门上）。
+
+        供任务列表算"等待确认"状态用：回合线程此刻阻塞在 wait_all 上，
+        从 HTTP 线程读这个数必须是安全的——只取一次 _lock 快照。
+        """
+        with self._lock:
+            return len(self._pending)
+
     # ---------- 判定 ----------
 
     def _effective_rules(self) -> list[Rule]:

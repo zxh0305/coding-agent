@@ -54,6 +54,12 @@ body {
 .task.empty:hover { background: none; }
 .t-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .t-time { font-size: 11px; color: var(--text-3); flex-shrink: 0; }
+/* 任务状态徽标：running 呼吸圆点 / waiting 圆点+文字。不靠颜色单独表意。 */
+.t-state { font-size: 11px; flex-shrink: 0; white-space: nowrap; }
+.t-state.running { color: #3b82f6; animation: t-pulse 1.4s ease-in-out infinite; }
+.t-state.waiting { color: #d97706; }
+@keyframes t-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+@media (prefers-reduced-motion: reduce) { .t-state.running { animation: none; } }
 .t-del {
   border: none; background: none; cursor: pointer;
   font-size: 11px; opacity: 0; flex-shrink: 0; padding: 2px;

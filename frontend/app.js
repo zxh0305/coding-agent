@@ -352,6 +352,20 @@ async function loadSessions() {
   } catch (e) { /* 启动时后端未就绪不打扰 */ }
 }
 
+// 列表状态轮询：state 是服务端内存态，只在"当前会话"的回合边界事件里刷新
+// 列表是不够的——别的会话在别处跑完时本页看不到。低频轮询兜住这个缺口；
+// 页面隐藏（切标签/最小化）时跳过，不白费请求，回到前台立刻补一次。
+let statePollTimer = null;
+function startStatePolling() {
+  if (statePollTimer) return;
+  statePollTimer = setInterval(() => {
+    if (!document.hidden) loadSessions();
+  }, 8000);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) loadSessions();
+  });
+}
+
 function removeSessionLocal(id) {
   // 乐观更新：点击"删除"瞬间先在本地移除该行（请求后台进行），失败再回滚刷新。
   // 原先要等 DELETE + 列表刷新两个往返都回来 UI 才动，页面忙时会被感知成"点了没反应"。
@@ -370,6 +384,22 @@ async function submitRename(id, title) {
   } catch (e) { toast("重命名失败：" + e.message); }
   renamingSession = null;
   renderSessions(sessionsCache);
+}
+
+// 任务状态徽标：state 来自 GET /api/sessions（后端内存态现算）。
+// idle 返回 null（不占位），其余返回一个小元素。unknown 值也当 idle——
+// 老后端不返回 state 时列表退化成原样，不会画出空点。
+function stateBadge(state) {
+  const meta = {
+    running: { cls: "running", text: "●", title: "运行中" },
+    waiting: { cls: "waiting", text: "● 等待确认", title: "等待你确认权限" },
+  }[state];
+  if (!meta) return null;
+  const el = document.createElement("span");
+  el.className = "t-state " + meta.cls;
+  el.textContent = meta.text;
+  el.title = meta.title;
+  return el;
 }
 
 function taskRow(s, list) {
@@ -424,6 +454,9 @@ function taskRow(s, list) {
   const time = document.createElement("span");
   time.className = "t-time";
   time.textContent = fmtTime(s.updated);
+  // 状态徽标：只在非 idle 时出现（idle 就是平时的样子，不画点免得满屏灰）。
+  // 不只靠颜色区分——running 用会呼吸的圆点，waiting 额外给文字，色盲也可辨。
+  const state = stateBadge(s.state);
   const rename = document.createElement("button");
   rename.className = "t-del";
   rename.textContent = "✏️";
@@ -444,7 +477,7 @@ function taskRow(s, list) {
     confirmingDelete = s.id;   // 第一次点：只进入确认状态，不真删
     renderSessions(list);
   });
-  li.append(title, time, rename, del);
+  li.append(title, state, time, rename, del);
   li.title = s.title || "";
   li.addEventListener("click", () => {
     confirmingDelete = null;
@@ -2391,6 +2424,7 @@ function boot() {
   loadConfig();
   loadWorkspace();
   loadSessions();
+  startStatePolling();  // 列表状态徽标的低频刷新（见 startStatePolling）
 }
 
 (async () => {
