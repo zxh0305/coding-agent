@@ -111,10 +111,24 @@ function buildBubble(className, text) {
   return div;
 }
 
+// ---------- 贴底滚动（stick-to-bottom） ----------
+// 流式输出时每帧都强制拉底的话，用户往上滑看历史会被拽回来（"卡卡的、
+// 优先流式输出"的体感就来自这里）。规则：只有用户本来就在底部附近（80px）
+// 才跟随滚动；往上滑了就不打扰，滚回底部或用户自己发消息时恢复跟随。
+let stickBottom = true;
+chatEl.addEventListener("scroll", () => {
+  stickBottom = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 80;
+}, { passive: true });
+
+function scrollBottom(force = false) {
+  if (!force && !stickBottom) return;  // 用户在看历史：不拽
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
 function bubble(className, text) {
   const div = buildBubble(className, text);
   chatEl.appendChild(div);
-  chatEl.scrollTop = chatEl.scrollHeight;
+  scrollBottom(true);  // 出现的新消息（错误/提示）永远贴底
   return div;
 }
 
@@ -501,7 +515,7 @@ function artifactCard(m) {
         .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
       const full = buildUserBubble(text, imgs);  // data URI 进 <img>，可点放大
       holder.replaceChildren(full);              // 原位替换占位气泡
-      chatEl.scrollTop = chatEl.scrollHeight;    // 图片加载会撑高，重新贴底
+      scrollBottom();                            // 图片加载会撑高；贴底才跟随
     }).catch(() => { /* 取回失败：保留 head 预览占位，不打扰 */ });
     return holder;
   }
@@ -807,7 +821,7 @@ function buildUserBubble(text, atts) {
 
 function userBubble(text, atts) {
   chatEl.appendChild(buildUserBubble(text, atts));
-  chatEl.scrollTop = chatEl.scrollHeight;
+  scrollBottom(true);  // 用户自己的消息永远贴底（同时恢复跟随）
 }
 
 // ---------- 模型：激活切换（工具栏气泡）+ 供应商管理（弹窗） ----------
@@ -1469,7 +1483,7 @@ function appendTrace(el) {
   traceEl.appendChild(el);
   traceSteps += 1;
   traceTick();
-  chatEl.scrollTop = chatEl.scrollHeight;
+  scrollBottom();  // 执行步骤追加：只在用户本来贴底时跟随
 }
 
 function traceLine(text) {
@@ -1609,7 +1623,7 @@ function showPermissionCard(evt) {
   card.append(title, reason, pre, btns, note);
   traceEl.appendChild(card);  // 不走 appendTrace：确认卡不算执行步骤
   permissionCards.set(evt.id, card);
-  chatEl.scrollTop = chatEl.scrollHeight;
+  scrollBottom(true);  // 确认卡是必须看到的交互：强制贴底
 }
 
 // ⏱ 耗时 + token 统计行（跟随当前回答气泡）
@@ -1639,7 +1653,7 @@ function ensureLiveMsg(mid) {
     chatEl.appendChild(metaEl);  // 已存在则移动到当前气泡后
   }
   liveBubble = b.el;  // 兼容既有的"当前气泡"语义（retire/done 收尾用）
-  chatEl.scrollTop = chatEl.scrollHeight;
+  scrollBottom();
   return b;
 }
 
@@ -1666,7 +1680,7 @@ function flushStreamBuffers() {
       b.el.textContent = b.text;
     }
     pendingDeltas.clear();
-    chatEl.scrollTop = chatEl.scrollHeight;
+    scrollBottom();  // 流式增量：只在用户贴底时跟随，上滑看历史时不打扰
   }
   if (pendingThink) {
     if (thinkEl) {
@@ -1674,7 +1688,7 @@ function flushStreamBuffers() {
       thinkEl.scrollTop = thinkEl.scrollHeight;
     }
     pendingThink = "";
-    chatEl.scrollTop = chatEl.scrollHeight;
+    scrollBottom();
   }
 }
 
@@ -1760,13 +1774,13 @@ function applyEvent(evt, seq) {
       traceEl.querySelector("summary").textContent =
         `已工作 ${fmtElapsed(evt.elapsed_s)} · ${traceSteps} 步`;
     }
-    chatEl.scrollTop = chatEl.scrollHeight;
+    scrollBottom();  // 回答完成：贴底用户直接看到答案，上滑用户不受打扰
     loadSessions();  // 任务时间/排序刷新
   } else if (t === "compacted") {
     // 回答结束后的自动压缩（不产生回答流）：补一张分隔卡片并刷新容量显示。
     // 到达顺序在 done 之后——回答气泡已定稿，卡片插在对话流末尾即正确位置。
     chatEl.appendChild(compactCard(evt.summary));
-    chatEl.scrollTop = chatEl.scrollHeight;
+    scrollBottom();
     usageNow = { prompt_tokens: evt.prompt_tokens, context: evt.context, cache_hit_rate: null };
     updateCtxChip();
     toast("早期对话已压缩为摘要，上下文占用已下降");
@@ -1934,7 +1948,7 @@ function queueMessage(text, payloadAtts) {
   });
   wrap.appendChild(actions);
   chatEl.appendChild(wrap);
-  chatEl.scrollTop = chatEl.scrollHeight;
+  scrollBottom(true);  // 队列卡片是用户自己的操作：永远贴底
   item.el = wrap;
   pendingQueue.push(item);
 }
