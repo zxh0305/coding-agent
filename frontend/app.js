@@ -296,11 +296,27 @@ function renderSessions(list) {
     head.className = "group-head";
     const collapsed = collapsedGroups.has(key);
     const icon = key === "__other__" ? "💬" : "📁";
-    head.textContent = `${collapsed ? "▸" : "▾"} ${icon} ${label}（${count}）`;
-    head.addEventListener("click", () => {
+    const text = document.createElement("span");
+    text.className = "gh-label";
+    text.textContent = `${collapsed ? "▸" : "▾"} ${icon} ${label}（${count}）`;
+    text.addEventListener("click", () => {
       collapsed ? collapsedGroups.delete(key) : collapsedGroups.add(key);
       renderSessions(sessionsCache);
     });
+    head.appendChild(text);
+    // 项目组头部「＋」：新建一个直接绑定该项目的任务（首条消息建会话时原子绑定）
+    if (key !== "__other__") {
+      const g = groups.get(key);
+      const add = document.createElement("button");
+      add.className = "gh-add";
+      add.textContent = "＋";
+      add.title = `在 ${label} 里新建任务`;
+      add.addEventListener("click", (e) => {
+        e.stopPropagation();
+        newTask(g.items[0].workspace);  // 组内任务的 workspace 即该项目的绝对路径
+      });
+      head.appendChild(add);
+    }
     return head;
   };
   // 项目组在前（按名排序），"其他"固定垫底
@@ -340,16 +356,28 @@ async function doDeleteSession(id) {
   loadSessions();  // 与服务端对齐一次（时间戳/排序），不阻塞交互
 }
 
-async function newTask() {
+async function newTask(presetProject = null) {
+  // presetProject = 项目组头「＋」传入的绝对路径：新建即绑定该项目
   currentSession = null;
   confirmingDelete = null;
+  pendingProjectPath = presetProject;
   resetStreamState();  // 旧任务的事件流已断，流式状态必须随之复位
   closeEvents();      // 旧任务的事件流断开：新任务未建，第一条消息发出后再连
   chatEl.innerHTML = "";
   welcome();
   usageNow = null;
   updateCtxChip();
-  loadWorkspace();  // 回到"新任务"态：工具栏显示用户默认工作区
+  if (presetProject) {
+    // 直接绑定项目的新任务：工具栏立刻显示项目名（绑定发生在首条消息建会话时）
+    wsCustom = true;
+    setWsLabel(presetProject);
+    renderWsChip();
+    inputEl.focus();
+  } else {
+    wsCustom = false;
+    loadWorkspace();  // 回到"新任务"态：工具栏显示「选择项目」
+  }
+  renderWsChip();
   await loadSessions();  // 重新拉取列表：旧任务仍显示，只是没有选中项；首条消息后新任务才出现
 }
 
@@ -1073,7 +1101,20 @@ async function openPicker() {
 
 async function chooseWorkspace() {
   try {
-    const body = { path: mCwd };
+    const path = mCwd;
+    // 发送流程因"未选项目"挂起的：目录先记进挂起项，跟着建会话请求原子绑定
+    //（不写用户默认——新任务不预绑任何目录是本次改版的前提）
+    if (pendingAfterWsPick && !currentSession) {
+      const pend = pendingAfterWsPick; pendingAfterWsPick = null;
+      $("modal").classList.add("hidden");
+      wsCustom = true;
+      setWsLabel(path);
+      renderWsChip();
+      userBubble(pend.text, []);
+      performSend({ ...pend, chosenPath: path });
+      return;
+    }
+    const body = { path };
     if (currentSession) body.session_id = currentSession;
     const w = await api("/api/workspace", { method: "POST", body: JSON.stringify(body) });
     wsCustom = true;
@@ -1081,14 +1122,8 @@ async function chooseWorkspace() {
     renderWsChip();
     $("modal").classList.add("hidden");
     bubble("note", currentSession
-      ? `（本任务的工作区已切换到 ${w.path}，之后我的文件操作和命令都在这个目录里进行；其他任务不受影响）`
+      ? `（本任务已绑定项目 ${w.path}，之后我的文件操作和命令都在这个目录里进行；其他任务不受影响）`
       : `（已把 ${w.path} 设为新任务的默认工作区）`);
-    // 发送流程因"未选项目"挂起的：选完目录接着发
-    const pend = pendingAfterWsPick; pendingAfterWsPick = null;
-    if (pend) {
-      userBubble(pend.text, []);
-      performSend(pend);
-    }
   } catch (e) {
     $("m-path").textContent = "切换失败：" + e.message;
   }
@@ -1745,6 +1780,7 @@ async function stopGeneration() {
 let pendingQueue = [];  // {text, payloadAtts, sessionId, el, immediate}
 
 let pendingAfterWsPick = null;  // 选完工作区后要继续的动作（发送流程挂起等选目录）
+let pendingProjectPath = null;  // 项目组头「＋」新建的任务：首条消息建会话时绑定此目录
 
 function send() {
   const text = inputEl.value.trim();
@@ -1756,9 +1792,9 @@ function send() {
   const payloadAtts = attachments.map(a => ({ kind: a.kind, name: a.name, mime: a.mime, data: a.data }));
   const outAtts = attachments.map(a => ({ kind: a.kind, name: a.name, preview: a.preview }));
 
-  // 新任务且还没选过项目：先弹文件夹选择框，选完接着发（Agent 的工作区
-  // 不能靠系统兜底猜——用户得知道自己的代码/文件会被读写到哪里）
-  if (!currentSession && !wsCustom) {
+  // 新任务且还没绑定项目（组头「＋」预绑的除外）：先弹文件夹选择框，选完
+  // 接着发——Agent 的工作区不能靠系统兜底猜，用户得知道文件会被读写到哪里
+  if (!currentSession && !wsCustom && !pendingProjectPath) {
     inputEl.value = "";
     attachments = [];
     renderAttachTray();
@@ -1776,7 +1812,9 @@ function send() {
     return;
   }
   userBubble(text, outAtts);
-  performSend({ text, payloadAtts, sessionId: currentSession });
+  performSend({ text, payloadAtts, sessionId: currentSession,
+                chosenPath: pendingProjectPath || undefined });
+  pendingProjectPath = null;
 }
 
 function queueMessage(text, payloadAtts) {
@@ -1857,10 +1895,16 @@ async function performSend(item) {
      `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`);
   myNonce = item.nonce;
   const target = item.sessionId ?? currentSession;
+  // 新任务首次发送的绑定目录：选目录挂起流程带 chosenPath；项目组头「＋」
+  // 新建的带 pendingProjectPath。发出后即清，防串到别的会话。
+  const bindPath = item.chosenPath || (!target ? pendingProjectPath : null);
+  pendingProjectPath = null;
   const body = JSON.stringify({
     message: item.text,
     nonce: item.nonce,
     attachments: item.payloadAtts,
+    // 创建即绑定项目（原子——回合启动前落库）
+    workspace: bindPath || undefined,
   });
   try {
     if (target) {
@@ -1906,7 +1950,7 @@ bind("file-input", "change", onFilesChosen);
 bind("input", "paste", onPaste);
 bindDragAndDrop(document.querySelector(".composer"));
 bind("send", "click", () => (streaming ? stopGeneration() : send()));
-bind("new-task", "click", newTask);
+bind("new-task", "click", () => newTask());  // 顶栏"新任务"：不预绑项目（组头「＋」才带项目）
 bind("model-chip", "click", toggleModelPop);
 bind("manage-models", "click", openProvModal);
 bind("prov-add", "click", addProv);

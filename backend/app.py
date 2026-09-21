@@ -393,16 +393,19 @@ def _build_user_message(body: dict) -> tuple[str, dict | None]:
     return plain, {"role": "user", "content": parts}
 
 
-def _resolve_workspace(user_id: int, sid: str) -> Path:
-    """解析一个任务的工作区，优先级：任务自选 → 用户默认（新任务继承）→ .env/项目默认。
+def _resolve_workspace(user_id: int, sid: str) -> Path | None:
+    """解析一个任务的工作区，优先级：任务自选 → 用户默认（仅存量兼容）。
 
-    工作区按任务隔离的关键：每个任务在构建 Agent 时各自解析，结果写进该任务
-    的 ToolContext；切换某个任务的工作区不再影响其他任务（此前是全局环境变量）。
-    sid 为空（前端还没开任务）时返回该用户的默认工作区，供工具栏展示。
+    返回 None = 任务未绑定项目（新任务未选目录时）：工具调用会被闸门拦下，
+    前端引导先选目录。sid 为空时返回 None（新任务的绑定发生在选目录那一刻，
+    不再预绑用户默认——此前默认目录会让"新任务"悄悄带上项目归属）。
     """
     ws = db.get_session_workspace(sid) if sid else None
     if not ws:
-        ws = db.get_setting(f"default_workspace:{user_id}")
+        # 存量兼容：老会话（升级前就有 workspace 行为空）落回用户默认，
+        # 不至于让历史任务突然失去项目归属；新任务不走这条路。
+        legacy = db.get_setting(f"default_workspace:{user_id}") if sid else None
+        return prepare_workspace(legacy) if legacy else None
     return prepare_workspace(ws)
 
 
@@ -426,6 +429,11 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
         sid = uuid.uuid4().hex[:8]
         db.create_session(sid, user_id)
     workspace = _resolve_workspace(user_id, sid)
+    if workspace is None:
+        # 未绑定项目的会话不构建 Agent（无法提交回合）：前端在发送前强制
+        # 选目录，这里只是后端兜底——绝不能静默回落默认目录，否则"新任务"
+        # 会悄悄带上用户没选过的项目归属。
+        raise ValueError("该任务尚未绑定工作目录，请先选择项目文件夹")
     # 工作区纳入配置指纹：任务的工作区被切换后，下次构建会重建 Agent（历史照旧从库里恢复）
     sig += "|" + str(workspace)
 
@@ -561,15 +569,18 @@ class Handler(SimpleHTTPRequestHandler):
                 provs.append({**p, "api_key": None, "api_key_masked": _mask(p["api_key"])})
             self._json(provs)
         elif self.path.startswith("/api/workspace"):
-            # 带当前任务 id 时返回该任务的工作区；不带 = 用户默认（新任务将用的）。
-            # custom = 用户是否真正选过（任务自选 / 有用户默认）；false 说明是
-            # 系统兜底路径，前端显示"选择项目"并要求先选目录再发送。
+            # 带当前任务 id 时返回该任务的绑定目录；不带 = 用户默认（仅展示用）。
+            # custom = 该会话是否已绑定项目（新任务未选目录时为 false：前端
+            # 显示"选择项目"，发送前强制先选）。
             sid = (self._query().get("session_id") or [""])[0]
             if sid and db.session_owner(sid) != self.user["id"]:
                 return self._json({"error": "任务不存在或不属于当前用户"}, 404)
-            custom = bool(db.get_session_workspace(sid) if sid
-                          else db.get_setting(f"default_workspace:{self.user['id']}"))
-            self._json({"path": str(_resolve_workspace(self.user["id"], sid)), "custom": custom})
+            if sid:
+                ws, custom = db.get_session_workspace(sid), bool(db.get_session_workspace(sid))
+            else:
+                ws = db.get_setting(f"default_workspace:{self.user['id']}")
+                custom = bool(ws)
+            self._json({"path": str(ws) if ws else "", "custom": custom})
         elif self.path.startswith("/api/fs/dirs"):
             self._handle_fs_dirs()
         elif self.path == "/api/tools":
@@ -752,9 +763,25 @@ class Handler(SimpleHTTPRequestHandler):
         plain, user_message = _build_user_message(body)
         if not plain:
             return self._json({"error": "输入不能为空"}, 400)
+        # 新任务可随请求携带 workspace：创建即绑定项目。先校验目录再建会话，
+        # 绑定（set_session_workspace）发生在 get_session 构建回合 Agent 之前
+        # ——原子性由"绑定落库 → 构建 Agent → 启动回合线程"的顺序保证。
+        ws_req = str(body.get("workspace") or "").strip()
+        ws_target = None
+        if ws_req:
+            ws_target = Path(ws_req).expanduser().resolve()
+            if not ws_target.is_dir() or ws_target == Path(ws_target.root):
+                return self._json({"error": "工作目录不存在或不可用"}, 400)
+            if sid_or_none:
+                return self._json({"error": "已存在的任务不支持随消息改绑目录，请用 /api/workspace"}, 400)
         # get_session 内部只短持锁（见其注释）；这里不持全局锁——回合已不在
         # 本请求内执行，本接口本身是毫秒级返回的。
         sid, agent = get_session(sid_or_none, self.user["id"])
+        if ws_target is not None:
+            db.set_session_workspace(sid, str(ws_target))
+            with _lock:
+                _agents.pop(sid, None)  # 丢弃无目录时构建的占位实例，下一回合按绑定目录重建
+            agent = get_session(sid, self.user["id"])[1]
         title = next((s["title"] for s in db.list_sessions(self.user["id"]) if s["id"] == sid), "")
         if not title:
             db.set_session_title(sid, plain[:24])

@@ -277,8 +277,16 @@ button.primary:hover { background: #3d69d8; }
 .group-head {
   font-size: 12px; font-weight: 600; color: var(--text-2);
   padding: 8px 10px 4px; cursor: pointer; user-select: none;
+  display: flex; align-items: center; justify-content: space-between;
 }
 .group-head:hover { color: var(--text-1); }
+.group-head .gh-add {
+  border: none; background: transparent; color: var(--text-3);
+  font-size: 13px; cursor: pointer; padding: 0 4px; border-radius: 4px;
+  opacity: 0; transition: opacity .12s;
+}
+.group-head:hover .gh-add { opacity: 1; }
+.group-head .gh-add:hover { color: var(--accent); background: #eef2ff; }
 .t-rename {
   width: 100%; font: inherit; font-size: 13px;
   border: 1px solid var(--accent); border-radius: 6px; padding: 4px 6px;
