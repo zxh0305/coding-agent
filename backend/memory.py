@@ -292,12 +292,14 @@ def message_text(content) -> str:
 def recent_user_texts(history: list[dict], limit: int = SNAPSHOT_MESSAGES,
                       min_words: int = MIN_USER_WORDS) -> list[str]:
     """提取请求的输入②：快照最近 limit 条消息里 role=user 的原文，滤掉
-    过短消息。过滤发生在快照上而非活历史上——调用方（worker）在启动提取
-    线程前把本函数的返回值（纯字符串列表）快照出来，线程内不碰任何可变状态。
+    过短消息与 _synthetic 合成消息（收尾指令/循环提醒是运行时构造的，不是
+    用户说的话，不该被提炼成记忆）。过滤发生在快照上而非活历史上——调用方
+    （worker）在启动提取线程前把本函数的返回值（纯字符串列表）快照出来，
+    线程内不碰任何可变状态。
     """
     texts = []
     for m in history[-limit:]:
-        if m.get("role") != "user":
+        if m.get("role") != "user" or m.get("_synthetic"):
             continue
         text = message_text(m.get("content")).strip()
         if text and len(_WORD_RE.findall(text)) >= min_words:

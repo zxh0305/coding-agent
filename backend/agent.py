@@ -23,6 +23,7 @@ Agent 核心循环 —— 本项目最值得精读的文件
 Function Calling、Tool Use、ReAct……底层都是这个循环的不同包装。
 """
 
+import hashlib
 import json
 import logging
 import threading
@@ -31,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from code_tools import prepare_workspace
 from memory import memory_dir, system_memory_block
+from permissions import ALLOW, ASK, DENY, PermissionGate, Verdict, rejection_result
 from tools import TOOL_SCHEMAS, ToolContext, execute_tool, is_read_only
 from ui import colored
 
@@ -87,13 +89,45 @@ SUMMARIZE_PROMPT = """\
 
 PARALLEL_TOOL_WORKERS = 4  # 只读组的最大并发数：读文件/搜索以 IO 等待为主，4 个线程已足够重叠
 
+# ---------------------------------------------------------------------------
+# 防失控与收尾（参照 ZCode 的设计哲学：防失控靠「模式检测 + 注入提醒让模型自纠」，
+# 不靠计数砍停；轮数上限只负责兜底，到限走「禁工具的收尾轮」，回合永远以真实
+# 总结收场）。
+#
+# 合成消息（_synthetic: true 标记）的生命周期硬性不变式：
+#   * 只由运行时构造（收尾指令、循环/预算提醒），用户输入永不带此标记；
+#   * 发送给模型：保留（_clean_outgoing 剥掉全部下划线前缀键，自动剥离）；
+#   * 落库：跳过（db.save_messages 不写 _synthetic 行）——重启恢复后历史里没有
+#     它，DB 仍是时间线唯一真相，前端零改动；
+#   * SSE：提醒类合成消息不发任何事件；收尾轮照常发 round/answer_delta/usage/done
+#     （worker 的 seg_mid 依赖 round 事件，必须发）；
+#   * 记忆提取：提取输入跳过 _synthetic（不是用户说的话，不该被提炼成记忆）；
+#   * 压缩：无需特殊处理——合成 user 消息位于 tool 结果之后，是合法压缩切点。
+# ---------------------------------------------------------------------------
+
+REPEAT_STREAK_REMIND = 3   # 同一工具 + 相同参数连续重复达到该次数 → 注入循环提醒
+MAX_TURN_REMINDERS = 3     # 每回合全部合成提醒的总预算（循环提醒与轮数预算提醒共享）
+
+WRAP_UP_INSTRUCTION = ("本轮工具调用轮数已达上限（{max_rounds}）。不要再调用任何工具——"
+                       "请基于以上已获得的信息：①总结目前已完成或已修改的内容；"
+                       "②指出未完成的部分和下一步建议。直接输出总结。")
+
+REPEAT_REMIND_TEXT = ("（系统提示：你已连续 {count} 次以完全相同的参数调用工具 {name}。"
+                      "不要原样重试——基于已有结果换一个做法：调整参数、换工具、"
+                      "说明阻塞在哪里，或直接向用户汇报。）")
+
+BUDGET_REMIND_TEXT = ("（系统提示：本轮已进行到第 {round_no} 轮 / 上限 {max_rounds} 轮。"
+                      "请开始收敛：优先完成核心改动，规划好剩余步骤，避免再做大范围探索。）")
+
 
 class Agent:
     """一个带工具调用能力的对话 Agent。
 
     参数：
         llm:            提供 chat(messages, tools) -> dict 的客户端（llm_client.py）
-        max_rounds:     单次提问内最多"问 LLM"几轮，防止模型反复调工具停不下来
+        max_rounds:     单次提问内最多"问 LLM"几轮。它只负责兜底：跑满后不再硬砍，
+                        而是注入合成指令进入「收尾轮」，让回合以模型自己的真实总结
+                        收场（防反复空转另有重复指纹提醒，见 REPEAT_STREAK_REMIND）
         verbose:        是否在终端打印每一轮的思考/工具调用过程（学习时强烈建议开着）
         workspace:      本会话的工作区目录（文件/命令工具的边界）。不传 = 默认工作区
                         （.env 的 WORKSPACE_DIR 或项目 workspace/）。每个任务各自解析，
@@ -105,13 +139,20 @@ class Agent:
         artifact_reader: fn(rel_path) -> dict，外置大消息的还原器（db.read_artifact），
                         由 app.py 注入；不传 = 无还原能力（遇到归档消息退回 head/tail
                         预览文字）。Agent 本身不依赖存储层——命令行版不传。
+        permission_gate: PermissionGate 实例（permissions.py，最小权限闸门）。
+                        不传时按内置默认规则自建一个、ask 等待上限为 0——即
+                        「高危命令直接带原因拒绝」，命令行版没有网页确认卡片，
+                        宁可拒绝改道也不挂死终端；Web 版由 app.py 注入带用户
+                        规则加载器、可等待用户决定的正式闸门。
     """
 
     def __init__(self, llm, system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-                 max_rounds: int = 16, verbose: bool = True, vision_supported: bool = True,
+                 max_rounds: int = 40, verbose: bool = True, vision_supported: bool = True,
                  workspace=None, vision_backend=None, context_window: int = 0,
-                 artifact_reader=None):
-        # max_rounds=16：coding 任务一轮提问往往要 读代码→改→跑验证→再修 好几个来回
+                 artifact_reader=None, permission_gate=None):
+        # max_rounds=40：上限只是兜底（真失控另有指纹提醒拦截），合法的长任务
+        # （读代码→改→跑验证→再修）经常要几十轮，40 是给它们的余量；到限走
+        # 收尾轮（_wrap_up_round）而不是"强制停止"。
         self.llm = llm
         self.system_prompt = system_prompt
         self.max_rounds = max_rounds
@@ -138,6 +179,9 @@ class Agent:
         # 状态挂在实例上而不是模块级全局，两个会话并发执行工具才不会串数据。
         self.ctx = ToolContext(workspace=prepare_workspace(workspace), vision_backend=vision_backend)
         self.cancel_event: threading.Event | None = None  # 本轮生成的停止开关（stop() 置位）
+        # 权限闸门（permissions.py）：挂实例而非模块级——规则里的工作区边界、
+        # 会话内记住的 ask 决定都按会话隔离，两个会话并发各判各的。
+        self.permissions = permission_gate or PermissionGate(self.ctx.workspace, ask_timeout=0.0)
 
     @staticmethod
     def _clean_outgoing(m: dict) -> dict:
@@ -286,18 +330,27 @@ class Agent:
         数组）。不传则用 user_input 包装成纯文本消息——CLI 走这条路。
 
         事件序列（kind, payload)：
-          ("round",           {"round": n})                  开始第 n 轮
+          ("round",           {"round": n, "wrap_up"?: True})    开始第 n 轮；wrap_up=True
+                                                              标记收尾轮（跑满 max_rounds
+                                                              后的禁工具总结轮）
           ("reasoning_delta", {"delta": "..."})              思考模型的推理片段（仅实时展示，不进历史）
           ("answer_delta",    {"delta": "..."})              LLM 正在输出的文字片段
           ("tool_call",       {"name", "arguments"})         模型请求调用工具
+          ("permission_request", {"id", "tool", "input",     权限闸门命中 ask：回合
+                                  "reason"})                 在此暂停等用户决定
+                                                             （恢复后继续，见下）
           ("tool_result",     {"name", "result"})            工具执行结果
           ("usage",           {...})                         token 用量 / 上下文构成 / 缓存命中
-          ("done",            {"answer": "...", "stopped"?}) 最终回答，循环结束；
-                                                              用户中途停止时带 stopped=True
+          ("done",            {"answer": "...", "stopped"?,  最终回答，循环结束；
+                               "stopped_reason"?})            用户中途停止时带 stopped=True；
+                                                              收尾轮正常结束带
+                                                              stopped_reason="max_rounds"
           ("compacted",       {"summary", "prompt_tokens",   done 之后可能跟上：回答结束、
                                "context"})                   上下文超阈值已自动压缩（不产生
                                                               回答流，前端渲染分隔卡片）
-        """
+
+        循环提醒 / 轮数预算提醒（_maybe_remind 注入的合成 user 消息）不产生任何
+        事件——它们只进历史与下一轮的模型请求，前端零感知。        """
         # 停止开关：每次提问配一个新 Event，stop() 置位后循环尽快带部分结果收尾；
         # 结束（或生成器被关闭）时也置位，让 llm_client 里的看护线程退出。
         self.cancel_event = threading.Event()
@@ -324,6 +377,16 @@ class Agent:
         if self.cancel_event is not None:
             self.cancel_event.set()
 
+    def resolve_permission(self, request_id: str, decision: str) -> bool:
+        """用户对一次权限确认的决定（Web 端点 → 这里 → 闸门唤醒等待中的回合）。
+
+        本方法跑在 HTTP 线程、只在闸门上 set 一个 Event——回合线程正阻塞在
+        wait_all 的分片等待上，会被及时唤醒；此处不碰历史、不持会话锁。
+        未知 id / 已处理过 / 非法取值返回 False（超时后的迟到点击、补发重放
+        出的旧卡片都安全落在这里，由前端提示"确认已失效"）。
+        """
+        return self.permissions.resolve(request_id, decision)
+
     def _run(self, user_input: str, user_message: dict | None = None):
         """run() 的实际循环体（run 只负责停止开关的生命周期）。"""
         self.trace = []  # 每次提问重新记录过程轨迹
@@ -335,10 +398,18 @@ class Agent:
             self.ctx.images = [p for p in content if p.get("type") == "image_url"]
         else:
             self.ctx.images = []
+        # 回合内提醒状态（防失控，见 _maybe_remind）：重复指纹 streak、提醒预算、
+        # 预算提醒轮数（上限前 10 轮、前 4 轮各提醒一次）。每回合重置。
+        self._streak_sig = None
+        self._streak_count = 0
+        self._reminders_used = 0
+        self._budget_remind_rounds = {self.max_rounds - 10, self.max_rounds - 4}
         start = time.time()
         usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        last_cache = None
-        last_ctx = self.context_stats()  # 还没发过请求时给个纯估算
+        # 跨轮回调状态（主循环与收尾轮共用一套）：缓存命中率、上下文估算、计时起点。
+        # 由 _consume_stream / 两个收尾方法就地更新。
+        metrics = {"start": start, "cache_hit_rate": None,
+                   "context": self.context_stats()}  # 还没发过请求时给个纯估算
 
         for round_no in range(1, self.max_rounds + 1):
             if self.cancel_event.is_set():
@@ -360,59 +431,23 @@ class Agent:
             log.debug("第 %d 轮请求 payload:\n%s", round_no,
                       json.dumps(messages, ensure_ascii=False, indent=2))
 
-            # 流式拿模型回复：文字片段实时往外 yield，最后拿到完整 message
-            assistant_msg = None
-            for kind, payload in self.llm.chat_stream(messages=messages, tools=TOOL_SCHEMAS,
-                                                      cancel=self.cancel_event):
-                if kind == "delta":
-                    yield "answer_delta", {"delta": payload}
-                elif kind == "reasoning_delta":  # 思考过程只往前端推，不落历史（部分服务商拒收回传的推理内容）
-                    yield "reasoning_delta", {"delta": payload}
-                elif kind == "usage":  # 本轮 token 用量 → 累计后实时推给前端
-                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                        usage_total[key] += payload.get(key) or 0
-                    hit = payload.get("prompt_cache_hit_tokens")
-                    miss = payload.get("prompt_cache_miss_tokens")
-                    if hit is not None and (hit + (miss or 0)) > 0:
-                        last_cache = round(hit / (hit + miss) * 100, 1)
-                    last_ctx = self.context_stats(prompt_tokens=payload.get("prompt_tokens"))
-                    yield "usage", {**usage_total, "elapsed_s": round(time.time() - start, 1),
-                                    "cache_hit_rate": last_cache, "context": last_ctx}
-                else:
-                    assistant_msg = payload
+            # 流式拿模型回复：文字片段实时往外 yield，最后拿到完整 message。
+            # 消费逻辑提取成 _consume_stream——收尾轮复用同一份，防止两处漂移。
+            assistant_msg = yield from self._consume_stream(messages, TOOL_SCHEMAS,
+                                                            usage_total, metrics)
             log.debug("LLM 原始返回: %s", json.dumps(assistant_msg, ensure_ascii=False))
 
             if self.cancel_event.is_set():
                 # 用户点了停止：已生成的半截文字直接作为回答收尾。
                 # 不能把带 tool_calls 的"悬空"assistant 消息留在历史里
                 # （下一轮请求会 400），所以这里只追加纯文本回答。
-                partial = (assistant_msg or {}).get("content") or ""
-                answer = (partial + "\n\n（已手动停止）").strip()
-                elapsed = round(time.time() - start, 1)
-                self.history.append({"role": "assistant", "content": answer,
-                                     "_stats": {"elapsed_s": elapsed, "usage": dict(usage_total),
-                                                "cache_hit_rate": last_cache, "stopped": True}})
-                log.info("耗时 %.1fs · 用户中途停止", elapsed)
-                yield "done", {"answer": answer, "elapsed_s": elapsed, "usage": usage_total,
-                               "cache_hit_rate": last_cache, "context": last_ctx, "stopped": True}
+                yield from self._tail_stopped(assistant_msg, usage_total, metrics)
                 return
 
             tool_calls = assistant_msg.get("tool_calls")
             if not tool_calls:
                 # 情况 a：模型直接给出回答，循环结束。
-                # 统计信息随消息一起存进历史（_stats 前缀 = 内部字段，
-                # 发送给模型前会被剥离，见 _messages_for_model），回放时可见。
-                answer = assistant_msg.get("content") or ""
-                elapsed = round(time.time() - start, 1)
-                record = {"role": "assistant", "content": answer,
-                          "_stats": {"elapsed_s": elapsed,
-                                     "usage": dict(usage_total),
-                                     "cache_hit_rate": last_cache}}
-                self.history.append(record)
-                log.info("耗时 %.1fs · tokens 输入 %d / 输出 %d",
-                         elapsed, usage_total["prompt_tokens"], usage_total["completion_tokens"])
-                yield "done", {"answer": answer, "elapsed_s": elapsed, "usage": usage_total,
-                               "cache_hit_rate": last_cache, "context": last_ctx}
+                yield from self._tail_answer(assistant_msg, usage_total, metrics)
                 return
 
             # 情况 b：模型请求调用工具
@@ -430,17 +465,192 @@ class Agent:
             # （分组调度规则与正确性论证见 _execute_tool_calls）
             yield from self._execute_tool_calls(tool_calls)
 
+            # 防失控提醒：不是砍停——检测到死循环苗头 / 轮数接近上限时注入合成
+            # user 提醒，让模型下一轮自己纠偏（触发规则与预算见 _maybe_remind；
+            # 提醒静默进历史，不发任何事件）。
+            self._maybe_remind(tool_calls, round_no)
+
         # 走到循环外只有两种情况：被用户停止，或跑满 max_rounds
         if self.cancel_event.is_set():
             log.info("生成被用户停止（未在流式阶段截住）")
             yield "done", {"answer": "（已手动停止）",
-                           "elapsed_s": round(time.time() - start, 1), "usage": usage_total,
-                           "cache_hit_rate": last_cache, "context": last_ctx, "stopped": True}
+                           "elapsed_s": round(time.time() - metrics["start"], 1),
+                           "usage": usage_total, "cache_hit_rate": metrics["cache_hit_rate"],
+                           "context": metrics["context"], "stopped": True}
             return
-        log.warning("达到最大轮数 %d，强制停止", self.max_rounds)
-        yield "done", {"answer": "（已达到最大工具调用轮数，强制停止。可调大 max_rounds，或把问题拆简单些。）",
-                       "elapsed_s": round(time.time() - start, 1), "usage": usage_total,
-                       "cache_hit_rate": last_cache, "context": last_ctx}
+        # 跑满 max_rounds：轮数上限的新语义是「触发收尾」而非「强制杀死」——
+        # 注入合成指令，以 tools=None 请求一轮真实总结，回合以模型自己的总结
+        # + done 收场（收尾轮与普通回答同一套完成后压缩判断，见 _wrap_up_round）。
+        yield from self._wrap_up_round(usage_total, metrics)
+
+    # ------------------------------------------------------------------
+    # 收尾轮与流的统一消费（主循环 / 收尾轮共用，防两份逻辑漂移）
+    # ------------------------------------------------------------------
+
+    def _consume_stream(self, messages: list[dict], tools: list | None,
+                        usage_total: dict, metrics: dict):
+        """消费一次 LLM 流式回复。
+
+        产出与 run() 同名的事件：answer_delta / reasoning_delta 实时透传；usage
+        累计进调用方的 usage_total 并就地更新 metrics（cache_hit_rate / context，
+        每次真实 prompt_tokens 都会重新校准估算系数）。生成器最终 return 完整的
+        assistant 消息——调用方用
+            assistant_msg = yield from self._consume_stream(...)
+        事件转发与返回值一步到位。
+        """
+        assistant_msg = None
+        for kind, payload in self.llm.chat_stream(messages=messages, tools=tools,
+                                                  cancel=self.cancel_event):
+            if kind == "delta":
+                yield "answer_delta", {"delta": payload}
+            elif kind == "reasoning_delta":  # 思考过程只往前端推，不落历史（部分服务商拒收回传的推理内容）
+                yield "reasoning_delta", {"delta": payload}
+            elif kind == "usage":  # 本轮 token 用量 → 累计后实时推给前端
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    usage_total[key] += payload.get(key) or 0
+                hit = payload.get("prompt_cache_hit_tokens")
+                miss = payload.get("prompt_cache_miss_tokens")
+                if hit is not None and (hit + (miss or 0)) > 0:
+                    metrics["cache_hit_rate"] = round(hit / (hit + miss) * 100, 1)
+                metrics["context"] = self.context_stats(prompt_tokens=payload.get("prompt_tokens"))
+                yield "usage", {**usage_total, "elapsed_s": round(time.time() - metrics["start"], 1),
+                                "cache_hit_rate": metrics["cache_hit_rate"],
+                                "context": metrics["context"]}
+            else:
+                assistant_msg = payload
+        return assistant_msg
+
+    def _tail_stopped(self, assistant_msg, usage_total: dict, metrics: dict):
+        """「用户中途停止」收尾：已生成的半截文字直接作为回答。
+
+        不能把带 tool_calls 的"悬空"assistant 消息留在历史里（下一轮请求会 400），
+        所以这里只追加纯文本回答。主循环与收尾轮共用。"""
+        partial = (assistant_msg or {}).get("content") or ""
+        answer = (partial + "\n\n（已手动停止）").strip()
+        elapsed = round(time.time() - metrics["start"], 1)
+        self.history.append({"role": "assistant", "content": answer,
+                             "_stats": {"elapsed_s": elapsed, "usage": dict(usage_total),
+                                        "cache_hit_rate": metrics["cache_hit_rate"],
+                                        "stopped": True}})
+        log.info("耗时 %.1fs · 用户中途停止", elapsed)
+        yield "done", {"answer": answer, "elapsed_s": elapsed, "usage": usage_total,
+                       "cache_hit_rate": metrics["cache_hit_rate"],
+                       "context": metrics["context"], "stopped": True}
+
+    def _tail_answer(self, assistant_msg, usage_total: dict, metrics: dict,
+                     stopped_reason: str | None = None):
+        """「模型直接给出回答」收尾：统计随消息一起存进历史（_stats 前缀 = 内部
+        字段，发送给模型前会被剥离，见 _messages_for_model），回放时可见。
+
+        stopped_reason：非 None 时附加到 done payload（收尾轮用它标记
+        "max_rounds"），其余字段与正常 done 完全一致。"""
+        answer = assistant_msg.get("content") or ""
+        elapsed = round(time.time() - metrics["start"], 1)
+        self.history.append({"role": "assistant", "content": answer,
+                             "_stats": {"elapsed_s": elapsed, "usage": dict(usage_total),
+                                        "cache_hit_rate": metrics["cache_hit_rate"]}})
+        log.info("耗时 %.1fs · tokens 输入 %d / 输出 %d",
+                 elapsed, usage_total["prompt_tokens"], usage_total["completion_tokens"])
+        payload = {"answer": answer, "elapsed_s": elapsed, "usage": usage_total,
+                   "cache_hit_rate": metrics["cache_hit_rate"], "context": metrics["context"]}
+        if stopped_reason:
+            payload["stopped_reason"] = stopped_reason
+        yield "done", payload
+
+    def _wrap_up_round(self, usage_total: dict, metrics: dict):
+        """收尾轮：跑满 max_rounds 后注入合成 user 指令，以 tools=None 请求一轮
+        真实总结，让回合以模型自己的总结收场（替换旧的"强制停止"兜底文案）。
+
+        1. 合成消息（_synthetic 标记）的生命周期不变式见模块头注释——这里只
+           负责构造与追加，剥离（发给模型）/跳过（落库/提取）都在下游自动生效；
+        2. 收尾轮照常发 round / answer_delta / usage / done 事件（worker 的
+           seg_mid 依赖 round 事件换回答气泡，必须发）；
+        3. 收尾途中被停止 → 与主循环同一套「用户中途停止」收尾；chat_stream 抛
+           RuntimeError → 原样上抛，worker 的错误路径（error + turn_end）收尾，
+           合成消息未落库，历史状态依然合法；
+        4. 正常结束 → done 带 stopped_reason="max_rounds"；run() 对 done 的
+           压缩判断一视同仁（未被停止就走 _maybe_compact），不另起路径。
+        """
+        round_no = self.max_rounds + 1
+        self.history.append({"role": "user", "_synthetic": True,
+                             "content": WRAP_UP_INSTRUCTION.format(max_rounds=self.max_rounds)})
+        log.warning("达到最大轮数 %d，进入收尾轮（禁工具总结）", self.max_rounds)
+        self._log(f"── 第 {round_no} 轮（收尾）：请求总结 ──", "gray")
+        self.trace.append({"type": "round", "round": round_no, "wrap_up": True})
+        yield "round", {"round": round_no, "wrap_up": True}
+        messages = [{"role": "system", "content": self._system_content()},
+                    *self._messages_for_model()]
+        log.debug("收尾轮请求 payload:\n%s", json.dumps(messages, ensure_ascii=False, indent=2))
+        assistant_msg = yield from self._consume_stream(messages, None, usage_total, metrics)
+        log.debug("LLM 原始返回: %s", json.dumps(assistant_msg, ensure_ascii=False))
+        if self.cancel_event.is_set():
+            yield from self._tail_stopped(assistant_msg, usage_total, metrics)
+            return
+        yield from self._tail_answer(assistant_msg, usage_total, metrics,
+                                     stopped_reason="max_rounds")
+
+    # ------------------------------------------------------------------
+    # 防失控提醒：死循环指纹 + 轮数预算（提醒不是砍停）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tool_signature(name: str, raw_arguments) -> str:
+        """一次工具调用的指纹 = sha1([工具名, 规范化参数])。
+
+        arguments 是服务商给的 JSON 文本，键序/空白可能每次不同——先解析成
+        对象再 sort_keys 序列化，语义相同的调用才得到同一个指纹；解析失败退回
+        直接哈希原始文本。必须哈希而非原文：write_file 的参数可能带几万字符，
+        明文留存是负担；指纹不写进日志。
+        """
+        try:
+            canonical = json.dumps([name, json.loads(raw_arguments)],
+                                   sort_keys=True, ensure_ascii=False)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            canonical = json.dumps([name, str(raw_arguments)], ensure_ascii=False)
+        return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
+
+    def _inject_reminder(self, text: str, kind: str, detail: dict) -> bool:
+        """往历史里注入一条合成 user 提醒。受 MAX_TURN_REMINDERS 总预算约束，
+        预算耗尽后一律放弃（提醒是提示性的，预算保证了它永远无法反过来绑架
+        回合）。返回是否真正注入。"""
+        if self._reminders_used >= MAX_TURN_REMINDERS:
+            return False
+        self._reminders_used += 1
+        self.history.append({"role": "user", "_synthetic": True, "content": text})
+        self.trace.append({"type": "system_reminder", "kind": kind, **detail})
+        log.info("注入合成提醒（%s），本回合已用 %d/%d",
+                 kind, self._reminders_used, MAX_TURN_REMINDERS)
+        return True
+
+    def _maybe_remind(self, tool_calls: list[dict], round_no: int) -> None:
+        """工具结果入历史后检查两类提醒（静默进历史，不发任何事件——下一轮
+        请求模型自然看到）：
+
+        1. 循环提醒：按【请求顺序】逐个更新重复指纹 streak（与 _execute_tool_calls
+           的回填顺序一致，论证见其 docstring「回填顺序只认请求顺序」）。同一
+           签名连续达到 REPEAT_STREAK_REMIND 次才提醒，且同一段连续重复内只提醒
+           一次（== 阈值才触发，第 4、5 次不再触发）；签名变化即重置计数。
+        2. 轮数预算提醒：round_no 进入预算提醒轮数集合（max_rounds-10 / -4 各
+           一次）时提醒模型收敛。
+
+        两类提醒共享 _reminders_used 预算（见 _inject_reminder）。
+        """
+        for call in tool_calls:
+            fn = call.get("function") or {}
+            name = fn.get("name", "")
+            sig = self._tool_signature(name, fn.get("arguments"))
+            if sig == self._streak_sig:
+                self._streak_count += 1
+            else:
+                self._streak_sig, self._streak_count = sig, 1
+            if self._streak_count == REPEAT_STREAK_REMIND:
+                self._inject_reminder(REPEAT_REMIND_TEXT.format(
+                    count=self._streak_count, name=name),
+                    "repeat_loop", {"tool": name, "streak": self._streak_count})
+        if round_no in self._budget_remind_rounds:
+            self._inject_reminder(BUDGET_REMIND_TEXT.format(
+                round_no=round_no, max_rounds=self.max_rounds),
+                "round_budget", {"round": round_no})
 
     def chat(self, user_input: str, user_message: dict | None = None) -> str:
         """处理一次用户提问，返回最终文字回答（CLI 用；Web 走 run() 流式）。"""
@@ -593,9 +803,31 @@ class Agent:
     def _execute_tool_calls(self, tool_calls: list[dict]):
         """执行同一轮的全部 tool_calls，按请求顺序逐个产出 ("tool_result", ...) 事件。
 
+        ── 阶段〇：权限闸门（本方法新增的前置阶段）──
+        分组调度之前，先在【当前线程】（回合线程，即 app.py 的 worker）对本轮
+        全部 tool_calls 逐个判定。判定与等待绝不能落进 ThreadPoolExecutor 的
+        工作线程，三段论：
+        1. 并行组内没有暂停点——线程池的 future 一旦提交就必须跑到结束，
+           组内没有任何"挂起等用户"的位置；
+        2. 在工作线程里等用户会卡死线程池并破坏组间屏障——ask 一等几分钟，
+           4 个 worker 全被占住，后续所有组（哪怕全是只读工具）无限排队；
+           且屏障的语义是"上一组全部结束才进下一组"，永远结束不了的组
+           直接把调度管线焊死；
+        3. 恢复后必须对整轮重新分组调度——用户决定会改变每个调用的
+           allow/deny 状态，也会写入会话记忆（「本会话内同类操作不再问」）；
+           只有拿最终状态重新分组，才能既保住"连续只读才并行"的组 formation，
+           又保住「回填顺序 = 请求顺序」不变式（见下文 3，论证不变）。
+        含 ask 时：逐条产出 ("permission_request", {id, tool, input, reason})
+        事件（app.py 经事件总线推给前端弹确认卡片），然后 wait_all 阻塞在
+        【回合线程】——HTTP 线程与池线程都不受影响；用户在
+        POST /api/sessions/<sid>/permission/<id> 里的决定通过 Event 唤醒。
+        超时/停止一律按拒绝收场（超时不是安全边界，只是防挂死）。
+
         调度规则：tool_calls 序列被切成若干组——【连续的只读工具】为一组，
         交给线程池并行执行；每个非只读（写）工具单独成组，在当前线程串行
         执行。进入下一组前必须拿到上一组的全部结果（收集处即屏障）。
+        deny 的调用不执行、不参与分组，在它的请求位置原位回填带原因的拒绝
+        结果（它是即时回填、不产生执行，不会扰动读写顺序语义）。
 
         为什么"读写分组"能保证顺序安全（效果等价于纯串行执行）：
         1. 组内并行不改变任何结果：read_only 工具对工作区和会话状态零写入
@@ -614,28 +846,76 @@ class Agent:
            tool_calls 的顺序完全相同——服务商按 tool_call_id 配对、模型按
            顺序引用结果，任何错位都会把结果安到别的调用头上。
         """
+        # ── 阶段〇：权限判定（回合线程里、分组调度之前）──
+        # arguments 在这里解析一次供判定用；_run_tool 执行时还会自己解析
+        # （它要容错畸形 JSON），两处互不依赖。
+        items: list[dict] = []  # [{call, name, args, verdict}]
+        for call in tool_calls:
+            fn = call.get("function") or {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+                if not isinstance(args, dict):
+                    args = {}
+            except json.JSONDecodeError:
+                args = {}
+            items.append({"call": call, "name": fn.get("name", ""),
+                          "args": args,
+                          "verdict": self.permissions.check(fn.get("name", ""), args)})
+        if any(it["verdict"].verb == ASK for it in items):
+            # ask：登记待确认（同一规则去重，一轮只弹一张卡）→ 发事件 →
+            # 等决定 → 用一次性 overlay + 会话记忆对整轮重新判定。
+            requests = self.permissions.open_requests(
+                [(it["name"], it["args"], it["verdict"])
+                 for it in items if it["verdict"].verb == ASK])
+            for req in requests:
+                self._log(f"🔐 等待权限确认: {req['tool']} {req['reason']}", "yellow")
+                yield "permission_request", req
+            decisions = self.permissions.wait_all(cancel=self.cancel_event)
+            overlay = self.permissions.apply_decisions(decisions)
+            for it in items:
+                it["verdict"] = self.permissions.check(it["name"], it["args"],
+                                                       overlay=overlay)
+                if it["verdict"].verb == ASK:
+                    # 理论不可达：open_requests 为每条 ask 登记了请求，overlay
+                    # 必然覆盖它的键。留这道闸是防御规则键错位——残留的 ask
+                    # 按拒绝收场（安全侧），绝不能掉进下面的执行循环。
+                    it["verdict"] = Verdict(DENY,
+                                            f"{it['verdict'].reason}；确认状态丢失，按拒绝处理")
+
+        # ── 分组调度：只在 allow 的调用上成立；deny 原位回填拒绝结果 ──
         idx = 0
-        while idx < len(tool_calls):
-            if not is_read_only(tool_calls[idx]["function"].get("name", "")):
-                group = [tool_calls[idx]]  # 写操作：单独成组，当前线程串行执行
-            else:
-                end = idx + 1              # 只读操作：收集从 idx 起连续的只读工具
-                while (end < len(tool_calls)
-                       and is_read_only(tool_calls[end]["function"].get("name", ""))):
-                    end += 1
-                group = tool_calls[idx:end]
+        while idx < len(items):
+            it = items[idx]
+            if it["verdict"].verb == DENY:
+                self._log(f"⛔ 权限拒绝: {it['name']} {it['verdict'].reason}", "yellow")
+                yield self._backfill_tool_result(it["call"], rejection_result(it["verdict"]))
+                idx += 1
+                continue
+            end = idx
+            while (end < len(items) and items[end]["verdict"].verb == ALLOW
+                   and is_read_only(items[end]["name"])):
+                end += 1
+            if end == idx:  # 首个 allow 是写操作：单独成组，当前线程串行执行
+                end = idx + 1
+            group = [items[i]["call"] for i in range(idx, end)]
             for call, result in zip(group, self._run_tool_group(group)):
-                tool_msg = {
-                    "role": "tool",
-                    "tool_call_id": call.get("id", ""),  # 与请求里的 id 对应，服务商靠它配对
-                    "content": result,
-                }
-                self.history.append(tool_msg)
-                self._log(f"🔧 工具返回: {result}", "yellow")
-                name = call["function"]["name"]
-                self.trace.append({"type": "tool_result", "name": name, "result": result})
-                yield "tool_result", {"name": name, "result": result}
-            idx += len(group)
+                yield self._backfill_tool_result(call, result)
+            idx = end
+
+    def _backfill_tool_result(self, call: dict, result: str):
+        """把一个工具结果按请求位置回填：追加历史、记轨迹、产出事件。
+        正常执行与权限拒绝共用同一条回填路径——对下游（历史配对/前端渲染）
+        而言，拒绝结果就是一个普通的（带 error 的）工具结果。"""
+        tool_msg = {
+            "role": "tool",
+            "tool_call_id": call.get("id", ""),  # 与请求里的 id 对应，服务商靠它配对
+            "content": result,
+        }
+        self.history.append(tool_msg)
+        self._log(f"🔧 工具返回: {result}", "yellow")
+        name = (call.get("function") or {}).get("name", "")
+        self.trace.append({"type": "tool_result", "name": name, "result": result})
+        return ("tool_result", {"name": name, "result": result})
 
     def _run_tool_group(self, group: list[dict]) -> list[str]:
         """执行一组 tool_calls，返回与 group 下标一一对应的结果列表。

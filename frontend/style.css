@@ -569,3 +569,30 @@ button.primary:hover { background: #3d69d8; }
   font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px;
   white-space: pre-wrap; word-break: break-all; color: var(--text-2);
 }
+
+/* 🔐 权限确认卡片：ask 暂停回合时在「执行过程」里弹出的三选一卡片 */
+.perm-card {
+  margin-top: 8px; padding: 10px 12px;
+  border: 1px solid #f0d47a; border-radius: 8px; background: #fffdf3;
+}
+.perm-title { font-weight: 600; font-size: 12.5px; color: var(--text); }
+.perm-reason { margin-top: 3px; font-size: 11.5px; color: var(--text-2); }
+.perm-card pre {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px; line-height: 1.5; margin: 6px 0;
+  padding: 6px 8px; max-height: 160px; overflow: auto;
+  background: #fff; border: 1px solid #ece3c8; border-radius: 6px;
+  white-space: pre-wrap; word-break: break-all;
+}
+.perm-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+.perm-btn {
+  padding: 5px 10px; border-radius: 7px; border: 1px solid var(--border);
+  background: #fff; cursor: pointer; font-size: 12px;
+}
+.perm-btn.ok { border-color: #bcd0f7; color: #2c5bd1; }
+.perm-btn.ok:hover:not(:disabled) { background: #eef3fd; }
+.perm-btn.no { border-color: #f2b8b5; color: #b3261e; }
+.perm-btn.no:hover:not(:disabled) { background: #fdecec; }
+.perm-btn:disabled { opacity: 0.45; cursor: default; }
+.perm-note { margin-top: 6px; font-size: 11px; color: var(--text-3); }
+.perm-note.resolved { color: #2e7d32; }

@@ -352,6 +352,17 @@ class TestRecentUserTexts(unittest.TestCase):
         ]}]
         self.assertEqual(recent_user_texts(history), ["带图的正式提问"])
 
+    def test_skips_synthetic_messages(self):
+        """_synthetic 合成消息（收尾指令/循环提醒，运行时构造）不是用户说的话，
+        提取输入必须跳过——否则"不要再调用任何工具"会被提炼成记忆。"""
+        history = [
+            {"role": "user", "content": "记住我偏好深色主题"},
+            {"role": "assistant", "content": "好的"},
+            {"role": "user", "_synthetic": True,
+             "content": "本轮工具调用轮数已达上限（16）。不要再调用任何工具——请直接输出总结。"},
+        ]
+        self.assertEqual(recent_user_texts(history), ["记住我偏好深色主题"])
+
 
 # ---------------------------------------------------------------------------
 # 五、单飞锁与提取流程

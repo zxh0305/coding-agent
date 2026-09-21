@@ -65,8 +65,39 @@ def save_env_values(updates: dict, path: str = ".env") -> None:
         f.write("\n".join(lines) + "\n")
 
 
+class ApiHTTPError(RuntimeError):
+    """服务商返回了 HTTP 错误状态码。携带结构化信息供重试层判断：
+    status=状态码；retry_after=响应头 Retry-After 的整数秒（无则 None）；
+    body=响应体摘要。作为 RuntimeError 的子类，上层 except RuntimeError 的
+    兼容面不变（worker 的错误路径照常接住）。"""
+
+    def __init__(self, status: int, body: str, retry_after: float | None = None):
+        self.status = status
+        self.retry_after = retry_after
+        self.body = body
+        super().__init__(f"API 返回错误 HTTP {status}：{body}")
+
+
+class ApiConnectionError(RuntimeError):
+    """连接层失败（DNS / 拒绝连接 / 读超时）：请求没发出去或没等到响应头。
+    与 ApiHTTPError 的区分只在重试判断用——这类错误值得退避后再试一次。"""
+
+
+def _parse_retry_after(raw) -> float | None:
+    """Retry-After 头 → 整数秒。只认 delta-seconds 形式；HTTP 日期格式
+    （极少见于限流响应）解析不了就返回 None，退回固定退避。"""
+    if not raw:
+        return None
+    try:
+        return max(0, int(str(raw).strip()))
+    except ValueError:
+        return None
+
+
 def _http_post_json(url: str, headers: dict, payload: dict, timeout: int):
-    """两种协议共用的 JSON POST：发送并返回响应对象，网络/HTTP 错误统一转成带原因的 RuntimeError。"""
+    """两种协议共用的 JSON POST：发送并返回响应对象，网络/HTTP 错误统一转成
+    带原因的 RuntimeError（ApiHTTPError / ApiConnectionError 是其子类，
+    结构化信息供 post_json_with_retry 决定"要不要再试一次"）。"""
     request = urllib.request.Request(
         url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -79,11 +110,14 @@ def _http_post_json(url: str, headers: dict, payload: dict, timeout: int):
         # 把服务商返回的错误原文带出来，方便排查（key 无效/额度不足等）
         detail = e.read().decode("utf-8", errors="replace")[:500]
         log.error("API 返回 HTTP %s: %s", e.code, detail)
-        raise RuntimeError(f"API 返回错误 HTTP {e.code}：{detail}") from e
+        raise ApiHTTPError(e.code, detail,
+                           _parse_retry_after(e.headers.get("Retry-After") if e.headers else None)) from e
     except urllib.error.URLError as e:
         if "CERTIFICATE_VERIFY_FAILED" in str(e.reason):
             # python.org 安装版 Python 的经典坑：不读 macOS 钥匙串，自带信任库为空，
             # OpenSSL 会把链尾的正常根证书也误报成 "self-signed certificate in chain"。
+            # 刻意抛普通 RuntimeError（不是 ApiConnectionError）：证书配置错误
+            # 不会因为等两秒就自愈，重试纯属浪费——重试层只认 ApiConnectionError。
             log.error("TLS 证书校验失败: %s", e.reason)
             raise RuntimeError(
                 f"TLS 证书校验失败（{e.reason}）\n"
@@ -93,13 +127,71 @@ def _http_post_json(url: str, headers: dict, payload: dict, timeout: int):
                 "    b. 运行 /Applications/Python 3.12/Install Certificates.command（全局生效，需管理员权限）"
             ) from e
         log.error("连接失败: %s", e.reason)
-        raise RuntimeError(f"无法连接 API（{url}）：{e.reason}") from e
+        raise ApiConnectionError(f"无法连接 API（{url}）：{e.reason}") from e
     except TimeoutError as e:
         # socket 级超时：连接 / 发请求 / 等响应头，任一步 60s 没动静。
         # 注意必须是 RuntimeError——app.py 只接 RuntimeError，让 TimeoutError
         # 漏过去的话，前端只会看到连接无声断掉，没有任何提示。
         log.error("请求超时: %s", e)
-        raise RuntimeError(f"请求超时（{timeout}s 内服务器没有响应）: {e}") from e
+        raise ApiConnectionError(f"请求超时（{timeout}s 内服务器没有响应）: {e}") from e
+
+
+# ---------------------------------------------------------------------------
+# 瞬态错误退避重试：429（TPM 限流）、5xx 网关抖动、连接失败这类"等一等就能好"
+# 的错误，在【请求发出前】退避重试自愈，不再把整个回合打死。
+# ---------------------------------------------------------------------------
+
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}  # 限流 + 网关/上游瞬态故障；400/401/403/404 重试注定失败
+_RETRY_BACKOFFS = (2.0, 4.0)   # 无 Retry-After 时的固定退避：attempts=3 → 最坏新增延迟 2+4=6s，有界
+_MAX_RETRY_WAIT = 30.0         # Retry-After 封顶防呆：个别网关会回大得离谱的值
+_RETRY_SLICE = 0.2             # 等待分片：长等待也要能及时响应停止请求
+
+_sleep = time.sleep  # 模块级别名：单测替换它验证退避节奏（不真睡）
+
+
+def _sleep_cancellable(seconds: float, cancel) -> bool:
+    """分片睡眠，等待期间响应停止请求。返回 True=等待完成；False=已被取消。"""
+    remaining = seconds
+    while remaining > 0:
+        if cancel is not None and cancel.is_set():
+            return False
+        step = min(_RETRY_SLICE, remaining)
+        _sleep(step)
+        remaining -= step
+    return True
+
+
+def post_json_with_retry(url: str, headers: dict, payload: dict, timeout: int,
+                         cancel=None, attempts: int = 3):
+    """带退避重试的 JSON POST（两个 client 的 _post 共用）。
+
+    可重试 = HTTP 429/500/502/503/504、连接失败、读超时——都发生在【请求发出
+    之前或未完成】；流已经开始后的中断不在这里处理（维持现状，不扩大范围）。
+    400/401/403/404 等立即抛出：重试一个注定失败的请求只会白等。
+    节奏：优先服务商的 Retry-After（封顶 30s），否则 2s、4s。
+    等待期间按 0.2s 分片检查 cancel：置位则重抛最后一个错误、不再重试——已知
+    取舍：此刻请求没发出去，回合由 worker 的错误路径收尾（error + turn_end），
+    与"请求没发出去就取消"的既有行为一致。
+    """
+    attempts = max(1, attempts)
+    for attempt in range(1, attempts + 1):
+        try:
+            return _http_post_json(url, headers, payload, timeout)
+        except ApiHTTPError as e:
+            if e.status not in _RETRYABLE_STATUS:
+                raise
+            error: RuntimeError = e
+            wait = min(e.retry_after, _MAX_RETRY_WAIT) if e.retry_after else None
+        except ApiConnectionError as e:
+            error, wait = e, None
+        if attempt >= attempts:
+            raise error
+        if wait is None:
+            wait = _RETRY_BACKOFFS[min(attempt, len(_RETRY_BACKOFFS)) - 1]
+        log.warning("API 请求失败（%s），%.0f 秒后重试（第 %d/%d 次）",
+                    error, wait, attempt, attempts - 1)
+        if not _sleep_cancellable(wait, cancel):
+            raise error  # 等待期间被停止：交回 worker 错误路径收尾（取舍见 docstring）
 
 
 def _arm_cancel_watchdog(resp, cancel) -> None:
@@ -134,9 +226,10 @@ class OpenAIChatClient:
         # GLM 的 base_url 以 / 结尾（…/v4/），OpenAI 的不带（…/v1），统一兜一下
         self.api_url = base_url.rstrip("/") + "/chat/completions"
 
-    def _post(self, payload: dict):
-        """构造请求并发送，返回响应对象；网络/HTTP 错误统一转成带原因的 RuntimeError。"""
-        return _http_post_json(
+    def _post(self, payload: dict, cancel=None):
+        """构造请求并发送（瞬态错误退避重试，见 post_json_with_retry），
+        返回响应对象；不可恢复的网络/HTTP 错误统一转成带原因的 RuntimeError。"""
+        return post_json_with_retry(
             self.api_url,
             {
                 "Content-Type": "application/json",
@@ -144,6 +237,7 @@ class OpenAIChatClient:
             },
             payload,
             self.timeout,
+            cancel=cancel,
         )
 
     def chat(self, messages: list, tools: list | None = None,
@@ -156,12 +250,14 @@ class OpenAIChatClient:
         payload = {
             "model": self.model,
             "messages": messages,
-            "tool_choice": "auto",  # 让模型自己决定：直接回答 or 调用工具
         }
         if temperature is not None:
             payload["temperature"] = temperature
         if tools:
+            # tool_choice 必须与 tools 成对出现：只发 tool_choice 不发 tools，
+            # OpenAI 协议直接 400 拒收（收尾轮/记忆提取都是 tools=None 的纯对话请求）
             payload["tools"] = tools
+            payload["tool_choice"] = "auto"  # 让模型自己决定：直接回答 or 调用工具
         start = time.time()
         with self._post(payload) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -185,21 +281,24 @@ class OpenAIChatClient:
         payload = {
             "model": self.model,
             "messages": messages,
-            "tool_choice": "auto",
             "stream": True,
         }
         if tools:
+            # 同 chat()：tool_choice 必须与 tools 成对出现，单独发会被 400 拒收
             payload["tools"] = tools
+            payload["tool_choice"] = "auto"
 
         # 请求 token 用量统计（最后一个 chunk 会带 usage）。部分兼容服务不认
         # stream_options 参数，首次报错就自动降级为不请求。
+        # cancel 在这里传给 _post：这是 _arm_cancel_watchdog 之前的空窗，
+        # 停止请求在重试等待期间也能被响应。
         resp = None
         want_usage = self._stream_usage
         while True:
             if want_usage:
                 payload["stream_options"] = {"include_usage": True}
             try:
-                resp = self._post(payload)
+                resp = self._post(payload, cancel=cancel)
                 break
             except RuntimeError as e:
                 if want_usage and "stream_options" in str(e):
@@ -370,11 +469,15 @@ class AnthropicMessagesClient:
                  "input_schema": t["function"].get("parameters") or {"type": "object", "properties": {}}}
                 for t in tools
             ]
+            # tool_choice 必须与 tools 成对出现（OpenAI 协议只发 tool_choice 不发
+            # tools 会 400；Anthropic 同理）——收尾轮 tools=None 的纯文本请求
+            # 绝不能带上它
             body["tool_choice"] = {"type": "auto"}
         return body
 
-    def _post(self, payload: dict):
-        return _http_post_json(
+    def _post(self, payload: dict, cancel=None):
+        """发送请求（瞬态错误退避重试，见 post_json_with_retry）。"""
+        return post_json_with_retry(
             self.api_url,
             {
                 "Content-Type": "application/json",
@@ -384,6 +487,7 @@ class AnthropicMessagesClient:
             },
             payload,
             self.timeout,
+            cancel=cancel,
         )
 
     @staticmethod
@@ -433,7 +537,9 @@ class AnthropicMessagesClient:
 
         blocks: dict[int, dict] = {}  # content block 下标 -> 累积中的内容
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        resp = self._post(body)
+        # cancel 在这里传给 _post：_arm_cancel_watchdog 之前的空窗，重试等待
+        # 期间也能响应停止请求
+        resp = self._post(body, cancel=cancel)
         _arm_cancel_watchdog(resp, cancel)
         try:
             with resp:

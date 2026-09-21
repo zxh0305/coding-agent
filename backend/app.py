@@ -35,6 +35,9 @@ Web 服务
                                     token 参数鉴权：EventSource 无法带自定义头
   GET  /api/sessions/<id>/messages  某任务的历史消息（须是自己的任务；?before_ord=&limit=
                                     向上翻页，默认最近 100 条；归档消息带 artifact/path/head）
+  POST /api/sessions/<id>/permission/<pid>  回答权限确认卡片
+                                    {"decision": "allow"|"allow_session"|"deny"}
+                                    （ask 暂停的回合在此恢复；超时按拒绝处理）
   GET  /api/sessions/<id>/artifact?path=  读取外置归档消息的完整原文（路径白名单校验）
   DELETE /api/sessions?session_id=  删除任务（须是自己的任务）
   GET  /api/context?session_id=   该任务当前上下文容量
@@ -81,6 +84,7 @@ from events import SSE_HEARTBEAT, SessionEvents, sse_frame
 from llm_client import create_client, load_env_file, save_env_values
 from logger import setup_logging
 from memory import memory_dir, recent_user_texts, run_extraction_async
+from permissions import PermissionGate
 from tools import TOOL_SCHEMAS
 
 log = logging.getLogger("app")
@@ -122,6 +126,25 @@ def _event_bus(sid: str) -> SessionEvents:
         return bus
 
 
+# ask 等待用户决定的上限（秒）。超时不是安全边界——超时按拒绝处理，本来就
+# 站在安全侧；这里只是防挂死：别让 worker 线程为一张再没人看的卡片等一辈子。
+PERMISSION_ASK_TIMEOUT = 300
+
+
+def _build_permission_gate(workspace: Path) -> PermissionGate:
+    """构造一个会话的权限闸门（permissions.py）。用户规则按工作区隔离：存
+    settings 表，key = "permissions:<workspace_path>"，值是 JSON 数组、可直接
+    手编（后续可挂管理面板），例如：
+      [{"tool": "run_bash", "pattern": "git push*", "decision": "allow"}]
+    加载器以闭包注入而非让闸门直接 import db：闸门保持存储无关（CLI/单测
+    不引库也能跑），每次判定现读——手编规则下一轮工具调用立即生效。"""
+    return PermissionGate(
+        workspace=workspace,
+        user_rules_loader=lambda w=str(workspace): db.get_setting(f"permissions:{w}", []),
+        ask_timeout=PERMISSION_ASK_TIMEOUT,
+    )
+
+
 def _spawn_memory_extraction(sid: str, agent: Agent) -> None:
     """轮末记忆提取的启动点（必须在 worker 线程内、turn_end 发布之后调用）。
 
@@ -148,7 +171,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
     禁止第二条写入路径，旁路写入不会进缓冲，重连客户端永远看不到。
 
     事件协议：在原有回合事件（round/reasoning_delta/answer_delta/tool_call/
-    tool_result/usage/done/compacted）外增加两个回合边界事件：
+    tool_result/permission_request/usage/done/compacted）外增加两个回合边界事件：
       turn_start {nonce, input, atts}  回合开始：多标签页/刷新后的页面靠它
                                        补画用户气泡并进入"生成中"状态；nonce
                                        让发起方识别自己（不重复画）
@@ -205,8 +228,12 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 # 序号空间）全部失效，推事件让前端重拉时间线
                 db.renumbered_sessions.discard(sid)
                 bus.publish({"type": "history_renumbered"})
+            # user_mid = 本回合输入消息的 mid。必须跳过 _synthetic 合成消息
+            # （收尾指令/循环提醒也是 role=user 且排在最后，但永不落库、没有
+            # _mid）——否则收尾轮结束的回合会把去重键带成 None，前端的补发
+            # 去重会把这回合误判成"不在时间线里"而重复渲染。
             user_mid = next((m.get("_mid") for m in reversed(agent.history)
-                             if m.get("role") == "user"), None)
+                             if m.get("role") == "user" and not m.get("_synthetic")), None)
             bus.publish({"type": "turn_end", "user_mid": user_mid})
             # 轮末自动提取（memory.py）：daemon 线程异步跑，绝不阻塞 worker
             # 返回与下一个回合。全程静默——不发 SSE 事件、不写数据库：记忆是
@@ -403,7 +430,8 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
             agent = Agent(llm=client, verbose=False, vision_supported=vision,
                           workspace=workspace, vision_backend=_vision_backend,
                           context_window=_active_window(),  # 压缩触发线的基准（切换模型后重建实例即更新）
-                          artifact_reader=db.read_artifact)  # 外置大消息的还原器（模型视图用）
+                          artifact_reader=db.read_artifact,  # 外置大消息的还原器（模型视图用）
+                          permission_gate=_build_permission_gate(workspace))
             # 窗口恢复：从未压缩 = 全量；压缩过 = 锚点 + 最后一条边界及其之后
             # （边界摘要是后续再压缩的输入）。内存占用与当前窗口成正比，而非
             # 全会话长度；模型视图与全量恢复逐字节一致。
@@ -587,6 +615,13 @@ class Handler(SimpleHTTPRequestHandler):
                 if db.session_owner(sid) != self.user["id"]:
                     return self._json({"error": "任务不存在或不属于当前用户"}, 404)
                 self._handle_session_submit(sid)
+            elif re.fullmatch(r"/api/sessions/[^/]+/permission/[^/]+", path):
+                # 权限确认的决定回令：/api/sessions/<sid>/permission/<pid>
+                parts = path.split("/")
+                sid, pid = parts[3], parts[5]
+                if db.session_owner(sid) != self.user["id"]:
+                    return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+                self._handle_permission(sid, pid)
             elif path == "/api/active-model":
                 self._handle_active_model()
             elif self.path == "/api/providers/save":
@@ -804,6 +839,26 @@ class Handler(SimpleHTTPRequestHandler):
         agent.stop()
         log.info("[会话 %s] 用户请求停止生成", sid)
         self._json({"ok": True, "running": True})
+
+    def _handle_permission(self, sid: str, pid: str):
+        """权限确认的决定回令：{"decision": "allow"|"allow_session"|"deny"}。
+
+        时刻注意：回合 worker 此刻正阻塞在闸门的等待上（permission_request
+        已发出），本 handler 跑在 HTTP 线程、只调 agent.resolve_permission 在
+        闸门上 set 一个 Event 唤醒它——不持会话锁、不碰消息历史。等待超过
+        PERMISSION_ASK_TIMEOUT 无人应答会按拒绝收场，此后迟到的点击在这里
+        得到 ok=false（前端提示"确认已失效"）。会话实例被重建（切模型/工作区）
+        后 pending 随旧实例丢弃，同样落到 ok=false——等待方超时兜底，无悬挂。"""
+        decision = str(self._body().get("decision") or "")
+        agent = _agents.get(sid)
+        if agent is None:
+            return self._json({"ok": False, "error": "任务不存在或已重建，确认已失效"}, 404)
+        if decision not in ("allow", "allow_session", "deny"):
+            return self._json({"error": "decision 须为 allow / allow_session / deny"}, 400)
+        ok = agent.resolve_permission(pid, decision)
+        if not ok:
+            return self._json({"ok": False, "error": "确认请求不存在或已被处理"}, 404)
+        self._json({"ok": True})
 
     # ---------- 任务消息（分页回放 + 归档全文） ----------
 

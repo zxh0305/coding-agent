@@ -132,10 +132,10 @@ schema 升级用 `PRAGMA user_version` + 有序迁移列表（`db.MIGRATIONS`）
 2. **工具报错不抛异常，而是把错误字符串返回给 LLM**——模型看到 `{"error": ...}` 后可以自己纠正参数重试。实测：`python` 不存在时模型会自己换 `python3`。
 3. **apply_patch 用"锚定原文"的编辑协议**（Aider 的 SEARCH/REPLACE 思路）——search 必须逐字符匹配且唯一，失败模式只有"找不到"和"多处匹配"两种，都能反馈给模型自纠。比整文件重写省 token，比 diff 格式抗幻觉。
 4. **工作区越界保护**——`resolve()` 消解 `../` 后校验必须仍在工作区内，模型传 `/etc/passwd` 或 `../../.env` 都会被拒。
-5. **`max_rounds` 强制止损（默认 16）**——防止模型陷入"调工具→不满意→再调"的死循环烧钱；coding 任务一轮要多次往返，所以比普通问答的 8 大。
+5. **`max_rounds` 兜底 + 收尾轮（默认 40）**——上限不再"强制砍停"：跑满后注入一条合成 user 指令（`_synthetic` 标记：发给模型保留、落库/记忆提取跳过、不发事件），以 `tools=None` 再请求一轮，回合以模型自己的真实总结 + `done(stopped_reason="max_rounds")` 收场。防死循环另有**指纹提醒**：同一工具+相同参数连续 3 次注入"换做法"提醒、轮数到 `max_rounds-10`/`-4` 注入"收敛"提醒，每回合总预算 3 条——参照 ZCode 的哲学：防失控靠模式检测 + 提醒让模型自纠，不靠计数砍停。
 6. **calculator 不用 `eval`**——用 ast 白名单只允许四则运算，防止模型（或注入）执行任意代码。
 7. **前端一律用 `textContent` 渲染**——不拼 `innerHTML`，天然防 XSS。
-8. **流式链路（四层各有关卡）**——① LLM 层：`stream: true` 时工具调用是**分片**到达的，必须按 `index` 累积拼接 arguments；`stream_options: include_usage` 拿 token 用量（服务商不支持时自动降级重试）；② Agent 层：核心循环重构为 `run()` 生成器，边跑边产出事件，usage 跨轮累计；③ 后端：SSE 推送，刻意用 HTTP/1.0"关闭连接即结束"语义，免写 chunked 分块，且 `wbufsize=0` 保证每次 write 直接到网络；④ 前端：EventSource 常驻连接 events 通道（浏览器自动重连并携带 Last-Event-ID），本地 localStorage 记每会话最近 seq，刷新后 `?since=` 补发接上进行中的回合；delta 按消息 mid 归并进同一气泡。
+8. **流式链路（四层各有关卡）**——① LLM 层：`stream: true` 时工具调用是**分片**到达的，必须按 `index` 累积拼接 arguments；`stream_options: include_usage` 拿 token 用量（服务商不支持时自动降级重试）；`tool_choice` 必须与 `tools` 成对出现（只发前者会 400，收尾轮/记忆提取都是无工具的纯对话请求）；瞬态错误（429 限流 / 5xx / 连接失败）在请求发出前退避重试（优先 `Retry-After` 封顶 30s，否则 2s/4s，最坏新增 6s；等待期间可被「停止」打断），`tool_choice` 配对约束见 `backend/test_retry.py`；② Agent 层：核心循环重构为 `run()` 生成器，边跑边产出事件，usage 跨轮累计；③ 后端：SSE 推送，刻意用 HTTP/1.0"关闭连接即结束"语义，免写 chunked 分块，且 `wbufsize=0` 保证每次 write 直接到网络；④ 前端：EventSource 常驻连接 events 通道（浏览器自动重连并携带 Last-Event-ID），本地 localStorage 记每会话最近 seq，刷新后 `?since=` 补发接上进行中的回合；delta 按消息 mid 归并进同一气泡。
 9. **工作区按任务隔离 + ToolContext 注入**——每个任务的工作区解析链是"任务自选 → 用户默认 → `.env` 的 `WORKSPACE_DIR` / 项目 `workspace/`"，结果不进全局环境变量，而是随 `ToolContext`（工作区、本轮图片、看图后端）注入到每次工具调用——切换某个任务的工作区不影响其他正在跑的任务，并发会话也不会串图片数据。选目录的接口只做最小校验（存在、非根目录），因为它的前提是"本机信任圈工具"。
 10. **上下文容量估算**——没有本地分词器，用"服务商返回的真实 prompt_tokens ÷ 上次请求总字符数"校准出每字符 token 系数，再按 系统提示词/工具定义/用户消息/助手回复/工具结果 的字符占比分摊——估算值，但量级和占比可信；缓存命中率直接用 DeepSeek 返回的 `prompt_cache_hit_tokens / prompt_cache_miss_tokens`。
 11. **任务（多会话）**——每个任务一个独立 Agent 实例（独立对话历史），标题取第一条提问；模型配置变更后按需重建实例但保留历史。任务、消息（含每条助手消息的耗时/token 统计，存在消息的 `_stats` 内部字段里）都落盘 SQLite，重启不丢；发给模型前会剥离 `_` 前缀的内部字段（部分服务商会拒绝未知字段）。

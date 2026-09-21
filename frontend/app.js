@@ -1065,6 +1065,7 @@ let liveBubble = null, metaEl = null, metaTimer = null, qStart = 0;
 let thinkEl = null;  // 当前轮次的思考流块（思考模型的 reasoning_delta 实时显示用）
 let traceEl = null, traceSteps = 0;
 let pendingCalls = [];  // 已发出但未见结果的工具调用（算持续时长用）
+let permissionCards = new Map();  // permission id -> 卡片元素：补发重放同一请求时复用/整卡重画，不叠卡片
 let liveMsgs = new Map();  // mid -> {el, text}：事件流里同一 mid 的 delta 归并进同一气泡
 let curMid = null;         // 当前回答段落的 mid（round 事件切换）
 let historyMids = new Set();  // 已从分页接口加载进时间线的消息 mid（补发去重基准）
@@ -1136,9 +1137,11 @@ function toolResultLine(name, resultStr) {
     if (parsed.exit_code !== 0) summary.classList.add("err");
     pre.textContent = [parsed.stdout, parsed.stderr].filter(Boolean).join("\n[stderr]\n") || "(无输出)";
   } else if (parsed && typeof parsed === "object" && "error" in parsed) {
-    summary.textContent = `↩ 出错${dur}`;
+    // 权限拒绝是"人做的决定"而非故障：单独标注，并带上给模型的改道提示
+    const denied = typeof parsed.error === "string" && parsed.error.startsWith("权限拒绝");
+    summary.textContent = denied ? `↩ 已拒绝${dur}` : `↩ 出错${dur}`;
     summary.classList.add("err");
-    pre.textContent = parsed.error;
+    pre.textContent = [parsed.error, parsed.hint ? "💡 " + parsed.hint : ""].filter(Boolean).join("\n");
   } else if (parsed && typeof parsed === "object" && "added" in parsed) {
     summary.textContent = `↩ +${parsed.added} −${parsed.removed}${dur}`;
   } else if (parsed && typeof parsed === "object" && "lines" in parsed) {
@@ -1152,6 +1155,65 @@ function toolResultLine(name, resultStr) {
   }
   d.append(summary, pre);
   appendTrace(d);
+}
+
+// 🔐 权限确认卡片：闸门命中 ask 时，回合暂停等用户三选一。
+// 决定 POST /api/sessions/<sid>/permission/<pid>（事件到达时回合还没结束，
+// streaming 状态保持，输入照常排队）。补发/重放会带来同一条 permission_request：
+// 同一 id 整卡重画（覆盖旧卡），已答过的再答会得到 ok=false → 提示"已失效"。
+async function decidePermission(evt, decision, noteEl, buttons) {
+  for (const b of buttons) b.disabled = true;
+  try {
+    const r = await api(`/api/sessions/${encodeURIComponent(currentSession)}/permission/${encodeURIComponent(evt.id)}`,
+      { method: "POST", body: JSON.stringify({ decision }) });
+    if (r && r.ok === false) throw new Error(r.error || "确认已失效");
+    noteEl.textContent = decision === "deny"
+      ? "已拒绝：助手会收到拒绝原因并改用别的方案"
+      : (decision === "allow_session" ? "已允许（本会话内同类操作不再询问）" : "已允许（仅本次）");
+    noteEl.classList.add("resolved");
+  } catch (e) {
+    noteEl.textContent = "提交失败：" + e.message;
+    noteEl.classList.add("resolved");
+    for (const b of buttons) b.disabled = false;  // 可重试（如刷新后补发的旧卡重新生效前）
+  }
+}
+
+function showPermissionCard(evt) {
+  flushStreamBuffers();
+  retireLiveBubble();
+  ensureTrace();
+  let card = permissionCards.get(evt.id);
+  if (card) card.remove();  // 同一请求重放：整卡重画，绝不允许出现两张活卡
+  card = document.createElement("div");
+  card.className = "perm-card";
+  const title = document.createElement("div");
+  title.className = "perm-title";
+  title.textContent = `🔐 权限确认 · ${evt.tool}`;
+  const reason = document.createElement("div");
+  reason.className = "perm-reason";
+  reason.textContent = "触发原因：" + (evt.reason || "该操作需要确认");
+  const pre = document.createElement("pre");
+  pre.textContent = typeof evt.input === "string" ? evt.input : JSON.stringify(evt.input, null, 2);
+  const btns = document.createElement("div");
+  btns.className = "perm-btns";
+  const mk = (label, decision, cls) => {
+    const b = document.createElement("button");
+    b.className = "perm-btn " + cls;
+    b.textContent = label;
+    b.onclick = () => decidePermission(evt, decision, note, [bOnce, bSession, bDeny]);
+    return b;
+  };
+  const bOnce = mk("仅本次允许", "allow", "ok");
+  const bSession = mk("本会话内允许", "allow_session", "ok");
+  const bDeny = mk("拒绝", "deny", "no");
+  btns.append(bOnce, bSession, bDeny);
+  const note = document.createElement("div");
+  note.className = "perm-note";
+  note.textContent = "等待你的决定（5 分钟未确认将按拒绝处理）";
+  card.append(title, reason, pre, btns, note);
+  traceEl.appendChild(card);  // 不走 appendTrace：确认卡不算执行步骤
+  permissionCards.set(evt.id, card);
+  chatEl.scrollTop = chatEl.scrollHeight;
 }
 
 // ⏱ 耗时 + token 统计行（跟随当前回答气泡）
@@ -1247,6 +1309,7 @@ function applyEvent(evt, seq) {
     liveMsgs = new Map();
     liveBubble = null; traceEl = null; traceSteps = 0;
     metaEl = null; thinkEl = null; pendingCalls = [];
+    permissionCards = new Map();  // 新回合的确认卡是新的请求：旧卡引用随时间线一起失效
     pendingDeltas = new Map(); pendingThink = "";
     usageNow = null; curMid = null; qStart = Date.now();
     clearInterval(metaTimer);
@@ -1279,6 +1342,8 @@ function applyEvent(evt, seq) {
     toolCallLine(evt.name, evt.arguments);
   } else if (t === "tool_result") {
     toolResultLine(evt.name, evt.result);
+  } else if (t === "permission_request") {
+    showPermissionCard(evt);
   } else if (t === "usage") {
     usageNow = evt;   // 供上下文气泡与统计行使用
     updateCtxChip();

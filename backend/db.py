@@ -655,6 +655,11 @@ def save_messages(sid: str, history: list[dict], saved: dict) -> int:
             return 0
         _assign_ords(conn, sid, history)
         for m in history:
+            if m.get("_synthetic"):
+                # 合成消息（收尾指令/循环提醒，见 agent.py 模块头注释）只活在
+                # 内存与发给模型的请求里：不落库、不进指纹账本——重启恢复后
+                # 历史里没有它，DB 仍是时间线唯一真相
+                continue
             mid = m.get("_mid")
             if not mid:
                 mid = uuid.uuid4().hex

@@ -5,9 +5,13 @@ Coding 工具集
 让 Agent 能在"工作区"目录里读写本地代码、执行命令——这就是主流 coding agent
 （Claude Code / Codex CLI 等）的基本工作方式：直接在本地文件夹中干活，不要求 git。
 
-三道安全边界（初学阶段在本机直接干活的最低保障）：
+安全边界（初学阶段在本机直接干活的最低保障）：
 1. 路径越界保护：所有文件操作被限制在工作区内，`../..` 逃逸直接报错；
-2. 命令黑名单：`sudo`、`rm -rf /` 等高危命令直接拒绝，并把原因反馈给模型；
+   权限层（permissions.py）在调度前复用同一检查，把越界从「执行时报错」
+   提前为「带原因的权限拒绝」；
+2. 权限闸门：高危命令不再在本模块静默拦截——命令拆解、allow/deny/ask
+   三态判定与用户确认全部收编进 permissions.py（拆段匹配能看清 `ls;rm -rf /`
+   这类复合命令，也不会再误伤引号里的字符串）；
 3. 超时与输出上限：防止命令卡死，也防止海量输出撑爆模型上下文。
 
 真正的生产环境应把执行隔离进 Docker（见 docs/coding-agent-selection.md）。
@@ -24,12 +28,6 @@ DEFAULT_WORKSPACE = _PROJECT_DIR / "workspace"
 
 # 遍历时永远跳过的目录
 IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".idea", ".vscode"}
-
-# 高危命令黑名单（粗粒度兜底，不是安全边界；重要数据请自行备份或后续上 Docker）
-_DANGEROUS_RE = re.compile(
-    r"\bsudo\b|\bshutdown\b|\breboot\b|\brm\s+(-[a-z]*r[a-z]*f|-rf)\b\s*[/~]|\bmkfs\b|\bdd\s+if=",
-    re.IGNORECASE,
-)
 
 MAX_READ_CHARS = 40_000   # 单次读文件上限，防止撑爆上下文
 MAX_OUTPUT_CHARS = 8_000  # 命令输出上限（保留末尾，报错通常在尾部）
@@ -130,7 +128,7 @@ def write_file(path: str, content: str, ctx=None) -> str:
     }, ensure_ascii=False)
 
 
-def apply_patch(path: str, search: str, replace: str) -> str:
+def apply_patch(path: str, search: str, replace: str, ctx=None) -> str:
     """锚定式编辑（Aider 的 SEARCH/REPLACE 思路）：
     在文件里找 search 原文，替换为 replace。
 
@@ -206,11 +204,15 @@ def grep(pattern: str, path: str = ".", ctx=None) -> str:
 
 
 def run_bash(command: str, ctx=None) -> str:
-    """在工作区目录里执行 shell 命令（cwd 锁定工作区、30 秒超时、输出截断）。"""
+    """在工作区目录里执行 shell 命令（cwd 锁定工作区、30 秒超时、输出截断）。
+
+    高危判定不在这里做：本函数只管执行。allow/deny/ask 三态判定（含命令
+    拆解与用户确认）在调度前的权限闸门（permissions.py）完成——那里能把
+    `ls;rm -rf /` 拆开看、也能让 `rm -rf /tmp/test` 这类操作先过问用户。
+    到达这里 = 已获放行。
+    """
     if not command or not isinstance(command, str):
         return _err("command 不能为空")
-    if _DANGEROUS_RE.search(command):
-        return _err("命令被安全策略拒绝：涉及 sudo / 全盘删除等高危操作。请换用更精确、作用域更小的方式")
     try:
         proc = subprocess.run(
             command, shell=True, cwd=_ws(ctx),
@@ -301,7 +303,7 @@ CODE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "run_bash",
-            "description": "在工作区目录里执行 shell 命令（30 秒超时，输出截断）。用于运行程序、跑测试、做语法检查。高危命令会被拒绝。",
+            "description": "在工作区目录里执行 shell 命令（30 秒超时，输出截断）。用于运行程序、跑测试、做语法检查。高危命令会先请求用户确认，被拒会给出原因。",
             "parameters": {
                 "type": "object",
                 "properties": {"command": {"type": "string", "description": "要执行的命令"}},
