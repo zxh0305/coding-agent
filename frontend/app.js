@@ -373,11 +373,33 @@ function historyNode(m) {
   return frag;
 }
 
-// 外置归档消息卡片：head 预览 + 归档标记；点开懒加载全文（1MB 级内容
-// 不随时间线整页带回，用户要看时才走 artifact 接口取）。
-// 带图片的用户消息（base64 多模态 content 必然超 64KB 行内上限）点开后
-// 还原成正常的用户气泡——图片渲染出来，而不是把 base64 JSON 摆在 <pre> 里。
+// 外置归档消息：超大正文不随时间线整页带回，用户要看时才走 artifact 接口取。
+// 带图/带附件文本的用户消息直接按【正常用户气泡】渲染（右侧、图片可点放大）：
+// 先用 head 预览画占位，后台取回归档正文后原位替换——用户消息显示成"归档
+// 卡片"很反直觉。其余归档（超大工具输出/助手消息）维持"点开加载全文"卡片。
 function artifactCard(m) {
+  const placeholder = (text) => buildBubble("user", text || "（仅附件）");
+  if (m.role === "user") {
+    // 从 head 预览里能挤出文字部分（head 是完整消息 JSON 的前 2000 字符）
+    let headText = "";
+    try { headText = (JSON.parse(m.head).content || [])
+      .filter(p => p.type === "text").map(p => p.text || "").join("\n"); } catch { /* head 截断处非法 JSON */ }
+    const holder = document.createElement("div");
+    holder.appendChild(placeholder(headText));
+    api(`/api/sessions/${encodeURIComponent(currentSession)}` +
+        `/artifact?path=${encodeURIComponent(m.path)}`).then((r) => {
+      const msg = r.message;
+      const parts = Array.isArray(msg.content) ? msg.content : [];
+      const text = parts.filter(p => p.type === "text")
+        .map(p => p.text || "").join("\n");
+      const imgs = parts.filter(p => p.type === "image_url")
+        .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
+      const full = buildUserBubble(text, imgs);  // data URI 进 <img>，可点放大
+      holder.replaceChildren(full);              // 原位替换占位气泡
+      chatEl.scrollTop = chatEl.scrollHeight;    // 图片加载会撑高，重新贴底
+    }).catch(() => { /* 取回失败：保留 head 预览占位，不打扰 */ });
+    return holder;
+  }
   const d = document.createElement("details");
   d.className = "bubble assistant artifact";
   const s = document.createElement("summary");
@@ -396,13 +418,13 @@ function artifactCard(m) {
         `/artifact?path=${encodeURIComponent(m.path)}`);
       const msg = r.message;
       const parts = Array.isArray(msg.content) ? msg.content : null;
-      if (msg.role === "user" && parts) {
+      if (msg.role === "user" && parts) {  // 翻页等路径下的兜底，同上还原
         const text = parts.filter(p => p.type === "text")
           .map(p => p.text || "").join("\n");
         const imgs = parts.filter(p => p.type === "image_url")
           .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
         box.innerHTML = "";
-        box.appendChild(buildUserBubble(text, imgs));  // data URI 直接进 <img src>
+        box.appendChild(buildUserBubble(text, imgs));
       } else {
         pre.textContent = prettyJson(JSON.stringify(msg));
       }
