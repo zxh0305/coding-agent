@@ -194,6 +194,15 @@ MIGRATIONS: list[tuple[int, str | None]] = [
     #    的 seq 去重闸门会把新事件误判为"已应用过"而丢弃。注意 seq 是【事件】
     #    的流水号，与消息的 mid（稳定身份）是两套体系，互不通用。
     (8, "ALTER TABLE sessions ADD COLUMN last_seq INTEGER DEFAULT 0"),
+    # 9：执行过程轨迹（每轮提问的思考/工具调用记录）。前端实时过程只存在于
+    #    SSE 事件流里，切换会话/刷新即失；落库后随历史消息带回，用户可回看
+    #    "当时每一步做了什么、改了哪些文件"。键 = (session_id, 最终回答 mid)。
+    (9, "CREATE TABLE IF NOT EXISTS session_traces(\n"
+        "    session_id TEXT NOT NULL,\n"
+        "    mid TEXT NOT NULL,\n"
+        "    trace_json TEXT NOT NULL,\n"
+        "    PRIMARY KEY(session_id, mid)\n"
+        ")"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -223,6 +232,9 @@ def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
                                  "AND name='message_usage'").fetchone())
     if version == 8:           # sessions.last_seq
         return "last_seq" in _table_columns(conn, "sessions")
+    if version == 9:           # session_traces 表
+        return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                 "AND name='session_traces'").fetchone())
     return False
 
 
@@ -439,6 +451,35 @@ def set_last_seq(sid: str, seq: int) -> None:
     with _conn() as conn:
         conn.execute("UPDATE sessions SET last_seq=MAX(COALESCE(last_seq,0),?) WHERE id=?",
                      (int(seq), sid))
+
+
+# ---------------------------------------------------------------------------
+# 执行过程轨迹（session_traces）：每轮提问的轮次/工具调用记录，随历史回放
+# ---------------------------------------------------------------------------
+
+def set_trace(sid: str, mid: str, trace_json: str) -> None:
+    """保存一轮提问的执行过程轨迹（键 = 最终回答消息的 mid，重复写幂等覆盖）。"""
+    with _conn() as conn:
+        conn.execute("INSERT INTO session_traces(session_id, mid, trace_json) VALUES(?,?,?) "
+                     "ON CONFLICT(session_id, mid) DO UPDATE SET trace_json=excluded.trace_json",
+                     (sid, mid, trace_json))
+
+
+def get_traces(sid: str, mids: list[str]) -> dict:
+    """批量取本页消息的轨迹，返回 {mid: [entry, ...]}；没有轨迹的 mid 不在结果里。"""
+    if not mids:
+        return {}
+    marks = ",".join("?" * len(mids))
+    with _conn() as conn:
+        rows = conn.execute(f"SELECT mid, trace_json FROM session_traces "
+                            f"WHERE session_id=? AND mid IN ({marks})", (sid, *mids)).fetchall()
+    out = {}
+    for r in rows:
+        try:
+            out[r["mid"]] = json.loads(r["trace_json"])
+        except (ValueError, TypeError):
+            continue  # 损坏的行当没有轨迹，不影响其余
+    return out
 
 
 def list_sessions(user_id: int) -> list[dict]:

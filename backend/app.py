@@ -168,6 +168,25 @@ def _spawn_memory_extraction(sid: str, agent: Agent) -> None:
         log.exception("[会话 %s] 记忆提取线程启动失败（忽略，不影响回合）", sid)
 
 
+def _persist_trace(sid: str, mid: str, trace: list) -> None:
+    """把一轮提问的轨迹裁剪后落库。轨迹里的工具结果原样来自执行器（可能几 MB），
+    回放场景用不到全文（那在归档/历史消息里），逐条截断控制体积；
+    总条数也设上限——失控回合的轨迹不该撑爆库。"""
+    entries = []
+    for e in trace[:150]:
+        if not isinstance(e, dict):
+            continue
+        e = dict(e)
+        r = e.get("result")
+        if isinstance(r, str) and len(r) > 1200:
+            e["result"] = r[:1200] + f"…[截断，完整输出见执行记录，共 {len(r)} 字符]"
+        a = e.get("arguments")
+        if isinstance(a, str) and len(a) > 2000:
+            e["arguments"] = a[:2000] + "…[截断]"
+        entries.append(e)
+    db.set_trace(sid, mid, json.dumps(entries, ensure_ascii=False))
+
+
 def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                nonce: str, atts: list) -> None:
     """回合执行体（POST 只入队，真正的生成在这里跑）。
@@ -197,6 +216,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             bus.publish({"type": "turn_start", "nonce": nonce, "input": plain, "atts": atts})
             log.info("[会话 %s] 用户提问: %s", sid, plain)
             seg_mid = None  # 当前回答段落的 mid（每个 round 事件换一段）
+            final_mid = None  # 最终回答段落的 mid（轨迹落库的键）
             error = None
             try:
                 for kind, payload in agent.run(plain, user_message):
@@ -210,6 +230,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                     if kind in ("usage", "compacted"):  # 最新上下文容量，供 /api/context
                         _ctx[sid] = payload
                     if kind == "done":
+                        final_mid = seg_mid
                         log.info("[会话 %s] 最终回答: %s", sid, str(payload.get("answer"))[:200])
             except RuntimeError as e:
                 log.exception("LLM 请求失败")
@@ -226,6 +247,13 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             written = db.save_messages(sid, agent.history, agent.saved)
             db.touch_session(sid)
             log.info("[会话 %s] 本轮落盘 %d 行", sid, written)
+            if final_mid and error is None:
+                # 执行过程轨迹随最终回答落库：切换会话/刷新后历史回放仍能
+                # 展开看"当时每一步做了什么、改了哪些文件"。失败不阻塞收尾。
+                try:
+                    _persist_trace(sid, final_mid, agent.trace)
+                except Exception:
+                    log.exception("[会话 %s] 轨迹落库失败（忽略）", sid)
             if error is not None:
                 db.renumbered_sessions.discard(sid)  # 错误路径不带重编号信号（与旧行为一致）
                 bus.publish({"type": "error", "message": error})
@@ -947,8 +975,16 @@ class Handler(SimpleHTTPRequestHandler):
                               "stats": m.get("_stats")})
             elif m.get("content"):
                 # 助手消息带回耗时/token 统计（回放渲染用，来自 message_usage 表）
-                items.append({"role": role, "content": m["content"], "ord": m["_ord"],
-                              "mid": m["_mid"], "stats": m.get("_stats")})
+                item = {"role": role, "content": m["content"], "ord": m["_ord"],
+                        "mid": m["_mid"], "stats": m.get("_stats")}
+                items.append(item)
+        # 执行过程轨迹按本页的 mid 批量取（只有最终回答消息才有）：前端历史
+        # 回放渲染折叠条，点开可看当时每一步做了什么
+        answer_mids = [it["mid"] for it in items if it["role"] == "assistant"]
+        traces = db.get_traces(sid, answer_mids)
+        for it in items:
+            if it["mid"] in traces:
+                it["trace"] = traces[it["mid"]]
         # has_more：本页最小 ord 之前还有更早的消息（向上翻页入口的显隐依据）
         has_more = bool(items) and db.has_messages_before(sid, items[0]["ord"])
         self._json({"messages": items, "has_more": has_more})

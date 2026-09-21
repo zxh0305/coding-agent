@@ -222,6 +222,7 @@ function taskRow(s, list) {
     });
     inp.addEventListener("blur", () => { if (renamingSession === s.id) done(); });
     inp.addEventListener("click", (e) => e.stopPropagation());
+    li.appendChild(inp);
     return li;
   }
 
@@ -478,6 +479,11 @@ function historyNode(m) {
   // 用 fragment 直接把气泡/meta 挂进 #chat：外面包一层普通 div 会让
   // .bubble.user 的 align-self 失效（父级不是 flex），用户消息就会挤到左侧
   const frag = document.createDocumentFragment();
+  // 落库的执行过程轨迹：折叠条插在回答气泡前（与实时视图的位置一致）
+  if (m.role === "assistant" && m.trace) {
+    const tr = traceFromHistory(m.trace, m.stats?.elapsed_s);
+    if (tr) frag.appendChild(tr);
+  }
   frag.appendChild(buildBubble(m.role === "user" ? "user" : "assistant", m.content || ""));
   // 历史消息也带回当时的耗时/token 统计（message_usage 表随消息附带）
   if (m.role === "assistant" && m.stats) {
@@ -760,6 +766,40 @@ function msgImage(src, gallery) {
     img.addEventListener("click", () => openLightbox(src));
   }
   return img;
+}
+
+// 历史回放的执行过程折叠条：由落库的轨迹 JSON 重建（与实时版同一套行渲染）。
+// 默认收起；elapsed 用来在摘要里显示"已工作 N 秒"（没有就只显示步数）。
+function traceFromHistory(entries, elapsed) {
+  const d = document.createElement("details");
+  d.className = "trace";
+  d.open = false;
+  const list = Array.isArray(entries) ? entries : [];
+  let steps = 0;
+  for (const e of list) {
+    if (!e || typeof e !== "object") continue;
+    if (e.type === "round") {
+      const div = document.createElement("div");
+      div.className = "trace-line";
+      div.textContent = `🧠 思考 · 第 ${e.round} 轮${e.wrap_up ? "（收尾）" : ""}`;
+      d.appendChild(div);
+    } else if (e.type === "tool_call") {
+      d.appendChild(makeToolCallLine(e.name, e.arguments || "{}"));
+      steps += 1;
+    } else if (e.type === "tool_result") {
+      d.appendChild(makeToolResultLine(e.name, e.result || ""));
+    } else if (e.type === "system_reminder") {
+      const div = document.createElement("div");
+      div.className = "trace-line";
+      div.textContent = "🔔 系统提醒";
+      d.appendChild(div);
+    }
+  }
+  if (!list.length) return null;  // 空轨迹不渲染
+  const label = steps > 0 ? "已工作" : "已思考";
+  const t = elapsed != null ? ` ${fmtElapsed(elapsed)}` : "";
+  d.querySelector("summary").textContent = `${label}${t} · ${steps} 步`;
+  return d;
 }
 
 // 带附件的用户气泡：文字 + 图片缩略图（多图走 2 列网格）/文件名
@@ -1470,7 +1510,8 @@ const TOOL_KIND = {
   run_bash: "命令", calculator: "计算", current_time: "时间", get_weather: "天气",
 };
 
-function toolCallLine(name, argsStr) {
+// 构建工具调用行（游离节点）：实时流与历史回放共用
+function makeToolCallLine(name, argsStr) {
   let a = {};
   try { a = JSON.parse(argsStr); } catch { /* 参数不是 JSON */ }
   const main = summarize(a.command || a.path || a.expression || a.pattern || a.city || "", 46);
@@ -1482,18 +1523,17 @@ function toolCallLine(name, argsStr) {
   const pre = document.createElement("pre");
   pre.textContent = prettyJson(argsStr);
   d.append(summary, pre);
+  return d;
+}
+
+function toolCallLine(name, argsStr) {
+  const d = makeToolCallLine(name, argsStr);
   appendTrace(d);
   pendingCalls.push({ name, el: d, t: Date.now() });
 }
 
-function toolResultLine(name, resultStr) {
-  // 持续时长：配对最近一次同名调用
-  let dur = "";
-  const idx = pendingCalls.map(c => c.name).lastIndexOf(name);
-  if (idx >= 0) {
-    const call = pendingCalls.splice(idx, 1)[0];
-    dur = ` · ${((Date.now() - call.t) / 1000).toFixed(1)}s`;
-  }
+// 构建工具结果行（游离节点）。dur：实时流配对调用算出的耗时；回放没有，传空。
+function makeToolResultLine(name, resultStr, dur = "") {
   const d = document.createElement("details");
   d.className = "tl result";
   const summary = document.createElement("summary");
@@ -1535,7 +1575,18 @@ function toolResultLine(name, resultStr) {
     pre.textContent = resultStr;
   }
   d.append(summary, pre);
-  appendTrace(d);
+  return d;
+}
+
+function toolResultLine(name, resultStr) {
+  // 持续时长：配对最近一次同名调用
+  let dur = "";
+  const idx = pendingCalls.map(c => c.name).lastIndexOf(name);
+  if (idx >= 0) {
+    const call = pendingCalls.splice(idx, 1)[0];
+    dur = ` · ${((Date.now() - call.t) / 1000).toFixed(1)}s`;
+  }
+  appendTrace(makeToolResultLine(name, resultStr, dur));
 }
 
 // 🔐 权限确认卡片：闸门命中 ask 时，回合暂停等用户三选一。
