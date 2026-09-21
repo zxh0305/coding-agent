@@ -1,6 +1,6 @@
 .env
 agent.log
-agent_data.db
+agent_data.db*
 __pycache__/
 *.pyc
 .DS_Store
