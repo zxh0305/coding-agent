@@ -259,6 +259,11 @@ body {
   margin: 6px 0 0 2px; white-space: pre-wrap; word-break: break-word;
   color: #98a0b3;
 }
+/* 流式中的过程正文：尾部光标——面板收起时也看得到它在动，不会以为卡死 */
+.process-text.streaming::after {
+  content: "▍"; color: var(--accent);
+  animation: blink 0.9s steps(2) infinite;
+}
 
 /* 工具调用/结果行：一行摘要，点开看完整内容。
    小字 + 浅灰，与正文回答拉开层级：它是执行痕迹，不是回答。 */

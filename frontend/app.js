@@ -1933,9 +1933,17 @@ function ensureLiveMsg(mid) {
   mid = mid || curMid || "_";
   let b = liveMsgs.get(mid);
   if (!b) {
+    // 流式期间正文一律按【过程样式】渲染（小字，挂在执行过程面板内）：此刻
+    // 还无法预知这段是过程说明还是最终答案——要等 done 才知道。先小字流出，
+    // 若最终是答案，done 时把它移出面板、升级为正常正文卡（见 finalizeAnswer）。
+    // 这样避免了"先大字流出、再缩成小字"的跳动（旧实现每段都缩一次）。
+    ensureTrace();
+    // 展开面板：正文流式输出必须让用户看得见"它在动"——收起状态下过程文字
+    // 不可见，用户会以为卡死。done 时统一收起（答案回归正文区）。
+    traceEl.open = true;
     const el = document.createElement("div");
-    el.className = "bubble assistant streaming";
-    chatEl.appendChild(el);
+    el.className = "process-text streaming";
+    traceEl.appendChild(el);
     b = { el, text: "" };
     liveMsgs.set(mid, b);
     if (!metaEl) {
@@ -1943,7 +1951,7 @@ function ensureLiveMsg(mid) {
       metaEl.className = "meta";
     }
     metaEl.textContent = metaText(((Date.now() - qStart) / 1000).toFixed(1), usageNow);
-    chatEl.appendChild(metaEl);  // 已存在则移动到当前气泡后
+    chatEl.appendChild(metaEl);  // 统计行留在正文区末尾，跟随最终答案
   }
   liveBubble = b.el;  // 兼容既有的"当前气泡"语义（retire/done 收尾用）
   scrollBottom();
@@ -1958,23 +1966,26 @@ function retireLiveBubble() {
   if (!liveBubble.textContent) liveBubble.remove();
 }
 
-// 把"过程性正文"降级进执行过程面板：中间轮次模型输出的说明文字（"我先看看…
-// 现在改…"这类），不是最终答案。它随 answer_delta 流成一个气泡，但下一个
-// round 事件一到就证明"后面还有内容"——于是移进 traceEl 弱化展示，正文区
-// 只留最终答案。文字为空则直接丢弃气泡（模型这轮没输出正文、只调了工具）。
-// 注意：这类文字本就不落库（只有最终 answer 进历史），所以刷新后历史回放里
-// 天然没有它，这里降级只为实时观感，不涉及回放一致性。
+// 把当前流式正文"定格为过程说明"：下一个 round / tool_call / 权限卡事件一到，
+// 就证明这段不是最终答案——它本来就在执行过程面板里（ensureLiveMsg 挂进去的），
+// 这里只需去掉打字机光标、清掉空块。文字为空（模型只调工具没输出正文）则移除。
+// 最终答案走的是相反方向：finalizeAnswer 把它移出面板、升级为正文卡。
 function demoteLiveBubbleToTrace() {
   const el = liveBubble;
   if (!el) return;
   el.classList.remove("streaming");
-  const text = el.textContent.trim();
-  el.remove();
-  if (!text) return;
-  const div = document.createElement("div");
-  div.className = "process-text";
-  div.textContent = text;
-  appendTrace(div);  // 计入步数：过程正文也是"做了什么"的一部分
+  if (!el.textContent.trim()) el.remove();
+}
+
+// 最终答案定稿：把流式期间挂在执行过程面板里的那个气泡【移出面板】，插到
+// 正文区（折叠条之后）、升级为正常字号，并做 Markdown 渲染。
+// 这是"先小字流出、完成后升级"的落点——升级只发生一次，且是"小→大"的揭晓，
+// 不像旧实现每段都"大→小"地缩一次。
+function finalizeAnswer(el, text) {
+  el.classList.remove("streaming", "process-text");  // 去掉过程小字样式，换成正文卡
+  el.classList.add("bubble", "assistant");
+  traceEl.after(el);  // 紧跟折叠条：答案在执行过程之后，符合阅读顺序
+  renderIntoBubble(el, text);
 }
 
 // 流式增量按帧合并：delta 到达频率远高于屏幕刷新率，逐条 textContent += 和
@@ -2091,20 +2102,20 @@ function applyEvent(evt, seq) {
       // 正文为空：保留已流出的增量（若有），一条都没有则不留空白气泡
       b.text = b.text || "";
       if (!b.text) b.el.remove();
-      else renderIntoBubble(b.el, b.text);
+      else finalizeAnswer(b.el, b.text);
     } else if (authoritative === b.text) {
-      renderIntoBubble(b.el, b.text);  // 与增量一致：照常定稿
+      finalizeAnswer(b.el, b.text);  // 与增量一致：照常定稿
     } else if (b.text && !authoritative.includes(b.text)) {
       // 服务端正文与已渲染增量对不上（疑似推理混入/乱序）：保留用户已看到的
       // 流式内容，不整体覆盖，并留一行提示便于排查
-      renderIntoBubble(b.el, b.text);
+      finalizeAnswer(b.el, b.text);
       const warn = document.createElement("div");
       warn.className = "meta";
       warn.textContent = "（本轮回答与流式内容不一致，已保留流式版本）";
       chatEl.appendChild(warn);
     } else {
       b.text = authoritative;
-      renderIntoBubble(b.el, authoritative);
+      finalizeAnswer(b.el, authoritative);
     }
     clearInterval(metaTimer);
     metaEl.textContent = metaText(evt.elapsed_s, evt.usage);
