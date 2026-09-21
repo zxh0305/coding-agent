@@ -31,6 +31,7 @@ def build_agent(verbose: bool) -> Agent:
     print(colored("═" * 56, "blue"))
     print(colored("  🤖 Agent 问答 Demo（命令行版）", "bold"))
     print(colored(f"  模型: {llm.model}    API: {llm.api_url}", "gray"))
+    print(colored(f"  工作区: {agent.ctx.workspace}", "gray"))
     print(colored("  已注册工具:", "blue"))
     print(colored(describe_tools(), "gray"))
     print(colored("  命令: /tools 查看工具  /reset 清空历史  /exit 退出", "gray"))

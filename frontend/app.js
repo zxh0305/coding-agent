@@ -147,12 +147,21 @@ function toast(text) {
 
 // ---------- 任务（会话）列表 ----------
 let confirmingDelete = null;  // 正处于"确认删除"状态的任务 id（二次确认，防误触）
+let sessionsCache = [];       // 最近一次拉取的任务列表，删除的乐观更新直接改它
 
 async function loadSessions() {
   try {
     const list = await api("/api/sessions");
-    renderSessions(Array.isArray(list) ? list : []);
+    sessionsCache = Array.isArray(list) ? list : [];
+    renderSessions(sessionsCache);
   } catch (e) { /* 启动时后端未就绪不打扰 */ }
+}
+
+function removeSessionLocal(id) {
+  // 乐观更新：点击"删除"瞬间先在本地移除该行（请求后台进行），失败再回滚刷新。
+  // 原先要等 DELETE + 列表刷新两个往返都回来 UI 才动，页面忙时会被感知成"点了没反应"。
+  sessionsCache = sessionsCache.filter(s => s.id !== id);
+  renderSessions(sessionsCache);
 }
 
 function renderSessions(list) {
@@ -222,7 +231,14 @@ function renderSessions(list) {
 }
 
 async function doDeleteSession(id) {
-  try { await api(`/api/sessions?session_id=${encodeURIComponent(id)}`, { method: "DELETE" }); } catch (e) {}
+  removeSessionLocal(id);  // 先让行消失（即时反馈），请求在后台进行
+  try {
+    await api(`/api/sessions?session_id=${encodeURIComponent(id)}`, { method: "DELETE" });
+  } catch (e) {
+    toast("删除失败：" + e.message);
+    loadSessions();  // 回滚：以服务端列表为准
+    return;
+  }
   if (currentSession === id) {
     // 删的是当前打开的任务：清空对话区，回到待新建状态
     currentSession = null;
@@ -230,7 +246,7 @@ async function doDeleteSession(id) {
     welcome();
     refreshCtx();
   }
-  await loadSessions();
+  loadSessions();  // 与服务端对齐一次（时间戳/排序），不阻塞交互
 }
 
 async function newTask() {
@@ -240,6 +256,7 @@ async function newTask() {
   welcome();
   usageNow = null;
   updateCtxChip();
+  loadWorkspace();  // 回到"新任务"态：工具栏显示用户默认工作区
   await loadSessions();  // 重新拉取列表：旧任务仍显示，只是没有选中项；首条消息后新任务才出现
 }
 
@@ -275,6 +292,7 @@ async function switchSession(id) {
   } catch (e) { /* 历史拉取失败不阻塞 */ }
   await loadSessions();
   await refreshCtx();
+  loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换
   dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
 }
 
@@ -690,10 +708,11 @@ async function testProv() {
   }
 }
 
-// ---------- 工作区 ----------
+// ---------- 工作区（按任务隔离：带 session_id 查/改该任务的；不带 = 用户默认） ----------
 async function loadWorkspace() {
   try {
-    const w = await api("/api/workspace");
+    const qs = currentSession ? `?session_id=${encodeURIComponent(currentSession)}` : "";
+    const w = await api("/api/workspace" + qs);
     setWsLabel(w.path);
   } catch (e) { /* 忽略 */ }
 }
@@ -743,10 +762,14 @@ async function openPicker() {
 
 async function chooseWorkspace() {
   try {
-    const w = await api("/api/workspace", { method: "POST", body: JSON.stringify({ path: mCwd }) });
+    const body = { path: mCwd };
+    if (currentSession) body.session_id = currentSession;
+    const w = await api("/api/workspace", { method: "POST", body: JSON.stringify(body) });
     setWsLabel(w.path);
     $("modal").classList.add("hidden");
-    bubble("assistant", `（工作区已切换到 ${w.path}，之后我的文件操作和命令都在这个目录里进行）`);
+    bubble("assistant", currentSession
+      ? `（本任务的工作区已切换到 ${w.path}，之后我的文件操作和命令都在这个目录里进行；其他任务不受影响）`
+      : `（已把 ${w.path} 设为新任务的默认工作区）`);
   } catch (e) {
     $("m-path").textContent = "切换失败：" + e.message;
   }
@@ -923,11 +946,42 @@ function retireLiveBubble() {
   if (!liveBubble.textContent) liveBubble.remove();
 }
 
+// 流式增量按帧合并：delta 到达频率远高于屏幕刷新率，逐条 textContent += 和
+// scrollTop = scrollHeight 会各自强制一次重排，把主线程切碎——生成期间整个页面的
+// 点击都会因此变迟钝。这里只攒增量，requestAnimationFrame 每帧最多刷一次。
+let pendingAnswer = "", pendingThink = "", deltaFlushQueued = false;
+
+function flushStreamBuffers() {
+  deltaFlushQueued = false;
+  if (pendingAnswer) {
+    if (liveBubble) liveBubble.textContent += pendingAnswer;
+    pendingAnswer = "";
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+  if (pendingThink) {
+    if (thinkEl) {
+      thinkEl.textContent += pendingThink;
+      thinkEl.scrollTop = thinkEl.scrollHeight;
+    }
+    pendingThink = "";
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+}
+
+function queueStreamDelta(kind, text) {
+  if (kind === "answer") pendingAnswer += text; else pendingThink += text;
+  if (deltaFlushQueued) return;
+  deltaFlushQueued = true;
+  requestAnimationFrame(flushStreamBuffers);
+}
+
 function handleStreamEvent(evt) {
   if (evt.type === "session") {
     currentSession = evt.id;   // 后端告知本条消息归属的任务，后续追问带上它
     loadSessions();
+    loadWorkspace();           // 新任务按用户默认解析了自己的工作区，工具栏对齐
   } else if (evt.type === "round") {
+    flushStreamBuffers();  // 上一轮的增量先落进旧气泡，再开新一轮
     traceLine(`🧠 思考 · 第 ${evt.round} 轮`);
     thinkEl = null;  // 新一轮的思考流开一个新块
     retireLiveBubble();
@@ -941,13 +995,11 @@ function handleStreamEvent(evt) {
       thinkEl.className = "think-line";
       traceEl.appendChild(thinkEl);  // 不走 appendTrace：思考流不算一步
     }
-    thinkEl.textContent += evt.delta;
-    thinkEl.scrollTop = thinkEl.scrollHeight;
-    chatEl.scrollTop = chatEl.scrollHeight;
+    queueStreamDelta("think", evt.delta);
   } else if (evt.type === "answer_delta") {
-    liveBubble.textContent += evt.delta;
-    chatEl.scrollTop = chatEl.scrollHeight;
+    queueStreamDelta("answer", evt.delta);
   } else if (evt.type === "tool_call") {
+    flushStreamBuffers();
     retireLiveBubble();
     toolCallLine(evt.name, evt.arguments);
   } else if (evt.type === "tool_result") {
@@ -957,6 +1009,7 @@ function handleStreamEvent(evt) {
     updateCtxChip();
     if (metaEl) metaEl.textContent = metaText(evt.elapsed_s, usageNow);
   } else if (evt.type === "done") {
+    pendingAnswer = pendingThink = "";  // 完整回答直接覆盖，丢弃未刷的增量，防止 rAF 晚到追加旧文本
     if (!liveBubble) newLiveBubble();
     liveBubble.classList.remove("streaming");
     liveBubble.textContent = evt.answer;
@@ -969,6 +1022,7 @@ function handleStreamEvent(evt) {
     chatEl.scrollTop = chatEl.scrollHeight;
     loadSessions();  // 任务时间/排序刷新
   } else if (evt.type === "error") {
+    flushStreamBuffers();  // 已生成的部分内容留在气泡里，再显示错误
     retireLiveBubble();
     clearInterval(metaTimer);
     if (traceEl) traceEl.querySelector("summary").textContent = `执行过程（${traceSteps} 步 · 出错）`;

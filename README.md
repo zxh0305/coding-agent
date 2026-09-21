@@ -36,7 +36,7 @@ python3 backend/cli.py "37*89+100 等于多少"  # 单次提问
 
 试试这些（coding agent 能力）之外，输入框还支持**附件**：点 📎 或直接选择文件，图片（≤4MB）作为视觉输入发给模型（需模型支持视觉），文本/代码文件（≤300KB）内容注入上下文；输入框上方会出现可删除的缩略图卡片，历史任务里也会回放。
 
-Agent 的工作区是项目根目录的 `workspace/`（首次运行会自动生成两个练习文件），所有文件操作和命令执行都被限制在这个目录里：
+Agent 的工作区默认是项目根目录的 `workspace/`（首次运行会自动生成两个练习文件），所有文件操作和命令执行都被限制在这个目录里。**工作区按任务隔离**：每个任务可以有自己的工作区（在工具栏为当前任务切换，或设为"新任务默认"），切换互不影响、并发任务不会互相踩文件——每个任务构建 Agent 时各自解析路径，通过 `ToolContext` 注入到每次工具调用：
 
 - `工作区里的 demo.py 有个 bug，2+3 应该等于 5，修复并验证` → 感受 **读代码 → apply_patch 改 → run_bash 跑验证** 的完整循环
 - `在工作区新建一个猜数字小游戏，写完自己玩一轮验证` → 让它自建项目并自测
@@ -85,7 +85,7 @@ Agent 的工作区是项目根目录的 `workspace/`（首次运行会自动生�
 
 | 表 | 存什么 |
 |---|---|
-| `sessions` | 任务列表：标题、创建/更新时间 |
+| `sessions` | 任务列表：标题、创建/更新时间、归属用户、各自的工作区 |
 | `messages` | 每个任务的完整消息历史（OpenAI 消息格式的 JSON，含工具调用） |
 | `providers` | 模型供应商：名称 / Base URL / API Key / 启用状态 |
 | `provider_models` | 供应商下的模型：模型名 / 上下文窗口 / 启用状态 |
@@ -108,7 +108,7 @@ Agent 的工作区是项目根目录的 `workspace/`（首次运行会自动生�
 | `/api/providers/models/save` / `delete` | POST | 供应商下的模型增改/删除 |
 | `/api/providers/test` | POST | **测试链接**：拿 Base URL/Key/模型名发一次真实 ping，返回延迟或错误 |
 | `/api/config` | GET | 当前激活模型信息（供应商/模型/Key 打码/上下文窗口） |
-| `/api/workspace` | GET / POST | 查看当前工作区；`{"path": "绝对路径"}` 切换（立即生效并写回 `.env`） |
+| `/api/workspace` | GET / POST | 查看/切换工作区（按任务隔离：`?session_id=` 与 `{"path","session_id"}` 作用于该任务；不带 id 时作用于"新任务默认"） |
 | `/api/fs/dirs` | GET | `?path=...` 列出某目录的子目录，供选文件夹弹窗逐级浏览 |
 | `/api/config` | GET | 当前配置，API Key 打码返回（只露前 3 后 4 位） |
 | `/api/config` | POST | 修改配置并写回 `.env`，留空的字段保持不变，保存后立即生效 |
@@ -130,7 +130,7 @@ Agent 的工作区是项目根目录的 `workspace/`（首次运行会自动生�
 6. **calculator 不用 `eval`**——用 ast 白名单只允许四则运算，防止模型（或注入）执行任意代码。
 7. **前端一律用 `textContent` 渲染**——不拼 `innerHTML`，天然防 XSS。
 8. **流式链路（四层各有关卡）**——① LLM 层：`stream: true` 时工具调用是**分片**到达的，必须按 `index` 累积拼接 arguments；`stream_options: include_usage` 拿 token 用量（服务商不支持时自动降级重试）；② Agent 层：核心循环重构为 `run()` 生成器，边跑边产出事件，usage 跨轮累计；③ 后端：SSE 推送，刻意用 HTTP/1.0"关闭连接即结束"语义，免写 chunked 分块，且 `wbufsize=0` 保证每次 write 直接到网络；④ 前端：POST 不能用 EventSource，用 `fetch` + `ReadableStream` 按空行切分事件手动解析。
-9. **工作区切换**——`WORKSPACE_DIR` 每次工具调用时动态读取（不是启动时定格），所以 Web 端改环境变量立即生效；选目录的接口只做最小校验（存在、非根目录），因为它的前提是"本机单人学习工具"。
+9. **工作区按任务隔离 + ToolContext 注入**——每个任务的工作区解析链是"任务自选 → 用户默认 → `.env` 的 `WORKSPACE_DIR` / 项目 `workspace/`"，结果不进全局环境变量，而是随 `ToolContext`（工作区、本轮图片、看图后端）注入到每次工具调用——切换某个任务的工作区不影响其他正在跑的任务，并发会话也不会串图片数据。选目录的接口只做最小校验（存在、非根目录），因为它的前提是"本机信任圈工具"。
 10. **上下文容量估算**——没有本地分词器，用"服务商返回的真实 prompt_tokens ÷ 上次请求总字符数"校准出每字符 token 系数，再按 系统提示词/工具定义/用户消息/助手回复/工具结果 的字符占比分摊——估算值，但量级和占比可信；缓存命中率直接用 DeepSeek 返回的 `prompt_cache_hit_tokens / prompt_cache_miss_tokens`。
 11. **任务（多会话）**——每个任务一个独立 Agent 实例（独立对话历史），标题取第一条提问；模型配置变更后按需重建实例但保留历史。任务、消息（含每条助手消息的耗时/token 统计，存在消息的 `_stats` 内部字段里）都落盘 SQLite，重启不丢；发给模型前会剥离 `_` 前缀的内部字段（部分服务商会拒绝未知字段）。
 
@@ -186,7 +186,7 @@ agent_demo/
 │   ├── index.html    # 页面结构：对话区 + 配置面板
 │   ├── app.js        # 前端逻辑：fetch API、渲染、配置
 │   └── style.css     # 样式
-├── workspace/        # Agent 的工作区（自动生成，前端可切换到任意本地文件夹）
+├── workspace/        # Agent 的默认工作区（自动生成；每个任务可单独切换到任意本地文件夹）
 ├── agent_data.db     # SQLite 数据库：任务、消息历史、供应商与模型配置
 ├── docs/             # 调研笔记（coding agent 选型报告）
 ├── logs/             # 运行日志（按天切分：agent.log + agent.log.日期）

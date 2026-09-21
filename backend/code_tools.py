@@ -54,25 +54,40 @@ _WORKSPACE_SEED = {
 }
 
 
-def get_workspace() -> Path:
-    """工作区根目录：Agent 的全部文件操作都被限制在这里。可用 .env 的 WORKSPACE_DIR 覆盖。"""
-    ws = Path(os.environ.get("WORKSPACE_DIR") or DEFAULT_WORKSPACE).expanduser().resolve()
-    if not ws.exists():
-        ws.mkdir(parents=True, exist_ok=True)
-        for name, content in _WORKSPACE_SEED.items():  # 首次创建时放两个练习文件（不覆盖已有）
-            (ws / name).write_text(content, encoding="utf-8")
-    return ws
+def prepare_workspace(ws: str | Path | None = None) -> Path:
+    """解析工作区根目录并确保存在，返回绝对路径。
+
+    优先级：显式传入（会话自己的工作区）> .env 的 WORKSPACE_DIR > 项目 workspace/。
+    工作区曾经是全局唯一的环境变量——任何一个用户切换，所有会话立即跟着变，
+    并发生成的两个 Agent 会互相踩对方目录；现在每个任务解析出自己的路径，
+    通过 ToolContext 注入到每次工具调用（见 tools.py），互不可见。
+    """
+    if ws:
+        target = Path(ws).expanduser().resolve()
+    else:
+        target = Path(os.environ.get("WORKSPACE_DIR") or DEFAULT_WORKSPACE).expanduser().resolve()
+    if not target.exists():
+        target.mkdir(parents=True, exist_ok=True)
+        # 只给内置默认工作区放练习文件；用户自选的目录保持原样，别往里塞东西
+        if target == DEFAULT_WORKSPACE:
+            for name, content in _WORKSPACE_SEED.items():
+                (target / name).write_text(content, encoding="utf-8")
+    return target
 
 
-def _resolve(path: str) -> Path:
+def _ws(ctx) -> Path:
+    """工具执行时的工作区：来自注入的 ToolContext，缺省回落到默认工作区。"""
+    return prepare_workspace(getattr(ctx, "workspace", None) if ctx is not None else None)
+
+
+def _resolve(path: str, ws: Path) -> Path:
     """把（相对工作区的）路径解析成绝对路径，并拦截越界访问。
 
     这是本模块最重要的一道防线：resolve() 消解掉 ../ 和符号链接之后，
-    再校验目标必须仍在工作区之内。
+    再校验目标必须仍在工作区之内。ws 是【本次调用】的工作区，由 ctx 注入。
     """
     if not path or not isinstance(path, str):
         raise ValueError("path 不能为空")
-    ws = get_workspace()
     target = (ws / path).resolve()
     if target != ws and ws not in target.parents:
         raise ValueError(f"路径越界：{path} 位于工作区之外，Agent 只能访问工作区内的文件")
@@ -87,8 +102,11 @@ def _err(msg: str) -> str:
 # 六个工具：read_file / write_file / apply_patch / list_dir / grep / run_bash
 # ---------------------------------------------------------------------------
 
-def read_file(path: str) -> str:
-    p = _resolve(path)
+# 六个工具的 ctx 形参不进 schema（模型看不到），由 execute_tool 在执行时注入——
+# 模型只该决定"操作哪个相对路径"，"在哪个工作区里操作"是服务端的会话属性。
+
+def read_file(path: str, ctx=None) -> str:
+    p = _resolve(path, _ws(ctx))
     if not p.exists():
         return _err(f"文件不存在: {path}")
     if p.is_dir():
@@ -99,9 +117,9 @@ def read_file(path: str) -> str:
     return json.dumps({"path": path, "content": text}, ensure_ascii=False)
 
 
-def write_file(path: str, content: str) -> str:
+def write_file(path: str, content: str, ctx=None) -> str:
     """新建或整文件覆盖。修改已有代码请优先用 apply_patch（省 token、不易误伤）。"""
-    p = _resolve(path)
+    p = _resolve(path, _ws(ctx))
     if p.is_dir():
         return _err(f"{path} 是目录，不能当作文件写入")
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -120,7 +138,7 @@ def apply_patch(path: str, search: str, replace: str) -> str:
     - 找不到原文（模型记错了内容）→ 提示先 read_file 核对；
     - 原文出现多次（锚点不唯一）→ 提示增加上下文行数。
     """
-    p = _resolve(path)
+    p = _resolve(path, _ws(ctx))
     if not p.exists():
         return _err(f"文件不存在: {path}")
     text = p.read_text(encoding="utf-8", errors="replace")
@@ -136,8 +154,8 @@ def apply_patch(path: str, search: str, replace: str) -> str:
     }, ensure_ascii=False)
 
 
-def list_dir(path: str = ".") -> str:
-    p = _resolve(path)
+def list_dir(path: str = ".", ctx=None) -> str:
+    p = _resolve(path, _ws(ctx))
     if not p.is_dir():
         return _err(f"{path} 不是目录")
     entries = []
@@ -149,14 +167,14 @@ def list_dir(path: str = ".") -> str:
     return json.dumps({"path": path, "entries": entries}, ensure_ascii=False)
 
 
-def grep(pattern: str, path: str = ".") -> str:
+def grep(pattern: str, path: str = ".", ctx=None) -> str:
     """在工作区内做正则搜索（简化版 ripgrep）：返回 文件:行号: 内容。path 可为目录或单个文件。"""
     try:
         rx = re.compile(pattern)
     except re.error as e:
         return _err(f"正则表达式不合法: {e}")
-    root = _resolve(path)
-    ws = get_workspace()
+    ws = _ws(ctx)
+    root = _resolve(path, ws)
     if root.is_file():
         files = [root]  # os.walk 对文件路径一次都不迭代，直接传会静默返回 0 匹配
     else:
@@ -187,7 +205,7 @@ def grep(pattern: str, path: str = ".") -> str:
     return json.dumps({"matches": matches, "total": len(matches)}, ensure_ascii=False)
 
 
-def run_bash(command: str) -> str:
+def run_bash(command: str, ctx=None) -> str:
     """在工作区目录里执行 shell 命令（cwd 锁定工作区、30 秒超时、输出截断）。"""
     if not command or not isinstance(command, str):
         return _err("command 不能为空")
@@ -195,7 +213,7 @@ def run_bash(command: str) -> str:
         return _err("命令被安全策略拒绝：涉及 sudo / 全盘删除等高危操作。请换用更精确、作用域更小的方式")
     try:
         proc = subprocess.run(
-            command, shell=True, cwd=get_workspace(),
+            command, shell=True, cwd=_ws(ctx),
             capture_output=True, text=True, timeout=BASH_TIMEOUT,
         )
     except subprocess.TimeoutExpired:

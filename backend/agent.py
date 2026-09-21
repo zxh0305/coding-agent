@@ -28,7 +28,8 @@ import logging
 import threading
 import time
 
-from tools import TOOL_SCHEMAS, execute_tool
+from code_tools import prepare_workspace
+from tools import TOOL_SCHEMAS, ToolContext, execute_tool
 from ui import colored
 
 log = logging.getLogger("agent")  # 输出目的地由 logger.py 统一配置（写入 agent.log）
@@ -48,13 +49,19 @@ class Agent:
     """一个带工具调用能力的对话 Agent。
 
     参数：
-        llm:          提供 chat(messages, tools) -> dict 的客户端（llm_client.py）
-        max_rounds:   单次提问内最多"问 LLM"几轮，防止模型反复调工具停不下来
-        verbose:      是否在终端打印每一轮的思考/工具调用过程（学习时强烈建议开着）
+        llm:            提供 chat(messages, tools) -> dict 的客户端（llm_client.py）
+        max_rounds:     单次提问内最多"问 LLM"几轮，防止模型反复调工具停不下来
+        verbose:        是否在终端打印每一轮的思考/工具调用过程（学习时强烈建议开着）
+        workspace:      本会话的工作区目录（文件/命令工具的边界）。不传 = 默认工作区
+                        （.env 的 WORKSPACE_DIR 或项目 workspace/）。每个任务各自解析，
+                        互不共享——这是多会话隔离的关键。
+        vision_backend: fn(image_parts, question) -> str，analyze_image 工具的"看图"
+                        后端，由 app.py 按当前模型配置提供；命令行版不传（无图可看）。
     """
 
     def __init__(self, llm, system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-                 max_rounds: int = 16, verbose: bool = True, vision_supported: bool = True):
+                 max_rounds: int = 16, verbose: bool = True, vision_supported: bool = True,
+                 workspace=None, vision_backend=None):
         # max_rounds=16：coding 任务一轮提问往往要 读代码→改→跑验证→再修 好几个来回
         self.llm = llm
         self.system_prompt = system_prompt
@@ -63,7 +70,9 @@ class Agent:
         self.vision_supported = vision_supported  # 激活模型能否直接看图（决定是否剥离图片输入）
         self.history: list[dict] = []  # 不含 system 的完整对话历史，跨提问持续累积
         self.trace: list[dict] = []    # 最近一次提问的过程轨迹（轮次/工具调用），供前端展示
-        self.current_images: list[dict] = []  # 本轮用户消息附带的图片（供 analyze_image 工具）
+        # 工具执行上下文：工作区 + 看图后端随 Agent 实例走；images 每轮提问时更新。
+        # 状态挂在实例上而不是模块级全局，两个会话并发执行工具才不会串数据。
+        self.ctx = ToolContext(workspace=prepare_workspace(workspace), vision_backend=vision_backend)
         self.cancel_event: threading.Event | None = None  # 本轮生成的停止开关（stop() 置位）
 
     @staticmethod
@@ -154,13 +163,13 @@ class Agent:
         """run() 的实际循环体（run 只负责停止开关的生命周期）。"""
         self.trace = []  # 每次提问重新记录过程轨迹
         self.history.append(user_message or {"role": "user", "content": user_input})
-        # 提取本轮附带的图片（OpenAI content 数组里的 image_url 部分）。
+        # 提取本轮附带的图片（OpenAI content 数组里的 image_url 部分），挂进工具上下文。
         # 主模型看不见像素；analyze_image 工具借"视觉模型"看图时用的就是这份数据。
         content = (user_message or {}).get("content")
         if isinstance(content, list):
-            self.current_images = [p for p in content if p.get("type") == "image_url"]
+            self.ctx.images = [p for p in content if p.get("type") == "image_url"]
         else:
-            self.current_images = []
+            self.ctx.images = []
         start = time.time()
         usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         last_cache = None
@@ -177,7 +186,7 @@ class Agent:
             # 每轮都重发【系统提示 + 完整历史】—— 这就是 LLM 的全部"记忆"
             # 每轮都重发【系统提示 + 完整历史】—— 这就是 LLM 的全部"记忆"。
             # 主模型不支持视觉时，先把历史里的图片剥离成文字提示（图片数据留在
-            # self.current_images，由 analyze_image 工具借视觉模型识别）。
+            # self.ctx.images，由 analyze_image 工具借视觉模型识别）。
             messages = [{"role": "system", "content": self.system_prompt}, *self._messages_for_model()]
             # 完整 payload 进日志（DEBUG 级）：排错时能看到模型到底"看到"了什么
             log.debug("第 %d 轮请求 payload:\n%s", round_no,
@@ -299,7 +308,7 @@ class Agent:
                 arguments = {}
         except json.JSONDecodeError:
             arguments = {}
-        result = execute_tool(name, arguments, images=self.current_images)
+        result = execute_tool(name, arguments, self.ctx)
         if '"error"' in result:
             log.warning("工具 %s 执行出错: %s", name, result)
         return result

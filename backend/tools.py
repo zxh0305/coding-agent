@@ -16,8 +16,11 @@ LLM 本身只会"生成文字"，不能算数、不知道现在几点、查不�
 
 import ast
 import datetime
+import inspect
 import json
 import operator
+from dataclasses import dataclass, field
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # 第一部分：工具实现（普通 Python 函数，返回值统一转成字符串）
@@ -133,6 +136,21 @@ TOOL_SCHEMAS = [
 # 第三部分：注册表 + 统一执行器（Agent 只跟这里打交道）
 # ---------------------------------------------------------------------------
 
+@dataclass
+class ToolContext:
+    """工具执行上下文：一次工具调用能"看见"的全部环境。
+
+    图片和看图后端曾经是本模块的两个模块级全局变量——两个会话并发执行
+    analyze_image 时，后设置的图片列表会覆盖先设置的，A 会话的模型可能
+    拿到 B 会话的图。教训：工具层不持有任何"当前请求"状态，状态挂在
+    调用方（Agent 实例）上，随每次 execute_tool 显式传入。
+    """
+
+    workspace: Path | None = None               # 本会话的工作区（文件/命令工具的边界）
+    images: list = field(default_factory=list)  # 本轮用户消息附带的图片（OpenAI content 部分）
+    vision_backend: object = None               # fn(image_parts, question) -> str，由 app.py 注入
+
+
 TOOL_REGISTRY = {
     "calculator": calculator,
     "current_time": current_time,
@@ -149,22 +167,13 @@ TOOL_REGISTRY.update(CODE_TOOL_REGISTRY)
 # 设计模式："用工具补偿模型短板"。主模型不支持视觉（或看不清细节）时，
 # 由这个工具借一个标记了"视觉"的模型把图片转成文字描述。
 #
-# 依赖注入：工具层不该知道"有哪些模型、怎么构造客户端"，所以 app.py 启动时
-# 通过 set_vision_backend() 注入一个看图函数 fn(image_parts, question) -> str。
-# 工具需要的图片数据也不来自模型参数——模型看不见像素，图片列表由 Agent
-# 在执行工具时注入（见 execute_tool 的 images 形参）。
+# 依赖注入：工具层不该知道"有哪些模型、怎么构造客户端"，看图函数由 app.py
+# 构造 Agent 时注入（ToolContext.vision_backend）。工具需要的图片数据也不
+# 来自模型参数——模型看不见像素，图片列表由 Agent 每轮从用户消息里提取后
+# 更新到 ToolContext.images。
 
-_vision_backend = None  # fn(image_parts: list[dict], question: str) -> str
-_current_images: list = []  # 当前用户消息附带的图片（Agent 每轮执行工具时注入）
-
-
-def set_vision_backend(fn) -> None:
-    global _vision_backend
-    _vision_backend = fn
-
-
-def analyze_image(image_id: str = "", question: str = "请详细描述这张图片的内容") -> str:
-    images = _current_images or []
+def analyze_image(image_id: str = "", question: str = "请详细描述这张图片的内容", ctx: ToolContext = None) -> str:
+    images = ctx.images if ctx is not None else []
     if not images:
         return json.dumps({"error": "当前这条消息没有附带图片。请让用户重新上传图片后重试。"}, ensure_ascii=False)
     # image_id：'1'/'2'/... 按用户消息中图片出现顺序；空值默认第一张
@@ -172,10 +181,11 @@ def analyze_image(image_id: str = "", question: str = "请详细描述这张图�
     index = (int(digits) - 1) if digits else 0
     if index < 0 or index >= len(images):
         index = 0
-    if _vision_backend is None:
+    backend = ctx.vision_backend if ctx is not None else None
+    if backend is None:
         return json.dumps({"error": "图片识别后端未配置（系统内部问题，请联系服务部署者）"}, ensure_ascii=False)
     try:
-        description = _vision_backend([images[index]], question)
+        description = backend([images[index]], question)
     except RuntimeError as e:
         # 视觉模型调用失败：把原因交回主模型，让它告知用户怎么办
         return json.dumps({
@@ -206,27 +216,26 @@ TOOL_SCHEMAS.append({
 TOOL_REGISTRY["analyze_image"] = analyze_image
 
 
-def execute_tool(name: str, arguments: dict, images: list | None = None) -> str:
+def execute_tool(name: str, arguments: dict, ctx: ToolContext | None = None) -> str:
     """按名字执行工具。
 
     注意：工具报错时【不抛异常】，而是把错误信息作为字符串返回给 LLM ——
     这样模型有机会看到错误并自行纠正（换参数重试 / 换个工具 / 直接告知用户）。
 
-    images：当前用户消息里附带的图片（OpenAI content 部分格式），由 Agent 注入。
-    模型看不见像素，analyze_image 这类"看图"工具全靠它拿数据。
+    ctx：本次调用的执行上下文（工作区、图片、看图后端），由 Agent 注入。
+    声明了 ctx 形参的工具（文件/命令/看图类）才拿到它；calculator 这类
+    纯函数工具不声明、也不感知。ctx 不出现在 schema 里——"在哪个工作区
+    干活"是会话属性，由服务端决定，不该是模型可填的参数。
     """
-    global _current_images
     func = TOOL_REGISTRY.get(name)
     if func is None:
         return json.dumps({"error": f"未知工具：{name}"}, ensure_ascii=False)
     try:
-        if name == "analyze_image":
-            _current_images = images or []
-            return func(**arguments)
-        result = func(**arguments)
+        if "ctx" in inspect.signature(func).parameters:
+            return func(**arguments, ctx=ctx)
+        return func(**arguments)
     except Exception as e:  # 参数缺失、类型不对、算式非法……都统一吞掉转成 error
         return json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
-    return result
 
 
 def describe_tools() -> str:

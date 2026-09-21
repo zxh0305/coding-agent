@@ -7,7 +7,7 @@ agent_data.db（SQLite 单文件数据库，可直接用任何 SQLite 工具打�
 
   users            登录用户：用户名 / 密码哈希（PBKDF2，不存明文）
   auth_tokens      登录令牌：随机 token -> 用户，重启不失效
-  sessions         任务（会话）：标题、创建/更新时间、归属用户
+  sessions         任务（会话）：标题、创建/更新时间、归属用户、各自的工作区
   messages         每个任务的完整消息历史（OpenAI 消息格式的 JSON，按顺序）
   providers        模型供应商：名称 / Base URL / API 格式 / API Key / 启用状态
   provider_models  供应商下的模型：模型名 / 上下文窗口 / 启用 / 是否支持视觉
@@ -15,8 +15,9 @@ agent_data.db（SQLite 单文件数据库，可直接用任何 SQLite 工具打�
 
 首库自动播种：providers 表为空时，把 .env 里的 LLM_* 配置导入为"默认"供应商。
 关于 API Key：以明文存在本机数据库里（学习项目的务实选择），接口回显一律打码。
-用户体系：登录只做身份区分与会话隔离（任务列表按用户过滤），供应商/模型/工作区
-仍是全局共享——所有登录用户共用服务端配置的 LLM Key。
+用户体系：登录只做身份区分与会话隔离（任务列表按用户过滤），供应商/模型
+仍是全局共享——所有登录用户共用服务端配置的 LLM Key；工作区按任务隔离
+（每个任务可有自己的工作区，切换互不影响）。
 """
 
 import hashlib
@@ -34,6 +35,11 @@ DB_PATH = Path(__file__).resolve().parent.parent / "agent_data.db"
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # WAL：写不阻塞读。生成结束会把整段历史一次性落盘（replace_messages），
+    # 默认 journal 模式下这期间其他请求的读写都要排队；WAL 让它们互不等待。
+    conn.execute("PRAGMA journal_mode = WAL")
+    # WAL 推荐档位：断电最多丢最后一次写入，库文件本身不会损坏
+    conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -104,6 +110,13 @@ def init_db() -> None:
         # 由用户在管理面板标注；analyze_image 工具据此挑选"替主模型看图"的模型）
         try:
             conn.execute("ALTER TABLE provider_models ADD COLUMN vision INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        # 旧库升级：给 sessions 补 workspace 列（每任务各自的工作区，NULL = 未指定，
+        # 用"用户默认 → .env/项目默认"链解析）。此前工作区是全局环境变量，任何
+        # 用户一切换、所有会话立即跟着变，并发生成的 Agent 会互相踩目录。
+        try:
+            conn.execute("ALTER TABLE sessions ADD COLUMN workspace TEXT")
         except sqlite3.OperationalError:
             pass
         # 播种：没有供应商时，把 .env 的配置导入为"默认"供应商
@@ -229,6 +242,18 @@ def session_owner(sid: str) -> int | None:
 def set_session_title(sid: str, title: str) -> None:
     with _conn() as conn:
         conn.execute("UPDATE sessions SET title=? WHERE id=?", (title, sid))
+
+
+def get_session_workspace(sid: str) -> str | None:
+    """任务自选的工作区（用户在"选择工作区"弹窗里为该任务指定过才有值）。"""
+    with _conn() as conn:
+        row = conn.execute("SELECT workspace FROM sessions WHERE id=?", (sid,)).fetchone()
+    return row["workspace"] if row else None
+
+
+def set_session_workspace(sid: str, path: str) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE sessions SET workspace=? WHERE id=?", (path, sid))
 
 
 def touch_session(sid: str) -> None:

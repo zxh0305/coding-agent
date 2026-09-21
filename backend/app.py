@@ -20,8 +20,8 @@ Web 服务
   POST /api/providers/models/save 保存单个模型（新增/改名/窗口/启停）
   POST /api/providers/models/delete 删除模型
   POST /api/providers/test        测试链接：拿 Base URL/Key/模型 发一次真实请求
-  GET  /api/workspace             当前工作区路径
-  POST /api/workspace             切换工作区 {"path": "绝对路径"}（立即生效 + 写回 .env）
+  GET  /api/workspace?session_id=  工作区路径（带 id = 该任务的；不带 = 用户默认，新任务将用的）
+  POST /api/workspace               切换工作区 {"path", "session_id"?}（带 id 只改该任务；不带改用户默认）
   GET  /api/fs/dirs?path=         列出某目录的子目录（供选文件夹弹窗逐级浏览）
   GET  /api/sessions              任务列表（仅当前用户的）
   GET  /api/sessions/<id>/messages  某任务的历史消息（须是自己的任务）
@@ -31,8 +31,10 @@ Web 服务
   POST /api/chat/stop             停止指定任务的生成 {"session_id"}
 
 登录与鉴权：除 /api/auth/* 外的所有接口要求 Authorization: Bearer <token>。
-登录只做身份区分与会话隔离（各用户只看到自己的任务列表），供应商/模型/工作区
-是全局共享的——所有登录用户共用服务端配置的 LLM Key，也都能进"管理模型"面板。
+登录只做身份区分与会话隔离（各用户只看到自己的任务列表）；供应商/模型是
+全局共享的——所有登录用户共用服务端配置的 LLM Key，也都能进"管理模型"面板。
+工作区按任务隔离：每个任务可有自己的工作区（解析链：任务自选 → 用户默认
+→ .env 的 WORKSPACE_DIR / 项目 workspace/），切换互不影响，并发任务不互踩。
 
 数据存储：任务、消息、用户、供应商配置全部落盘在项目根目录的 agent_data.db
 （SQLite，见 db.py）；重启不丢。Agent 进程内只缓存实例，历史按需从库里恢复。
@@ -58,10 +60,10 @@ from pathlib import Path
 
 import db
 from agent import Agent
-from code_tools import get_workspace
+from code_tools import prepare_workspace
 from llm_client import create_client, load_env_file, save_env_values
 from logger import setup_logging
-from tools import TOOL_SCHEMAS, set_vision_backend
+from tools import TOOL_SCHEMAS
 
 log = logging.getLogger("app")
 
@@ -220,6 +222,19 @@ def _build_user_message(body: dict) -> tuple[str, dict | None]:
     return plain, {"role": "user", "content": parts}
 
 
+def _resolve_workspace(user_id: int, sid: str) -> Path:
+    """解析一个任务的工作区，优先级：任务自选 → 用户默认（新任务继承）→ .env/项目默认。
+
+    工作区按任务隔离的关键：每个任务在构建 Agent 时各自解析，结果写进该任务
+    的 ToolContext；切换某个任务的工作区不再影响其他任务（此前是全局环境变量）。
+    sid 为空（前端还没开任务）时返回该用户的默认工作区，供工具栏展示。
+    """
+    ws = db.get_session_workspace(sid) if sid else None
+    if not ws:
+        ws = db.get_setting(f"default_workspace:{user_id}")
+    return prepare_workspace(ws)
+
+
 def get_session(session_id, user_id: int) -> tuple[str, Agent]:
     """取回（或创建）一个任务会话，返回 (id, Agent)。历史缺失时从数据库恢复。
 
@@ -239,16 +254,21 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
     if sid is None:
         sid = uuid.uuid4().hex[:8]
         db.create_session(sid, user_id)
+    workspace = _resolve_workspace(user_id, sid)
+    # 工作区纳入配置指纹：任务的工作区被切换后，下次构建会重建 Agent（历史照旧从库里恢复）
+    sig += "|" + str(workspace)
 
     # 锁只保护实例缓存的读写这一瞬间。生成过程可能持续几分钟，绝不能全程
     # 持锁——否则一条慢请求会把所有提问/删除/停止请求全部卡死（真实踩过的坑）。
     with _lock:
         if sid not in _agents or _sigs.get(sid) != sig:
-            agent = Agent(llm=client, verbose=False, vision_supported=vision)
+            agent = Agent(llm=client, verbose=False, vision_supported=vision,
+                          workspace=workspace, vision_backend=_vision_backend)
             agent.history = db.get_messages(sid)  # 重启/换模型后从库里恢复对话
             _agents[sid] = agent
             _sigs[sid] = sig
-            log.info("会话 %s Agent 就绪 model=%s（历史 %d 条，视觉=%s）", sid, model, len(agent.history), vision)
+            log.info("会话 %s Agent 就绪 model=%s 工作区=%s（历史 %d 条，视觉=%s）",
+                     sid, model, workspace, len(agent.history), vision)
         return sid, _agents[sid]
 
 
@@ -350,8 +370,12 @@ class Handler(SimpleHTTPRequestHandler):
             for p in db.list_providers():
                 provs.append({**p, "api_key": None, "api_key_masked": _mask(p["api_key"])})
             self._json(provs)
-        elif self.path == "/api/workspace":
-            self._json({"path": str(get_workspace())})
+        elif self.path.startswith("/api/workspace"):
+            # 带当前任务 id 时返回该任务的工作区；不带 = 用户默认（新任务将用的）
+            sid = (self._query().get("session_id") or [""])[0]
+            if sid and db.session_owner(sid) != self.user["id"]:
+                return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+            self._json({"path": str(_resolve_workspace(self.user["id"], sid))})
         elif self.path.startswith("/api/fs/dirs"):
             self._handle_fs_dirs()
         elif self.path == "/api/tools":
@@ -671,19 +695,35 @@ class Handler(SimpleHTTPRequestHandler):
     # ---------- 工作区 ----------
 
     def _handle_workspace_set(self):
-        """切换工作区：校验是真实目录后，立即生效（环境变量）并持久化到 .env。"""
-        path = str(self._body().get("path") or "").strip()
+        """切换工作区（按任务隔离，替代曾经的"全局环境变量 + 写回 .env"）：
+        - 带 session_id：只改该任务的工作区（须是自己的任务）；
+        - 不带：改当前用户的"新任务默认工作区"。
+        正在生成的任务拒绝切换——生成中的 Agent 仍持有旧工作区，切了也要等
+        下一条消息才生效，用户容易误以为切失败。
+        """
+        b = self._body()
+        path = str(b.get("path") or "").strip()
+        sid = str(b.get("session_id") or "").strip()
         target = Path(path).expanduser() if path else None
         if target is None or not target.is_dir():
             return self._json({"error": "目录不存在或不可用"}, 400)
         target = target.resolve()
-        if target == target.root:  # 拒绝文件系统根：等于把整块盘交给 Agent
-            return self._json({"error": "不能选择文件系统根目录"}, 400)
-        with _lock:
-            os.environ["WORKSPACE_DIR"] = str(target)
-            save_env_values({"WORKSPACE_DIR": str(target)}, str(ENV_FILE))
-        log.info("工作区切换为 %s", target)
-        self._json({"ok": True, "path": str(target)})
+        if target == Path(target.root):  # Path 与 str 比较为 False，必须同类型比较——
+            return self._json({"error": "不能选择文件系统根目录"}, 400)  # 此前这里用 target.root 裸比，从未拦住过
+        if sid:
+            if db.session_owner(sid) != self.user["id"]:
+                return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+            with _lock:
+                lock = _session_locks.get(sid)
+                if lock is not None and lock.locked():
+                    return self._json({"error": "该任务正在生成，请等回答结束再切换工作区"}, 409)
+                _agents.pop(sid, None)  # 丢弃旧实例：下一条消息用新工作区重建（历史从库里恢复）
+            db.set_session_workspace(sid, str(target))
+            log.info("[会话 %s] 工作区切换为 %s", sid, target)
+        else:
+            db.set_setting(f"default_workspace:{self.user['id']}", str(target))
+            log.info("用户 %s 的新任务默认工作区: %s", self.user["username"], target)
+        self._json({"ok": True, "path": str(target), "scope": "session" if sid else "default"})
 
     def _handle_fs_dirs(self):
         """列出某个目录下的子目录，供前端"选择工作区"弹窗逐级浏览（起点：用户主目录）。"""
@@ -719,9 +759,8 @@ def _lan_ips() -> list[str]:
 
 
 def main():
-    load_env_file(str(ENV_FILE))   # 读 .env（首库播种 / 默认供应商用）
+    load_env_file(str(ENV_FILE))   # 读 .env（首库播种 / 默认供应商 / 默认工作区用）
     db.init_db()                   # 建表 + 播种（已初始化则跳过）
-    set_vision_backend(_vision_backend)  # 给 analyze_image 工具注入"看图"后端
     log_file = setup_logging(console=True)
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
