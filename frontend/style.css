@@ -250,6 +250,16 @@ body {
   max-height: 140px; overflow-y: auto;
 }
 
+/* 过程性正文：中间轮次模型输出的说明文字（不是最终答案）。比正文小一号、
+   浅灰，缩进带左边线——与工具行/思考流同属"过程"，展开面板才看得到。
+   行高放宽到 1.6：它比单行工具摘要长，太挤会难读。 */
+.process-text {
+  font-size: 11.5px; line-height: 1.6;
+  padding: 4px 0 4px 10px; border-left: 2px solid #eef1f7;
+  margin: 6px 0 0 2px; white-space: pre-wrap; word-break: break-word;
+  color: #98a0b3;
+}
+
 /* 工具调用/结果行：一行摘要，点开看完整内容。
    小字 + 浅灰，与正文回答拉开层级：它是执行痕迹，不是回答。 */
 .tl { margin-top: 6px; }

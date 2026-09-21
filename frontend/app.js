@@ -682,6 +682,15 @@ function historyNode(m) {
   // 用 fragment 直接把气泡/meta 挂进 #chat：外面包一层普通 div 会让
   // .bubble.user 的 align-self 失效（父级不是 flex），用户消息就会挤到左侧
   const frag = document.createDocumentFragment();
+  // 中间轮次的 assistant 消息（带 tool_calls）只承载"过程说明"正文，那段文字
+  // 已随最终回答的 trace 落库（type=process_text）。这里不再单独画成正文气泡——
+  // 否则回放时它又变回一张卡片，与实时视图（降级进执行过程面板）割裂。
+  // 依赖：trace 落库成功（后端 _run_round 里失败只记日志不阻断）。trace 万一
+  // 缺失，这条消息的正文在回放里就不显示——这是为"实时/回放一致"付出的代价，
+  // 只在 trace 落库失败或本次改动之前产生的旧历史里才可能发生。
+  if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+    return frag;  // 空 fragment：这条消息在时间线上不占位
+  }
   // 落库的执行过程轨迹：折叠条插在回答气泡前（与实时视图的位置一致）
   if (m.role === "assistant" && m.trace) {
     const tr = traceFromHistory(m.trace, m.stats?.elapsed_s);
@@ -1004,6 +1013,13 @@ function traceFromHistory(entries, elapsed) {
         div.textContent = e.text;
         d.appendChild(div);
       }
+    } else if (e.type === "process_text") {
+      // 中间轮次的过程说明正文：与实时降级同一套 .process-text 渲染，
+      // 折叠面板收起时默认看不到，展开才显示"当时说了什么"。
+      const div = document.createElement("div");
+      div.className = "process-text";
+      div.textContent = e.text || "";
+      d.appendChild(div);
     } else if (e.type === "system_reminder") {
       const div = document.createElement("div");
       div.className = "trace-line";
@@ -1867,7 +1883,7 @@ async function decidePermission(evt, decision, noteEl, buttons) {
 
 function showPermissionCard(evt) {
   flushStreamBuffers();
-  retireLiveBubble();
+  demoteLiveBubbleToTrace();  // 权限卡前的正文也是过程说明，降级进面板
   ensureTrace();
   let card = permissionCards.get(evt.id);
   if (card) card.remove();  // 同一请求重放：整卡重画，绝不允许出现两张活卡
@@ -1942,6 +1958,25 @@ function retireLiveBubble() {
   if (!liveBubble.textContent) liveBubble.remove();
 }
 
+// 把"过程性正文"降级进执行过程面板：中间轮次模型输出的说明文字（"我先看看…
+// 现在改…"这类），不是最终答案。它随 answer_delta 流成一个气泡，但下一个
+// round 事件一到就证明"后面还有内容"——于是移进 traceEl 弱化展示，正文区
+// 只留最终答案。文字为空则直接丢弃气泡（模型这轮没输出正文、只调了工具）。
+// 注意：这类文字本就不落库（只有最终 answer 进历史），所以刷新后历史回放里
+// 天然没有它，这里降级只为实时观感，不涉及回放一致性。
+function demoteLiveBubbleToTrace() {
+  const el = liveBubble;
+  if (!el) return;
+  el.classList.remove("streaming");
+  const text = el.textContent.trim();
+  el.remove();
+  if (!text) return;
+  const div = document.createElement("div");
+  div.className = "process-text";
+  div.textContent = text;
+  appendTrace(div);  // 计入步数：过程正文也是"做了什么"的一部分
+}
+
 // 流式增量按帧合并：delta 到达频率远高于屏幕刷新率，逐条 textContent += 和
 // scrollTop = scrollHeight 会各自强制一次重排，把主线程切碎——生成期间整个页面的
 // 点击都会因此变迟钝。这里只攒增量（回答按 mid 分桶），requestAnimationFrame
@@ -2008,9 +2043,11 @@ function applyEvent(evt, seq) {
     loadSessions();  // 新任务/新标题此刻才在服务端落定，列表刷新
   } else if (t === "round") {
     flushStreamBuffers();  // 上一轮的增量先落进旧气泡，再开新一轮
+    // 上一段正文（若有）是"过程性说明"：新轮次已开，证明它不是最终答案。
+    // 先降级进执行过程面板（顺序在轮次标题之前，读起来才顺），再写标题。
+    demoteLiveBubbleToTrace();
     traceLine(`🧠 思考 · 第 ${evt.round} 轮`);
     thinkEl = null;  // 新一轮的思考流开一个新块
-    retireLiveBubble();
     curMid = evt.mid;  // 本轮回答段落的 mid：后续 delta/done 归并的键
   } else if (t === "reasoning_delta") {
     // 思考模型的推理过程实时流进「执行过程」面板当前轮次下方：
@@ -2028,7 +2065,8 @@ function applyEvent(evt, seq) {
     queueStreamDelta("answer", evt.mid, evt.delta);
   } else if (t === "tool_call") {
     flushStreamBuffers();
-    retireLiveBubble();
+    // 调工具前输出的正文同样是过程说明（"我先看看这个文件…"），一并降级
+    demoteLiveBubbleToTrace();
     toolCallLine(evt.name, evt.arguments);
   } else if (t === "tool_result") {
     toolResultLine(evt.name, evt.result);

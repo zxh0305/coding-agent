@@ -452,6 +452,13 @@ class Agent:
             # 关键：这条"要求调用工具"的 assistant 消息必须原样进历史。
             # 否则下一轮历史里就出现了"没有提问却冒出 tool 结果"的悬空消息，
             # 大多数服务端会直接报 400。
+            # 顺带把它的正文记为过程说明（process_text）进 trace：这类文字是
+            # "我接下来要做什么"，不是最终答案——实时视图把它降级进执行过程
+            # 折叠面板，回放也必须落在同一处（否则刷新后它又变回一张正文卡，
+            # 与实时观感割裂）。落 trace 而非只在内存：回放靠 trace 重建过程。
+            _ptext = (assistant_msg.get("content") or "").strip()
+            if _ptext:
+                self.trace.append({"type": "process_text", "round": round_no, "text": _ptext})
             self.history.append(assistant_msg)
             for call in tool_calls:
                 self._log(f"🤖 LLM 请求调用: {call['function']['name']}({call['function']['arguments']})", "cyan")
