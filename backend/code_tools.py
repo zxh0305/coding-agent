@@ -319,3 +319,17 @@ CODE_TOOL_REGISTRY = {
     "grep": grep,
     "run_bash": run_bash,
 }
+
+# 工具元数据 read_only：该工具是否只读（不改动工作区/会话的任何状态）。
+# read_file / list_dir / grep 只打开文件读 → True，可被 Agent 安全地并行执行；
+# write_file / apply_patch 真的会写、run_bash 是任意 shell 命令（无法证明它
+# 不写，哪怕看起来只是 cat/ls）→ False，必须串行。
+# tools.py 会把这份表并入全局 TOOL_READ_ONLY，Agent 的分组调度以它为准。
+CODE_TOOL_READ_ONLY = {
+    "read_file": True,
+    "write_file": False,
+    "apply_patch": False,
+    "list_dir": True,
+    "grep": True,
+    "run_bash": False,
+}

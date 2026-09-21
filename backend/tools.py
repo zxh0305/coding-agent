@@ -158,7 +158,7 @@ TOOL_REGISTRY = {
 }
 
 # ---- 合并 Coding 工具（code_tools.py）：读写工作区文件、执行命令 ----
-from code_tools import CODE_TOOL_REGISTRY, CODE_TOOL_SCHEMAS
+from code_tools import CODE_TOOL_REGISTRY, CODE_TOOL_READ_ONLY, CODE_TOOL_SCHEMAS
 
 TOOL_SCHEMAS += CODE_TOOL_SCHEMAS
 TOOL_REGISTRY.update(CODE_TOOL_REGISTRY)
@@ -214,6 +214,30 @@ TOOL_SCHEMAS.append({
     },
 })
 TOOL_REGISTRY["analyze_image"] = analyze_image
+
+# ---------------------------------------------------------------------------
+# 工具元数据：read_only（是否只读、能否并行）
+#
+# 标记原则：只有"对工作区与会话状态零写入"的工具才标 True——
+# read_file / list_dir / grep 只打开文件读，calculator / current_time 是
+# 纯函数，它们与同组其它只读工具并行执行的结果和串行完全一致。
+# 其余一律 False（按写操作串行）：write_file / apply_patch / run_bash 真的
+# 会写；get_weather / analyze_image 虽不写工作区，但要出网/跨模型调用，
+# 保守起见也不并行。Agent 的分组调度完全依据这份表（见 agent.py）。
+# ---------------------------------------------------------------------------
+
+TOOL_READ_ONLY = {
+    "calculator": True,
+    "current_time": True,
+    "get_weather": False,
+    "analyze_image": False,
+}
+TOOL_READ_ONLY.update(CODE_TOOL_READ_ONLY)  # 并入 coding 工具的标记（同样的合并方式）
+
+
+def is_read_only(name: str) -> bool:
+    """name 是否只读工具。未知工具返回 False——没有元数据就当写操作走串行，永远站在安全侧。"""
+    return bool(TOOL_READ_ONLY.get(name))
 
 
 def execute_tool(name: str, arguments: dict, ctx: ToolContext | None = None) -> str:

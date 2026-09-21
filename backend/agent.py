@@ -27,9 +27,10 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from code_tools import prepare_workspace
-from tools import TOOL_SCHEMAS, ToolContext, execute_tool
+from tools import TOOL_SCHEMAS, ToolContext, execute_tool, is_read_only
 from ui import colored
 
 log = logging.getLogger("agent")  # 输出目的地由 logger.py 统一配置（写入 agent.log）
@@ -76,6 +77,14 @@ SUMMARIZE_PROMPT = """\
 5. 用户的重要偏好（沟通语言、代码风格、明确禁止的做法等）。
 用简洁的条目式中文输出，不要复述本提示，不要寒暄。细节可以有损，但上述五类信息一条都不能漏。\
 """
+
+# ---------------------------------------------------------------------------
+# 工具并行执行：同一轮 tool_calls 里【连续的只读工具】并行跑、写操作串行跑。
+# 为什么这样分组是安全的：正确性论证见 Agent._execute_tool_calls；
+# 每个工具的 read_only 标记登记在 tools.py 的 TOOL_READ_ONLY。
+# ---------------------------------------------------------------------------
+
+PARALLEL_TOOL_WORKERS = 4  # 只读组的最大并发数：读文件/搜索以 IO 等待为主，4 个线程已足够重叠
 
 
 class Agent:
@@ -355,18 +364,9 @@ class Agent:
                 self.trace.append({"type": "tool_call", "name": call["function"]["name"], "arguments": arguments})
                 yield "tool_call", {"name": call["function"]["name"], "arguments": arguments}
 
-            for call in tool_calls:
-                result = self._run_tool(call)
-                tool_msg = {
-                    "role": "tool",
-                    "tool_call_id": call.get("id", ""),  # 与请求里的 id 对应，服务商靠它配对
-                    "content": result,
-                }
-                self.history.append(tool_msg)
-                self._log(f"🔧 工具返回: {result}", "yellow")
-                name = call["function"]["name"]
-                self.trace.append({"type": "tool_result", "name": name, "result": result})
-                yield "tool_result", {"name": name, "result": result}
+            # 执行工具：连续只读工具并行、写操作串行，结果按请求顺序回填
+            # （分组调度规则与正确性论证见 _execute_tool_calls）
+            yield from self._execute_tool_calls(tool_calls)
 
         # 走到循环外只有两种情况：被用户停止，或跑满 max_rounds
         if self.cancel_event.is_set():
@@ -524,10 +524,93 @@ class Agent:
 
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 工具执行：读并行 / 写串行（同一轮 tool_calls 的分组调度）
+    # ------------------------------------------------------------------
+
+    def _execute_tool_calls(self, tool_calls: list[dict]):
+        """执行同一轮的全部 tool_calls，按请求顺序逐个产出 ("tool_result", ...) 事件。
+
+        调度规则：tool_calls 序列被切成若干组——【连续的只读工具】为一组，
+        交给线程池并行执行；每个非只读（写）工具单独成组，在当前线程串行
+        执行。进入下一组前必须拿到上一组的全部结果（收集处即屏障）。
+
+        为什么"读写分组"能保证顺序安全（效果等价于纯串行执行）：
+        1. 组内并行不改变任何结果：read_only 工具对工作区和会话状态零写入
+           （read_file / list_dir / grep 只打开文件读，calculator / current_time
+           是纯函数），彼此没有数据依赖——谁先谁后执行，各自的输出都一样。
+           并行只是把总耗时从"各调用相加"变成"取最慢者"；
+        2. 组间屏障保住读写顺序：非只读工具会改工作区状态（写文件/改代码/
+           跑命令），它与前后的调用存在真实依赖——写之前的读组必须全部
+           完成（不能读到"尚未发生的写"），写之后的调用必须等写落地（才能
+           读到它写入的结果）。按组顺序推进，读写之间、写写之间的相对顺序
+           就与模型请求顺序严格一致，不会出现两个写并行互踩、或读穿越到
+           写的另一侧；
+        3. 回填顺序只认请求顺序、不认完成顺序：并行组的 futures 按提交顺序
+           收集，结果下标与调用下标一一对应；主线程再按原顺序 append 历史、
+           yield 事件。历史里 tool 消息的顺序因此与 assistant 消息里
+           tool_calls 的顺序完全相同——服务商按 tool_call_id 配对、模型按
+           顺序引用结果，任何错位都会把结果安到别的调用头上。
+        """
+        idx = 0
+        while idx < len(tool_calls):
+            if not is_read_only(tool_calls[idx]["function"].get("name", "")):
+                group = [tool_calls[idx]]  # 写操作：单独成组，当前线程串行执行
+            else:
+                end = idx + 1              # 只读操作：收集从 idx 起连续的只读工具
+                while (end < len(tool_calls)
+                       and is_read_only(tool_calls[end]["function"].get("name", ""))):
+                    end += 1
+                group = tool_calls[idx:end]
+            for call, result in zip(group, self._run_tool_group(group)):
+                tool_msg = {
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),  # 与请求里的 id 对应，服务商靠它配对
+                    "content": result,
+                }
+                self.history.append(tool_msg)
+                self._log(f"🔧 工具返回: {result}", "yellow")
+                name = call["function"]["name"]
+                self.trace.append({"type": "tool_result", "name": name, "result": result})
+                yield "tool_result", {"name": name, "result": result}
+            idx += len(group)
+
+    def _run_tool_group(self, group: list[dict]) -> list[str]:
+        """执行一组 tool_calls，返回与 group 下标一一对应的结果列表。
+
+        只有 ≥2 个调用才开线程池：并行的收益是"耗时相加变取最慢"，单个
+        调用开池纯属浪费（还多一次线程创建与切换）。写工具永远只会以
+        大小为 1 的组走到这里，天然串行。
+        """
+        if len(group) < 2:
+            return [self._run_tool(group[0])]
+        names = ", ".join(c["function"].get("name", "?") for c in group)
+        self._log(f"⚡ 只读工具并行执行（{len(group)} 个）: {names}", "cyan")
+        with ThreadPoolExecutor(max_workers=PARALLEL_TOOL_WORKERS) as pool:
+            # futures 列表顺序 = 提交顺序 = 回填顺序：结果与调用的配对由
+            # 下标保证，与哪个先跑完无关
+            futures = [pool.submit(self._run_tool, c) for c in group]
+            results = []
+            for f in futures:
+                try:
+                    results.append(f.result())
+                except Exception as e:
+                    # 双保险：_run_tool 承诺不抛（见其 docstring），万一真抛了，
+                    # 也只把这一个调用转成 error 回填，绝不让整组连坐
+                    results.append(json.dumps(
+                        {"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False))
+            return results
+
     def _run_tool(self, call: dict) -> str:
-        """解析并执行一次工具调用，任何错误都转成字符串交给 LLM 处理。"""
-        name = call["function"]["name"]
-        raw_args = call["function"].get("arguments") or "{}"
+        """解析并执行一次工具调用，任何错误都转成字符串交给 LLM 处理。
+
+        本方法【绝不抛异常】：串行路径靠它把错误反馈给模型；并行路径里它
+        跑在 ThreadPoolExecutor 的工作线程上，一旦抛出，future.result() 会在
+        收集处重新抛出、殃及同组其它工具的回填（要求：单个工具出错不能
+        影响同组其它工具）。
+        """
+        name = (call.get("function") or {}).get("name", "")
+        raw_args = (call.get("function") or {}).get("arguments") or "{}"
         try:
             # 注意坑点：arguments 是【JSON 字符串】不是 dict（模型输出的是文本）
             arguments = json.loads(raw_args)
@@ -535,7 +618,10 @@ class Agent:
                 arguments = {}
         except json.JSONDecodeError:
             arguments = {}
-        result = execute_tool(name, arguments, self.ctx)
+        try:
+            result = execute_tool(name, arguments, self.ctx)
+        except Exception as e:  # execute_tool 已兜底一次；这里再兜一层，守住"绝不抛"的承诺
+            result = json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
         if '"error"' in result:
             log.warning("工具 %s 执行出错: %s", name, result)
         return result
