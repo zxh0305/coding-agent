@@ -504,19 +504,19 @@ button.primary:hover { background: #3d69d8; }
 }
 .att-del:hover { background: #b3261e; }
 
-/* 气泡里的附件图片/文件名 */
+/* 气泡里的附件图片/文件名：小缩略图（大图进灯箱看） */
 .msg-img {
-  max-width: 220px; max-height: 180px;
+  max-width: 150px; max-height: 110px;
   border-radius: 8px; margin-top: 6px; display: block;
 }
-/* 多图消息：缩略图 2 列网格铺排（略图墙），点击进灯箱左右切换。
-   气泡限宽（约两个略图宽），否则 1fr 网格会跟着 76% 的气泡上限被撑巨大 */
+/* 多图消息：缩略图 3 列网格铺排（略图墙），点击进灯箱左右切换。
+   气泡限宽，否则 1fr 网格会跟着 76% 的气泡上限被撑巨大 */
 .bubble.multi-img {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
-  max-width: 380px;
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px;
+  max-width: 300px;
 }
 .bubble.multi-img .msg-img {
-  max-width: 100%; width: 100%; height: 110px; object-fit: cover;
+  max-width: 100%; width: 100%; height: 88px; object-fit: cover;
   margin-top: 0;
 }
 .bubble.multi-img > div:not(.msg-img),
