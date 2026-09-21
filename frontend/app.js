@@ -460,8 +460,7 @@ function renderAttachTray() {
     card.className = "att-card";
     card.title = a.name;
     if (a.kind === "image" && a.preview) {
-      const img = document.createElement("img");
-      img.src = a.preview;
+      const img = msgImage(a.preview);  // 与消息里的图片同构：可点放大/复制
       img.alt = a.name;
       card.appendChild(img);
     } else {
