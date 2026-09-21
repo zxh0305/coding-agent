@@ -1,4 +1,4 @@
-/* 前端逻辑：任务列表、流式对话、执行过程时间线、模型/工作区/上下文工具栏。
+/* 前端逻辑：任务列表、常驻事件流对话、执行过程时间线、模型/工作区/上下文工具栏。
    原生 JS，无框架、无构建步骤。 */
 
 const $ = (id) => document.getElementById(id);
@@ -6,7 +6,7 @@ const chatEl = $("chat");
 const inputEl = $("input");
 
 let currentSession = null;   // 当前任务（会话）id；null = 将开新任务
-let streaming = false;       // 正在生成回答：此时发送按钮变身停止按钮
+let streaming = false;       // 正在生成回答：此时发送按钮变身停止按钮（由 turn_start/turn_end 事件驱动）
 let contextWindow = 262144;  // 上下文容量显示上限（/api/config 提供）
 let usageNow = null;         // 最近一次 usage 事件（含上下文构成）
 
@@ -36,6 +36,7 @@ function showLogin() {
   currentSession = null;      // 下一个登录者不能沿用上一个用户的任务 id
   chatEl.innerHTML = "";
   pendingQueue = [];          // 排队消息也作废（它们属于上一个用户的任务）
+  closeEvents();              // 事件流属于上一个登录者，立即断开
   localStorage.removeItem("auth_token");
   localStorage.removeItem("auth_username");
   $("login-error").textContent = "";
@@ -252,11 +253,14 @@ async function doDeleteSession(id) {
     return;
   }
   if (currentSession === id) {
-    // 删的是当前打开的任务：清空对话区，回到待新建状态
+    // 删的是当前打开的任务：清空对话区，回到待新建状态；事件流随任务一起
+    // 消失（其他标签页的连接由 session_deleted 事件收摊）
     currentSession = null;
     chatEl.innerHTML = "";
     welcome();
     refreshCtx();
+    closeEvents();
+    historyMids = new Set();
   }
   loadSessions();  // 与服务端对齐一次（时间戳/排序），不阻塞交互
 }
@@ -264,6 +268,7 @@ async function doDeleteSession(id) {
 async function newTask() {
   currentSession = null;
   confirmingDelete = null;
+  closeEvents();      // 旧任务的事件流断开：新任务未建，第一条消息发出后再连
   chatEl.innerHTML = "";
   welcome();
   usageNow = null;
@@ -283,7 +288,9 @@ async function switchSession(id) {
   welcome();
   histOldestOrd = null;
   histHasMore = false;
-  await loadHistoryPage();
+  historyMids = new Set();        // 补发去重基准随任务重建
+  await loadHistoryPage();        // 时间线先行：补发定性（finishBoot）要拿它比对
+  openEvents(id);                 // 再接事件流：断线/刷新期间的回合靠 since 补发接上
   await loadSessions();
   await refreshCtx();
   loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换
@@ -301,7 +308,10 @@ async function loadHistoryPage() {
     if (!data.messages.length) { updateLoadOlder(); return; }
     histOldestOrd = data.messages[0].ord;
     const frag = document.createDocumentFragment();
-    for (const m of data.messages) frag.appendChild(historyNode(m));
+    for (const m of data.messages) {
+      if (m.mid) historyMids.add(m.mid);  // 事件流补发去重的比对基准
+      frag.appendChild(historyNode(m));
+    }
     const btn = $("load-older");
     if (btn) {
       // 向上翻页：更早的消息插在"加载更早"按钮之后、现有历史之前；
@@ -935,11 +945,129 @@ function renderCtxPop() {
   $("ctx-cache").textContent = usageNow && usageNow.cache_hit_rate != null ? usageNow.cache_hit_rate + "%" : "—";
 }
 
+// ---------- 常驻事件流（SSE 断线重连） ----------
+// 「每轮一个流」改为「命令(POST 立即返回) + 常驻事件流(GET events)」：
+// 回合过程（delta/done/…）全部从 events 通道到达。断线重连三件套：
+//   * 浏览器 EventSource 断线自动重连，并自动携带 Last-Event-ID 头（服务端优先采用）；
+//   * 每会话最近 seq 存 localStorage，页面刷新后以 ?since= 续接正在进行的回合；
+//   * seq 闸门（lastSeq）：服务端补发可能带回本页已应用过的事件（正在进行的
+//     回合会从 turn_start 起整段补发），按 seq 跳过——这是"不丢字不重复"的关键。
+let es = null;               // 当前任务的 EventSource（每任务一条，切换任务时换）
+let lastSeq = null;          // 本页已应用（渲染过）的最大事件 seq；null = 全新观看者
+let bootBuffer = null;       // 补发段缓冲：caught_up 到达前无法判定回合完整性，先攒着
+let myNonce = null;          // 本 tab 发出的当前回合 nonce：turn_start 不重复画自己的气泡
+
+const seqKey = (sid) => `sse_seq_${sid}`;
+
+function closeEvents() {
+  if (es) { es.close(); es = null; }
+  bootBuffer = null;
+}
+
+function openEvents(sid) {
+  closeEvents();
+  if (!sid) return;
+  lastSeq = null;          // 新连接的 DOM 可能刚重建过：闸门清零，补发全量应用
+  bootBuffer = [];         // 补发段先缓冲，caught_up 后一次性定性（见 finishBoot）
+  const qs = [`token=${encodeURIComponent(authToken)}`];  // EventSource 带不了 Authorization 头
+  const stored = localStorage.getItem(seqKey(sid));
+  if (stored != null) qs.push(`since=${stored}`);
+  es = new EventSource(`/api/sessions/${encodeURIComponent(sid)}/events?` + qs.join("&"));
+  es.onmessage = onSSEEvent;
+  // onerror 不额外处理：EventSource 会自动重连（携带 Last-Event-ID 头）；
+  // 需要"放弃续接"的场景（缺口太大/服务重启）由服务端 resync 事件驱动。
+  // 唯一例外：已登出还无限重连没有意义，这里直接停。
+  es.onerror = () => { if (!authToken) closeEvents(); };
+}
+
+function onSSEEvent(e) {
+  let evt;
+  try { evt = JSON.parse(e.data); } catch { return; }
+  const seq = e.lastEventId ? Number(e.lastEventId) : null;
+  if (seq != null && !Number.isNaN(seq) && currentSession) {
+    // 每条业务事件都续存 localStorage：页面随时刷新都能以最新 seq 续接
+    localStorage.setItem(seqKey(currentSession), String(seq));
+  }
+  if (evt.type === "caught_up") return finishBoot(evt);
+  if (evt.type === "resync") return handleResync(evt);
+  // seq 闸门：跳过本页已应用过的事件（服务端为覆盖"刷新接上正在输出的回合"
+  // 场景，会把进行中回合从 turn_start 起整段补发，与本页已渲染部分重叠）
+  if (seq != null && lastSeq != null && seq <= lastSeq) return;
+  if (bootBuffer !== null) { bootBuffer.push({ seq, evt }); return; }
+  applyEvent(evt, seq);
+}
+
+// 补发段定性：把缓冲里的事件按回合分组，逐组决定渲染与否。
+//  * 完整回合（…turn_end 俱全）且 turn_end.user_mid 已在时间线 → 该回合其实
+//    早已落库（断线期间完成、刷新页面时历史已含它），跳过渲染，否则与时间线重复；
+//  * 其余（时间线里没有的完整回合、以及没有 turn_end 的"进行中"尾巴）→ 渲染。
+// 回合开头之前的孤立尾巴（补发从回合中段起）也按"隐式完整回合"处理：它必然
+// 跟着一个 turn_end——进行中回合的 turn_start 一定被服务端一并补发（见
+// 后端 replay_plan），不会出现悬空尾巴；turn_end.user_mid 同样能判定去留。
+function finishBoot(caughtUp) {
+  const buf = bootBuffer || [];
+  bootBuffer = null;
+  if (caughtUp && caughtUp.running === false && streaming) {
+    // 连上时服务端已无进行中回合，而本页还挂在"生成中"：回合在断线/服务
+    // 重启之间死掉了（未落盘）。手动收尾不挂起——手测②"刷新接上进行中
+    // 回合"的正常路径不会走到这里（running=true）。
+    setStreaming(false);
+    clearInterval(metaTimer);
+    if (liveBubble) {
+      liveBubble.classList.remove("streaming");
+      const note = document.createElement("div");
+      note.className = "meta";
+      note.textContent = "（连接中断，本回合未完成，输入未保存）";
+      chatEl.appendChild(note);
+    }
+    toast("连接已恢复；中断的回合未保存，请重新发送");
+  }
+  const segments = [];  // 每段 = { events: [{seq,evt}...], userMid, closed }
+  let cur = { events: [], userMid: null, closed: false };
+  for (const item of buf) {
+    if (item.evt.type === "turn_start") {
+      segments.push(cur);           // 之前的孤立尾巴（若有）先封段
+      cur = { events: [item], userMid: null, closed: false };
+    } else {
+      cur.events.push(item);
+      if (item.evt.type === "turn_end") {
+        cur.closed = true;
+        cur.userMid = item.evt.user_mid;
+        segments.push(cur);
+        cur = { events: [], userMid: null, closed: false };
+      }
+    }
+  }
+  segments.push(cur);
+  for (const seg of segments) {
+    if (!seg.events.length) continue;
+    if (seg.closed && seg.userMid && historyMids.has(seg.userMid)) continue;  // 已在时间线
+    for (const { seq: s, evt } of seg.events) applyEvent(evt, s);
+  }
+}
+
+// resync：服务端判定缺口补不齐（缓冲被挤掉 / 服务重启内存清空）。
+// 处理：断开自动重连 → 全量刷新时间线 → 以 resync.seq 为锚重连。重连后若
+// 回合仍在进行，服务端会从回合 turn_start 起整段补发，自然接上；若已结束，
+// 全量刷新的时间线已含它。绝不能停在重连里——缺口不会自愈。
+function handleResync(evt) {
+  if (es) { es.close(); es = null; }
+  bootBuffer = null;
+  lastSeq = null;        // 时间线即将整页重建：闸门清零
+  if (currentSession) localStorage.setItem(seqKey(currentSession), String(evt.seq ?? 0));
+  const keep = currentSession;
+  currentSession = null;  // 绕过 switchSession 的同 id 早退
+  switchSession(keep);
+}
+
 // ---------- 流式渲染：执行过程时间线 + 打字机回答 ----------
 let liveBubble = null, metaEl = null, metaTimer = null, qStart = 0;
 let thinkEl = null;  // 当前轮次的思考流块（思考模型的 reasoning_delta 实时显示用）
 let traceEl = null, traceSteps = 0;
 let pendingCalls = [];  // 已发出但未见结果的工具调用（算持续时长用）
+let liveMsgs = new Map();  // mid -> {el, text}：事件流里同一 mid 的 delta 归并进同一气泡
+let curMid = null;         // 当前回答段落的 mid（round 事件切换）
+let historyMids = new Set();  // 已从分页接口加载进时间线的消息 mid（补发去重基准）
 
 const TOOL_ICONS = {
   write_file: "✏️", apply_patch: "✏️",
@@ -1033,20 +1161,31 @@ function metaText(elapsed, u) {
   return t;
 }
 
-function newLiveBubble() {
-  liveBubble = document.createElement("div");
-  liveBubble.className = "bubble assistant streaming";
-  chatEl.appendChild(liveBubble);
-  if (!metaEl) {
-    metaEl = document.createElement("div");
-    metaEl.className = "meta";
+// 取到（或创建）mid 对应的回答气泡。mid 是回答段落的身份（服务端 round
+// 事件分配）：同一 mid 的 delta 归并进同一气泡——这是"归并事件流中同一 mid
+// 消息的增量"的落点，也是补发重放时能对上已有气泡的键。
+function ensureLiveMsg(mid) {
+  mid = mid || curMid || "_";
+  let b = liveMsgs.get(mid);
+  if (!b) {
+    const el = document.createElement("div");
+    el.className = "bubble assistant streaming";
+    chatEl.appendChild(el);
+    b = { el, text: "" };
+    liveMsgs.set(mid, b);
+    if (!metaEl) {
+      metaEl = document.createElement("div");
+      metaEl.className = "meta";
+    }
+    metaEl.textContent = metaText(((Date.now() - qStart) / 1000).toFixed(1), usageNow);
+    chatEl.appendChild(metaEl);  // 已存在则移动到当前气泡后
   }
-  metaEl.textContent = metaText(((Date.now() - qStart) / 1000).toFixed(1), usageNow);
-  chatEl.appendChild(metaEl);  // 已存在则移动到当前气泡后
+  liveBubble = b.el;  // 兼容既有的"当前气泡"语义（retire/done 收尾用）
   chatEl.scrollTop = chatEl.scrollHeight;
+  return b;
 }
 
-// SSE 事件 → 页面更新（事件类型见 backend/app.py 的 _handle_chat_stream）
+// SSE 事件 → 页面更新（事件类型见 backend/app.py 的 _run_round）
 function retireLiveBubble() {
   // 当前气泡"退役"：去掉打字机光标（否则中间轮次的气泡会一直闪），空的直接移除
   if (!liveBubble) return;
@@ -1056,14 +1195,19 @@ function retireLiveBubble() {
 
 // 流式增量按帧合并：delta 到达频率远高于屏幕刷新率，逐条 textContent += 和
 // scrollTop = scrollHeight 会各自强制一次重排，把主线程切碎——生成期间整个页面的
-// 点击都会因此变迟钝。这里只攒增量，requestAnimationFrame 每帧最多刷一次。
-let pendingAnswer = "", pendingThink = "", deltaFlushQueued = false;
+// 点击都会因此变迟钝。这里只攒增量（回答按 mid 分桶），requestAnimationFrame
+// 每帧最多刷一次。
+let pendingDeltas = new Map(), pendingThink = "", deltaFlushQueued = false;
 
 function flushStreamBuffers() {
   deltaFlushQueued = false;
-  if (pendingAnswer) {
-    if (liveBubble) liveBubble.textContent += pendingAnswer;
-    pendingAnswer = "";
+  if (pendingDeltas.size) {
+    for (const [mid, text] of pendingDeltas) {
+      const b = ensureLiveMsg(mid);
+      b.text += text;
+      b.el.textContent = b.text;
+    }
+    pendingDeltas.clear();
     chatEl.scrollTop = chatEl.scrollHeight;
   }
   if (pendingThink) {
@@ -1076,25 +1220,48 @@ function flushStreamBuffers() {
   }
 }
 
-function queueStreamDelta(kind, text) {
-  if (kind === "answer") pendingAnswer += text; else pendingThink += text;
+function queueStreamDelta(kind, mid, text) {
+  if (kind === "answer") pendingDeltas.set(mid, (pendingDeltas.get(mid) || "") + text);
+  else pendingThink += text;
   if (deltaFlushQueued) return;
   deltaFlushQueued = true;
   requestAnimationFrame(flushStreamBuffers);
 }
 
-function handleStreamEvent(evt) {
-  if (evt.type === "session") {
-    currentSession = evt.id;   // 后端告知本条消息归属的任务，后续追问带上它
-    loadSessions();
-    loadWorkspace();           // 新任务按用户默认解析了自己的工作区，工具栏对齐
-  } else if (evt.type === "round") {
+// 事件应用（常驻事件流与补发段共用同一条路径——补发重放的就是当初的事件流）。
+// 事件类型见 backend/app.py 的 _run_round：回合边界 turn_start/turn_end 是
+// 新增的，其余与旧的每轮流式输出一致。
+function applyEvent(evt, seq) {
+  if (seq != null) lastSeq = seq;
+  const t = evt.type;
+  if (t === "turn_start") {
+    // 回合开始。本 tab 自己发的消息（nonce 相同）不重复画气泡——发起方在
+    // send/dispatch 时已带缩略图画过；其他标签页/刷新后的页面靠事件里的
+    // 原文补画（附件只带名字：图片 base64 不该进环形缓冲占容量）
+    if (!evt.nonce || evt.nonce !== myNonce) {
+      userBubble(evt.input || "（仅附件）",
+        (evt.atts || []).map(a => ({ kind: a.kind, name: a.name, preview: "" })));
+    }
+    // 回合级状态复位（原在 performSend 里；改为事件驱动后，刷新页面接上
+    // 正在进行的回合也走同一套初始化）
+    liveMsgs = new Map();
+    liveBubble = null; traceEl = null; traceSteps = 0;
+    metaEl = null; thinkEl = null; pendingCalls = [];
+    pendingDeltas = new Map(); pendingThink = "";
+    usageNow = null; curMid = null; qStart = Date.now();
+    clearInterval(metaTimer);
+    metaTimer = setInterval(() => {
+      if (metaEl && streaming) metaEl.textContent = metaText(((Date.now() - qStart) / 1000).toFixed(1), usageNow);
+    }, 100);
+    setStreaming(true);
+    loadSessions();  // 新任务/新标题此刻才在服务端落定，列表刷新
+  } else if (t === "round") {
     flushStreamBuffers();  // 上一轮的增量先落进旧气泡，再开新一轮
     traceLine(`🧠 思考 · 第 ${evt.round} 轮`);
     thinkEl = null;  // 新一轮的思考流开一个新块
     retireLiveBubble();
-    newLiveBubble();
-  } else if (evt.type === "reasoning_delta") {
+    curMid = evt.mid;  // 本轮回答段落的 mid：后续 delta/done 归并的键
+  } else if (t === "reasoning_delta") {
     // 思考模型的推理过程实时流进「执行过程」面板当前轮次下方：
     // 思考阶段再长界面也有动静，不会再像假死；面板收起后不占聊天区
     if (!thinkEl) {
@@ -1103,33 +1270,35 @@ function handleStreamEvent(evt) {
       thinkEl.className = "think-line";
       traceEl.appendChild(thinkEl);  // 不走 appendTrace：思考流不算一步
     }
-    queueStreamDelta("think", evt.delta);
-  } else if (evt.type === "answer_delta") {
-    queueStreamDelta("answer", evt.delta);
-  } else if (evt.type === "tool_call") {
+    queueStreamDelta("think", evt.mid, evt.delta);
+  } else if (t === "answer_delta") {
+    queueStreamDelta("answer", evt.mid, evt.delta);
+  } else if (t === "tool_call") {
     flushStreamBuffers();
     retireLiveBubble();
     toolCallLine(evt.name, evt.arguments);
-  } else if (evt.type === "tool_result") {
+  } else if (t === "tool_result") {
     toolResultLine(evt.name, evt.result);
-  } else if (evt.type === "usage") {
+  } else if (t === "usage") {
     usageNow = evt;   // 供上下文气泡与统计行使用
     updateCtxChip();
     if (metaEl) metaEl.textContent = metaText(evt.elapsed_s, usageNow);
-  } else if (evt.type === "done") {
-    pendingAnswer = pendingThink = "";  // 完整回答直接覆盖，丢弃未刷的增量，防止 rAF 晚到追加旧文本
-    if (!liveBubble) newLiveBubble();
-    liveBubble.classList.remove("streaming");
-    liveBubble.textContent = evt.answer;
+  } else if (t === "done") {
+    pendingDeltas = new Map(); pendingThink = "";  // 完整回答直接覆盖，丢弃未刷的增量，防止 rAF 晚到追加旧文本
+    const b = ensureLiveMsg(evt.mid);
+    b.el.classList.remove("streaming");
+    b.text = evt.answer;
+    b.el.textContent = evt.answer;
     clearInterval(metaTimer);
     metaEl.textContent = metaText(evt.elapsed_s, evt.usage);
+    if (evt.mid) historyMids.add(evt.mid);  // 已在屏上：防后续补发重复渲染
     if (traceEl) {
       traceEl.open = false;  // 执行完收起，保持对话清爽；点开可回看全过程
       traceEl.querySelector("summary").textContent = `执行过程（${traceSteps} 步 · ${evt.elapsed_s}s）`;
     }
     chatEl.scrollTop = chatEl.scrollHeight;
     loadSessions();  // 任务时间/排序刷新
-  } else if (evt.type === "compacted") {
+  } else if (t === "compacted") {
     // 回答结束后的自动压缩（不产生回答流）：补一张分隔卡片并刷新容量显示。
     // 到达顺序在 done 之后——回答气泡已定稿，卡片插在对话流末尾即正确位置。
     chatEl.appendChild(compactCard(evt.summary));
@@ -1137,7 +1306,15 @@ function handleStreamEvent(evt) {
     usageNow = { prompt_tokens: evt.prompt_tokens, context: evt.context, cache_hit_rate: null };
     updateCtxChip();
     toast("早期对话已压缩为摘要，上下文占用已下降");
-  } else if (evt.type === "history_renumbered") {
+  } else if (t === "turn_end") {
+    // 回合结束（服务端已落盘）：驱动排队队列推进的唯一信号——原来靠 POST
+    // 收尾推进，现在 POST 立即返回，队列只能跟着回合生命周期走
+    if (evt.user_mid) historyMids.add(evt.user_mid);
+    clearInterval(metaTimer);
+    setStreaming(false);
+    myNonce = null;
+    dispatchNextQueued();
+  } else if (t === "history_renumbered") {
     // 服务端 ord 间隔耗尽兜底：整会话重编号过，before_ord 游标指向的旧序号
     // 在新序号空间里落在哪完全随机——继续翻页会漏条目或重复。重拉整个时间线
     // （绕过 switchSession 的同 id 早退）。罕见事件，整页重建的开销可接受。
@@ -1145,12 +1322,20 @@ function handleStreamEvent(evt) {
     const keep = currentSession;
     currentSession = null;
     switchSession(keep);
-  } else if (evt.type === "error") {
+  } else if (t === "session_deleted") {
+    // 其他标签页删掉了这个任务：收摊回到新建态
+    closeEvents();
+    currentSession = null;
+    chatEl.innerHTML = "";
+    welcome();
+    loadSessions();
+    toast("该任务已在其他窗口被删除");
+  } else if (t === "error") {
     flushStreamBuffers();  // 已生成的部分内容留在气泡里，再显示错误
     retireLiveBubble();
-    clearInterval(metaTimer);
     if (traceEl) traceEl.querySelector("summary").textContent = `执行过程（${traceSteps} 步 · 出错）`;
     bubble("assistant error", "❌ " + evt.message);
+    // 生成中状态不在这里复位：turn_end 紧随 error 事件到达，由它统一收尾
   }
 }
 
@@ -1268,61 +1453,40 @@ function dispatchNextQueued() {
 }
 
 async function performSend(item) {
+  // 命令接口：POST 立即返回，过程事件走常驻事件流。「生成中」状态在这里
+  // 乐观置位（防连点双发——turn_start 事件到达前有一小段窗口），回合的真
+  // 正结束由事件流的 turn_end 驱动（那里统一复位并推进队列）。
   setStreaming(true);
-  // 注意：用户气泡由调用方渲染（直接发送在 send()，排队消息在 dispatchNextQueued），
-  // 这里不再画一遍——否则每条排队的消息会出现两个重复气泡。
-  liveBubble = null; traceEl = null; traceSteps = 0;
-  metaEl = null; usageNow = null; qStart = Date.now();
-  clearInterval(metaTimer);
-  metaTimer = setInterval(() => {
-    if (metaEl) metaEl.textContent = metaText(((Date.now() - qStart) / 1000).toFixed(1), usageNow);
-  }, 100);
-
+  // 回令：服务端会在 turn_start 里原样带回，本 tab 据此不重复画自己的气泡。
+  // crypto.randomUUID 只在安全上下文可用（本机 http OK，局域网 http 不一定），
+  // 手写兜底保证任何环境都能生成足够唯一的 nonce。
+  item.nonce = item.nonce ||
+    ((crypto.randomUUID ? crypto.randomUUID() : "") ||
+     `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`);
+  myNonce = item.nonce;
+  const target = item.sessionId ?? currentSession;
+  const body = JSON.stringify({
+    message: item.text,
+    nonce: item.nonce,
+    attachments: item.payloadAtts,
+  });
   try {
-    const resp = await fetch("/api/chat/stream", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...authHeaders(),
-      },
-      body: JSON.stringify({
-        message: item.text,
-        session_id: item.sessionId ?? currentSession,
-        attachments: item.payloadAtts,
-      }),
-    });
-    if (resp.status === 401) {
-      showLogin();
-      throw new Error("登录已失效，请重新登录");
-    }
-    if (!resp.ok) {
-      const data = await resp.json().catch(() => ({}));
-      throw new Error(data.error || `HTTP ${resp.status}`);
-    }
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf("\n\n")) >= 0) {
-        const rawEvent = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        for (const line of rawEvent.split("\n")) {
-          if (!line.startsWith("data:")) continue;
-          handleStreamEvent(JSON.parse(line.slice(5)));
-        }
-      }
+    if (target) {
+      // 追问：REST 路径（任务已存在）
+      await api(`/api/sessions/${encodeURIComponent(target)}/messages`, { method: "POST", body });
+    } else {
+      // 新任务的第一次发送：创建任务 + 入队一步完成
+      const data = await api(`/api/sessions`, { method: "POST", body });
+      currentSession = data.session_id;
+      openEvents(currentSession);  // 立刻接事件流：turn_start 可能已在缓冲里等着补发
+      loadWorkspace();             // 新任务按用户默认解析了自己的工作区，工具栏对齐
     }
   } catch (e) {
+    // 命令没送出去（后端不可达/登录失效）：回合不会开始，本地复位。
+    // 已发出的消息不放回队列（与旧行为一致：旧版 finally 里也是直接结束）
     bubble("assistant error", "❌ " + e.message);
-  } finally {
-    if (liveBubble) liveBubble.classList.remove("streaming");
     setStreaming(false);
-    inputEl.focus();
-    setTimeout(dispatchNextQueued, 60);  // 队列里还有排队的就接着发
+    myNonce = null;
   }
 }
 
@@ -1430,6 +1594,7 @@ function boot() {
   // 登录成功（或刷新后 token 仍有效）后的页面初始化；切用户时先清现场
   currentSession = null;
   chatEl.innerHTML = "";
+  historyMids = new Set();  // 上一个用户/任务的去重基准作废
   $("login-page").classList.add("hidden");   // 离开登录页
   $("layout").classList.remove("hidden");    // 进入对话页
   setWho(who);

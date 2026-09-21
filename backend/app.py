@@ -24,13 +24,27 @@ Web 服务
   POST /api/workspace               切换工作区 {"path", "session_id"?}（带 id 只改该任务；不带改用户默认）
   GET  /api/fs/dirs?path=         列出某目录的子目录（供选文件夹弹窗逐级浏览）
   GET  /api/sessions              任务列表（仅当前用户的）
+  POST /api/sessions              提交输入，必要时创建任务 → 立即返回
+                                    {session_id, nonce}（新任务的第一次发送走这里）
+  POST /api/sessions/<id>/messages 提交输入（命令接口）：立即返回，回合在后台
+                                    按会话锁串行执行，过程事件走 events 通道
+  GET  /api/sessions/<id>/events?since=&token=  常驻事件流（SSE）：回合过程事件
+                                    （delta/tool/done/…）的唯一出口。每事件带会话内
+                                    自增 seq（SSE id: 行）；?since=/Last-Event-ID
+                                    断线补发，缺口过大发 resync 让前端全量刷新。
+                                    token 参数鉴权：EventSource 无法带自定义头
   GET  /api/sessions/<id>/messages  某任务的历史消息（须是自己的任务；?before_ord=&limit=
                                     向上翻页，默认最近 100 条；归档消息带 artifact/path/head）
   GET  /api/sessions/<id>/artifact?path=  读取外置归档消息的完整原文（路径白名单校验）
   DELETE /api/sessions?session_id=  删除任务（须是自己的任务）
   GET  /api/context?session_id=   该任务当前上下文容量
-  POST /api/chat/stream           流式问答（SSE）
   POST /api/chat/stop             停止指定任务的生成 {"session_id"}
+
+命令与事件解耦：POST 只入队（HTTP/1.0 时代的"每轮一个流"被替换掉），回合
+由后台线程按会话锁串行执行，全部过程事件经统一发布口（events.SessionEvents
+的 publish）进每会话一条的环形缓冲——常驻 SSE 连接、断线补发、多标签页
+共用同一个真相。seq 是事件流水号（sessions.last_seq 持久化，重启不归零），
+与消息的 mid 是两套身份。
 
 登录与鉴权：除 /api/auth/* 外的所有接口要求 Authorization: Bearer <token>。
 登录只做身份区分与会话隔离（各用户只看到自己的任务列表）；供应商/模型是
@@ -63,6 +77,7 @@ from pathlib import Path
 import db
 from agent import Agent
 from code_tools import prepare_workspace
+from events import SSE_HEARTBEAT, SessionEvents, sse_frame
 from llm_client import create_client, load_env_file, save_env_values
 from logger import setup_logging
 from tools import TOOL_SCHEMAS
@@ -89,6 +104,100 @@ def _session_lock(sid: str) -> threading.Lock:
     刻意不在停止接口用这把锁——生成卡住时，停止请求必须还能进来。"""
     with _lock:
         return _session_locks.setdefault(sid, threading.Lock())
+
+
+# 每会话一条事件总线（常驻事件流的真相源）。惰性创建：seq 从 sessions.last_seq
+# 恢复（重启不归零），persist 回调把最新 seq 写回去。删除任务时整体摘除。
+_buses: dict[str, SessionEvents] = {}
+
+
+def _event_bus(sid: str) -> SessionEvents:
+    with _lock:
+        bus = _buses.get(sid)
+        if bus is None:
+            bus = SessionEvents(last_seq=db.get_last_seq(sid),
+                                persist=lambda seq, _sid=sid: db.set_last_seq(_sid, seq))
+            _buses[sid] = bus
+        return bus
+
+
+def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
+               nonce: str, atts: list) -> None:
+    """回合执行体（POST 只入队，真正的生成在这里跑）。
+
+    会话锁串行同一任务的回合（多个 POST 排队时各自线程等锁，等价于旧
+    "请求内执行"的排队语义）；所有过程事件走统一发布口 bus.publish——
+    禁止第二条写入路径，旁路写入不会进缓冲，重连客户端永远看不到。
+
+    事件协议：在原有回合事件（round/reasoning_delta/answer_delta/tool_call/
+    tool_result/usage/done/compacted）外增加两个回合边界事件：
+      turn_start {nonce, input, atts}  回合开始：多标签页/刷新后的页面靠它
+                                       补画用户气泡并进入"生成中"状态；nonce
+                                       让发起方识别自己（不重复画）
+      turn_end   {user_mid}            回合结束（落盘已完成）：前端驱动排队队
+                                       列推进的唯一信号；user_mid = 本回合输入
+                                       消息的 mid，前端补发去重靠它识别
+                                       "这回合已在时间线里"
+    回答类事件额外带 mid（本轮回答段落的身份）：前端把同一 mid 的 delta
+    归并进同一个气泡——与历史消息的 mid 同一体系，补发与时间线才能对上。
+    """
+    bus = _event_bus(sid)
+    with _session_lock(sid):
+        # 排队期间任务可能已被删除：直接放弃（会话行没了，落盘也会跳过）
+        if db.session_owner(sid) is None:
+            return
+        try:
+            bus.publish({"type": "turn_start", "nonce": nonce, "input": plain, "atts": atts})
+            log.info("[会话 %s] 用户提问: %s", sid, plain)
+            seg_mid = None  # 当前回答段落的 mid（每个 round 事件换一段）
+            error = None
+            try:
+                for kind, payload in agent.run(plain, user_message):
+                    if kind == "round":
+                        seg_mid = uuid.uuid4().hex[:12]
+                        bus.publish({"type": "round", "mid": seg_mid, **payload})
+                    elif kind in ("answer_delta", "reasoning_delta", "done"):
+                        bus.publish({"type": kind, "mid": seg_mid, **payload})
+                    else:
+                        bus.publish({"type": kind, **payload})
+                    if kind in ("usage", "compacted"):  # 最新上下文容量，供 /api/context
+                        _ctx[sid] = payload
+                    if kind == "done":
+                        log.info("[会话 %s] 最终回答: %s", sid, str(payload.get("answer"))[:200])
+            except RuntimeError as e:
+                log.exception("LLM 请求失败")
+                error = str(e)
+            except Exception:
+                # 未预期异常也必须转成 error 事件：前端把 turn_end 当回合结束的
+                # 唯一信号，线程无声死掉会让所有订阅页永远挂在"生成中"
+                log.exception("回合执行出现未预期异常")
+                error = "服务器内部错误，详情见 backend 日志"
+
+            # 收尾（正常/停止/出错共用）：增量落盘 → 重编号信号 → turn_end。
+            # 落盘在前、turn_end 在后——turn_end 里的 user_mid 是"这回合已可
+            # 从时间线读到"的承诺，顺序反了前端去重会误判。
+            written = db.save_messages(sid, agent.history, agent.saved)
+            db.touch_session(sid)
+            log.info("[会话 %s] 本轮落盘 %d 行", sid, written)
+            if error is not None:
+                db.renumbered_sessions.discard(sid)  # 错误路径不带重编号信号（与旧行为一致）
+                bus.publish({"type": "error", "message": error})
+            elif sid in db.renumbered_sessions:
+                # 间隔耗尽兜底触发过整会话重编号：分页游标（before_ord 指向旧
+                # 序号空间）全部失效，推事件让前端重拉时间线
+                db.renumbered_sessions.discard(sid)
+                bus.publish({"type": "history_renumbered"})
+            user_mid = next((m.get("_mid") for m in reversed(agent.history)
+                             if m.get("role") == "user"), None)
+            bus.publish({"type": "turn_end", "user_mid": user_mid})
+        except Exception:
+            # 最后一道兜底：连收尾都炸了也要把回合关掉，绝不挂起订阅页
+            log.exception("[会话 %s] 回合线程收尾异常", sid)
+            try:
+                bus.publish({"type": "error", "message": "回合执行异常，详情见 backend 日志"})
+                bus.publish({"type": "turn_end", "user_mid": None})
+            except Exception:
+                pass
 
 
 def _context_window_fallback() -> int:
@@ -315,6 +424,10 @@ class Handler(SimpleHTTPRequestHandler):
         """统一入口鉴权：/api/auth/* 放行，其余 /api/* 必须带有效 token。
 
         静态文件（前端页面本身）不拦——页面得先打开才能登录。
+        例外：events 端点额外接受 ?token= 查询参数鉴权——浏览器原生
+        EventSource 不支持自定义请求头，Authorization 带不进去。只对
+        events 开这一个口子：token 出现在 URL 里存在被代理日志记录的
+        暴露面，能窄则窄。
         通过后把用户挂在 self.user 上，后续接口直接用。
         """
         path = urllib.parse.urlparse(self.path).path
@@ -322,6 +435,10 @@ class Handler(SimpleHTTPRequestHandler):
             self.user = None
             return True
         user = self._auth_user()
+        if user is None and path.endswith("/events"):
+            tok = (self._query().get("token") or [""])[0]
+            if tok:
+                user = db.user_for_token(tok)
         if user is None:
             self._json({"error": "未登录或登录已失效", "code": "unauthorized"}, 401)
             return False
@@ -410,6 +527,8 @@ class Handler(SimpleHTTPRequestHandler):
             sub = parts[3] if len(parts) > 3 else ""
             if sub == "artifact":
                 return self._handle_session_artifact(sid)
+            if sub == "events":
+                return self._handle_session_events(sid)
             return self._handle_session_messages(sid)
         elif self.path.startswith("/api/context"):
             sid = (self._query().get("session_id") or [""])[0]
@@ -433,13 +552,18 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._handle_auth(self.path.rsplit("/", 1)[-1])
             if not self._require_auth():
                 return
-            if self.path == "/api/chat":
-                self._handle_chat()
-            elif self.path == "/api/chat/stream":
-                self._handle_chat_stream()
-            elif self.path == "/api/chat/stop":
+            path = urllib.parse.urlparse(self.path).path  # 剥掉 ?query 再匹配
+            if path == "/api/chat/stop":
                 self._handle_chat_stop()
-            elif self.path == "/api/active-model":
+            elif path == "/api/sessions":
+                # 新任务的第一次发送：创建任务 + 入队（老任务每次都带 id 走下面）
+                self._handle_session_submit(None)
+            elif re.fullmatch(r"/api/sessions/[^/]+/messages", path):
+                sid = path.split("/")[3]
+                if db.session_owner(sid) != self.user["id"]:
+                    return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+                self._handle_session_submit(sid)
+            elif path == "/api/active-model":
                 self._handle_active_model()
             elif self.path == "/api/providers/save":
                 self._handle_provider_save()
@@ -476,6 +600,12 @@ class Handler(SimpleHTTPRequestHandler):
             with _lock:
                 _agents.pop(sid, None)
                 _ctx.pop(sid, None)
+                bus = _buses.pop(sid, None)
+            if bus is not None:
+                # 先发 session_deleted 再关总线：其他标签页的常驻连接收到后
+                # 自行收摊（切走/清空界面），close 的哨兵再把连接线程送终
+                bus.publish({"type": "session_deleted"})
+                bus.close()
             log.info("删除会话 %s", sid)
             self._json({"ok": True})
         else:
@@ -521,49 +651,78 @@ class Handler(SimpleHTTPRequestHandler):
         log.info("用户 %s %s成功", username, "注册并登录" if action == "register" else "登录")
         self._json({"token": token, "username": user["username"]})
 
-    # ---------- 问答 ----------
+    # ---------- 问答：命令接口（POST 立即返回）+ 常驻事件流（GET events） ----------
 
-    def _handle_chat(self):
+    def _handle_session_submit(self, sid_or_none):
+        """提交输入的命令接口：创建/复用任务，立即返回，不在本请求内流式输出。
+
+        回合真正跑在后台线程里（_run_round），按会话锁串行——同一任务并发
+        提交自然排队，不同任务并行。POST 返回 {session_id, nonce}：
+        session_id 告知前端新任务的 id；nonce 是本客户端生成的回令，回合
+        开始事件（turn_start）会原样带回——前端靠它识别"这回合是我发的"，
+        不重复渲染自己刚画的用户气泡（其他标签页/刷新后的页面没有这个
+        nonce，会按事件里的原文补画）。
+        """
         body = self._body()
         plain, user_message = _build_user_message(body)
         if not plain:
             return self._json({"error": "输入不能为空"}, 400)
-        # get_session 内部已用锁保护实例缓存；这里不再持全局锁——
-        # 一次问答可能跑几分钟，全程持锁会卡死其他请求（含停止）。
-        # 只拿【本任务】的锁：同一任务并发提问串行化，不同任务并行。
-        sid, agent = get_session(body.get("session_id"), self.user["id"])
-        with _session_lock(sid):
-            try:
-                if not next((s["title"] for s in db.list_sessions(self.user["id"]) if s["id"] == sid), ""):
-                    db.set_session_title(sid, plain[:24])
-                log.info("[会话 %s] 用户提问: %s", sid, plain)
-                answer = agent.chat(plain, user_message)
-                log.info("[会话 %s] 最终回答: %s", sid, answer)
-            except RuntimeError as e:
-                log.exception("LLM 请求失败")
-                db.save_messages(sid, agent.history, agent.saved)  # 部分历史也落盘（增量）
-                db.renumbered_sessions.discard(sid)  # 信号只随正常响应走，错误路径清掉防串轮
-                return self._json({"error": str(e), "session_id": sid}, 502)
-            renumbered = self._finish_round(sid, agent)
-            self._json({"session_id": sid, "answer": answer, "trace": agent.trace,
-                        "history_renumbered": renumbered})
+        # get_session 内部只短持锁（见其注释）；这里不持全局锁——回合已不在
+        # 本请求内执行，本接口本身是毫秒级返回的。
+        sid, agent = get_session(sid_or_none, self.user["id"])
+        title = next((s["title"] for s in db.list_sessions(self.user["id"]) if s["id"] == sid), "")
+        if not title:
+            db.set_session_title(sid, plain[:24])
+        # 附件只带 kind/name 进 turn_start 事件（原文/图片数据太大，不该进
+        # 环形缓冲占 500 个格子里的一个——完整内容在消息存储里）
+        atts = [{"kind": a.get("kind"), "name": str(a.get("name") or "")[:80]}
+                for a in (body.get("attachments") or [])[:6]]
+        nonce = str(body.get("nonce") or uuid.uuid4().hex[:12])
+        threading.Thread(target=_run_round, daemon=True,
+                         args=(sid, agent, plain, user_message, nonce, atts)).start()
+        self._json({"session_id": sid, "nonce": nonce})
 
-    def _handle_chat_stream(self):
-        """流式问答：SSE。第一个事件是 session（告知前端任务 id），之后是过程事件。"""
-        body = self._body()
-        plain, user_message = _build_user_message(body)
-        if not plain:
-            return self._json({"error": "输入不能为空"}, 400)
-        # get_session 内部已用锁保护实例缓存；这里不再持全局锁——流式生成
-        # 可能持续几分钟，全程持锁曾把删除任务/停止请求全部卡死。
-        # 只拿【本任务】的锁：同一任务并发提问串行化，不同任务并行。
-        sid, agent = get_session(body.get("session_id"), self.user["id"])
-        session_lock = _session_lock(sid)
-        with session_lock:
-            title = next((s["title"] for s in db.list_sessions(self.user["id"]) if s["id"] == sid), "")
-            if not title:
-                title = plain[:24]
-                db.set_session_title(sid, title)
+    def _handle_session_events(self, sid: str):
+        """常驻事件流（SSE）。每连接占一个线程（ThreadingHTTPServer 每请求
+        一线程，前置检查已确认），客户端断开即线程收尾。
+
+        连接生命周期（顺序是正确性的一部分）：
+        1) 先订阅、后快照：两步之间新发布的事件会同时出现在订阅队列和补发
+           快照里，用"seq ≤ 已写出的最大 seq 则跳过"闸门去重。反过来（先
+           快照后订阅）快照与订阅之间的事件会两头都够不着——漏事件；
+        2) 按 replay_plan 补发（events.py，纯逻辑有单测）：缺口补不齐时发
+           resync 事件（带当前 seq 作重连锚点）并照常续流——客户端收到
+           resync 会主动断开、全量刷新、以该 seq 重连；
+        3) caught_up 标记补发段结束（不带 id，不污染 Last-Event-ID）。前端
+           靠它把缓冲住的补发事件一次性定性：已在时间线里的完整回合跳过，
+           进行中的回合从 turn_start 起渲染；
+        4) 实时段：订阅队列 15 秒无事件就写心跳注释行（: ping）。Cloudflare
+           等隧道会掐空闲连接，心跳让它们保持存活；心跳不进缓冲不占 seq
+           （哪些进缓冲见 events.py 的角色表）。
+
+        since 的两个来路，Last-Event-ID 头优先于 ?since= 参数：浏览器自动
+        重连会带头（值 = 最后收到的事件 id，最新鲜）；页面刷新/切换任务走
+        参数（来自 localStorage）。保留 HTTP/1.0 + Connection close + 禁
+        缓存的既有措施——代理不缓冲、连接语义简单，与心跳配合防超时。
+        """
+        bus = _event_bus(sid)
+        sub = bus.subscribe()  # 先订阅（见上）
+        try:
+            position = None
+            header_id = (self.headers.get("Last-Event-ID") or "").strip()
+            if header_id:
+                try:
+                    position = int(header_id)
+                except ValueError:
+                    position = None
+            if position is None:
+                raw = (self._query().get("since") or [""])[0]
+                if raw not in ("", None):
+                    try:
+                        position = int(raw)
+                    except ValueError:
+                        return self._json({"error": "since 须为整数"}, 400)
+            mode, items = bus.replay_plan(position)
 
             self.protocol_version = "HTTP/1.0"
             self.send_response(200)
@@ -572,49 +731,44 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
 
-            def send_event(obj: dict) -> None:
-                self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8"))
-
-            send_event({"type": "session", "id": sid, "title": title})
-            log.info("[会话 %s] 用户提问: %s", sid, plain)
-            try:
-                for kind, payload in agent.run(plain, user_message):
-                    send_event({"type": kind, **payload})
-                    if kind == "usage":  # 记录最新上下文容量，供 /api/context 查询
-                        _ctx[sid] = payload
-                    if kind == "compacted":  # 回答后的自动压缩：容量骤降，同步刷新缓存
-                        _ctx[sid] = payload
-                    if kind == "done":
-                        log.info("[会话 %s] 最终回答: %s", sid, payload["answer"])
-            except RuntimeError as e:
-                log.exception("LLM 请求失败")
-                send_event({"type": "error", "message": str(e)})
-            except (BrokenPipeError, ConnectionResetError):
-                # 用户关页面/刷新导致连接断开：推不出事件了，安静收尾（finally 仍会落盘）
-                log.info("[会话 %s] 客户端提前断开", sid)
-            finally:
-                # 增量落盘：只写本轮新增/有变化的消息（done、用户停止、异常收尾
-                # 都走这里；完整历史重启后可从库恢复）。写入行数进日志——它是
-                # "第二轮起只写增量"这一验收指标的观测点。
-                written = db.save_messages(sid, agent.history, agent.saved)
-                db.touch_session(sid)
-                log.info("[会话 %s] 本轮落盘 %d 行", sid, written)
-                # 间隔耗尽兜底触发过整会话重编号：分页游标（before_ord 指向的
-                # 是旧序号空间）全部失效，推事件让前端重拉时间线。连接可能已被
-                # 客户端关掉（finally 里常见），推不出去就算了——前端下次进入
-                # 任务时会全量重建游标，不影响正确性。
-                if sid in db.renumbered_sessions:
-                    db.renumbered_sessions.discard(sid)
-                    try:
-                        send_event({"type": "history_renumbered"})
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        pass
+            if mode == "resync":
+                # 带当前 seq 作锚点：客户端刷新后以它重连，重连与刷新之间
+                # 新发生的事件仍在缓冲里，可从锚点补回
+                self.wfile.write(sse_frame(None, {"type": "resync", "seq": bus.current_seq}))
+            # last_written 取实际写出的第一条 seq-1：回合扩展补发会故意从
+            # turn_start 起重发客户端已应用过的段落（页面刷新场景需要完整
+            # 回合开头），去重闸门由客户端按它自己的渲染记录做，这里只管
+            # 网络层不重复写同一条
+            last_written = (items[0][0] - 1) if items else (position if position is not None else 0)
+            for seq, event in items:
+                self.wfile.write(sse_frame(seq, event))
+                last_written = seq
+            self.wfile.write(sse_frame(None, {"type": "caught_up", "running": bus.running}))
+            while True:
+                try:
+                    item = sub.get(timeout=15)
+                except Exception:  # queue.Empty：15 秒无事件
+                    self.wfile.write(SSE_HEARTBEAT)  # 心跳只在网络连接上（见 events.py）
+                    continue
+                if item is None:
+                    break  # 会话被删除（bus.close 的哨兵）：结束连接
+                seq, event = item
+                if seq <= last_written:
+                    continue  # 订阅队列与补发快照的重叠段
+                self.wfile.write(sse_frame(seq, event))
+                last_written = seq
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # 客户端断开/刷新：常驻连接的常态（每 15 秒心跳也会在连接死后
+            # 抛出），安静收尾。回合不受影响——事件进缓冲，重连可补
+            pass
+        finally:
+            bus.unsubscribe(sub)
 
     def _handle_chat_stop(self):
         """停止指定任务的生成：给 Agent 的停止开关置位。
 
         看护线程随即掐断 LLM 连接，agent.run 带着已生成的部分内容收尾，
-        SSE 上照常收到 done(stopped=true)。这里刻意不拿全局锁——
+        事件流上照常收到 done(stopped=true) + turn_end。这里刻意不拿全局锁——
         恰恰是生成卡住时，停止请求必须还能进来。
         """
         sid = str(self._body().get("session_id") or "")
@@ -626,15 +780,6 @@ class Handler(SimpleHTTPRequestHandler):
         agent.stop()
         log.info("[会话 %s] 用户请求停止生成", sid)
         self._json({"ok": True, "running": True})
-
-    def _finish_round(self, sid: str, agent: Agent) -> bool:
-        """增量落盘本轮新增消息；返回是否触发过整会话 ord 重编号（前端据此
-        重拉时间线，见 db._renumber_session_ords）。"""
-        db.save_messages(sid, agent.history, agent.saved)  # 增量落盘本轮新增消息
-        db.touch_session(sid)
-        renumbered = sid in db.renumbered_sessions
-        db.renumbered_sessions.discard(sid)
-        return renumbered
 
     # ---------- 任务消息（分页回放 + 归档全文） ----------
 
@@ -662,15 +807,17 @@ class Handler(SimpleHTTPRequestHandler):
             role = m.get("role")
             if role not in ("user", "assistant", "compact"):
                 continue  # 工具消息/带 tool_calls 的中间 assistant 不进时间线
+            # mid 一并带回：它是事件流（delta/done/turn_end.user_mid）与时间线
+            # 之间的关联键——前端补发去重（"这回合已在时间线里"）靠它比对
             if m.get("_artifact"):
-                items.append({"role": role, "content": "", "ord": m["_ord"],
+                items.append({"role": role, "content": "", "ord": m["_ord"], "mid": m["_mid"],
                               "artifact": True, "path": m.get("path"),
                               "bytes": m.get("bytes"), "head": m.get("head"),
                               "stats": m.get("_stats")})
             elif m.get("content"):
                 # 助手消息带回耗时/token 统计（回放渲染用，来自 message_usage 表）
                 items.append({"role": role, "content": m["content"], "ord": m["_ord"],
-                              "stats": m.get("_stats")})
+                              "mid": m["_mid"], "stats": m.get("_stats")})
         # has_more：本页最小 ord 之前还有更早的消息（向上翻页入口的显隐依据）
         has_more = bool(items) and db.has_messages_before(sid, items[0]["ord"])
         self._json({"messages": items, "has_more": has_more})

@@ -54,7 +54,7 @@ Agent 的工作区默认是项目根目录的 `workspace/`（首次运行会自�
 | `backend/llm_client.py`（AnthropicMessagesClient） | ★ 协议适配层：Anthropic Messages 的双向转换（system 顶层、tool_use/tool_result 块、input_json_delta 分片），对外暴露同样的接口，agent.py 零改动 |
 | `backend/agent.py` | ★ **核心循环**：消息历史管理、工具调用回合、过程轨迹、防死循环；上下文压缩（`_visible_history` 模型视图 + `_maybe_compact`） |
 | `backend/app.py` | 不用框架怎么写 Web 服务：路由、JSON API、SSE 流式、静态托管、并发锁 |
-| `frontend/app.js` | 原生 JS 怎么调 API：fetch、DOM 渲染、textContent 防 XSS、ReadableStream 手动解析 SSE |
+| `frontend/app.js` | 原生 JS 怎么调 API：fetch、EventSource 常驻事件流（断线自动重连）、DOM 渲染、textContent 防 XSS |
 
 ## 一轮工具调用期间，消息历史长什么样
 
@@ -100,7 +100,9 @@ schema 升级用 `PRAGMA user_version` + 有序迁移列表（`db.MIGRATIONS`）
 
 | 接口 | 方法 | 说明 |
 |---|---|---|
-| `/api/chat/stream` | POST | **流式问答（SSE）**：`session` 事件先行（返回任务 id），之后逐个推送 `round` / `answer_delta` / `tool_call` / `tool_result` / `usage`（token、耗时、上下文构成、缓存命中率）/ `done` / `compacted`（回答结束后若自动压缩了早期对话，携带摘要与压缩后的容量） / `error` |
+| `/api/sessions` | POST | **提交输入并创建任务**（命令接口）：立即返回 `{session_id, nonce}`，回合在后台按会话锁串行执行 |
+| `/api/sessions/<id>/messages` | POST | **提交输入**（命令接口）：同上，任务已存在时用 |
+| `/api/sessions/<id>/events` | GET | **常驻事件流（SSE）**：回合过程事件的唯一出口。每事件带会话内自增 `seq`（`id:` 行）；`turn_start`（回合开始，带输入原文与 nonce 回令）/ `round`（带回答段落 mid，前端按 mid 归并 delta）/ `reasoning_delta` / `answer_delta` / `tool_call` / `tool_result` / `usage` / `done` / `compacted` / `error` / `turn_end`。断线重连带 `Last-Event-ID` 头或 `?since=`，环形缓冲（500 条）补发缺口，缺口过大发 `resync` 让前端全量刷新；15 秒 `: ping` 心跳防代理掐连接 |
 | `/api/sessions` | GET / DELETE | 任务列表（id/标题/更新时间）；`?session_id=` 删除任务 |
 | `/api/sessions/<id>/messages` | GET | 某任务的历史消息（分页回放，默认最近 100 条；`?before_ord=&limit=` 向上翻页；助手消息附带当时的耗时/token 统计；归档消息带 `artifact/path/head` 摘要字段） |
 | `/api/sessions/<id>/artifact` | GET | `?path=` 读取外置归档消息的完整原文（realpath 白名单校验，防路径逃逸与跨任务读取） |
@@ -119,7 +121,7 @@ schema 升级用 `PRAGMA user_version` + 有序迁移列表（`db.MIGRATIONS`）
 | `/api/tools` | GET | 已注册工具的 schema |
 | `/api/reset` | POST | 清空服务端对话历史 |
 
-几个值得注意的后端设计：配置变更后按需重建 Agent 但**保留对话历史**；`POST /api/chat` 全程持锁，避免并发请求弄乱历史；未配置 Key 时返回 400 加友好提示，而不是让服务崩掉。
+几个值得注意的后端设计：配置变更后按需重建 Agent 但**保留对话历史**；同一任务的回合按会话锁在后台线程串行（并发提交自然排队，不同任务并行）；命令与事件解耦——POST 只入队立即返回，过程事件全部经每会话一条的事件总线（统一发布口 + 环形缓冲 + seq 持久化）走常驻 SSE 通道，刷新页面/断网恢复都能按 seq 补发接上正在进行的回合；未配置 Key 时返回 400 加友好提示，而不是让服务崩掉。
 
 ## 关键设计点（都藏在代码注释里）
 
@@ -133,7 +135,7 @@ schema 升级用 `PRAGMA user_version` + 有序迁移列表（`db.MIGRATIONS`）
 5. **`max_rounds` 强制止损（默认 16）**——防止模型陷入"调工具→不满意→再调"的死循环烧钱；coding 任务一轮要多次往返，所以比普通问答的 8 大。
 6. **calculator 不用 `eval`**——用 ast 白名单只允许四则运算，防止模型（或注入）执行任意代码。
 7. **前端一律用 `textContent` 渲染**——不拼 `innerHTML`，天然防 XSS。
-8. **流式链路（四层各有关卡）**——① LLM 层：`stream: true` 时工具调用是**分片**到达的，必须按 `index` 累积拼接 arguments；`stream_options: include_usage` 拿 token 用量（服务商不支持时自动降级重试）；② Agent 层：核心循环重构为 `run()` 生成器，边跑边产出事件，usage 跨轮累计；③ 后端：SSE 推送，刻意用 HTTP/1.0"关闭连接即结束"语义，免写 chunked 分块，且 `wbufsize=0` 保证每次 write 直接到网络；④ 前端：POST 不能用 EventSource，用 `fetch` + `ReadableStream` 按空行切分事件手动解析。
+8. **流式链路（四层各有关卡）**——① LLM 层：`stream: true` 时工具调用是**分片**到达的，必须按 `index` 累积拼接 arguments；`stream_options: include_usage` 拿 token 用量（服务商不支持时自动降级重试）；② Agent 层：核心循环重构为 `run()` 生成器，边跑边产出事件，usage 跨轮累计；③ 后端：SSE 推送，刻意用 HTTP/1.0"关闭连接即结束"语义，免写 chunked 分块，且 `wbufsize=0` 保证每次 write 直接到网络；④ 前端：EventSource 常驻连接 events 通道（浏览器自动重连并携带 Last-Event-ID），本地 localStorage 记每会话最近 seq，刷新后 `?since=` 补发接上进行中的回合；delta 按消息 mid 归并进同一气泡。
 9. **工作区按任务隔离 + ToolContext 注入**——每个任务的工作区解析链是"任务自选 → 用户默认 → `.env` 的 `WORKSPACE_DIR` / 项目 `workspace/`"，结果不进全局环境变量，而是随 `ToolContext`（工作区、本轮图片、看图后端）注入到每次工具调用——切换某个任务的工作区不影响其他正在跑的任务，并发会话也不会串图片数据。选目录的接口只做最小校验（存在、非根目录），因为它的前提是"本机信任圈工具"。
 10. **上下文容量估算**——没有本地分词器，用"服务商返回的真实 prompt_tokens ÷ 上次请求总字符数"校准出每字符 token 系数，再按 系统提示词/工具定义/用户消息/助手回复/工具结果 的字符占比分摊——估算值，但量级和占比可信；缓存命中率直接用 DeepSeek 返回的 `prompt_cache_hit_tokens / prompt_cache_miss_tokens`。
 11. **任务（多会话）**——每个任务一个独立 Agent 实例（独立对话历史），标题取第一条提问；模型配置变更后按需重建实例但保留历史。任务、消息（含每条助手消息的耗时/token 统计，存在消息的 `_stats` 内部字段里）都落盘 SQLite，重启不丢；发给模型前会剥离 `_` 前缀的内部字段（部分服务商会拒绝未知字段）。
@@ -172,7 +174,7 @@ schema 升级用 `PRAGMA user_version` + 有序迁移列表（`db.MIGRATIONS`）
 4. **repo map**：用 `tree_sitter`（需要 pip 装包）抽取工作区所有函数/类签名，按引用频率排序，在 Agent 读文件前先给它"全库骨架"（Aider 的核心思路）。
 5. **Docker 隔离**：把 `run_bash` 的执行从本机换成 `docker run` 容器内，体会真正的执行隔离。
 6. **多会话支持**：现在全局只有一个 Agent，试着加 `session_id`，用字典管理多个会话的 history。
-7. **过程事件实时推送的极限版**：把 SSE 升级成 WebSocket 双向通道，或加"停止生成"按钮（前端中断 fetch，后端感知断连后终止生成器）。
+7. **过程事件实时推送的再进一步**：事件流已是常驻 SSE + seq 补发（断线/刷新都接得上）；再往后可以做多设备 presence（谁在看这个任务）、或把更多命令（改名/置顶）也并进同一条事件通道。
 
 ## 目录结构
 

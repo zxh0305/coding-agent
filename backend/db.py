@@ -184,6 +184,11 @@ MIGRATIONS: list[tuple[int, str | None]] = [
         "    stats_json TEXT,\n"
         "    PRIMARY KEY(session_id, mid)\n"
         ")"),
+    # 8：常驻事件流（SSE）的事件流水号 last_seq。每条业务事件发布后 +1 落库，
+    #    重启后新事件从它继续、绝不归零——否则重启前后的事件会撞号，客户端
+    #    的 seq 去重闸门会把新事件误判为"已应用过"而丢弃。注意 seq 是【事件】
+    #    的流水号，与消息的 mid（稳定身份）是两套体系，互不通用。
+    (8, "ALTER TABLE sessions ADD COLUMN last_seq INTEGER DEFAULT 0"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -211,6 +216,8 @@ def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
     if version == 7:
         return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                                  "AND name='message_usage'").fetchone())
+    if version == 8:           # sessions.last_seq
+        return "last_seq" in _table_columns(conn, "sessions")
     return False
 
 
@@ -410,6 +417,23 @@ def set_session_workspace(sid: str, path: str) -> None:
 def touch_session(sid: str) -> None:
     with _conn() as conn:
         conn.execute("UPDATE sessions SET updated=? WHERE id=?", (time.time(), sid))
+
+
+def get_last_seq(sid: str) -> int:
+    """会话事件流（SSE）的最新 seq。会话不存在返回 0（等价于"从头开始"）。"""
+    with _conn() as conn:
+        row = conn.execute("SELECT last_seq FROM sessions WHERE id=?", (sid,)).fetchone()
+    return int(row["last_seq"]) if row and row["last_seq"] is not None else 0
+
+
+def set_last_seq(sid: str, seq: int) -> None:
+    """记录会话事件流的最新 seq（每条事件发布后调用一次）。
+    WAL + synchronous=NORMAL 下一行 UPDATE 是微秒级，流式 delta 的间隔
+    （几十毫秒）里绰绰有余，换来"客户端见过的 seq 重启后绝不回退"的强保证。
+    标量 MAX 保证只前进：乱序到达的旧值不会把计数器拉回去。"""
+    with _conn() as conn:
+        conn.execute("UPDATE sessions SET last_seq=MAX(COALESCE(last_seq,0),?) WHERE id=?",
+                     (int(seq), sid))
 
 
 def list_sessions(user_id: int) -> list[dict]:
