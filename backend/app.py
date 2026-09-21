@@ -206,6 +206,9 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                                        "这回合已在时间线里"
     回答类事件额外带 mid（本轮回答段落的身份）：前端把同一 mid 的 delta
     归并进同一个气泡——与历史消息的 mid 同一体系，补发与时间线才能对上。
+    reasoning_delta 是例外：它【不带 mid】。推理不是回答，带 mid 会让前端把
+    思考过程归并进回答气泡（同一 mid = 同一气泡），正文区就出现了思考过程；
+    它在「执行过程」面板里有自己的块，靠 round 事件切换归属。
     """
     bus = _event_bus(sid)
     with _session_lock(sid):
@@ -223,8 +226,13 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                     if kind == "round":
                         seg_mid = uuid.uuid4().hex[:12]
                         bus.publish({"type": "round", "mid": seg_mid, **payload})
-                    elif kind in ("answer_delta", "reasoning_delta", "done"):
+                    elif kind in ("answer_delta", "done"):
                         bus.publish({"type": kind, "mid": seg_mid, **payload})
+                    elif kind == "reasoning_delta":
+                        # 思考过程不是回答：绝不带 seg_mid。带上的话前端会把推理
+                        # 归并进回答气泡（同一 mid = 同一气泡），推理文字就冒充了
+                        # 正文——思考流在「执行过程」面板里有自己的块，不需要 mid。
+                        bus.publish({"type": kind, **payload})
                     else:
                         bus.publish({"type": kind, **payload})
                     if kind in ("usage", "compacted"):  # 最新上下文容量，供 /api/context

@@ -1759,14 +1759,16 @@ function applyEvent(evt, seq) {
     curMid = evt.mid;  // 本轮回答段落的 mid：后续 delta/done 归并的键
   } else if (t === "reasoning_delta") {
     // 思考模型的推理过程实时流进「执行过程」面板当前轮次下方：
-    // 思考阶段再长界面也有动静，不会再像假死；面板收起后不占聊天区
+    // 思考阶段再长界面也有动静，不会再像假死；面板收起后不占聊天区。
+    // 推理与回答是两个流：这里绝不带 mid（后端也不再发），否则同一 mid 会
+    // 把推理归并进回答气泡——思考过程冒充正文正是要杜绝的那个 bug。
     if (!thinkEl) {
       ensureTrace();
       thinkEl = document.createElement("div");
       thinkEl.className = "think-line";
       traceEl.appendChild(thinkEl);  // 不走 appendTrace：思考流不算一步
     }
-    queueStreamDelta("think", evt.mid, evt.delta);
+    queueStreamDelta("think", null, evt.delta);
   } else if (t === "answer_delta") {
     queueStreamDelta("answer", evt.mid, evt.delta);
   } else if (t === "tool_call") {
@@ -1785,8 +1787,28 @@ function applyEvent(evt, seq) {
     pendingDeltas = new Map(); pendingThink = "";  // 完整回答直接覆盖，丢弃未刷的增量，防止 rAF 晚到追加旧文本
     const b = ensureLiveMsg(evt.mid);
     b.el.classList.remove("streaming");
-    b.text = evt.answer;
-    b.el.textContent = evt.answer;
+    // done.answer 是权威正文，但只在它"确有内容"时才覆盖气泡：
+    // 为空（模型本轮只产出推理）或与本轮已收到的增量不符时整体覆盖，会把
+    // 推理文字或空白写进正文区——思考过程属于「执行过程」面板，不是回答。
+    const authoritative = typeof evt.answer === "string" ? evt.answer : "";
+    if (!authoritative) {
+      // 正文为空：保留已流出的增量（若有），一条都没有则不留空白气泡
+      b.text = b.text || "";
+      if (!b.text) b.el.remove();
+      else b.el.textContent = b.text;
+    } else if (authoritative === b.text) {
+      b.el.textContent = b.text;  // 与增量一致：照常定稿
+    } else if (b.text && !authoritative.includes(b.text)) {
+      // 服务端正文与已渲染增量对不上（疑似推理混入/乱序）：保留用户已看到的
+      // 流式内容，不整体覆盖，并留一行提示便于排查
+      const warn = document.createElement("div");
+      warn.className = "meta";
+      warn.textContent = "（本轮回答与流式内容不一致，已保留流式版本）";
+      chatEl.appendChild(warn);
+    } else {
+      b.text = authoritative;
+      b.el.textContent = authoritative;
+    }
     clearInterval(metaTimer);
     metaEl.textContent = metaText(evt.elapsed_s, evt.usage);
     if (evt.mid) historyMids.add(evt.mid);  // 已在屏上：防后续补发重复渲染

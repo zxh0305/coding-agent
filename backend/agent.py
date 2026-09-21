@@ -329,7 +329,8 @@ class Agent:
           ("round",           {"round": n, "wrap_up"?: True})    开始第 n 轮；wrap_up=True
                                                               标记收尾轮（跑满 max_rounds
                                                               后的禁工具总结轮）
-          ("reasoning_delta", {"delta": "..."})              思考模型的推理片段（仅实时展示，不进历史）
+          ("reasoning_delta", {"delta": "..."})              思考模型的推理片段（仅实时展示，不进历史；
+                                                             worker 转发时不带 mid——推理不是回答）
           ("answer_delta",    {"delta": "..."})              LLM 正在输出的文字片段
           ("tool_call",       {"name", "arguments"})         模型请求调用工具
           ("permission_request", {"id", "tool", "input",     权限闸门命中 ask：回合
@@ -541,6 +542,13 @@ class Agent:
         stopped_reason：非 None 时附加到 done payload（收尾轮用它标记
         "max_rounds"），其余字段与正常 done 完全一致。"""
         answer = assistant_msg.get("content") or ""
+        # 空回答兜底：模型这一轮只产出了推理、没有正文（或推理被服务商混进
+        # content 后由 llm_client 剥离）时，不能把空串当回答——前端 done 分支
+        # 会用 evt.answer 整体覆盖气泡，空串会留下一句也没说的空白气泡。
+        # 这里换成一句明确说明，落库与展示都自洽。
+        if not answer:
+            answer = "（本轮没有产出文字回答；推理过程见执行过程）"
+            log.warning("本轮 LLM 未返回正文内容，已用占位说明收尾")
         elapsed = round(time.time() - metrics["start"], 1)
         self.history.append({"role": "assistant", "content": answer,
                              "_stats": {"elapsed_s": elapsed, "usage": dict(usage_total),

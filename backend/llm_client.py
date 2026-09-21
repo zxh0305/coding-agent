@@ -310,6 +310,7 @@ class OpenAIChatClient:
         _arm_cancel_watchdog(resp, cancel)
 
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []  # 推理累积（只用于下面的兜底判断，不进 message）
         calls: dict[int, dict] = {}  # tool_calls 的 index -> 累积中的调用
         usage: dict | None = None
         start = time.time()
@@ -343,6 +344,7 @@ class OpenAIChatClient:
                         # 思考模型的推理过程先于正文流出。不透传的话，整个思考阶段
                         # 界面毫无动静（socket 读被心跳/思考流喂着不会触发超时），
                         # 用户只能看着光标闪、误以为卡死。推理内容只做实时展示，不进历史。
+                        reasoning_parts.append(reasoning)
                         yield "reasoning_delta", reasoning
                     if delta.get("content"):
                         content_parts.append(delta["content"])
@@ -363,7 +365,15 @@ class OpenAIChatClient:
                     raise RuntimeError("LLM 连接中断（网络断开或读取超时）") from None
                 # cancel 置位导致的断连：当作正常结束，带着已收到的部分收尾
 
-        message: dict = {"role": "assistant", "content": "".join(content_parts) or None}
+        content = "".join(content_parts)
+        # 推理冒充正文的防御：极少数服务商（或网关转换层）把推理内容也塞进
+        # content 分片，此时正文流与推理流逐字符相同。正文是空串会让前端在
+        # done 时把推理覆盖成回答气泡（正文区出现\"思考过程\"），这里退回 None，
+        # 由 agent._tail_answer 兜底成空回答——推理已在「执行过程」面板展示过。
+        if content and content == "".join(reasoning_parts):
+            log.warning("检测到 content 与推理内容完全相同（疑似服务商把推理混入正文），已按空回答处理")
+            content = ""
+        message: dict = {"role": "assistant", "content": content or None}
         if calls:
             message["tool_calls"] = [
                 {
