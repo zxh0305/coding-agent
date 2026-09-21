@@ -667,26 +667,55 @@ function compactCard(summary) {
   return d;
 }
 
-// ---------- 图片灯箱：点气泡里的缩略图 → 全屏查看 + 复制 ----------
+// ---------- 图片灯箱：点缩略图 → 全屏查看（多图左右切换 + 缩放 + 复制） ----------
 // 全局单例：任意消息（实时/历史/归档还原）里的 .msg-img 点击后都进这里。
-// 复制优先 Clipboard API 的 image/png；失败降级为「已打开图片，可右键复制」。
-function openLightbox(src) {
+// openLightbox(src) 单图；openLightbox(src, gallery, idx) 传入同组图片数组
+// （整条消息的全部图片）后可左右切换。缩放：+/−/重置按钮、滚轮、键盘。
+let lbScale = 1;
+
+function openLightbox(src, gallery, idx) {
   closeLightbox();
+  lbScale = 1;
+  const list = Array.isArray(gallery) && gallery.length ? gallery : [src];
+  let cur = Math.max(0, idx || 0);
+
   const box = document.createElement("div");
   box.className = "lightbox";
   const img = document.createElement("img");
-  img.src = src;
+  img.className = "lb-img";
   const actions = document.createElement("div");
   actions.className = "lightbox-actions";
   const hint = document.createElement("div");
   hint.className = "lightbox-hint";
-  hint.textContent = "点击图片或空白处恢复，按 Esc 关闭";
+
+  const apply = () => {
+    img.src = list[cur];
+    img.style.transform = `scale(${lbScale})`;
+    const n = list.length > 1 ? `（${cur + 1}/${list.length}）` : "";
+    hint.textContent = `${Math.round(lbScale * 100)}%${n} · 点击图片或空白处恢复，Esc 关闭，←/→ 切换`;
+    prev.style.visibility = list.length > 1 ? "visible" : "hidden";
+    next.style.visibility = list.length > 1 ? "visible" : "hidden";
+  };
+  const setScale = (s) => { lbScale = Math.min(5, Math.max(0.2, s)); apply(); };
+  const step = (d) => { cur = (cur + d + list.length) % list.length; lbScale = 1; apply(); };
+
+  // 左右切换箭头（多图才显示）
+  const mkNav = (label, d) => {
+    const b = document.createElement("button");
+    b.className = "lb-nav";
+    b.textContent = label;
+    b.addEventListener("click", (e) => { e.stopPropagation(); step(d); });
+    return b;
+  };
+  const prev = mkNav("‹", -1), next = mkNav("›", 1);
+
   const copy = document.createElement("button");
   copy.textContent = "📋 复制图片";
-  copy.addEventListener("click", async () => {
+  copy.addEventListener("click", async (e) => {
+    e.stopPropagation();
     try {
       // data URI → blob（png/jpeg 都转成 png 写剪贴板，应用通用）
-      const blob = await (await fetch(src)).blob();
+      const blob = await (await fetch(list[cur])).blob();
       await navigator.clipboard.write([new ClipboardItem({ [blob.type || "image/png"]: blob })]);
       copy.textContent = "✓ 已复制";
       setTimeout(() => (copy.textContent = "📋 复制图片"), 1500);
@@ -696,32 +725,57 @@ function openLightbox(src) {
       hint.style.color = "rgba(255,255,255,.85)";
     }
   });
-  actions.append(copy);
-  box.append(img, actions, hint);
-  // 点放大的图片本身或空白处都关闭：不需要找特定按钮
-  const closeOnClick = (e) => { closeLightbox(); };
-  img.addEventListener("click", closeOnClick);
+  const zoomOut = document.createElement("button");
+  zoomOut.textContent = "−";
+  zoomOut.addEventListener("click", (e) => { e.stopPropagation(); setScale(lbScale - 0.25); });
+  const zoomIn = document.createElement("button");
+  zoomIn.textContent = "＋";
+  zoomIn.addEventListener("click", (e) => { e.stopPropagation(); setScale(lbScale + 0.25); });
+
+  actions.append(zoomOut, copy, zoomIn);
+  box.append(prev, img, next, actions, hint);
+  // 点放大的图片本身恢复原样；空白处关闭；滚轮缩放
+  img.addEventListener("click", () => closeLightbox());
   box.addEventListener("click", (e) => { if (e.target === box) closeLightbox(); });
-  document.addEventListener("keydown", lightboxEsc);
+  box.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    setScale(lbScale * (e.deltaY < 0 ? 1.12 : 0.89));
+  }, { passive: false });
+  document.addEventListener("keydown", lightboxKeys);
   document.body.appendChild(box);
+  apply();
+
+  function lightboxKeys(e) {
+    if (e.key === "Escape") closeLightbox();
+    else if (e.key === "ArrowLeft") step(-1);
+    else if (e.key === "ArrowRight") step(1);
+    else if (e.key === "+" || e.key === "=") setScale(lbScale + 0.25);
+    else if (e.key === "-") setScale(lbScale - 0.25);
+    else if (e.key === "0") setScale(1);
+  }
 }
-function lightboxEsc(e) { if (e.key === "Escape") closeLightbox(); }
 function closeLightbox() {
   document.querySelector(".lightbox")?.remove();
-  document.removeEventListener("keydown", lightboxEsc);
+  document.removeEventListener("keydown", lightboxKeys);
 }
 
-// 气泡里的消息图片统一走这里：带点击放大 + 复制
-function msgImage(src) {
+// 气泡里的消息图片统一走这里：带点击放大 + 复制。
+// 同一条消息的多张图自动编成一组（点击任意一张后可左右切换）。
+function msgImage(src, gallery) {
   const img = document.createElement("img");
   img.src = src;
   img.className = "msg-img clickable";
   img.title = "点击放大";
-  img.addEventListener("click", () => openLightbox(src));
+  if (gallery && gallery.length > 1) {
+    const idx = Math.max(0, gallery.indexOf(src));
+    img.addEventListener("click", () => openLightbox(src, gallery, idx));
+  } else {
+    img.addEventListener("click", () => openLightbox(src));
+  }
   return img;
 }
 
-// 带附件的用户气泡：文字 + 图片缩略图/文件名
+// 带附件的用户气泡：文字 + 图片缩略图（多图走 2 列网格）/文件名
 function buildUserBubble(text, atts) {
   const div = document.createElement("div");
   div.className = "bubble user";
@@ -730,9 +784,11 @@ function buildUserBubble(text, atts) {
     t.textContent = text;
     div.appendChild(t);
   }
+  const imgs = (atts || []).filter(a => a.kind === "image" && a.preview);
+  const sources = imgs.map(a => a.preview);  // 同组：灯箱左右切换的序列
   for (const a of atts || []) {
     if (a.kind === "image" && a.preview) {
-      div.appendChild(msgImage(a.preview));
+      div.appendChild(msgImage(a.preview, sources));
     } else {
       const f = document.createElement("div");
       f.className = "att-file";
@@ -740,6 +796,7 @@ function buildUserBubble(text, atts) {
       div.appendChild(f);
     }
   }
+  if (imgs.length > 1) div.classList.add("multi-img");
   return div;
 }
 
@@ -1824,11 +1881,10 @@ function queueMessage(text, payloadAtts) {
   const t = document.createElement("div");
   t.textContent = text || "（仅附件）";
   wrap.appendChild(t);
-  for (const a of payloadAtts) {
-    if (a.kind === "image") {
-      wrap.appendChild(msgImage(`data:${a.mime};base64,${a.data}`));
-    }
-  }
+  const qimgs = payloadAtts.filter(a => a.kind === "image")
+    .map(a => `data:${a.mime};base64,${a.data}`);
+  for (const src of qimgs) wrap.appendChild(msgImage(src, qimgs));
+  if (qimgs.length > 1) wrap.classList.add("multi-img");
   const actions = document.createElement("div");
   actions.className = "queue-actions";
   const mk = (label, fn, cls) => {

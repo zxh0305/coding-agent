@@ -506,6 +506,14 @@ button.primary:hover { background: #3d69d8; }
   max-width: 220px; max-height: 180px;
   border-radius: 8px; margin-top: 6px; display: block;
 }
+/* 多图消息：缩略图 2 列网格铺排（略图墙），点击进灯箱左右切换 */
+.bubble.multi-img .msg-img {
+  max-width: 100%; width: 100%; height: 150px; object-fit: cover;
+  margin-top: 0;
+}
+.bubble.multi-img { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.bubble.multi-img > div:not(.msg-img),
+.bubble.multi-img > .att-file { grid-column: 1 / -1; }  /* 文字/文件名占满整行 */
 
 /* 可点击放大的图片：hover 光标与轻微提示 */
 .msg-img.clickable { cursor: zoom-in; transition: filter .15s; }
@@ -522,12 +530,22 @@ button.primary:hover { background: #3d69d8; }
   max-width: 92vw; max-height: 78vh;
   border-radius: 8px; box-shadow: 0 8px 40px rgba(0, 0, 0, .5);
   cursor: zoom-out;  /* 点放大的图片本身即恢复原样 */
+  transition: transform .12s;
 }
+.lb-nav {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 44px; height: 44px; border: none; border-radius: 50%;
+  background: rgba(255, 255, 255, .14); color: #fff; font-size: 26px;
+  cursor: pointer; line-height: 1;
+}
+.lb-nav:hover { background: rgba(255, 255, 255, .3); }
+.lb-nav:first-child { left: 18px; }
+.lb-nav:nth-child(3) { right: 18px; }  /* prev, img, next 固定次序 */
 .lightbox-actions { display: flex; gap: 10px; }
 .lightbox-actions button {
-  padding: 7px 16px; border: none; border-radius: 8px;
-  background: rgba(255, 255, 255, .14); color: #fff; font-size: 13.5px;
-  cursor: pointer;
+  padding: 7px 14px; border: none; border-radius: 8px;
+  background: rgba(255, 255, 255, .14); color: #fff; font-size: 14px;
+  cursor: pointer; min-width: 40px;
 }
 .lightbox-actions button:hover { background: rgba(255, 255, 255, .26); }
 .lightbox-hint { color: rgba(255, 255, 255, .55); font-size: 12.5px; }
