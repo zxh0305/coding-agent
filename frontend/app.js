@@ -1137,6 +1137,14 @@ function handleStreamEvent(evt) {
     usageNow = { prompt_tokens: evt.prompt_tokens, context: evt.context, cache_hit_rate: null };
     updateCtxChip();
     toast("早期对话已压缩为摘要，上下文占用已下降");
+  } else if (evt.type === "history_renumbered") {
+    // 服务端 ord 间隔耗尽兜底：整会话重编号过，before_ord 游标指向的旧序号
+    // 在新序号空间里落在哪完全随机——继续翻页会漏条目或重复。重拉整个时间线
+    // （绕过 switchSession 的同 id 早退）。罕见事件，整页重建的开销可接受。
+    toast("历史序号已重排，正在刷新时间线");
+    const keep = currentSession;
+    currentSession = null;
+    switchSession(keep);
   } else if (evt.type === "error") {
     flushStreamBuffers();  // 已生成的部分内容留在气泡里，再显示错误
     retireLiveBubble();

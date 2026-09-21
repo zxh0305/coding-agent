@@ -542,9 +542,11 @@ class Handler(SimpleHTTPRequestHandler):
             except RuntimeError as e:
                 log.exception("LLM 请求失败")
                 db.save_messages(sid, agent.history, agent.saved)  # 部分历史也落盘（增量）
+                db.renumbered_sessions.discard(sid)  # 信号只随正常响应走，错误路径清掉防串轮
                 return self._json({"error": str(e), "session_id": sid}, 502)
-            self._finish_round(sid, agent)
-            self._json({"session_id": sid, "answer": answer, "trace": agent.trace})
+            renumbered = self._finish_round(sid, agent)
+            self._json({"session_id": sid, "answer": answer, "trace": agent.trace,
+                        "history_renumbered": renumbered})
 
     def _handle_chat_stream(self):
         """流式问答：SSE。第一个事件是 session（告知前端任务 id），之后是过程事件。"""
@@ -597,6 +599,16 @@ class Handler(SimpleHTTPRequestHandler):
                 written = db.save_messages(sid, agent.history, agent.saved)
                 db.touch_session(sid)
                 log.info("[会话 %s] 本轮落盘 %d 行", sid, written)
+                # 间隔耗尽兜底触发过整会话重编号：分页游标（before_ord 指向的
+                # 是旧序号空间）全部失效，推事件让前端重拉时间线。连接可能已被
+                # 客户端关掉（finally 里常见），推不出去就算了——前端下次进入
+                # 任务时会全量重建游标，不影响正确性。
+                if sid in db.renumbered_sessions:
+                    db.renumbered_sessions.discard(sid)
+                    try:
+                        send_event({"type": "history_renumbered"})
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
 
     def _handle_chat_stop(self):
         """停止指定任务的生成：给 Agent 的停止开关置位。
@@ -615,9 +627,14 @@ class Handler(SimpleHTTPRequestHandler):
         log.info("[会话 %s] 用户请求停止生成", sid)
         self._json({"ok": True, "running": True})
 
-    def _finish_round(self, sid: str, agent: Agent) -> None:
+    def _finish_round(self, sid: str, agent: Agent) -> bool:
+        """增量落盘本轮新增消息；返回是否触发过整会话 ord 重编号（前端据此
+        重拉时间线，见 db._renumber_session_ords）。"""
         db.save_messages(sid, agent.history, agent.saved)  # 增量落盘本轮新增消息
         db.touch_session(sid)
+        renumbered = sid in db.renumbered_sessions
+        db.renumbered_sessions.discard(sid)
+        return renumbered
 
     # ---------- 任务消息（分页回放 + 归档全文） ----------
 

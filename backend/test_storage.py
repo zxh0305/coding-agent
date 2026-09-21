@@ -56,6 +56,7 @@ class StorageTestBase(unittest.TestCase):
         db.DB_PATH = Path(self.tmp) / "test.db"
         db.init_db()
         db.create_session("s1", 1)
+        db.renumbered_sessions.clear()  # 模块级信号不是库状态，手动清保证用例隔离
 
     def tearDown(self):
         db.DB_PATH = self._orig_db_path
@@ -415,6 +416,100 @@ class TestModelViewExpansion(StorageTestBase):
         view = agent._messages_for_model()
         self.assertIn("读取失败", view[1]["content"])
         self.assertIn(m["head"][:50], view[1]["content"])  # head 预览还在
+
+
+# ---------------------------------------------------------------------------
+# 六、ord 间隔耗尽兜底：中点插不进整数时整会话重编号
+# ---------------------------------------------------------------------------
+
+class TestOrdExhaustion(StorageTestBase):
+    """背景：中点插入每次把间隔对半，同一对消息被反复插入会让间隔 1024/2^k
+    递减直至相邻；ord 无唯一约束，并列是静默的（分页游标漏条目/打转）。当前
+    压缩策略下插入点逐轮前移、不可达耗尽，但存储层不该赌调用方的插入模式。"""
+
+    def _seed_tight_pair(self):
+        """造出"间隔 1"的一对消息：_ord 已有的消息不会被 _assign_ords 覆盖。"""
+        left, right = user("左"), user("右")
+        left["_ord"], right["_ord"] = 5000, 5001
+        hist = [left, right]
+        saved = {}
+        db.save_messages("s1", hist, saved)
+        return hist, saved
+
+    def test_exhaustion_triggers_renumber_unique_monotonic_order_kept(self):
+        """间隔为 1 的位置插边界：触发重编号，所有 ord 唯一且严格单调、
+        消息顺序与插入前完全一致、重排为 ORD_GAP 倍数（边界落新间隔中点）。"""
+        hist, saved = self._seed_tight_pair()
+        hist.insert(1, boundary("耗尽位置的摘要"))  # 插进间隔为 1 的那一对
+        written = db.save_messages("s1", hist, saved)
+
+        self.assertIn("s1", db.renumbered_sessions)  # 信号已挂出（前端重拉时间线用）
+        msgs = db.get_messages("s1")
+        ords = [m["_ord"] for m in msgs]
+        self.assertEqual(len(ords), len(set(ords)))   # 唯一，无并列
+        self.assertEqual(ords, sorted(ords))          # 严格单调
+        self.assertEqual([m["content"] for m in msgs], ["左", "耗尽位置的摘要", "右"])
+        # 左/右重排为 0/GAP，边界取新间隔中点
+        self.assertEqual(ords, [0, db.ORD_GAP // 2, db.ORD_GAP])
+        # 重编号只 UPDATE ord 列、不碰内容指纹：本轮仅边界一条新行入库
+        self.assertEqual(written, 1)
+
+    def test_renumber_only_touches_that_session(self):
+        """重编号的有界性：只影响触发的会话，其他会话的 ord 与 content 逐字节不变。"""
+        db.create_session("s2", 1)
+        other = [user("别的会话1"), user("别的会话2")]
+        db.save_messages("s2", other, {})
+        ords2 = [(m["_mid"], m["_ord"]) for m in db.get_messages("s2")]
+        raw2 = self.row("SELECT group_concat(content) FROM messages WHERE session_id='s2'")[0]
+
+        hist, saved = self._seed_tight_pair()
+        hist.insert(1, boundary("摘要"))
+        db.save_messages("s1", hist, saved)
+
+        self.assertIn("s1", db.renumbered_sessions)
+        self.assertNotIn("s2", db.renumbered_sessions)
+        self.assertEqual([(m["_mid"], m["_ord"]) for m in db.get_messages("s2")], ords2)
+        self.assertEqual(self.row(
+            "SELECT group_concat(content) FROM messages WHERE session_id='s2'")[0], raw2)
+
+    def test_healthy_gap_never_renumbers(self):
+        """非耗尽场景不触发重编号：正常增量保存与中点插入的零重写不变式
+        不被兜底破坏（健康间隔的中点直接落位、幂等重存仍 0 写入）。"""
+        saved, history = {}, [user(f"m{i}") for i in range(8)]
+        db.save_messages("s1", history, saved)
+        history.insert(4, boundary("健康间隔的摘要"))  # 两侧 ord 相差 ORD_GAP
+        history.append(user("边界后"))
+        self.assertEqual(db.save_messages("s1", history, saved), 2)  # 边界+新消息
+        self.assertEqual(db.save_messages("s1", history, saved), 0)  # 幂等不变式仍在
+        self.assertNotIn("s1", db.renumbered_sessions)
+
+    def test_renumber_with_windowed_memory_stays_db_consistent(self):
+        """窗口恢复场景的耗尽：内存只是子集（边界之前还有库内消息），重编号
+        必须以库为准整会话重排、内存按 mid 对号入座，不得与窗口外的行撞号。"""
+        hist = []
+        for i in range(6):
+            m = user(f"m{i}")
+            m["_ord"] = i * db.ORD_GAP  # m0..m3 正常铺开
+            hist.append(m)
+        hist[4]["_ord"] = 3 * db.ORD_GAP + 1  # 尾部一对间隔 1（窗口内的耗尽点）
+        hist[5]["_ord"] = 3 * db.ORD_GAP + 2
+        saved = {}
+        db.save_messages("s1", hist, saved)
+
+        # 窗口式内存：锚点 m0 + 尾部 m4/m5，m1..m3 留在库里不进内存
+        window = [hist[0], hist[4], hist[5]]
+        window.insert(2, boundary("窗口内耗尽"))  # 插进间隔 1 的那对
+        db.save_messages("s1", window, db.fingerprints(window))
+
+        self.assertIn("s1", db.renumbered_sessions)
+        msgs = db.get_messages("s1")  # 全库 7 条：窗口外 4 条也必须已被重排
+        ords = [m["_ord"] for m in msgs]
+        self.assertEqual([m["content"] for m in msgs],
+                         ["m0", "m1", "m2", "m3", "m4", "窗口内耗尽", "m5"])
+        self.assertEqual(ords, sorted(ords))
+        self.assertEqual(len(ords), len(set(ords)))  # 窗口内外无一撞号
+        self.assertEqual(ords, [i * db.ORD_GAP for i in range(5)]
+                         + [4 * db.ORD_GAP + db.ORD_GAP // 2, 5 * db.ORD_GAP])
 
 
 if __name__ == "__main__":

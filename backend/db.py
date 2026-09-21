@@ -470,7 +470,8 @@ def fingerprints(msgs: list[dict]) -> dict[str, str]:
     return out
 
 
-def _assign_ords(conn: sqlite3.Connection, sid: str, history: list[dict]) -> None:
+def _assign_ords(conn: sqlite3.Connection, sid: str, history: list[dict],
+                 _renumbered: bool = False) -> None:
     """给历史里没有 _ord 的消息分配显示序（就地写回消息本体）。
 
     新消息只有两种来路，对应两种分配方式：
@@ -478,6 +479,28 @@ def _assign_ords(conn: sqlite3.Connection, sid: str, history: list[dict]) -> Non
     b) 夹在两条已知 ord 消息之间的孤立新消息（压缩刚插入的边界）——取两侧
        ord 的中点：唯一、单调、且不打扰任何已落盘消息的序号（间隔预留的
        目的就在这里，见 ORD_GAP 注释）。
+
+    间隔耗尽兜底：中点插入每次把间隔对半，同一对消息之间反复插入会让间隔
+    1024/2^k 递减直至相邻。实测当前 _maybe_compact 不会走到这一步——插入点
+    每轮至少前移 5 个槽位（cut ≥ head+MIN_SEGMENT，且活区起点在上一条边界
+    之后），同一对消息至多被插入一次，间隔最小折半到 512。但 _assign_ords
+    是存储层，它的正确性不该依赖 agent.py 插入模式这条【隐性跨模块不变式】：
+    换压缩策略、窗口恢复让锚点与边界在内存中相邻后再插入、防御分支命中，
+    都可能让同一对消息被反复插边界。而 ord 没有唯一约束，间隔耗尽后的中点
+    是【静默并列】而非报错——分页游标 ord<before_ord 会漏条目或打转，排序
+    正确性退化为靠 rowid 并列兜底。所以在真正写出并列之前触发整会话重编号
+    （_renumber_session_ords），把全部消息按当前顺序重排为 ORD_GAP 的倍数，
+    再重新放置新消息。
+
+    为什么重编号这个操作可接受：
+    1. 触发频率趋近于零（现有压缩策略下不可达，纯防御），且一旦触发、间隔
+       重新铺满 ORD_GAP，几十次压缩内不会再触发第二次；
+    2. 有界：只影响单个会话，一次性 O(N) 行 UPDATE（N=该会话消息数），
+       代价上封顶——对比的是"并列 ord 静默破坏分页与排序"这种数据级后果；
+    3. 重编号只动 ord 列。_ord 不进 content、不进内容指纹（指纹只算 content
+       字节），因此已有消息的内容零重写；若未来把 ord 编进 content/指纹，
+       重编号必须发生在指纹比较之前——save_messages 先 _assign_ords 再算
+       指纹的调用顺序已经保证了这一点。
     """
     if not history:
         return
@@ -505,10 +528,55 @@ def _assign_ords(conn: sqlite3.Connection, sid: str, history: list[dict]) -> Non
         nxt_has = history[i + 1].get("_ord")
         prev_ord = history[i - 1]["_ord"] if i > 0 else (
             (nxt_has - ORD_GAP) if nxt_has is not None else 0)
-        if nxt_has is not None:
-            m["_ord"] = (prev_ord + nxt_has) // 2  # 压缩边界：取两侧中点
-        else:
+        if nxt_has is None:
             m["_ord"] = prev_ord + ORD_GAP  # 防御：连续多条中段新消息，按追加链排
+            continue
+        if nxt_has - prev_ord <= 1:
+            # 间隔耗尽（相邻，插不进任何整数）。重编号后重启整个放置流程；
+            # 二次耗尽 = 数据已不一致（重编号铺满 ORD_GAP 后不可能再相邻），
+            # 此刻静默写出并列是最坏选择，响亮失败留给排查。
+            if _renumbered:
+                raise RuntimeError(f"会话 {sid} 重编号后仍无 ord 间隔可用，数据疑似不一致")
+            _renumber_session_ords(conn, sid, history)
+            _assign_ords(conn, sid, history, _renumbered=True)
+            return
+        m["_ord"] = (prev_ord + nxt_has) // 2  # 压缩边界：取两侧中点
+
+
+def _renumber_session_ords(conn: sqlite3.Connection, sid: str, history: list[dict]) -> None:
+    """间隔耗尽兜底：把该会话【全部】消息按当前顺序重排为 ORD_GAP 的倍数。
+
+    以数据库为准重排（窗口恢复时内存只是子集——锚点 + 边界之后的尾部，
+    边界之前的消息不在内存里，只改内存必然与库内行撞号），再按 mid 把新序
+    同步回内存历史。排序键 (ord, rowid) 与 get_messages 完全一致：即便库中
+    已存在并列 ord（旧代码写出的），两处看到的顺序也相同，重排不会翻转
+    时间线。重编号只 UPDATE ord 列——content 与指纹不动，已有消息的内容
+    零重写（见 _assign_ords 的论证）。
+
+    重排后记入 renumbered_sessions：app 层消费这个标记通知前端"分页游标已
+    失效、请重拉时间线"（before_ord 游标指向的是旧序号值，新序号空间里它
+    落在哪完全随机，继续用会漏条目或重复）。
+    """
+    rows = conn.execute("SELECT mid FROM messages WHERE session_id=? ORDER BY ord, rowid",
+                        (sid,)).fetchall()
+    fixed = {}
+    for i, r in enumerate(rows):
+        fixed[r["mid"]] = i * ORD_GAP
+        conn.execute("UPDATE messages SET ord=? WHERE session_id=? AND mid=?",
+                     (i * ORD_GAP, sid, r["mid"]))
+    for m in history:
+        mid = m.get("_mid")
+        if mid in fixed:
+            m["_ord"] = fixed[mid]
+    renumbered_sessions.add(sid)
+    log.warning("会话 %s 的 ord 间隔耗尽，已整会话重编号（%d 行，前端分页游标失效）",
+                sid, len(rows))
+
+
+# app 层消费：本轮 save_messages 是否触发过整会话重编号（消费后 discard）。
+# 挂在模块级而不是返回值里：save_messages 的返回值是"写入行数"，语义已被
+# 验收指标占用；重编号是罕见旁路事件，用集合把信号带给调用方最省事。
+renumbered_sessions: set[str] = set()
 
 
 def _write_artifact(sid: str, mid: str, blob: str) -> tuple[str, int]:
@@ -635,10 +703,13 @@ def get_messages(sid: str, since_ord: int | None = None,
             sql += " AND ord < ?"
             params.append(before_ord)
         if limit is not None:
-            sql += " ORDER BY ord DESC LIMIT ?"
+            # (ord, rowid) 双键：ord 并列时按插入序兜底。健康库不会并列（重编号
+            # 兜底保证），但旧数据可能已带并列——排序键必须与 _renumber_session_ords
+            # 一致，否则"读的顺序"和"重排的顺序"可能翻转时间线
+            sql += " ORDER BY ord DESC, rowid DESC LIMIT ?"
             params.append(int(limit))
         else:
-            sql += " ORDER BY ord"
+            sql += " ORDER BY ord, rowid"
         rows = conn.execute(sql, params).fetchall()
         if limit is not None:
             rows = list(reversed(rows))  # 回升序：时间线自上而下渲染
