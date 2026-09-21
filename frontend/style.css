@@ -87,6 +87,10 @@ body {
   flex: 1; overflow-y: auto; padding: 24px 10%;
   display: flex; flex-direction: column; gap: 12px;
 }
+/* 会话节奏：助手回答与它上方的用户消息拉开距离，形成"问—答"分组的呼吸感；
+   同一条回答内部的元素（trace/meta）仍靠原 gap 贴近。 */
+.bubble.user { margin-bottom: 4px; }
+.bubble.assistant, .bubble.error { margin-top: 6px; }
 
 .bubble {
   max-width: 76%; padding: 10px 14px; border-radius: 12px;
@@ -101,6 +105,64 @@ body {
   border-bottom-left-radius: 4px;
 }
 .bubble.error { background: #fdecec; border: 1px solid #f2b8b5; color: #b3261e; }
+
+/* ---------- 回答气泡里的 Markdown 排版 ---------- */
+/* 目的：让长回答有可扫读的骨架。之前所有内容都是 pre-wrap 纯文本，
+   标题/列表/代码块全退化成同字号同颜色的行——"看不到重点"的根因之一。
+   这里只负责块间距与强调，颜色仍沿用正文色。 */
+.bubble.md { white-space: normal; }          /* 交给块元素排版，不再整体 pre-wrap */
+.bubble.md > *:first-child { margin-top: 0; }
+.bubble.md > *:last-child { margin-bottom: 0; }
+
+.bubble.md .md-p { margin: 0 0 8px; line-height: 1.7; }
+.bubble.md .md-p:last-child { margin-bottom: 0; }
+
+/* 标题：加左侧色条 + 分级字号，长回答一眼能分段 */
+.bubble.md .md-h {
+  margin: 14px 0 8px; line-height: 1.4; font-weight: 700;
+  padding-left: 9px; border-left: 3px solid var(--accent);
+}
+.bubble.md .md-h1 { font-size: 17px; }
+.bubble.md .md-h2 { font-size: 15.5px; }
+.bubble.md .md-h3 { font-size: 14.5px; }
+.bubble.md .md-h4 { font-size: 14px; color: var(--text-2); }
+
+/* 列表：缩进 + 行距，比纯文本的 "- xxx" 明显更好扫读 */
+.bubble.md .md-list { margin: 0 0 8px; padding-left: 22px; }
+.bubble.md .md-list li { margin: 2px 0; line-height: 1.65; }
+
+/* 引用块：左侧灰条 */
+.bubble.md .md-quote {
+  margin: 0 0 8px; padding: 2px 0 2px 10px;
+  border-left: 3px solid #d4dae6; color: var(--text-2);
+}
+
+.bubble.md .md-hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+
+/* 行内代码：浅底等宽 */
+.bubble.md code {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12.5px; background: #eef1f7; border-radius: 4px;
+  padding: 1px 5px; color: #37415a;
+}
+
+/* 代码块：重点最集中的地方——独立底色、圆角、横向滚动、右上角语言标签 */
+.bubble.md .md-pre {
+  position: relative;
+  background: #f7f8fb; border: 1px solid #e4e8f0; border-radius: 8px;
+  padding: 10px 12px; margin: 0 0 8px;
+  overflow-x: auto;
+}
+.bubble.md .md-pre code {
+  background: none; padding: 0; font-size: 12px; line-height: 1.6;
+  color: #2a3142; white-space: pre;
+}
+.bubble.md .md-lang {
+  position: absolute; top: 6px; right: 10px;
+  font-size: 10px; color: var(--text-3);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  user-select: none;
+}
 
 /* 空会话占位：居中浅色提示，不占对话气泡的视觉重量 */
 .empty-hint {
@@ -169,14 +231,15 @@ body {
   color: #a0a8ba;
 }
 
-/* 思考模型的推理流：最浅灰小字，限高滚动，避免长思考把时间线撑爆 */
+/* 思考模型的推理流：最浅灰小字，限高滚动，避免长思考把时间线撑爆。
+   高度压到 140px：思考是过程噪声，展开时间线时也不该盖过工具行的信息量。 */
 .think-line {
   font-family: ui-monospace, Menlo, Consolas, monospace;
   font-size: 10.5px; line-height: 1.5;
   padding: 4px 0 4px 10px; border-left: 2px solid #eef1f7;
   margin: 6px 0 0 2px; white-space: pre-wrap; word-break: break-all;
   color: #aab1c2;
-  max-height: 180px; overflow-y: auto;
+  max-height: 140px; overflow-y: auto;
 }
 
 /* 工具调用/结果行：一行摘要，点开看完整内容。
@@ -193,6 +256,20 @@ body {
 /* 写入类（write_file/apply_patch）：提示色——改了哪些文件一眼可见 */
 .tl.write summary { color: #b45309; }
 .tl.write summary:hover { color: #8a4d0b; }
+/* 写入卡片：从一堆浅灰小行里"跳"出来，文件名是标题、增删是徽章。
+   读取/搜索仍是普通小行——噪声不该和写入抢注意力。 */
+.tl.card {
+  margin-top: 8px; padding: 7px 10px;
+  background: #fffaf2; border: 1px solid #f2d9b0; border-radius: 8px;
+}
+.tl.card summary { font-weight: 600; white-space: normal; }
+.tl.card summary.err { color: #b3261e; }
+.tl-badge {
+  display: inline-block; margin-left: 8px; padding: 0 6px;
+  font-size: 10.5px; font-weight: 600; line-height: 16px;
+  color: #8a4d0b; background: #fbe6c8; border-radius: 4px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
 .tl pre {
   font-family: ui-monospace, Menlo, Consolas, monospace;
   font-size: 11px; line-height: 1.5;
@@ -203,12 +280,17 @@ body {
 }
 
 /* 回答尾部的耗时 / token 统计 */
+/* 弱化：统计是次要信息，默认很浅，鼠标移到回答上才明显——不与正文争注意力 */
 .meta {
   align-self: flex-start;
   font-size: 11px; color: var(--text-3);
   font-family: ui-monospace, Menlo, Consolas, monospace;
   margin-top: -6px; padding-left: 4px;
+  opacity: 0.55; transition: opacity .15s;
 }
+.bubble.assistant:hover ~ .meta,
+.bubble.error:hover ~ .meta,
+.meta:hover { opacity: 1; }
 
 /* ---------- 输入框 + 工具栏 ---------- */
 .composer {

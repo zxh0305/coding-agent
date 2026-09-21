@@ -104,11 +104,177 @@ async function api(path, options = {}) {
 }
 
 // ---------- 小工具 ----------
+// ---------- 轻量 Markdown 渲染（只覆盖回答里高频出现的几种块/行内语法） ----------
+// 设计取舍：不引第三方库，全程用 createElement / createTextNode 构造节点，
+// 绝不拼 innerHTML —— 模型输出是外部内容，任何"先拼字符串再塞 HTML"的做法都
+// 会把注入风险引进页面。代价是慢一点，但一次回答的节点量完全可以接受。
+//
+// 支持：``` 代码块 ```、# / ## / ### 标题、- / * / + 无序列表、1. 有序列表、
+// > 引用、--- 分隔线、行内 `code`、**加粗**、*斜体*。
+// 不支持（按纯文本原样显示）：表格、嵌套列表、图片、链接。
+
+// 行内语法 → DocumentFragment。先按标记切分，再逐段构造节点。
+function renderInline(text) {
+  const frag = document.createDocumentFragment();
+  // 用一条正则同时匹配 `code`、**bold**、*italic*；未匹配部分原样成文本节点。
+  const re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*\n]+\*)/g;
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const tok = m[0];
+    if (tok.startsWith("`")) {
+      const c = document.createElement("code");
+      c.textContent = tok.slice(1, -1);
+      frag.appendChild(c);
+    } else if (tok.startsWith("**")) {
+      const b = document.createElement("strong");
+      b.textContent = tok.slice(2, -2);
+      frag.appendChild(b);
+    } else {
+      const i = document.createElement("em");
+      i.textContent = tok.slice(1, -1);
+      frag.appendChild(i);
+    }
+    last = m.index + tok.length;
+  }
+  if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+  return frag;
+}
+
+// 整段 Markdown → DocumentFragment。按行扫描，块级元素与行内元素分工明确。
+function renderMarkdown(src) {
+  const root = document.createDocumentFragment();
+  const lines = String(src || "").replace(/\r\n?/g, "\n").split("\n");
+  let i = 0;
+  let para = [];   // 正在累积的普通段落行
+
+  const flushPara = () => {
+    if (!para.length) return;
+    const p = document.createElement("p");
+    p.className = "md-p";
+    // 段落内的软换行保留为 <br>：模型常把一句话折行，合并反而丢信息
+    para.forEach((ln, idx) => {
+      if (idx) p.appendChild(document.createElement("br"));
+      p.appendChild(renderInline(ln));
+    });
+    root.appendChild(p);
+    para = [];
+  };
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // ``` 代码块：读到收尾的 ``` 为止（没有收尾就把剩余全部当代码）
+    const fence = line.match(/^\s*```\s*([\w+#.-]*)\s*$/);
+    if (fence) {
+      flushPara();
+      const lang = fence[1] || "";
+      const buf = [];
+      i += 1;
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) { buf.push(lines[i]); i += 1; }
+      i += 1;  // 跳过收尾 ```
+      const pre = document.createElement("pre");
+      pre.className = "md-pre";
+      if (lang) {
+        const tag = document.createElement("span");
+        tag.className = "md-lang";
+        tag.textContent = lang;
+        pre.appendChild(tag);
+      }
+      const code = document.createElement("code");
+      code.textContent = buf.join("\n");
+      pre.appendChild(code);
+      root.appendChild(pre);
+      continue;
+    }
+
+    // 标题
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) {
+      flushPara();
+      const lvl = Math.min(h[1].length, 4);  // h5/h6 归并到 h4，避免字号过小
+      const el = document.createElement("h" + lvl);
+      el.className = "md-h md-h" + lvl;
+      el.appendChild(renderInline(h[2].trim()));
+      root.appendChild(el);
+      i += 1;
+      continue;
+    }
+
+    // 分隔线
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      flushPara();
+      const hr = document.createElement("hr");
+      hr.className = "md-hr";
+      root.appendChild(hr);
+      i += 1;
+      continue;
+    }
+
+    // 引用：连续的 > 行合成一个 blockquote
+    if (/^\s*>\s?/.test(line)) {
+      flushPara();
+      const bq = document.createElement("blockquote");
+      bq.className = "md-quote";
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+        if (bq.childNodes.length) bq.appendChild(document.createElement("br"));
+        bq.appendChild(renderInline(lines[i].replace(/^\s*>\s?/, "")));
+        i += 1;
+      }
+      root.appendChild(bq);
+      continue;
+    }
+
+    // 列表：连续的同类行合成一个 ul/ol
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (ul || ol) {
+      flushPara();
+      const ordered = !!ol;
+      const list = document.createElement(ordered ? "ol" : "ul");
+      list.className = "md-list";
+      while (i < lines.length) {
+        const m = ordered ? lines[i].match(/^\s*\d+[.)]\s+(.*)$/)
+                          : lines[i].match(/^\s*[-*+]\s+(.*)$/);
+        if (!m) break;
+        const li = document.createElement("li");
+        li.appendChild(renderInline(m[1]));
+        list.appendChild(li);
+        i += 1;
+      }
+      root.appendChild(list);
+      continue;
+    }
+
+    // 空行：段落分隔
+    if (!line.trim()) { flushPara(); i += 1; continue; }
+
+    para.push(line);
+    i += 1;
+  }
+  flushPara();
+  return root;
+}
+
+// 回答气泡：assistant 走 Markdown 渲染，user/error/note 保持纯文本。
+// 纯文本路径用 textContent —— 与旧行为逐字节一致，不引入任何回归。
 function buildBubble(className, text) {
   const div = document.createElement("div");
   div.className = `bubble ${className}`;
-  div.textContent = text;
+  if (className === "assistant") {
+    div.classList.add("md");
+    div.appendChild(renderMarkdown(text));
+  } else {
+    div.textContent = text;
+  }
   return div;
+}
+
+// 就地重绘一个已存在的回答气泡（流式 textContent → 定稿 Markdown）。
+// 加 .md 类是为了让 Markdown 相关的排版样式生效（气泡本身仍是 .bubble.assistant）。
+function renderIntoBubble(el, text) {
+  el.classList.add("md");
+  el.replaceChildren(renderMarkdown(text));
 }
 
 // ---------- 贴底滚动（stick-to-bottom） ----------
@@ -776,6 +942,7 @@ function traceFromHistory(entries, elapsed) {
   d.open = false;
   const list = Array.isArray(entries) ? entries : [];
   let steps = 0;
+  let lastWriteCard = null;  // 历史回放：待回填徽章的写入调用卡
   for (const e of list) {
     if (!e || typeof e !== "object") continue;
     if (e.type === "round") {
@@ -784,9 +951,13 @@ function traceFromHistory(entries, elapsed) {
       div.textContent = `🧠 思考 · 第 ${e.round} 轮${e.wrap_up ? "（收尾）" : ""}`;
       d.appendChild(div);
     } else if (e.type === "tool_call") {
-      d.appendChild(makeToolCallLine(e.name, e.arguments || "{}"));
+      const line = makeToolCallLine(e.name, e.arguments || "{}");
+      d.appendChild(line);
+      // 落库轨迹里 tool_result 紧跟 tool_call：把写入类调用暂存，等结果回填徽章
+      if (line.classList.contains("card")) lastWriteCard = line;
       steps += 1;
     } else if (e.type === "tool_result") {
+      if (lastWriteCard) { decorateWriteCard(lastWriteCard, e.result || ""); lastWriteCard = null; }
       d.appendChild(makeToolResultLine(e.name, e.result || ""));
     } else if (e.type === "reasoning") {
       // 落库的思考过程：与实时流同一套 .think-line 渲染（纯文本，pre-wrap）
@@ -1456,6 +1627,7 @@ function handleResync(evt) {
 let liveBubble = null, metaEl = null, metaTimer = null, qStart = 0;
 let thinkEl = null;  // 当前轮次的思考流块（思考模型的 reasoning_delta 实时显示用）
 let traceEl = null, traceSteps = 0;
+let traceCurrent = "";  // 当前正在执行的工具（收起状态下摘要行显示的"此刻在干嘛"）
 let pendingCalls = [];  // 已发出但未见结果的工具调用（算持续时长用）
 let permissionCards = new Map();  // permission id -> 卡片元素：补发重放同一请求时复用/整卡重画，不叠卡片
 let liveMsgs = new Map();  // mid -> {el, text}：事件流里同一 mid 的 delta 归并进同一气泡
@@ -1472,9 +1644,10 @@ function ensureTrace() {
   if (traceEl) return;
   traceEl = document.createElement("details");
   traceEl.className = "trace";
-  // 生成中【自动展开】：用户实时看到每一步——想什么、读什么、改了哪个文件、
-  // 跑了什么命令；done/error 后自动折叠（见 applyEvent），只留一行摘要。
-  traceEl.open = true;
+  // 默认【收起】：执行过程不是回答。之前生成期间强制展开，几十行浅灰小字
+  // 在正文下方滚动，把真正的答案挤出视口——"看不到重点"的直接来源。
+  // 改成收起后，摘要行持续显示"当前正在做什么"，既有动静又不抢正文。
+  traceEl.open = false;
   const summary = document.createElement("summary");
   summary.textContent = "已思考 0 秒";
   traceEl.appendChild(summary);
@@ -1489,12 +1662,15 @@ function fmtElapsed(sec) {
     : `${Math.floor(n / 60)} 分 ${Math.round(n % 60)} 秒`;
 }
 
+// 摘要行 = 一行"当前状态"：正在跑的工具 + 已工作多久 + 步数。
+// 这是收起状态下用户唯一能看到的过程信息，必须把"此刻在干嘛"说清楚。
 function traceTick() {
   if (!traceEl) return;
-  const label = traceSteps > 0 ? `已工作 ${fmtElapsed((Date.now() - qStart) / 1000)}`
-                                : `已思考 ${fmtElapsed((Date.now() - qStart) / 1000)}`;
+  const el = fmtElapsed((Date.now() - qStart) / 1000);
+  const doing = traceCurrent ? `${traceCurrent} · ` : "";
+  const label = traceSteps > 0 ? "已工作" : "已思考";
   traceEl.querySelector("summary").textContent =
-    `${label} · ${traceSteps} 步`;
+    `${doing}${label} ${el} · ${traceSteps} 步`;
 }
 
 function appendTrace(el) {
@@ -1524,8 +1700,11 @@ function makeToolCallLine(name, argsStr) {
   try { a = JSON.parse(argsStr); } catch { /* 参数不是 JSON */ }
   const main = summarize(a.command || a.path || a.expression || a.pattern || a.city || "", 46);
   const kind = TOOL_KIND[name] || "";
+  // 写入类（write_file/apply_patch）用卡片：文件名作标题，一眼看到"动了哪个文件"。
+  // 其余工具仍是单行摘要——读取/搜索是噪声，不该和写入抢注意力。
+  const isWrite = name === "write_file" || name === "apply_patch";
   const d = document.createElement("details");
-  d.className = "tl" + (name === "write_file" || name === "apply_patch" ? " write" : "");
+  d.className = "tl" + (isWrite ? " write card" : "");
   const summary = document.createElement("summary");
   summary.textContent = `${TOOL_ICONS[name] || "🔧"} ${kind}${kind ? " " : ""}${main}`;
   const pre = document.createElement("pre");
@@ -1534,10 +1713,20 @@ function makeToolCallLine(name, argsStr) {
   return d;
 }
 
+// 从工具参数里取一个适合放进摘要行的短标签（"正在 run_bash xxx"）
+function toolDoingLabel(name, argsStr) {
+  let a = {};
+  try { a = JSON.parse(argsStr); } catch { /* 非 JSON */ }
+  const target = summarize(a.command || a.path || a.pattern || a.expression || a.city || "", 30);
+  return `${TOOL_ICONS[name] || "🔧"} ${TOOL_KIND[name] || name}${target ? " " + target : ""}`;
+}
+
 function toolCallLine(name, argsStr) {
   const d = makeToolCallLine(name, argsStr);
   appendTrace(d);
   pendingCalls.push({ name, el: d, t: Date.now() });
+  traceCurrent = toolDoingLabel(name, argsStr);  // 摘要行显示"此刻在跑什么"
+  traceTick();
 }
 
 // 构建工具结果行（游离节点）。dur：实时流配对调用算出的耗时；回放没有，传空。
@@ -1593,8 +1782,29 @@ function toolResultLine(name, resultStr) {
   if (idx >= 0) {
     const call = pendingCalls.splice(idx, 1)[0];
     dur = ` · ${((Date.now() - call.t) / 1000).toFixed(1)}s`;
+    // 写入类：把结果里的增删行数回填成调用卡上的徽章，让"改了多大"一眼可见
+    if (call.el && call.el.classList.contains("card")) decorateWriteCard(call.el, resultStr);
   }
   appendTrace(makeToolResultLine(name, resultStr, dur));
+  traceCurrent = "";  // 工具已返回：摘要行不再显示"正在…"
+  traceTick();
+}
+
+// 在写入卡片的 summary 上追加 +N −M / 新建 N 行 徽章（历史回放没有配对，不调用）
+function decorateWriteCard(callEl, resultStr) {
+  let p = null;
+  try { p = JSON.parse(resultStr); } catch { return; }
+  if (!p || typeof p !== "object") return;
+  let text = "";
+  if ("added" in p) text = `+${p.added} −${p.removed}`;
+  else if ("lines" in p) text = `新建 ${p.lines} 行`;
+  if (!text) return;
+  const s = callEl.querySelector("summary");
+  if (!s || s.querySelector(".tl-badge")) return;
+  const b = document.createElement("span");
+  b.className = "tl-badge";
+  b.textContent = text;
+  s.appendChild(b);
 }
 
 // 🔐 权限确认卡片：闸门命中 ask 时，回合暂停等用户三选一。
@@ -1747,7 +1957,7 @@ function applyEvent(evt, seq) {
     // 回合级状态复位（原在 performSend 里；改为事件驱动后，刷新页面接上
     // 正在进行的回合也走同一套初始化）
     liveMsgs = new Map();
-    liveBubble = null; traceEl = null; traceSteps = 0;
+    liveBubble = null; traceEl = null; traceSteps = 0; traceCurrent = "";
     metaEl = null; thinkEl = null; pendingCalls = [];
     permissionCards = new Map();  // 新回合的确认卡是新的请求：旧卡引用随时间线一起失效
     pendingDeltas = new Map(); pendingThink = "";
@@ -1799,23 +2009,27 @@ function applyEvent(evt, seq) {
     // 为空（模型本轮只产出推理）或与本轮已收到的增量不符时整体覆盖，会把
     // 推理文字或空白写进正文区——思考过程属于「执行过程」面板，不是回答。
     const authoritative = typeof evt.answer === "string" ? evt.answer : "";
+    // 定稿即把纯文本气泡升级为 Markdown 渲染：流式期间用 textContent 快刷，
+    // 只有此刻（内容已冻结）才做一次解析重建——既保住打字机性能，又让最终
+    // 答案带上标题/列表/代码块的骨架。下面三处赋值统一走 renderIntoBubble。
     if (!authoritative) {
       // 正文为空：保留已流出的增量（若有），一条都没有则不留空白气泡
       b.text = b.text || "";
       if (!b.text) b.el.remove();
-      else b.el.textContent = b.text;
+      else renderIntoBubble(b.el, b.text);
     } else if (authoritative === b.text) {
-      b.el.textContent = b.text;  // 与增量一致：照常定稿
+      renderIntoBubble(b.el, b.text);  // 与增量一致：照常定稿
     } else if (b.text && !authoritative.includes(b.text)) {
       // 服务端正文与已渲染增量对不上（疑似推理混入/乱序）：保留用户已看到的
       // 流式内容，不整体覆盖，并留一行提示便于排查
+      renderIntoBubble(b.el, b.text);
       const warn = document.createElement("div");
       warn.className = "meta";
       warn.textContent = "（本轮回答与流式内容不一致，已保留流式版本）";
       chatEl.appendChild(warn);
     } else {
       b.text = authoritative;
-      b.el.textContent = authoritative;
+      renderIntoBubble(b.el, authoritative);
     }
     clearInterval(metaTimer);
     metaEl.textContent = metaText(evt.elapsed_s, evt.usage);
