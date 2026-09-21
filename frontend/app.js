@@ -37,12 +37,12 @@ function showLogin() {
   chatEl.innerHTML = "";
   pendingQueue = [];          // 排队消息也作废（它们属于上一个用户的任务）
   closeEvents();              // 事件流属于上一个登录者，立即断开
+  resetStreamState();         // 流式状态同样属于上一个用户/任务
   localStorage.removeItem("auth_token");
   localStorage.removeItem("auth_username");
   $("login-error").textContent = "";
   $("layout").classList.add("hidden");     // 隐藏对话页
   $("login-page").classList.remove("hidden");  // 显示独立登录页
-  setStreaming(false);
   $("login-user").focus();
 }
 
@@ -256,6 +256,7 @@ async function doDeleteSession(id) {
     // 删的是当前打开的任务：清空对话区，回到待新建状态；事件流随任务一起
     // 消失（其他标签页的连接由 session_deleted 事件收摊）
     currentSession = null;
+    resetStreamState();
     chatEl.innerHTML = "";
     welcome();
     refreshCtx();
@@ -268,6 +269,7 @@ async function doDeleteSession(id) {
 async function newTask() {
   currentSession = null;
   confirmingDelete = null;
+  resetStreamState();  // 旧任务的事件流已断，流式状态必须随之复位
   closeEvents();      // 旧任务的事件流断开：新任务未建，第一条消息发出后再连
   chatEl.innerHTML = "";
   welcome();
@@ -284,6 +286,7 @@ let histHasMore = false;   // 其上是否还有更早的消息
 async function switchSession(id) {
   if (id === currentSession) return;
   currentSession = id;
+  resetStreamState();  // 旧会话的事件流已断，流式状态必须随之复位
   chatEl.innerHTML = "";
   welcome();
   histOldestOrd = null;
@@ -452,15 +455,23 @@ function addFileToAttachments(file) {
   if (isImage && !activeModelVision) {
     toast("当前模型未标注视觉能力，发送后将由 analyze_image 工具代为识别");
   }
-  const slot = attachments.length;
+  // FileReader 是异步的：读取期间用户可能删除其他附件（数组前移/缩短），
+  // 按读取开始时的下标回写会错位。这里先占一个真实位置，回写前核对
+  // （token 不匹配 = 列表变过，重新找位置；找不到说明该附件已被移除，丢弃）。
+  const entry = isImage
+    ? { kind: "image", name: file.name || `clipboard.${(file.type.split("/")[1] || "bin").replace("+xml", "")}`,
+        mime: file.type, data: "", preview: "" }
+    : { kind: "text", name: file.name || "clipboard.txt", mime: "text/plain", data: "", preview: "" };
+  attachments.push(entry);  // 占位：先出现在托盘里（空 data），读完后回填
+  renderAttachTray();
   const reader = new FileReader();
   reader.onload = () => {
     const dataUrl = String(reader.result);
     const data = dataUrl.slice(dataUrl.indexOf(",") + 1);  // 去掉 data:...;base64, 前缀
-    const ext = (file.type.split("/")[1] || "bin").replace("+xml", "");
-    attachments[slot] = isImage
-      ? { kind: "image", name: file.name || `clipboard.${ext}`, mime: file.type, data, preview: dataUrl }
-      : { kind: "text", name: file.name || "clipboard.txt", mime: "text/plain", data, preview: "" };
+    const i = attachments.indexOf(entry);  // 按对象身份找位置，不按下标猜
+    if (i < 0) return;  // 读取期间被用户移除：丢弃，不写回
+    entry.data = data;
+    entry.preview = isImage ? dataUrl : "";
     renderAttachTray();
   };
   reader.readAsDataURL(file);
@@ -1041,6 +1052,24 @@ function finishBoot(caughtUp) {
     }
   }
   segments.push(cur);
+  // 补发段里若有"已闭合且 user_mid 已在时间线"的回合，说明那个回合在离开
+  // 期间其实正常完成了（历史里已经有它）——这不是中断，不能报"输入未保存"。
+  const anyRecovered = segments.some(seg => seg.closed && seg.userMid && historyMids.has(seg.userMid));
+  if (caughtUp && caughtUp.running === false && streaming && !anyRecovered) {
+    // 连上时服务端已无进行中回合，而本页还挂在"生成中"：回合在断线/服务
+    // 重启之间死掉了（未落盘）。手动收尾不挂起——手测②"刷新接上进行中
+    // 回合"的正常路径不会走到这里（running=true）。
+    setStreaming(false);
+    clearInterval(metaTimer);
+    if (liveBubble) {
+      liveBubble.classList.remove("streaming");
+      const note = document.createElement("div");
+      note.className = "meta";
+      note.textContent = "（连接中断，本回合未完成，输入未保存）";
+      chatEl.appendChild(note);
+    }
+    toast("连接已恢复；中断的回合未保存，请重新发送");
+  }
   for (const seg of segments) {
     if (!seg.events.length) continue;
     if (seg.closed && seg.userMid && historyMids.has(seg.userMid)) continue;  // 已在时间线
@@ -1134,10 +1163,15 @@ function toolResultLine(name, resultStr) {
   let parsed = null;
   try { parsed = JSON.parse(resultStr); } catch { /* 纯文本 */ }
 
+  const hintSuffix = (p) => p.hint ? `\n💡 ${p.hint}` : "";
+
   if (parsed && typeof parsed === "object" && "exit_code" in parsed) {
+    // run_bash：非零退出也带完整输出（统一信封下 ok:false 但输出是第一手材料）
     summary.textContent = `↩ ${dur.replace(" · ", "") || "0s"} · exit ${parsed.exit_code}`;
     if (parsed.exit_code !== 0) summary.classList.add("err");
-    pre.textContent = [parsed.stdout, parsed.stderr].filter(Boolean).join("\n[stderr]\n") || "(无输出)";
+    pre.textContent = [parsed.stdout, parsed.stderr].filter(Boolean).join("\n[stderr]\n")
+      || "(无输出)";
+    pre.textContent += hintSuffix(parsed);
   } else if (parsed && typeof parsed === "object" && "error" in parsed) {
     // 权限拒绝是"人做的决定"而非故障：单独标注，并带上给模型的改道提示
     const denied = typeof parsed.error === "string" && parsed.error.startsWith("权限拒绝");
@@ -1148,6 +1182,13 @@ function toolResultLine(name, resultStr) {
     summary.textContent = `↩ +${parsed.added} −${parsed.removed}${dur}`;
   } else if (parsed && typeof parsed === "object" && "lines" in parsed) {
     summary.textContent = `↩ 新建 ${parsed.lines} 行${dur}`;
+  } else if (parsed && typeof parsed === "object" && "ok" in parsed && "result" in parsed) {
+    // 统一信封的成功返回（read_file/grep/list_dir/…）：正文在 result 字段，
+    // 直接展示正文而不是整坨 JSON
+    const r = parsed.result;
+    const flat = typeof r === "string" ? r : JSON.stringify(r, null, 2);
+    summary.textContent = `↩ ${summarize(flat, 60)}${dur}`;
+    pre.textContent = flat + hintSuffix(parsed);
   } else if (parsed) {
     summary.textContent = `↩ ${summarize(resultStr, 60)}${dur}`;
     pre.textContent = JSON.stringify(parsed, null, 2);
@@ -1393,6 +1434,7 @@ function applyEvent(evt, seq) {
     // 其他标签页删掉了这个任务：收摊回到新建态
     closeEvents();
     currentSession = null;
+    resetStreamState();
     chatEl.innerHTML = "";
     welcome();
     loadSessions();
@@ -1419,6 +1461,23 @@ function setStreaming(on) {
     : "输入问题或任务，Enter 发送（Shift+Enter 换行）";
 }
 
+// 离开当前会话视图（切换任务/新建任务/登出）时复位流式渲染状态。
+// 这些都是全局单例，而回合结束信号（turn_end）只从事件流到达——旧会话的流
+// 已随 closeEvents 断开，不复位的话 streaming 永远为 true：新会话里发消息
+// 会被静默排队且永不派发，停止按钮也把停止请求发给错误的会话。
+// 回合真身不丢：切回旧会话时由历史分页 + 补发定性（finishBoot）重建。
+function resetStreamState() {
+  clearInterval(metaTimer);
+  setStreaming(false);
+  myNonce = null;
+  liveBubble = null; metaEl = null; thinkEl = null;
+  traceEl = null; traceSteps = 0;
+  liveMsgs = new Map(); pendingCalls = [];
+  permissionCards = new Map();
+  pendingDeltas = new Map(); pendingThink = "";
+  curMid = null; usageNow = null;
+}
+
 async function stopGeneration() {
   $("send").textContent = "停止中…";
   try {
@@ -1436,6 +1495,10 @@ let pendingQueue = [];  // {text, payloadAtts, sessionId, el, immediate}
 function send() {
   const text = inputEl.value.trim();
   if (!text && !attachments.length) return;
+  if (attachments.some(a => !a.data)) {  // 占位附件还在读文件：等下一拍
+    toast("附件还在读取中，请稍候一秒再发送");
+    return;
+  }
   const payloadAtts = attachments.map(a => ({ kind: a.kind, name: a.name, mime: a.mime, data: a.data }));
   const outAtts = attachments.map(a => ({ kind: a.kind, name: a.name, preview: a.preview }));
   inputEl.value = "";
@@ -1552,8 +1615,7 @@ async function performSend(item) {
     // 命令没送出去（后端不可达/登录失效）：回合不会开始，本地复位。
     // 已发出的消息不放回队列（与旧行为一致：旧版 finally 里也是直接结束）
     bubble("assistant error", "❌ " + e.message);
-    setStreaming(false);
-    myNonce = null;
+    resetStreamState();
   }
 }
 
