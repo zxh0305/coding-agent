@@ -387,12 +387,14 @@ async function submitRename(id, title) {
 }
 
 // 任务状态徽标：state 来自 GET /api/sessions（后端内存态现算）。
-// idle 返回 null（不占位），其余返回一个小元素。unknown 值也当 idle——
-// 老后端不返回 state 时列表退化成原样，不会画出空点。
+// none / 未知值返回 null（不占位）——"从没跑过"和"老后端不返回 state"都
+// 退化成原样，不画空点。其余返回一个小圆点元素。
 function stateBadge(state) {
   const meta = {
     running: { cls: "running", text: "●", title: "运行中" },
     waiting: { cls: "waiting", text: "● 等待确认", title: "等待你确认权限" },
+    done: { cls: "done", text: "●", title: "已完成" },
+    error: { cls: "error", text: "●", title: "上一轮出错" },
   }[state];
   if (!meta) return null;
   const el = document.createElement("span");
@@ -477,7 +479,9 @@ function taskRow(s, list) {
     confirmingDelete = s.id;   // 第一次点：只进入确认状态，不真删
     renderSessions(list);
   });
-  li.append(title, state, time, rename, del);
+  // 注意 state 可能是 null（idle 无徽标）：appendChild(null) 会插入字面量
+  // "null"，必须过滤掉空值再 append。
+  li.append(...[title, state, time, rename, del].filter(Boolean));
   li.title = s.title || "";
   li.addEventListener("click", () => {
     confirmingDelete = null;

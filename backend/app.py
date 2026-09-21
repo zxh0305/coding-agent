@@ -101,6 +101,10 @@ ENV_FILE = PROJECT_DIR / ".env"
 _agents: dict[str, Agent] = {}
 _sigs: dict[str, str] = {}
 _ctx: dict[str, dict] = {}  # sid -> 最近一次上下文统计（非关键数据，只存内存）
+# 最近一轮的结局：sid -> "done" | "error"（只存内存）。用于列表状态徽标区分
+# "跑过且正常结束"（绿点）与"上一轮出错"（红点）；没有记录 = 从没跑过（不显示）。
+# 不落库：进程重启后没有"上一轮"可言，退回无状态是正确的。
+_turn_status: dict[str, str] = {}
 _lock = threading.Lock()    # 全局锁：只保护上面的共享 dict 和模型配置的短临界区
 _session_locks: dict[str, threading.Lock] = {}  # 每个任务一把锁（见 _session_lock）
 
@@ -134,19 +138,23 @@ def _session_state(sid: str) -> str:
 
       running  回合进行中（turn_start 已发、turn_end 未到）
       waiting  回合进行中且卡在权限闸门等用户确认（比 running 更该提醒）
-      idle     无进行中的回合（含从未打开过、没有 bus 的任务）
+      done     跑过且最近一轮正常结束（列表显示绿点）
+      error    最近一轮出错（列表显示红点）
+      none     从没跑过（不显示状态）
 
-    没有 bus 的会话必然 idle：bus 惰性创建，此处只读不建——为列表展示
+    没有 bus 的会话必然没在跑：bus 惰性创建，此处只读不建——为列表展示
     凭空造 bus 会白占内存、还会把 last_seq 从库里读出来。
     """
     with _lock:
         bus = _buses.get(sid)
         agent = _agents.get(sid)
-    if bus is None or not bus.running:
-        return "idle"
-    if agent is not None and agent.permissions.pending_count > 0:
-        return "waiting"
-    return "running"
+        last = _turn_status.get(sid)
+    if bus is not None and bus.running:
+        if agent is not None and agent.permissions.pending_count > 0:
+            return "waiting"
+        return "running"
+    # 不在跑：按"最近一轮的结局"给徽标；从没跑过（无记录）则无状态。
+    return last or "none"
 
 
 # ask 等待用户决定的上限（秒）。超时不是安全边界——超时按拒绝处理，本来就
@@ -240,6 +248,10 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
         if db.session_owner(sid) is None:
             return
         try:
+            # 新回合开跑：清掉上一轮的绿/红点（此刻列表应显示"运行中"，不是
+            # 上次的结局）。回合真结局在下面收尾处按 error 重新置位。
+            with _lock:
+                _turn_status.pop(sid, None)
             bus.publish({"type": "turn_start", "nonce": nonce, "input": plain, "atts": atts})
             log.info("[会话 %s] 用户提问: %s", sid, plain)
             seg_mid = None  # 当前回答段落的 mid（每个 round 事件换一段）
@@ -286,6 +298,11 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                     _persist_trace(sid, final_mid, agent.trace)
                 except Exception:
                     log.exception("[会话 %s] 轨迹落库失败（忽略）", sid)
+            # 记下本轮结局，供任务列表徽标用（"跑过且正常结束"= done 绿点、
+            # 出错 = error 红点）。用户主动停止不算错——stopped 走的是正常收尾
+            # 路径（error 为 None），与旧行为一致地显示为 done。
+            with _lock:
+                _turn_status[sid] = "error" if error is not None else "done"
             if error is not None:
                 db.renumbered_sessions.discard(sid)  # 错误路径不带重编号信号（与旧行为一致）
                 bus.publish({"type": "error", "message": error})
@@ -758,6 +775,7 @@ class Handler(SimpleHTTPRequestHandler):
             with _lock:
                 _agents.pop(sid, None)
                 _ctx.pop(sid, None)
+                _turn_status.pop(sid, None)
                 bus = _buses.pop(sid, None)
             if bus is not None:
                 # 先发 session_deleted 再关总线：其他标签页的常驻连接收到后
