@@ -571,7 +571,7 @@ function openLightbox(src) {
   actions.className = "lightbox-actions";
   const hint = document.createElement("div");
   hint.className = "lightbox-hint";
-  hint.textContent = "点击空白处或按 Esc 关闭";
+  hint.textContent = "点击图片或空白处恢复，按 Esc 关闭";
   const copy = document.createElement("button");
   copy.textContent = "📋 复制图片";
   copy.addEventListener("click", async () => {
@@ -587,11 +587,11 @@ function openLightbox(src) {
       hint.style.color = "rgba(255,255,255,.85)";
     }
   });
-  const close = document.createElement("button");
-  close.textContent = "✕ 关闭";
-  close.addEventListener("click", closeLightbox);
-  actions.append(copy, close);
+  actions.append(copy);
   box.append(img, actions, hint);
+  // 点放大的图片本身或空白处都关闭：不需要找特定按钮
+  const closeOnClick = (e) => { closeLightbox(); };
+  img.addEventListener("click", closeOnClick);
   box.addEventListener("click", (e) => { if (e.target === box) closeLightbox(); });
   document.addEventListener("keydown", lightboxEsc);
   document.body.appendChild(box);

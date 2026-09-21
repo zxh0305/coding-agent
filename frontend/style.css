@@ -463,6 +463,7 @@ button.primary:hover { background: #3d69d8; }
 .lightbox img {
   max-width: 92vw; max-height: 78vh;
   border-radius: 8px; box-shadow: 0 8px 40px rgba(0, 0, 0, .5);
+  cursor: zoom-out;  /* 点放大的图片本身即恢复原样 */
 }
 .lightbox-actions { display: flex; gap: 10px; }
 .lightbox-actions button {
