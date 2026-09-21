@@ -56,6 +56,7 @@
           <button id="attach-btn" class="chip" title="添加图片或文本文件">📎</button>
           <input type="file" id="file-input" multiple hidden
                  accept="image/png,image/jpeg,image/webp,image/gif,.txt,.md,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.html,.css,.csv,.log,.xml,.sh,.sql,.java,.c,.cpp,.go,.rs">
+          <button id="perm-chip" class="chip" title="权限模式：只读 = 写入和命令逐次确认；确认 = 高危操作才确认；完全访问 = 全部放行">🛡 <span id="perm-label">确认</span></button>
           <button id="ctx-chip" class="chip" title="上下文容量">⛁ —</button>
           <button id="ws-pick" class="chip" title="选择工作区文件夹">📁 <span id="ws-short">工作区</span></button>
           <button id="model-chip" class="chip" title="切换模型 / 管理模型">⚙️ <span id="model-label">模型</span></button>
@@ -171,6 +172,13 @@
     <div class="up-sec">数据</div>
     <p class="hint up-hint">任务与对话保存在本机 agent_data.db（SQLite），重启不丢。</p>
     <button id="pop-logout" class="up-btn danger">⎋ 退出登录</button>
+  </div>
+
+  <!-- 权限模式气泡：三选，按工作区记忆 -->
+  <div id="perm-pop" class="ctx-pop hidden">
+    <div class="perm-row" data-mode="readonly"><b>🔍 只读</b><span class="hint">看代码可以，写文件与执行命令每一步都先确认</span></div>
+    <div class="perm-row" data-mode="confirm"><b>🛡 确认</b><span class="hint">日常操作自动放行，删除/推送等高危操作先确认</span></div>
+    <div class="perm-row" data-mode="yolo"><b>⚡ 完全访问</b><span class="hint">全部放行，不再弹确认卡（工作区外的路径仍拒绝）</span></div>
   </div>
 
   <div id="toast" class="toast hidden"></div>

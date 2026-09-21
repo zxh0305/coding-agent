@@ -443,11 +443,13 @@ def set_last_seq(sid: str, seq: int) -> None:
 
 def list_sessions(user_id: int) -> list[dict]:
     with _conn() as conn:
-        rows = conn.execute("SELECT id, title, updated FROM sessions WHERE user_id=? "
+        rows = conn.execute("SELECT id, title, updated, workspace FROM sessions WHERE user_id=? "
                             "ORDER BY updated DESC", (user_id,)).fetchall()
     # 注意：返回原始 title（可能为空），"新任务"之类的展示兜底交给前端做。
     # 之前在这里兜底，导致"标题为空→设标题"的判断永远不成立，标题永远存不上。
-    return [{"id": r["id"], "title": r["title"], "updated": r["updated"]} for r in rows]
+    # workspace 随列表带回：前端按项目（工作区目录名）分组展示任务列表。
+    return [{"id": r["id"], "title": r["title"], "updated": r["updated"],
+             "workspace": r["workspace"]} for r in rows]
 
 
 def delete_session(sid: str) -> None:

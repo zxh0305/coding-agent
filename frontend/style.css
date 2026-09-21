@@ -102,6 +102,16 @@ body {
 }
 .bubble.error { background: #fdecec; border: 1px solid #f2b8b5; color: #b3261e; }
 
+/* 辅助提示条（如"已把 xx 设为默认工作区"）：小字、灰底灰字、无边框，
+   与正常的回答气泡拉开层级——它是系统告知，不是对话内容。 */
+.bubble.note {
+  align-self: flex-start; max-width: 76%;
+  font-size: 12px; line-height: 1.5;
+  color: var(--text-3); background: #f1f3f8;
+  border: 1px solid transparent; border-radius: 8px;
+  padding: 5px 10px;
+}
+
 /* 流式输出中的"光标" */
 .bubble.streaming::after {
   content: "▍"; color: var(--accent);
@@ -140,6 +150,7 @@ body {
 .trace summary { cursor: pointer; user-select: none; font-weight: 600; }
 .trace-line {
   font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11.5px; line-height: 1.5;
   padding: 4px 0 4px 10px; border-left: 2px solid #dde3ef;
   margin-top: 6px; white-space: pre-wrap; word-break: break-all;
   color: var(--text-3);
@@ -155,11 +166,13 @@ body {
   max-height: 180px; overflow-y: auto;
 }
 
-/* 工具调用/结果行：一行摘要，点开看完整内容 */
+/* 工具调用/结果行：一行摘要，点开看完整内容。
+   小字 + 灰字（text-3），与正文回答拉开层级：它是执行痕迹，不是回答。 */
 .tl { margin-top: 6px; }
 .tl summary {
   cursor: pointer; user-select: none;
   font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11.5px; line-height: 1.5; color: var(--text-3);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .tl summary:hover { color: var(--text); }
@@ -236,6 +249,30 @@ button.primary:hover { background: #3d69d8; }
   color: var(--text-2); border-top: 1px solid var(--border);
   margin-top: 8px; padding-top: 8px;
 }
+
+/* 权限模式气泡（复用 ctx-pop 定位）：三行选项 */
+.perm-row {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 13px;
+}
+.perm-row:hover { background: #f0f2f8; }
+.perm-row.active { background: #eef2ff; }
+.perm-row .hint { font-size: 11.5px; color: var(--text-3); }
+.perm-chip-warn { color: #b45309; }  /* yolo 时图标染警示色 */
+
+/* 任务列表：项目分组头 + 行内重命名输入框 */
+.group-head {
+  font-size: 12px; font-weight: 600; color: var(--text-2);
+  padding: 8px 10px 4px; cursor: pointer; user-select: none;
+}
+.group-head:hover { color: var(--text-1); }
+.t-rename {
+  width: 100%; font: inherit; font-size: 13px;
+  border: 1px solid var(--accent); border-radius: 6px; padding: 4px 6px;
+  outline: none;
+}
+/* 工作区未选（"选择项目"态）：虚线边框示意待选 */
+.chip.ws-unset { border-style: dashed; color: var(--text-3); }
 
 /* ---------- 工作区选择弹窗 ---------- */
 .modal {

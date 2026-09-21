@@ -42,6 +42,13 @@ ALLOW = "allow"
 DENY = "deny"
 ASK = "ask"
 
+# 会话级权限模式（前端输入框下拉三选，存 settings 表按工作区记忆）：
+#   confirm（默认）= 内置规则原样生效——只读放行、工作区写入放行、高危命令 ask；
+#   readonly       = 只读工具放行，其余（写入/命令）一律 ask——每一步都要确认；
+#   yolo           = 全部放行（"完全访问"）——高危规则也只提醒不拦截。
+# 模式只影响判定，不影响 deny（用户规则/工作区边界的显式拒绝仍然成立）。
+MODES = ("readonly", "confirm", "yolo")
+
 # ask 等待用户决定的默认上限（Web 版）。超时不是安全边界（拒绝才是安全侧），
 # 只是防挂死：worker 线程不能为一个再也没人看的卡片等一辈子。
 DEFAULT_ASK_TIMEOUT = 300.0
@@ -223,6 +230,14 @@ _WRITE_TOOLS = {"write_file", "apply_patch"}
 # 本会话内无法解析的命令直接放行——是他点掉的卡片，语义自洽。
 _PARSE_FAIL_KEY = ("run_bash", "<unparseable>")
 
+# 只读模式的固定规则键（BUILTIN_RULES 里 ALLOW 的只读工具集合的镜像）：
+# 与 _PARSE_FAIL_KEY 同理，readonly 的逐次确认 ask 也要能被 overlay/
+# 会话记忆吸收——用户点过允许之后恢复重判必须找得到这个键。
+_READONLY_MODE_KEY_PREFIX = "<readonly_mode>"
+
+READONLY_TOOLS = {"read_file", "list_dir", "grep", "calculator",
+                  "current_time", "analyze_image", "get_weather"}
+
 
 def _builtin_verdict(tool: str, arguments: dict, workspace: Path) -> Verdict:
     if tool in _WRITE_TOOLS:
@@ -297,7 +312,8 @@ class PermissionGate:
     """
 
     def __init__(self, workspace: Path, user_rules_loader=None,
-                 ask_timeout: float = DEFAULT_ASK_TIMEOUT):
+                 ask_timeout: float = DEFAULT_ASK_TIMEOUT,
+                 mode_loader=None, mode: str = "confirm"):
         # resolve 与 code_tools._resolve 的比较口径对齐：macOS 的 /tmp、
         # /var 等是符号链接，调用方若传入未解析路径，越界判断会把工作区内
         # 的目标误判成区外（smoke test 真实踩过）。resolve 非严格模式，路径
@@ -305,9 +321,24 @@ class PermissionGate:
         self.workspace = Path(workspace).resolve()
         self._user_rules_loader = user_rules_loader  # fn() -> list[dict]，可缺省
         self.ask_timeout = float(ask_timeout)
+        # 权限模式：固定值（CLI/单测）或加载器（Web 版每次判定现读——前端切换
+        # 模式下一轮工具调用立即生效，不需要重建会话实例）。非法值一律按 confirm。
+        self._mode_loader = mode_loader
+        self._mode = mode if mode in MODES else "confirm"
         self._memory: dict[tuple, str] = {}   # 会话内记住：规则 key → ALLOW（会话结束随实例销毁）
         self._pending: dict[str, _Pending] = {}
         self._lock = threading.Lock()         # 只保护 _memory/_pending 的读写瞬间
+
+    @property
+    def mode(self) -> str:
+        if self._mode_loader is not None:
+            try:
+                m = self._mode_loader()
+                return m if m in MODES else "confirm"
+            except Exception as e:
+                log.warning("权限模式加载失败，退回 confirm：%s", e)
+                return "confirm"
+        return self._mode
 
     # ---------- 判定 ----------
 
@@ -338,6 +369,7 @@ class PermissionGate:
     def check(self, tool: str, arguments: dict, overlay: dict | None = None) -> Verdict:
         """判定一次工具调用。overlay 是本轮一次性决定（规则 key → Verdict），
         由 ask 恢复后重新判定时传入；deny 优先于一切，且不受记忆/overlay 翻案。"""
+        mode = self.mode
         with self._lock:
             remembered = dict(self._memory)
         matched: list[tuple[str, str, tuple | None]] = []
@@ -370,10 +402,26 @@ class PermissionGate:
             for v, reason, key in matched:
                 if v == verb:
                     if verb == ASK:
+                        if mode == "yolo":
+                            # 完全访问：ask 降级为放行（deny 仍按最严者生效，走不到这里）
+                            continue
                         # 带上全部命中的 ask 键：确认卡的决定要对整组生效
                         keys = tuple(dict.fromkeys(k for vv, _, k in matched if vv == ASK and k))
                         return Verdict(ASK, reason, key, ask_keys=keys)
                     return Verdict(verb, reason, key)
+        if mode == "readonly" and tool not in READONLY_TOOLS:
+            # 只读模式：规则放行 ≠ 可直接执行，写入/命令一律先确认。
+            # 固定键让这个 ask 能被 overlay/会话记忆吸收（点过允许不重复问）；
+            # 键里带工具名，write 与 bash 的确认互不吸收。
+            key = (_READONLY_MODE_KEY_PREFIX, tool)
+            if overlay and key in overlay:
+                v = overlay[key]
+                if v.verb == ALLOW:
+                    return Verdict(ALLOW, f"{v.reason}", key)
+            if remembered.get(key) == ALLOW:
+                return Verdict(ALLOW, "只读模式（本会话已允许）", key)
+            return Verdict(ASK, "当前为只读模式：写文件与命令执行需要逐次确认",
+                           key, ask_keys=(key,))
         return Verdict(ALLOW, "允许", None)
 
     def _rule_hits(self, rule: Rule, tool: str, arguments: dict) -> bool:

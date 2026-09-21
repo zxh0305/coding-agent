@@ -28,7 +28,7 @@ from pathlib import Path
 
 from agent import Agent
 from permissions import (ALLOW, ASK, DENY, CommandParseError, PermissionGate,
-                         rejection_result, split_segments, words_match)
+                         rejection_result, split_segments, words_match, Verdict)
 from tools import TOOL_REGISTRY, TOOL_READ_ONLY
 
 
@@ -205,8 +205,100 @@ class TestVerdicts(GateTestBase):
         self.assertEqual(gate2.check("run_bash", {"command": "sudo x"}).verb, ASK)
 
 
-class TestWorkspaceBoundary(GateTestBase):
+class TestPermissionModes(GateTestBase):
+    """会话级权限模式（readonly/confirm/yolo）：模式加载、三模式下的判定、
+    ask 的吸收（overlay/会话记忆）、非法模式回退。"""
 
+    def test_mode_loader_read_every_check(self):
+        """mode_loader 每次判定现读：切换模式下一轮调用立即生效，无需重建闸门。"""
+        holder = {"mode": "confirm"}
+        gate = self.make_gate(mode_loader=lambda: holder["mode"])
+        self.assertEqual(gate.check("run_bash", {"command": "sudo x"}).verb, ASK)
+        holder["mode"] = "yolo"  # 前端切到"完全访问"
+        self.assertEqual(gate.check("run_bash", {"command": "sudo x"}).verb, ALLOW)
+        holder["mode"] = "readonly"  # 再切回"只读"
+        self.assertEqual(gate.check("run_bash", {"command": "sudo x"}).verb, ASK)
+
+    def test_invalid_mode_falls_back_to_confirm(self):
+        """加载器返回非法值（库被手编坏）→ confirm，不炸判定。"""
+        gate = self.make_gate(mode_loader=lambda: "chaos")
+        self.assertEqual(gate.mode, "confirm")
+        self.assertEqual(gate.check("run_bash", {"command": "sudo x"}).verb, ASK)
+
+        def boom():
+            raise RuntimeError("读不到")
+        self.assertEqual(self.make_gate(mode_loader=boom).mode, "confirm")
+
+    def test_fixed_mode_param(self):
+        """构造参数直接定模式（CLI/单测场景，无加载器）。"""
+        self.assertEqual(self.make_gate(mode="yolo").mode, "yolo")
+        self.assertEqual(self.make_gate(mode="bogus").mode, "confirm")  # 非法回退
+
+    def test_yolo_downgrades_ask_but_not_deny(self):
+        """完全访问：内置 ask（sudo/rm -rf）与工作区边界放行；deny 仍生效。"""
+        gate = self.make_gate(mode="yolo")
+        for cmd in ("sudo x", "rm -rf /tmp/x", "git push origin main",
+                    "echo 'unbalanced"):  # 解析失败的 ask 同样降级
+            self.assertEqual(gate.check("run_bash", {"command": cmd}).verb, ALLOW, cmd)
+        self.assertEqual(gate.check("write_file", {"path": "a.txt"}).verb, ALLOW)
+        # 工作区边界（内置 deny）不因 yolo 翻案
+        v = gate.check("write_file", {"path": "../escape.txt"})
+        self.assertEqual(v.verb, DENY)
+        # 用户显式 deny 规则也保持
+        gate2 = self.make_gate(mode="yolo", user_rules_loader=lambda: [
+            {"tool": "run_bash", "pattern": "git push*", "decision": "deny", "reason": "禁推"},
+        ])
+        self.assertEqual(gate2.check("run_bash", {"command": "git push"}).verb, DENY)
+
+    def test_readonly_asks_writes_and_commands_allows_reads(self):
+        """只读模式：只读工具照常；写文件/命令（含常规命令 ls）一律 ask。"""
+        gate = self.make_gate(mode="readonly")
+        for tool in ("read_file", "list_dir", "grep", "calculator"):
+            self.assertEqual(gate.check(tool, {"path": "x"}).verb, ALLOW, tool)
+        for tool, args in (("write_file", {"path": "a.txt"}),
+                           ("apply_patch", {"path": "a.txt"}),
+                           ("run_bash", {"command": "ls -la"})):
+            v = gate.check(tool, args)
+            self.assertEqual(v.verb, ASK, f"{tool} 在只读模式应逐次确认")
+            self.assertTrue(v.ask_keys)  # 固定键：决定必须可吸收
+
+    def test_readonly_ask_absorbed_by_decision_and_memory(self):
+        """只读模式的确认可被本轮 overlay 与会话记忆吸收——点过允许不重复问。"""
+        gate = self.make_gate(mode="readonly")
+        v = gate.check("write_file", {"path": "a.txt"})
+        self.assertEqual(v.verb, ASK)
+        key = v.rule_key
+        # 用户允许（本会话）：记忆吸收，同一工具不再问
+        gate._memory[key] = ALLOW
+        self.assertEqual(gate.check("write_file", {"path": "b.txt"}).verb, ALLOW)
+        # 本轮一次性 overlay 同样吸收（恢复重判路径）
+        gate2 = self.make_gate(mode="readonly")
+        v2 = gate2.check("run_bash", {"command": "ls"})
+        overlay = {v2.rule_key: Verdict(ALLOW, "用户已允许", v2.rule_key)}
+        self.assertEqual(gate2.check("run_bash", {"command": "ls"}, overlay).verb, ALLOW)
+        # 不同工具的确认互不吸收（键带工具名）
+        self.assertEqual(gate2.check("write_file", {"path": "a.txt"}).verb, ASK)
+
+    def test_readonly_ask_resolved_end_to_end(self):
+        """只读模式完整闭环：ask → open_requests → resolve(allow_session) →
+        apply_decisions → 重判放行（与既有 ask 机制共用同一条恢复路径）。"""
+        gate = self.make_gate(mode="readonly")
+        v = gate.check("write_file", {"path": "a.txt"})
+        payloads = gate.open_requests([("write_file", {"path": "a.txt"}, v)])
+        self.assertEqual(len(payloads), 1)
+        self.assertTrue(gate.resolve(payloads[0]["id"], "allow_session"))
+        overlay = gate.apply_decisions(gate.wait_all())
+        self.assertEqual(gate.check("write_file", {"path": "a.txt"}, overlay).verb, ALLOW)
+
+    def test_confirm_mode_unchanged(self):
+        """confirm（默认）行为与无模式时完全一致：常规命令放行、sudo ask。"""
+        gate = self.make_gate(mode="confirm")
+        self.assertEqual(gate.check("run_bash", {"command": "ls"}).verb, ALLOW)
+        self.assertEqual(gate.check("run_bash", {"command": "sudo x"}).verb, ASK)
+        self.assertEqual(gate.check("write_file", {"path": "a.txt"}).verb, ALLOW)
+
+
+class TestWorkspaceBoundary(GateTestBase):
     def test_write_outside_returns_reasoned_deny(self):
         """工作区越界：带原因的 DENY（而非静默），原因来自 _resolve 本身。"""
         gate = self.make_gate()

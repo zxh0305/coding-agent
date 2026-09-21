@@ -158,9 +158,11 @@ function toast(text) {
   toast._timer = setTimeout(() => t.classList.add("hidden"), 2500);
 }
 
-// ---------- 任务（会话）列表 ----------
+// ---------- 任务列表：按项目（工作区）分组 + 折叠 + 重命名 ----------
 let confirmingDelete = null;  // 正处于"确认删除"状态的任务 id（二次确认，防误触）
 let sessionsCache = [];       // 最近一次拉取的任务列表，删除的乐观更新直接改它
+let renamingSession = null;   // 正在重命名的任务 id（行内出现输入框）
+const collapsedGroups = new Set();  // 已折叠的项目组（存组名）
 
 async function loadSessions() {
   try {
@@ -177,6 +179,99 @@ function removeSessionLocal(id) {
   renderSessions(sessionsCache);
 }
 
+async function submitRename(id, title) {
+  title = (title || "").trim();
+  if (!title) { renamingSession = null; renderSessions(sessionsCache); return; }
+  try {
+    await api(`/api/sessions/${encodeURIComponent(id)}/rename`,
+      { method: "POST", body: JSON.stringify({ title }) });
+    const s = sessionsCache.find(x => x.id === id);
+    if (s) s.title = title;
+  } catch (e) { toast("重命名失败：" + e.message); }
+  renamingSession = null;
+  renderSessions(sessionsCache);
+}
+
+function taskRow(s, list) {
+  const li = document.createElement("li");
+  li.className = "task" + (s.id === currentSession ? " active" : "");
+
+  // 重命名状态：标题位置换成输入框（Enter 确认 / Esc 或失焦取消）
+  if (s.id === renamingSession) {
+    const inp = document.createElement("input");
+    inp.className = "t-rename";
+    inp.value = s.title || "";
+    const done = () => submitRename(s.id, inp.value);
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") done();
+      if (e.key === "Escape") { renamingSession = null; renderSessions(sessionsCache); }
+    });
+    inp.addEventListener("blur", () => { if (renamingSession === s.id) done(); });
+    inp.addEventListener("click", (e) => e.stopPropagation());
+    return li;
+  }
+
+  // 二次确认状态：这一行变成"确认删除？[删除][取消]"，不做弹窗
+  if (s.id === confirmingDelete) {
+    li.classList.add("confirming");
+    const q = document.createElement("div");
+    q.className = "t-question";
+    q.textContent = "确认删除？";
+    const yes = document.createElement("button");
+    yes.className = "t-yes";
+    yes.textContent = "删除";
+    yes.addEventListener("click", (e) => {
+      e.stopPropagation();
+      confirmingDelete = null;
+      doDeleteSession(s.id);
+    });
+    const no = document.createElement("button");
+    no.className = "t-no";
+    no.textContent = "取消";
+    no.addEventListener("click", (e) => {
+      e.stopPropagation();
+      confirmingDelete = null;
+      renderSessions(list);
+    });
+    li.append(q, yes, no);
+    return li;
+  }
+
+  const title = document.createElement("div");
+  title.className = "t-title";
+  title.textContent = s.title || "新任务";
+  const time = document.createElement("span");
+  time.className = "t-time";
+  time.textContent = fmtTime(s.updated);
+  const rename = document.createElement("button");
+  rename.className = "t-del";
+  rename.textContent = "✏️";
+  rename.title = "重命名";
+  rename.addEventListener("click", (e) => {
+    e.stopPropagation();
+    renamingSession = s.id;
+    renderSessions(sessionsCache);
+    const inp = document.querySelector(".t-rename");
+    if (inp) { inp.focus(); inp.select(); }
+  });
+  const del = document.createElement("button");
+  del.className = "t-del";
+  del.textContent = "🗑";
+  del.title = "删除任务";
+  del.addEventListener("click", (e) => {
+    e.stopPropagation();
+    confirmingDelete = s.id;   // 第一次点：只进入确认状态，不真删
+    renderSessions(list);
+  });
+  li.append(title, time, rename, del);
+  li.title = s.title || "";
+  li.addEventListener("click", () => {
+    confirmingDelete = null;
+    switchSession(s.id);
+  });
+  return li;
+}
+
 function renderSessions(list) {
   const ul = $("task-list");
   ul.innerHTML = "";
@@ -187,59 +282,38 @@ function renderSessions(list) {
     ul.appendChild(li);
     return;
   }
+  // 按项目分组：workspace 非空 → 组名 = 目录名；否则进"其他"。
+  // 组内保持 updated 降序（接口已排好，稳定的分组遍历不破坏次序）。
+  const groups = new Map();  // 组名 → sessions（保持原有顺序）
   for (const s of list) {
-    const li = document.createElement("li");
-    li.className = "task" + (s.id === currentSession ? " active" : "");
-
-    // 二次确认状态：这一行变成"确认删除？[删除][取消]"，不做弹窗
-    if (s.id === confirmingDelete) {
-      li.classList.add("confirming");
-      const q = document.createElement("div");
-      q.className = "t-question";
-      q.textContent = "确认删除？";
-      const yes = document.createElement("button");
-      yes.className = "t-yes";
-      yes.textContent = "删除";
-      yes.addEventListener("click", (e) => {
-        e.stopPropagation();
-        confirmingDelete = null;
-        doDeleteSession(s.id);
-      });
-      const no = document.createElement("button");
-      no.className = "t-no";
-      no.textContent = "取消";
-      no.addEventListener("click", (e) => {
-        e.stopPropagation();
-        confirmingDelete = null;
-        renderSessions(list);
-      });
-      li.append(q, yes, no);
-      ul.appendChild(li);
-      continue;
-    }
-
-    const title = document.createElement("div");
-    title.className = "t-title";
-    title.textContent = s.title || "新任务";
-    const time = document.createElement("span");
-    time.className = "t-time";
-    time.textContent = fmtTime(s.updated);
-    const del = document.createElement("button");
-    del.className = "t-del";
-    del.textContent = "🗑";
-    del.title = "删除任务";
-    del.addEventListener("click", (e) => {
-      e.stopPropagation();
-      confirmingDelete = s.id;   // 第一次点：只进入确认状态，不真删
-      renderSessions(list);
+    const name = s.workspace ? (s.workspace.replace(/\/+$/, "").split("/").pop() || "项目") : null;
+    const key = name || "__other__";
+    if (!groups.has(key)) groups.set(key, { label: name || "其他", items: [] });
+    groups.get(key).items.push(s);
+  }
+  const groupHeader = (label, count, key) => {
+    const head = document.createElement("li");
+    head.className = "group-head";
+    const collapsed = collapsedGroups.has(key);
+    const icon = key === "__other__" ? "💬" : "📁";
+    head.textContent = `${collapsed ? "▸" : "▾"} ${icon} ${label}（${count}）`;
+    head.addEventListener("click", () => {
+      collapsed ? collapsedGroups.delete(key) : collapsedGroups.add(key);
+      renderSessions(sessionsCache);
     });
-    li.append(title, time, del);
-    li.title = s.title || "";
-    li.addEventListener("click", () => {
-      confirmingDelete = null;
-      switchSession(s.id);
-    });
-    ul.appendChild(li);
+    return head;
+  };
+  // 项目组在前（按名排序），"其他"固定垫底
+  const keys = [...groups.keys()].filter(k => k !== "__other__").sort(
+    (a, b) => groups.get(a).label.localeCompare(groups.get(b).label, "zh"));
+  if (groups.has("__other__")) keys.push("__other__");
+  const onlyOneGroup = keys.length === 1;
+  for (const key of keys) {
+    const g = groups.get(key);
+    // 只有一个组且是"其他"（全场都没有项目）时不显示组头——列表退化为平铺
+    if (!(onlyOneGroup && key === "__other__")) ul.appendChild(groupHeader(g.label, g.items.length, key));
+    if (collapsedGroups.has(key) && !onlyOneGroup) continue;
+    for (const s of g.items) ul.appendChild(taskRow(s, list));
   }
 }
 
@@ -296,7 +370,7 @@ async function switchSession(id) {
   openEvents(id);                 // 再接事件流：断线/刷新期间的回合靠 since 补发接上
   await loadSessions();
   await refreshCtx();
-  loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换
+  loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换（内部顺带拉权限模式）
   dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
 }
 
@@ -930,11 +1004,16 @@ async function testProv() {
 }
 
 // ---------- 工作区（按任务隔离：带 session_id 查/改该任务的；不带 = 用户默认） ----------
+let wsCustom = false;  // 用户是否真正选过工作区（false = 系统兜底路径，发送前要先选）
+
 async function loadWorkspace() {
   try {
     const qs = currentSession ? `?session_id=${encodeURIComponent(currentSession)}` : "";
     const w = await api("/api/workspace" + qs);
+    wsCustom = !!w.custom;
     setWsLabel(w.path);
+    renderWsChip();
+    loadPermMode();  // 工作区变了，权限模式跟着工作区走
   } catch (e) { /* 忽略 */ }
 }
 
@@ -942,6 +1021,13 @@ function setWsLabel(path) {
   const seg = (path || "").replace(/\/+$/, "").split("/").pop() || path;
   $("ws-short").textContent = seg || "工作区";
   $("ws-pick").title = path || "";
+}
+
+function renderWsChip() {
+  // 未选过项目：像"选择项目"的下拉（示意待选）；选过：显示目录名
+  $("ws-short").textContent = wsCustom ? (($("ws-pick").title || "").replace(/\/+$/, "").split("/").pop() || "工作区")
+                                        : "选择项目";
+  $("ws-pick").classList.toggle("ws-unset", !wsCustom);
 }
 
 let mCwd = "", mParent = null, mHome = "";
@@ -986,14 +1072,65 @@ async function chooseWorkspace() {
     const body = { path: mCwd };
     if (currentSession) body.session_id = currentSession;
     const w = await api("/api/workspace", { method: "POST", body: JSON.stringify(body) });
+    wsCustom = true;
     setWsLabel(w.path);
+    renderWsChip();
     $("modal").classList.add("hidden");
-    bubble("assistant", currentSession
+    bubble("note", currentSession
       ? `（本任务的工作区已切换到 ${w.path}，之后我的文件操作和命令都在这个目录里进行；其他任务不受影响）`
       : `（已把 ${w.path} 设为新任务的默认工作区）`);
+    // 发送流程因"未选项目"挂起的：选完目录接着发
+    const pend = pendingAfterWsPick; pendingAfterWsPick = null;
+    if (pend) {
+      userBubble(pend.text, []);
+      performSend(pend);
+    }
   } catch (e) {
     $("m-path").textContent = "切换失败：" + e.message;
   }
+}
+
+// ---------- 权限模式（按工作区记忆；闸门每次判定现读，切换立即生效） ----------
+const PERM_LABELS = { readonly: "只读", confirm: "确认", yolo: "完全访问" };
+let permMode = "confirm";
+
+async function loadPermMode() {
+  if (!currentSession) return;  // 新任务没有会话级模式，保持全局选择
+  try {
+    const r = await api(`/api/sessions/${encodeURIComponent(currentSession)}/perm_mode`);
+    permMode = r.mode || "confirm";
+    renderPermChip();
+  } catch (e) { /* 拉取失败保留当前显示 */ }
+}
+
+function renderPermChip() {
+  $("perm-label").textContent = PERM_LABELS[permMode] || permMode;
+  $("perm-chip").classList.toggle("perm-chip-warn", permMode === "yolo");
+}
+
+function togglePermPop() {
+  const pop = $("perm-pop");
+  if (!pop.classList.contains("hidden")) { pop.classList.add("hidden"); return; }
+  for (const row of pop.querySelectorAll(".perm-row")) {
+    row.classList.toggle("active", row.dataset.mode === permMode);
+    row.onclick = async () => {
+      const mode = row.dataset.mode;
+      pop.classList.add("hidden");
+      if (!currentSession) {  // 新任务：先记住选择，发送建会话后跟随工作区写入
+        permMode = mode; renderPermChip(); return;
+      }
+      try {
+        const r = await api(`/api/sessions/${encodeURIComponent(currentSession)}/perm_mode`,
+          { method: "POST", body: JSON.stringify({ mode }) });
+        permMode = r.mode; renderPermChip();
+        toast(`权限模式：${PERM_LABELS[permMode]}`);
+      } catch (e) { toast("切换失败：" + e.message); }
+    };
+  }
+  const rect = $("perm-chip").getBoundingClientRect();
+  pop.style.left = Math.max(8, rect.left) + "px";
+  pop.style.bottom = (innerHeight - rect.top + 8) + "px";
+  pop.classList.remove("hidden");
 }
 
 // ---------- 上下文容量 ----------
@@ -1582,6 +1719,8 @@ async function stopGeneration() {
 // 队列卡片上可「⬆ 立即」（停止当前生成、马上执行这一条）/「✏ 编辑」/「🗑 删除」。
 let pendingQueue = [];  // {text, payloadAtts, sessionId, el, immediate}
 
+let pendingAfterWsPick = null;  // 选完工作区后要继续的动作（发送流程挂起等选目录）
+
 function send() {
   const text = inputEl.value.trim();
   if (!text && !attachments.length) return;
@@ -1591,6 +1730,17 @@ function send() {
   }
   const payloadAtts = attachments.map(a => ({ kind: a.kind, name: a.name, mime: a.mime, data: a.data }));
   const outAtts = attachments.map(a => ({ kind: a.kind, name: a.name, preview: a.preview }));
+
+  // 新任务且还没选过项目：先弹文件夹选择框，选完接着发（Agent 的工作区
+  // 不能靠系统兜底猜——用户得知道自己的代码/文件会被读写到哪里）
+  if (!currentSession && !wsCustom) {
+    inputEl.value = "";
+    attachments = [];
+    renderAttachTray();
+    pendingAfterWsPick = { text, payloadAtts };
+    openPicker();
+    return;
+  }
   inputEl.value = "";
   attachments = [];
   renderAttachTray();
@@ -1697,6 +1847,11 @@ async function performSend(item) {
       currentSession = data.session_id;
       openEvents(currentSession);  // 立刻接事件流：turn_start 可能已在缓冲里等着补发
       loadWorkspace();             // 新任务按用户默认解析了自己的工作区，工具栏对齐
+      // 新任务时在下拉里选过权限模式：建会话后写入（按工作区记忆）
+      if (permMode !== "confirm") {
+        api(`/api/sessions/${encodeURIComponent(currentSession)}/perm_mode`,
+          { method: "POST", body: JSON.stringify({ mode: permMode }) }).catch(() => {});
+      }
     }
   } catch (e) {
     // 命令没送出去（后端不可达/登录失效）：回合不会开始，本地复位。
@@ -1735,11 +1890,25 @@ bind("p-save", "click", saveProv);
 bind("p-test", "click", testProv);
 bind("p-delete", "click", deleteProv);
 bind("ws-pick", "click", openPicker);
-bind("m-cancel", "click", () => $("modal").classList.add("hidden"));
+bind("m-cancel", "click", () => {
+  $("modal").classList.add("hidden");
+  // 因"发送前先选项目"弹出的选择框被取消：把输入和附件还原回输入框
+  if (pendingAfterWsPick) {
+    inputEl.value = pendingAfterWsPick.text;
+    for (const a of pendingAfterWsPick.payloadAtts) {
+      attachments.push({ kind: a.kind, name: a.name, mime: a.mime, data: a.data,
+                         preview: a.kind === "image" ? `data:${a.mime};base64,${a.data}` : "" });
+    }
+    pendingAfterWsPick = null;
+    renderAttachTray();
+    inputEl.focus();
+  }
+});
 bind("m-up", "click", () => mParent && navTo(mParent));
 bind("m-home", "click", () => navTo(mHome || undefined));
 bind("m-choose", "click", chooseWorkspace);
 bind("ctx-chip", "click", toggleCtxPop);
+bind("perm-chip", "click", togglePermPop);
 bind("user-btn", "click", toggleUserPop);
 bind("pop-logout", "click", logoutNow);
 bind("up-manage", "click", () => {

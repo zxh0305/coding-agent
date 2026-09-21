@@ -85,6 +85,7 @@ from events import SSE_HEARTBEAT, SessionEvents, sse_frame
 from llm_client import create_client, load_env_file, save_env_values
 from logger import setup_logging
 from memory import memory_dir, recent_user_texts, run_extraction_async
+import permissions
 from permissions import PermissionGate
 from tools import TOOL_SCHEMAS
 
@@ -137,11 +138,15 @@ def _build_permission_gate(workspace: Path) -> PermissionGate:
     settings 表，key = "permissions:<workspace_path>"，值是 JSON 数组、可直接
     手编（后续可挂管理面板），例如：
       [{"tool": "run_bash", "pattern": "git push*", "decision": "allow"}]
+    权限模式（readonly/confirm/yolo，前端输入框下拉）同样按工作区记忆，
+    key = "perm_mode:<workspace_path>"，加载器每次判定现读——前端切换模式
+    下一轮工具调用立即生效，无需重建会话。
     加载器以闭包注入而非让闸门直接 import db：闸门保持存储无关（CLI/单测
     不引库也能跑），每次判定现读——手编规则下一轮工具调用立即生效。"""
     return PermissionGate(
         workspace=workspace,
         user_rules_loader=lambda w=str(workspace): db.get_setting(f"permissions:{w}", []),
+        mode_loader=lambda: db.get_setting(f"perm_mode:{workspace}", "confirm"),
         ask_timeout=PERMISSION_ASK_TIMEOUT,
     )
 
@@ -556,11 +561,15 @@ class Handler(SimpleHTTPRequestHandler):
                 provs.append({**p, "api_key": None, "api_key_masked": _mask(p["api_key"])})
             self._json(provs)
         elif self.path.startswith("/api/workspace"):
-            # 带当前任务 id 时返回该任务的工作区；不带 = 用户默认（新任务将用的）
+            # 带当前任务 id 时返回该任务的工作区；不带 = 用户默认（新任务将用的）。
+            # custom = 用户是否真正选过（任务自选 / 有用户默认）；false 说明是
+            # 系统兜底路径，前端显示"选择项目"并要求先选目录再发送。
             sid = (self._query().get("session_id") or [""])[0]
             if sid and db.session_owner(sid) != self.user["id"]:
                 return self._json({"error": "任务不存在或不属于当前用户"}, 404)
-            self._json({"path": str(_resolve_workspace(self.user["id"], sid))})
+            custom = bool(db.get_session_workspace(sid) if sid
+                          else db.get_setting(f"default_workspace:{self.user['id']}"))
+            self._json({"path": str(_resolve_workspace(self.user["id"], sid)), "custom": custom})
         elif self.path.startswith("/api/fs/dirs"):
             self._handle_fs_dirs()
         elif self.path == "/api/tools":
@@ -572,6 +581,12 @@ class Handler(SimpleHTTPRequestHandler):
             ]})
         elif self.path == "/api/sessions":
             self._json(db.list_sessions(self.user["id"]))
+        elif re.fullmatch(r"/api/sessions/[^/]+/perm_mode", path):
+            # 会话的权限模式（前端输入框下拉）：闸门 mode_loader 每次判定现读
+            sid = path.split("/")[3]
+            if db.session_owner(sid) != self.user["id"]:
+                return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+            self._handle_perm_mode(sid)
         elif path.startswith("/api/sessions/"):  # /api/sessions/<id>/messages|artifact
             parts = [p for p in path.split("/") if p]  # ["api","sessions",<id>,<子资源>]
             sid = parts[2] if len(parts) > 2 else ""
@@ -635,6 +650,16 @@ class Handler(SimpleHTTPRequestHandler):
                 self._handle_model_delete()
             elif self.path == "/api/providers/test":
                 self._handle_provider_test()
+            elif re.fullmatch(r"/api/sessions/[^/]+/rename", path):
+                sid = path.split("/")[3]
+                if db.session_owner(sid) != self.user["id"]:
+                    return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+                self._handle_session_rename(sid)
+            elif re.fullmatch(r"/api/sessions/[^/]+/perm_mode", path):
+                sid = path.split("/")[3]
+                if db.session_owner(sid) != self.user["id"]:
+                    return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+                self._handle_perm_mode(sid)
             elif self.path == "/api/workspace":
                 self._handle_workspace_set()
             else:
@@ -1019,6 +1044,29 @@ class Handler(SimpleHTTPRequestHandler):
             self._json({"ok": False, "error": str(e)})
 
     # ---------- 工作区 ----------
+
+    def _handle_session_rename(self, sid: str):
+        """重命名任务标题。自动标题（首轮提交时取输入前 24 字）之外，用户
+        可以在左侧任务列表里改任意名字——存 title 字段，与其他展示共用。"""
+        title = str(self._body().get("title") or "").strip()
+        if not title or len(title) > 80:
+            return self._json({"error": "标题须为 1-80 字符"}, 400)
+        db.set_session_title(sid, title)
+        self._json({"ok": True, "title": title})
+
+    def _handle_perm_mode(self, sid: str):
+        """读/写会话的权限模式（readonly|confirm|yolo）。按工作区记忆：
+        同一项目文件夹的新任务沿用上次选择的模式（与用户规则的隔离粒度一致）；
+        无工作区的会话落在空 key 下（等于全局默认）。闸门每次判定经 mode_loader
+        现读，切换后下一轮工具调用立即生效，无需重建会话。"""
+        ws = db.get_session_workspace(sid) or ""
+        if self.command == "POST":
+            mode = str(self._body().get("mode") or "").strip()
+            if mode not in permissions.MODES:
+                return self._json({"error": f"mode 须为 {'/'.join(permissions.MODES)}"}, 400)
+            db.set_setting(f"perm_mode:{ws}", mode)
+            log.info("[会话 %s] 权限模式切换为 %s（工作区 %s）", sid, mode, ws or "无")
+        self._json({"mode": db.get_setting(f"perm_mode:{ws}", "confirm")})
 
     def _handle_workspace_set(self):
         """切换工作区（按任务隔离，替代曾经的"全局环境变量 + 写回 .env"）：
