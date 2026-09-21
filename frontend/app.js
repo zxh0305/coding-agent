@@ -672,6 +672,7 @@ function compactCard(summary) {
 // openLightbox(src) 单图；openLightbox(src, gallery, idx) 传入同组图片数组
 // （整条消息的全部图片）后可左右切换。缩放：+/−/重置按钮、滚轮、键盘。
 let lbScale = 1;
+let lbKeysHandler = null;  // 当前灯箱的键盘处理器（closeLightbox 要摘掉它）
 
 function openLightbox(src, gallery, idx) {
   closeLightbox();
@@ -742,6 +743,7 @@ function openLightbox(src, gallery, idx) {
     setScale(lbScale * (e.deltaY < 0 ? 1.12 : 0.89));
   }, { passive: false });
   document.addEventListener("keydown", lightboxKeys);
+  lbKeysHandler = lightboxKeys;
   document.body.appendChild(box);
   apply();
 
@@ -756,7 +758,10 @@ function openLightbox(src, gallery, idx) {
 }
 function closeLightbox() {
   document.querySelector(".lightbox")?.remove();
-  document.removeEventListener("keydown", lightboxKeys);
+  if (lbKeysHandler) {
+    document.removeEventListener("keydown", lbKeysHandler);
+    lbKeysHandler = null;
+  }
 }
 
 // 气泡里的消息图片统一走这里：带点击放大 + 复制。
