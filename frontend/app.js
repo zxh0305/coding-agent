@@ -103,13 +103,25 @@ async function api(path, options = {}) {
 }
 
 // ---------- 小工具 ----------
-function bubble(className, text) {
+function buildBubble(className, text) {
   const div = document.createElement("div");
   div.className = `bubble ${className}`;
   div.textContent = text;
+  return div;
+}
+
+function bubble(className, text) {
+  const div = buildBubble(className, text);
   chatEl.appendChild(div);
   chatEl.scrollTop = chatEl.scrollHeight;
   return div;
+}
+
+function fmtBytes(n) {
+  if (n == null) return "—";
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + "MB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + "KB";
+  return n + "B";
 }
 
 function summarize(s, n) {
@@ -260,45 +272,115 @@ async function newTask() {
   await loadSessions();  // 重新拉取列表：旧任务仍显示，只是没有选中项；首条消息后新任务才出现
 }
 
+// ---------- 历史消息回放（分页加载 + 外置归档） ----------
+let histOldestOrd = null;  // 已加载最旧一条消息的 ord（向上翻页游标）
+let histHasMore = false;   // 其上是否还有更早的消息
+
 async function switchSession(id) {
   if (id === currentSession) return;
   currentSession = id;
   chatEl.innerHTML = "";
   welcome();
-  try {
-    const msgs = await api(`/api/sessions/${encodeURIComponent(id)}/messages`);
-    for (const m of msgs) {
-      // 压缩边界：渲染分隔卡片（可展开摘要），不作为普通对话
-      if (m.role === "compact") {
-        chatEl.appendChild(compactCard(m.content));
-        continue;
-      }
-      // 用户消息可能是多部分数组（文本 + 图片附件）
-      if (m.role === "user" && Array.isArray(m.content)) {
-        const text = m.content
-          .filter(p => p.type === "text")
-          .map(p => (p.text || "").length > 600 ? p.text.slice(0, 600) + "…[附件内容已折叠]" : p.text)
-          .join("\n");
-        const imgs = m.content
-          .filter(p => p.type === "image_url")
-          .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
-        userBubble(text, imgs);
-      } else {
-        bubble(m.role === "user" ? "user" : "assistant", m.content || "");
-        // 历史消息也带回当时的耗时/token 统计（新版本起随消息落盘）
-        if (m.role === "assistant" && m.stats) {
-          const meta = document.createElement("div");
-          meta.className = "meta";
-          meta.textContent = metaText(m.stats.elapsed_s, m.stats.usage);
-          chatEl.appendChild(meta);
-        }
-      }
-    }
-  } catch (e) { /* 历史拉取失败不阻塞 */ }
+  histOldestOrd = null;
+  histHasMore = false;
+  await loadHistoryPage();
   await loadSessions();
   await refreshCtx();
   loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换
   dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
+}
+
+async function loadHistoryPage() {
+  if (!currentSession) return;
+  try {
+    // 默认最近 100 条；向上翻页带 before_ord（已加载最旧一条的 ord）
+    const qs = new URLSearchParams({ limit: "100" });
+    if (histOldestOrd != null) qs.set("before_ord", histOldestOrd);
+    const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?` + qs);
+    histHasMore = !!data.has_more;
+    if (!data.messages.length) { updateLoadOlder(); return; }
+    histOldestOrd = data.messages[0].ord;
+    const frag = document.createDocumentFragment();
+    for (const m of data.messages) frag.appendChild(historyNode(m));
+    const btn = $("load-older");
+    if (btn) {
+      // 向上翻页：更早的消息插在"加载更早"按钮之后、现有历史之前；
+      // 补偿滚动位置，用户视线的消息不跳动
+      const prevHeight = chatEl.scrollHeight, prevTop = chatEl.scrollTop;
+      btn.after(frag);
+      chatEl.scrollTop = prevTop + (chatEl.scrollHeight - prevHeight);
+    } else {
+      chatEl.appendChild(frag);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+    updateLoadOlder();
+  } catch (e) { /* 历史拉取失败不阻塞 */ }
+}
+
+function updateLoadOlder() {
+  const old = $("load-older");
+  if (!histHasMore) { if (old) old.remove(); return; }
+  if (old) return;
+  const btn = document.createElement("button");
+  btn.id = "load-older";
+  btn.className = "load-older";
+  btn.textContent = "⬆ 加载更早的消息";
+  btn.addEventListener("click", loadHistoryPage);
+  // 插在欢迎语（第一个子节点）之后、历史消息之前
+  chatEl.insertBefore(btn, chatEl.children[1] || null);
+}
+
+// 单条历史消息 → DOM 节点（与实时对话一致的渲染规则）
+function historyNode(m) {
+  // 外置归档消息：库行内只有 head 预览（超大正文存 artifacts 文件），
+  // 展示"内容过大已归档"标记，点开按需拉取全文
+  if (m.artifact) return artifactCard(m);
+  if (m.role === "compact") return compactCard(m.content);
+  if (m.role === "user" && Array.isArray(m.content)) {
+    const text = m.content
+      .filter(p => p.type === "text")
+      .map(p => (p.text || "").length > 600 ? p.text.slice(0, 600) + "…[附件内容已折叠]" : p.text)
+      .join("\n");
+    const imgs = m.content
+      .filter(p => p.type === "image_url")
+      .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
+    return buildUserBubble(text, imgs);
+  }
+  const wrap = document.createElement("div");
+  wrap.appendChild(buildBubble(m.role === "user" ? "user" : "assistant", m.content || ""));
+  // 历史消息也带回当时的耗时/token 统计（message_usage 表随消息附带）
+  if (m.role === "assistant" && m.stats) {
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = metaText(m.stats.elapsed_s, m.stats.usage);
+    wrap.appendChild(meta);
+  }
+  return wrap;
+}
+
+// 外置归档消息卡片：head 预览 + 归档标记；点开懒加载全文（1MB 级内容
+// 不随时间线整页带回，用户要看时才走 artifact 接口取）
+function artifactCard(m) {
+  const d = document.createElement("details");
+  d.className = "bubble assistant artifact";
+  const s = document.createElement("summary");
+  s.textContent = `📦 内容过大已归档（${fmtBytes(m.bytes)}）· 点开加载全文`;
+  const pre = document.createElement("pre");
+  pre.className = "artifact-preview";
+  pre.textContent = m.head || "（无预览）";
+  d.append(s, pre);
+  d.addEventListener("toggle", async () => {
+    if (!d.open || d.dataset.loaded) return;
+    d.dataset.loaded = "1";
+    try {
+      const r = await api(`/api/sessions/${encodeURIComponent(currentSession)}` +
+        `/artifact?path=${encodeURIComponent(m.path)}`);
+      pre.textContent = prettyJson(JSON.stringify(r.message));
+    } catch (e) {
+      pre.textContent = "全文读取失败：" + e.message;
+    }
+  });
+  return d;
 }
 
 function welcome() {
@@ -418,7 +500,7 @@ function compactCard(summary) {
 }
 
 // 带附件的用户气泡：文字 + 图片缩略图/文件名
-function userBubble(text, atts) {
+function buildUserBubble(text, atts) {
   const div = document.createElement("div");
   div.className = "bubble user";
   if (text) {
@@ -439,7 +521,11 @@ function userBubble(text, atts) {
       div.appendChild(f);
     }
   }
-  chatEl.appendChild(div);
+  return div;
+}
+
+function userBubble(text, atts) {
+  chatEl.appendChild(buildUserBubble(text, atts));
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 

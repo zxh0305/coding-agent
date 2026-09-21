@@ -24,7 +24,9 @@ Web 服务
   POST /api/workspace               切换工作区 {"path", "session_id"?}（带 id 只改该任务；不带改用户默认）
   GET  /api/fs/dirs?path=         列出某目录的子目录（供选文件夹弹窗逐级浏览）
   GET  /api/sessions              任务列表（仅当前用户的）
-  GET  /api/sessions/<id>/messages  某任务的历史消息（须是自己的任务）
+  GET  /api/sessions/<id>/messages  某任务的历史消息（须是自己的任务；?before_ord=&limit=
+                                    向上翻页，默认最近 100 条；归档消息带 artifact/path/head）
+  GET  /api/sessions/<id>/artifact?path=  读取外置归档消息的完整原文（路径白名单校验）
   DELETE /api/sessions?session_id=  删除任务（须是自己的任务）
   GET  /api/context?session_id=   该任务当前上下文容量
   POST /api/chat/stream           流式问答（SSE）
@@ -267,12 +269,20 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
         if sid not in _agents or _sigs.get(sid) != sig:
             agent = Agent(llm=client, verbose=False, vision_supported=vision,
                           workspace=workspace, vision_backend=_vision_backend,
-                          context_window=_active_window())  # 压缩触发线的基准（切换模型后重建实例即更新）
-            agent.history = db.get_messages(sid)  # 重启/换模型后从库里恢复对话
+                          context_window=_active_window(),  # 压缩触发线的基准（切换模型后重建实例即更新）
+                          artifact_reader=db.read_artifact)  # 外置大消息的还原器（模型视图用）
+            # 窗口恢复：从未压缩 = 全量；压缩过 = 锚点 + 最后一条边界及其之后
+            # （边界摘要是后续再压缩的输入）。内存占用与当前窗口成正比，而非
+            # 全会话长度；模型视图与全量恢复逐字节一致。
+            total = db.count_messages(sid)
+            agent.history = db.restore_window(sid)
+            # 增量落盘的指纹账本从恢复的历史重建（只覆盖窗口内即可——窗口外
+            # 的行不会被 save_messages 触碰），重启后第一轮就是纯增量写。
+            agent.saved = db.fingerprints(agent.history)
             _agents[sid] = agent
             _sigs[sid] = sig
-            log.info("会话 %s Agent 就绪 model=%s 工作区=%s（历史 %d 条，视觉=%s）",
-                     sid, model, workspace, len(agent.history), vision)
+            log.info("会话 %s Agent 就绪 model=%s 工作区=%s（恢复 %d/%d 条，视觉=%s）",
+                     sid, model, workspace, len(agent.history), total, vision)
         return sid, _agents[sid]
 
 
@@ -351,7 +361,8 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if not self._require_auth():
             return
-        if self.path == "/api/auth/me":
+        path = urllib.parse.urlparse(self.path).path  # 剥掉 ?query 后的纯路径
+        if path == "/api/auth/me":
             user = self._auth_user()   # auth 路径不走 _require_auth，这里自己解析
             if user is None:
                 return self._json({"error": "未登录"}, 401)
@@ -391,17 +402,15 @@ class Handler(SimpleHTTPRequestHandler):
             ]})
         elif self.path == "/api/sessions":
             self._json(db.list_sessions(self.user["id"]))
-        elif self.path.startswith("/api/sessions/"):  # /api/sessions/<id>/messages
-            sid = self.path.split("/")[3]
-            if db.session_owner(sid) != self.user["id"]:
+        elif path.startswith("/api/sessions/"):  # /api/sessions/<id>/messages|artifact
+            parts = [p for p in path.split("/") if p]  # ["api","sessions",<id>,<子资源>]
+            sid = parts[2] if len(parts) > 2 else ""
+            if not sid or db.session_owner(sid) != self.user["id"]:
                 return self._json({"error": "任务不存在或不属于当前用户"}, 404)
-            # compact = 上下文压缩边界（role="compact"）：前端渲染"以上已压缩"分隔
-            # 卡片用，不作为普通对话气泡；summary 原文随消息带回，点开可查。
-            msgs = [{"role": m["role"], "content": m.get("content") or "",
-                     "stats": m.get("_stats")}  # 助手消息带回耗时/token 统计（回放渲染用）
-                    for m in db.get_messages(sid)
-                    if m.get("role") in ("user", "assistant", "compact") and m.get("content")]
-            self._json(msgs)
+            sub = parts[3] if len(parts) > 3 else ""
+            if sub == "artifact":
+                return self._handle_session_artifact(sid)
+            return self._handle_session_messages(sid)
         elif self.path.startswith("/api/context"):
             sid = (self._query().get("session_id") or [""])[0]
             if sid and db.session_owner(sid) != self.user["id"]:
@@ -532,7 +541,7 @@ class Handler(SimpleHTTPRequestHandler):
                 log.info("[会话 %s] 最终回答: %s", sid, answer)
             except RuntimeError as e:
                 log.exception("LLM 请求失败")
-                db.replace_messages(sid, agent.history)  # 部分历史也落盘
+                db.save_messages(sid, agent.history, agent.saved)  # 部分历史也落盘（增量）
                 return self._json({"error": str(e), "session_id": sid}, 502)
             self._finish_round(sid, agent)
             self._json({"session_id": sid, "answer": answer, "trace": agent.trace})
@@ -582,8 +591,12 @@ class Handler(SimpleHTTPRequestHandler):
                 # 用户关页面/刷新导致连接断开：推不出事件了，安静收尾（finally 仍会落盘）
                 log.info("[会话 %s] 客户端提前断开", sid)
             finally:
-                db.replace_messages(sid, agent.history)  # 完整历史落盘（重启后可恢复）
+                # 增量落盘：只写本轮新增/有变化的消息（done、用户停止、异常收尾
+                # 都走这里；完整历史重启后可从库恢复）。写入行数进日志——它是
+                # "第二轮起只写增量"这一验收指标的观测点。
+                written = db.save_messages(sid, agent.history, agent.saved)
                 db.touch_session(sid)
+                log.info("[会话 %s] 本轮落盘 %d 行", sid, written)
 
     def _handle_chat_stop(self):
         """停止指定任务的生成：给 Agent 的停止开关置位。
@@ -603,8 +616,63 @@ class Handler(SimpleHTTPRequestHandler):
         self._json({"ok": True, "running": True})
 
     def _finish_round(self, sid: str, agent: Agent) -> None:
-        db.replace_messages(sid, agent.history)
+        db.save_messages(sid, agent.history, agent.saved)  # 增量落盘本轮新增消息
         db.touch_session(sid)
+
+    # ---------- 任务消息（分页回放 + 归档全文） ----------
+
+    def _handle_session_messages(self, sid: str):
+        """历史消息分页：默认最近 100 条，before_ord 向上翻页。
+
+        compact = 上下文压缩边界（role="compact"）：前端渲染"以上已压缩"分隔
+        卡片用；summary 原文随消息带回，点开可查。外置归档消息（_artifact）
+        行内没有正文——只带 head 预览与 path/bytes，前端渲染"内容过大已归档"
+        标记，点"查看全文"再走 artifact 接口按需取回。
+        """
+        qs = self._query()
+        try:
+            limit = min(500, max(1, int(qs.get("limit", ["100"])[0])))
+        except ValueError:
+            limit = 100
+        raw_before = qs.get("before_ord", [None])[0]
+        try:
+            before_ord = int(raw_before) if raw_before is not None else None
+        except (TypeError, ValueError):
+            return self._json({"error": "before_ord 须为整数"}, 400)
+        msgs = db.get_messages(sid, before_ord=before_ord, limit=limit)
+        items = []
+        for m in msgs:
+            role = m.get("role")
+            if role not in ("user", "assistant", "compact"):
+                continue  # 工具消息/带 tool_calls 的中间 assistant 不进时间线
+            if m.get("_artifact"):
+                items.append({"role": role, "content": "", "ord": m["_ord"],
+                              "artifact": True, "path": m.get("path"),
+                              "bytes": m.get("bytes"), "head": m.get("head"),
+                              "stats": m.get("_stats")})
+            elif m.get("content"):
+                # 助手消息带回耗时/token 统计（回放渲染用，来自 message_usage 表）
+                items.append({"role": role, "content": m["content"], "ord": m["_ord"],
+                              "stats": m.get("_stats")})
+        # has_more：本页最小 ord 之前还有更早的消息（向上翻页入口的显隐依据）
+        has_more = bool(items) and db.has_messages_before(sid, items[0]["ord"])
+        self._json({"messages": items, "has_more": has_more})
+
+    def _handle_session_artifact(self, sid: str):
+        """读取本任务外置归档的完整消息。路径校验双保险：
+        1. db.read_artifact 的 realpath 白名单（防 ../、绝对路径、非 .json）；
+        2. 路径首段必须是本任务 id——任务归属虽已在上层校验，但 path 参数本身
+           还能指向别家任务的归档，这里一并拦死。"""
+        rel = (self._query().get("path") or [""])[0]
+        if not rel or not rel.startswith(f"{sid}/"):
+            return self._json({"error": "非法的归档路径"}, 400)
+        try:
+            msg = db.read_artifact(rel)
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        except (OSError, json.JSONDecodeError):
+            return self._json({"error": "归档文件缺失或损坏"}, 404)
+        self._json({"message": msg})
 
     # ---------- 模型供应商 ----------
 

@@ -86,10 +86,13 @@ Agent 的工作区默认是项目根目录的 `workspace/`（首次运行会自�
 | 表 | 存什么 |
 |---|---|
 | `sessions` | 任务列表：标题、创建/更新时间、归属用户、各自的工作区 |
-| `messages` | 每个任务的完整消息历史（OpenAI 消息格式的 JSON，含工具调用；压缩后额外含 `role=compact` 的边界标记消息，被压缩的原文仍在，不删） |
+| `messages` | 消息历史：**稳定身份 `mid`（uuid4）+ 显示序 `ord` + 正文**。每轮只增量写入新消息（按内容指纹跳过已落盘的，不再整表重写）；压缩后额外含 `role=compact` 的边界标记消息，被压缩的原文仍在，不删。单条序列化超 64KB 时正文外置到 `artifacts/<会话>/<mid>.json`，行内只留 head/tail 摘要（模型视图按需还原，看到的内容不变） |
+| `message_usage` | 消息级统计（prompt/completion/cached tokens 可查询列 + 完整 `_stats` JSON），与消息正文分离存储 |
 | `providers` | 模型供应商：名称 / Base URL / API Key / 启用状态 / 默认上下文窗口（模型级自填优先） |
 | `provider_models` | 供应商下的模型：模型名 / 上下文窗口 / 启用状态 |
 | `settings` | 键值设置（当前激活的模型等） |
+
+schema 升级用 `PRAGMA user_version` + 有序迁移列表（`db.MIGRATIONS`）管理，启动时只补执行未到达版本；会话恢复按窗口加载（压缩边界之前的消息不进内存，内存占用与当前窗口成正比）。
 
 首次启动会把 `.env` 里的 LLM_* 配置自动导入为"默认"供应商；此后在网页「管理模型」里的改动都写入数据库（"默认"供应商的 Base URL/Key 改动会同步回 `.env`，保证命令行版一致）。API Key 以明文存本机库中（学习项目的务实选择），接口回显一律打码；`agent_data.db` 已加入 `.gitignore`。
 
@@ -99,7 +102,8 @@ Agent 的工作区默认是项目根目录的 `workspace/`（首次运行会自�
 |---|---|---|
 | `/api/chat/stream` | POST | **流式问答（SSE）**：`session` 事件先行（返回任务 id），之后逐个推送 `round` / `answer_delta` / `tool_call` / `tool_result` / `usage`（token、耗时、上下文构成、缓存命中率）/ `done` / `compacted`（回答结束后若自动压缩了早期对话，携带摘要与压缩后的容量） / `error` |
 | `/api/sessions` | GET / DELETE | 任务列表（id/标题/更新时间）；`?session_id=` 删除任务 |
-| `/api/sessions/<id>/messages` | GET | 某任务的历史消息（切回任务时回放；助手消息附带当时的耗时/token 统计） |
+| `/api/sessions/<id>/messages` | GET | 某任务的历史消息（分页回放，默认最近 100 条；`?before_ord=&limit=` 向上翻页；助手消息附带当时的耗时/token 统计；归档消息带 `artifact/path/head` 摘要字段） |
+| `/api/sessions/<id>/artifact` | GET | `?path=` 读取外置归档消息的完整原文（realpath 白名单校验，防路径逃逸与跨任务读取） |
 | `/api/context` | GET | `?session_id=` 当前上下文容量（token 数 + 构成占比 + 缓存命中率） |
 | `/api/models` | GET | 可用模型列表（各供应商已启用的模型，供工具栏切换） |
 | `/api/active-model` | POST | 切换激活模型 `{"provider_id", "model"}` |

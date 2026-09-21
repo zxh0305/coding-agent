@@ -550,3 +550,22 @@ button.primary:hover { background: #3d69d8; }
 .up-btn:hover { background: #f0f3fa; }
 .up-btn.danger { color: #b3261e; border-color: #f2b8b5; }
 .up-btn.danger:hover { background: #fdecec; }
+
+/* 历史消息向上翻页入口 */
+.load-older {
+  display: block; margin: 6px auto 10px; padding: 5px 14px;
+  border: 1px dashed var(--border); border-radius: 999px;
+  background: transparent; color: var(--text-3); font-size: 12px; cursor: pointer;
+}
+.load-older:hover { color: var(--text-2); border-color: var(--accent); }
+
+/* 外置归档消息：超大正文存 artifacts 文件，时间线只渲染 head 预览 */
+.bubble.artifact { border-style: dashed; padding: 8px 12px; }
+.bubble.artifact summary { cursor: pointer; font-size: 12.5px; color: var(--text-3); }
+.bubble.artifact summary:hover { color: var(--text-2); }
+.artifact-preview {
+  margin: 6px 0 0; padding: 8px; max-height: 320px; overflow: auto;
+  background: #f7f8fb; border-radius: 8px;
+  font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px;
+  white-space: pre-wrap; word-break: break-all; color: var(--text-2);
+}

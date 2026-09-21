@@ -101,11 +101,15 @@ class Agent:
                         后端，由 app.py 按当前模型配置提供；命令行版不传（无图可看）。
         context_window: 当前模型的上下文窗口（token）。非零时启用自动压缩：
                         回答结束后估算超 80% 就把中段历史总结成摘要（0 = 不压缩）。
+        artifact_reader: fn(rel_path) -> dict，外置大消息的还原器（db.read_artifact），
+                        由 app.py 注入；不传 = 无还原能力（遇到归档消息退回 head/tail
+                        预览文字）。Agent 本身不依赖存储层——命令行版不传。
     """
 
     def __init__(self, llm, system_prompt: str = DEFAULT_SYSTEM_PROMPT,
                  max_rounds: int = 16, verbose: bool = True, vision_supported: bool = True,
-                 workspace=None, vision_backend=None, context_window: int = 0):
+                 workspace=None, vision_backend=None, context_window: int = 0,
+                 artifact_reader=None):
         # max_rounds=16：coding 任务一轮提问往往要 读代码→改→跑验证→再修 好几个来回
         self.llm = llm
         self.system_prompt = system_prompt
@@ -115,6 +119,15 @@ class Agent:
         self.context_window = int(context_window or 0)  # 压缩触发线的基准（providers 表解析链提供）
         self.history: list[dict] = []  # 不含 system 的完整对话历史，跨提问持续累积
         self.trace: list[dict] = []    # 最近一次提问的过程轨迹（轮次/工具调用），供前端展示
+        # 增量落盘的指纹账本 {mid: sha1}：save_messages 靠它识别"这条已写过、
+        # 内容没变"，每轮只落新增。跨轮随实例存活；进程重启后由恢复的历史重建
+        # （db.fingerprints，见 app.py 的会话恢复）。值由 db.save_messages 维护。
+        self.saved: dict[str, str] = {}
+        # 外置大消息还原器（db.read_artifact）。历史里的归档消息（_artifact 标记，
+        # 由 save_messages 落盘时就地替换而来）只有 head/tail 摘要，构造模型视图
+        # 时靠它把完整正文读回来。存储注入而非直接 import db：本文件保持存储无关，
+        # 命令行版与单测不引 db 也能跑。
+        self.artifact_reader = artifact_reader
         # 每字符 token 校准系数（真实 prompt_tokens ÷ 当次请求总字符数）。跨轮缓存：
         # 压缩判断发生在回答结束后，那时没有新 usage，只能靠上一轮校准的系数估算。
         # 压缩后置回 None——摘要的 token 密度与原始日志完全不同，旧系数必然失真，
@@ -158,14 +171,42 @@ class Agent:
         view.extend(self.history[last_boundary + 1:])
         return view
 
+    def _expand_artifact(self, m: dict) -> dict:
+        """还原一条外置归档消息为完整消息（模型视图专用）。
+
+        存储层把超过阈值的超大消息正文挪进了 artifacts 文件（行内只留
+        head/tail 摘要，见 db.save_messages）。外置只影响存储与前端展示，
+        【不改变模型看到的内容】——构造请求前必须把完整正文读回来，否则
+        模型的上下文里会凭空缺一大块（比如某轮 run_bash 的完整输出）。
+
+        容错：归档文件被误删/损坏时退回 head+tail 拼接的文字并注明截断——
+        一次读盘失败绝不能打断整轮对话，模型看到"输出被截断"仍能继续工作。
+        """
+        fallback = {"role": m.get("role", "assistant"),
+                    "content": (m.get("head") or "") + "\n…[内容过大已归档，完整原文读取失败，以上为开头部分]\n"
+                    + (m.get("tail") or "")}
+        if self.artifact_reader is None:
+            return fallback
+        try:
+            full = self.artifact_reader(m.get("path") or "")
+            return full if isinstance(full, dict) and full.get("role") else fallback
+        except Exception as e:
+            log.warning("归档消息还原失败（path=%s）：%s", m.get("path"), e)
+            return fallback
+
     def _messages_for_model(self) -> list[dict]:
-        """发给 LLM 的消息列表。三件事：
+        """发给 LLM 的消息列表。四件事：
         1. 换入压缩视图：被压缩的段落用摘要替代（见 _visible_history，DB 原文不动）；
+        1.5 视图内的外置归档消息（_artifact 摘要行）先还原成完整消息——
+            外置只是存储优化，模型必须看到当初的完整内容；窗口外的归档消息
+            连视图都不进，自然不还原（白省一次读盘）；
         2. 剥离内部字段（_stats 等下划线前缀），部分服务商会拒绝未知字段；
         3. 主模型不支持视觉时，把用户消息里的图片部分替换成文字提示——
            否则不支持视觉的服务商会对图片输入直接报 400。"""
         sanitized = []
         for m in self._visible_history():
+            if m.get("_artifact"):
+                m = self._expand_artifact(m)  # 还原后同样走下面的剥离/视觉处理
             content = m.get("content")
             if m.get("role") == "user" and isinstance(content, list) and not self.vision_supported:
                 texts, has_image = [], False
