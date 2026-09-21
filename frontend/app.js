@@ -1434,9 +1434,9 @@ function ensureTrace() {
   if (traceEl) return;
   traceEl = document.createElement("details");
   traceEl.className = "trace";
-  // 默认收起：执行痕迹不是回答，正文区只给答案；点折叠条才展开过程。
-  // 生成中实时更新秒数（见 traceTick / appendTrace），结束时按 elapsed 定格。
-  traceEl.open = false;
+  // 生成中【自动展开】：用户实时看到每一步——想什么、读什么、改了哪个文件、
+  // 跑了什么命令；done/error 后自动折叠（见 applyEvent），只留一行摘要。
+  traceEl.open = true;
   const summary = document.createElement("summary");
   summary.textContent = "已思考 0 秒";
   traceEl.appendChild(summary);
@@ -1474,14 +1474,21 @@ function traceLine(text) {
   appendTrace(div);
 }
 
+const TOOL_KIND = {
+  write_file: "写入", apply_patch: "修改",
+  read_file: "读取", grep: "搜索", list_dir: "列目录",
+  run_bash: "命令", calculator: "计算", current_time: "时间", get_weather: "天气",
+};
+
 function toolCallLine(name, argsStr) {
   let a = {};
   try { a = JSON.parse(argsStr); } catch { /* 参数不是 JSON */ }
   const main = summarize(a.command || a.path || a.expression || a.pattern || a.city || "", 46);
+  const kind = TOOL_KIND[name] || "";
   const d = document.createElement("details");
-  d.className = "tl";
+  d.className = "tl" + (name === "write_file" || name === "apply_patch" ? " write" : "");
   const summary = document.createElement("summary");
-  summary.textContent = `${TOOL_ICONS[name] || "🔧"} ${name}${main ? " · " + main : ""}`;
+  summary.textContent = `${TOOL_ICONS[name] || "🔧"} ${kind}${kind ? " " : ""}${main}`;
   const pre = document.createElement("pre");
   pre.textContent = prettyJson(argsStr);
   d.append(summary, pre);
@@ -1743,7 +1750,8 @@ function applyEvent(evt, seq) {
     metaEl.textContent = metaText(evt.elapsed_s, evt.usage);
     if (evt.mid) historyMids.add(evt.mid);  // 已在屏上：防后续补发重复渲染
     if (traceEl) {
-      traceEl.open = false;  // 执行完收起，保持对话清爽；点开可回看全过程
+      // 做完任务自动折叠：正文回归"只要答案"；点折叠条仍可回看全过程
+      traceEl.open = false;
       traceEl.querySelector("summary").textContent =
         `已工作 ${fmtElapsed(evt.elapsed_s)} · ${traceSteps} 步`;
     }
@@ -1785,8 +1793,11 @@ function applyEvent(evt, seq) {
   } else if (t === "error") {
     flushStreamBuffers();  // 已生成的部分内容留在气泡里，再显示错误
     retireLiveBubble();
-    if (traceEl) traceEl.querySelector("summary").textContent =
-      `已工作 ${fmtElapsed((Date.now() - qStart) / 1000)} · 出错`;
+    if (traceEl) {
+      traceEl.open = false;  // 出错同样收起过程；点开可排查卡在哪一步
+      traceEl.querySelector("summary").textContent =
+        `已工作 ${fmtElapsed((Date.now() - qStart) / 1000)} · 出错`;
+    }
     bubble("assistant error", "❌ " + evt.message);
     // 生成中状态不在这里复位：turn_end 紧随 error 事件到达，由它统一收尾
   }

@@ -190,6 +190,9 @@ body {
 }
 .tl summary:hover { color: var(--text); }
 .tl summary.err { color: #b3261e; }
+/* 写入类（write_file/apply_patch）：提示色——改了哪些文件一眼可见 */
+.tl.write summary { color: #b45309; }
+.tl.write summary:hover { color: #8a4d0b; }
 .tl pre {
   font-family: ui-monospace, Menlo, Consolas, monospace;
   font-size: 11px; line-height: 1.5;
