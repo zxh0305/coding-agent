@@ -2045,6 +2045,16 @@ bind("m-cancel", "click", () => {
     inputEl.focus();
   }
 });
+// 「不绑定项目」：新任务直接发出（不带目录），会话落进"其他"组；
+// 之后再想绑定项目，点工具栏的项目 chip 即可（带 session_id 改绑）
+bind("m-skip", "click", () => {
+  $("modal").classList.add("hidden");
+  if (pendingAfterWsPick && !currentSession) {
+    const pend = pendingAfterWsPick; pendingAfterWsPick = null;
+    userBubble(pend.text, []);
+    performSend(pend);  // 不带 chosenPath：建会话不写 workspace → 列表进"其他"
+  }
+});
 bind("m-up", "click", () => mParent && navTo(mParent));
 bind("m-home", "click", () => navTo(mHome || undefined));
 bind("m-choose", "click", chooseWorkspace);

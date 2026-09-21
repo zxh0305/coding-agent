@@ -430,10 +430,9 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
         db.create_session(sid, user_id)
     workspace = _resolve_workspace(user_id, sid)
     if workspace is None:
-        # 未绑定项目的会话不构建 Agent（无法提交回合）：前端在发送前强制
-        # 选目录，这里只是后端兜底——绝不能静默回落默认目录，否则"新任务"
-        # 会悄悄带上用户没选过的项目归属。
-        raise ValueError("该任务尚未绑定工作目录，请先选择项目文件夹")
+        # 未绑定项目的会话（用户选了"不绑定项目"）：工具沙箱用系统默认目录，
+        # 但【不落库为项目归属】——列表里进"其他"组。落库的话它就成了项目。
+        workspace = prepare_workspace(None)
     # 工作区纳入配置指纹：任务的工作区被切换后，下次构建会重建 Agent（历史照旧从库里恢复）
     sig += "|" + str(workspace)
 
