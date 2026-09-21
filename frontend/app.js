@@ -356,16 +356,18 @@ function historyNode(m) {
       .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
     return buildUserBubble(text, imgs);
   }
-  const wrap = document.createElement("div");
-  wrap.appendChild(buildBubble(m.role === "user" ? "user" : "assistant", m.content || ""));
+  // 用 fragment 直接把气泡/meta 挂进 #chat：外面包一层普通 div 会让
+  // .bubble.user 的 align-self 失效（父级不是 flex），用户消息就会挤到左侧
+  const frag = document.createDocumentFragment();
+  frag.appendChild(buildBubble(m.role === "user" ? "user" : "assistant", m.content || ""));
   // 历史消息也带回当时的耗时/token 统计（message_usage 表随消息附带）
   if (m.role === "assistant" && m.stats) {
     const meta = document.createElement("div");
     meta.className = "meta";
     meta.textContent = metaText(m.stats.elapsed_s, m.stats.usage);
-    wrap.appendChild(meta);
+    frag.appendChild(meta);
   }
-  return wrap;
+  return frag;
 }
 
 // 外置归档消息卡片：head 预览 + 归档标记；点开懒加载全文（1MB 级内容
