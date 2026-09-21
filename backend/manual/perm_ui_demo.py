@@ -2,7 +2,7 @@
 权限卡片 UI 演示服务（手动验收用，跑起来后用浏览器操作）
 ==========================================================
 
-python3 backend/perm_ui_demo.py [端口]     默认 8765
+python3 backend/manual/perm_ui_demo.py [端口]     默认 8765
 
 临时库 + mock LLM + 真实 app 服务，常驻前台直到 Ctrl+C。剧本与
 manual_permissions_check.py 相同：发「请清理临时目录 <TARGET>」→ mkdir 弹卡
@@ -16,7 +16,7 @@ import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-BACKEND_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = Path(__file__).resolve().parent.parent  # 脚本在 manual/ 子目录，退两级到 backend/
 sys.path.insert(0, str(BACKEND_DIR))
 
 import db                      # noqa: E402

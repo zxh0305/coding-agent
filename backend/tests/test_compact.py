@@ -1,5 +1,5 @@
 """
-上下文压缩的单元测试（纯标准库 unittest，运行：cd backend && python3 -m unittest test_compact -v）
+上下文压缩的单元测试（纯标准库 unittest，运行：cd backend && python3 -m unittest tests.test_compact -v）
 ================================================================================
 
 重点测【模型视图构建】（_visible_history / _messages_for_model）：这是"两套视图一个

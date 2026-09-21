@@ -1,8 +1,8 @@
 .env
-agent.log
-agent_data.db*
 __pycache__/
 *.pyc
 .DS_Store
-logs/
-artifacts/
+# 运行时数据统一收在 data/：数据库、artifacts（外置正文）、logs、backups
+data/
+# agent 记忆目录（WORKSPACE_DIR 指向项目根时会出现在项目根）
+.agent-memory/

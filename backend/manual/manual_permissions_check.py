@@ -2,7 +2,7 @@
 权限闸门真机手测（mock LLM，不发真实网络请求）
 ================================================
 
-python3 backend/manual_permissions_check.py
+python3 backend/manual/manual_permissions_check.py
 
 与 manual_memory_check.py 同一套搭建：临时 SQLite 库 + 临时工作区 + 真实
 app.py HTTP 服务 + 脚本内 mock LLM。区别在剧本：这回 mock 模型按「帮用户
@@ -34,7 +34,7 @@ from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-BACKEND_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = Path(__file__).resolve().parent.parent  # 脚本在 manual/ 子目录，退两级到 backend/
 sys.path.insert(0, str(BACKEND_DIR))
 
 import db          # noqa: E402

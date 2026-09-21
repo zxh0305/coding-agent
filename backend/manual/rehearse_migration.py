@@ -1,7 +1,7 @@
 """
 迁移演练脚本：在真实库的【副本】上完整走一遍迁移 + 增量落盘 + 窗口恢复 + 新接口冒烟。
 验收通过后才允许对真库执行 init_db()（见脚本末尾说明，演练脚本自身绝不碰真库）。
-运行：cd backend && python3 rehearse_migration.py
+运行：cd backend && python3 manual/rehearse_migration.py
 """
 import json
 import shutil
@@ -13,7 +13,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))  # 脚本在 manual/ 子目录，退两级到 backend/
 import db
 
 REAL_DB = Path(db.DB_PATH)

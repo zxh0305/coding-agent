@@ -2,14 +2,15 @@
 数据持久层（SQLite，标准库 sqlite3，零依赖）
 =============================================
 
-早期版本把对话存在服务进程的内存 dict 里，重启即丢；现在统一落盘到项目根目录的
+早期版本把对话存在服务进程的内存 dict 里，重启即丢；现在统一落盘到 data/ 目录的
 agent_data.db（SQLite 单文件数据库，可直接用任何 SQLite 工具打开查看）：
 
   users            登录用户：用户名 / 密码哈希（PBKDF2，不存明文）
   auth_tokens      登录令牌：随机 token -> 用户，重启不失效
   sessions         任务（会话）：标题、创建/更新时间、归属用户、各自的工作区
   messages         消息历史：稳定身份 mid + 显示序 ord + 消息正文（增量落盘，
-                   超大正文外置到 artifacts/ 文件，行内只留 head/tail 摘要）
+                   超大正文外置到 artifacts/ 文件（与库文件同目录，即
+                   data/artifacts/），行内只留 head/tail 摘要）
   message_usage    消息级统计（token 用量等）：与 messages.content 分离存储
   providers        模型供应商：名称 / Base URL / API 格式 / API Key / 启用状态 / 默认窗口
   provider_models  供应商下的模型：模型名 / 上下文窗口 / 启用 / 是否支持视觉
@@ -48,7 +49,9 @@ from pathlib import Path
 
 log = logging.getLogger("db")
 
-DB_PATH = Path(__file__).resolve().parent.parent / "agent_data.db"
+# 运行时数据统一收在 data/ 下：库文件本体，artifacts/（_artifacts_dir 跟随本路径
+# 所在目录，库内存的相对路径以它为根）、logs/（logger 同址）、backups/。
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "agent_data.db"
 
 # ---------------------------------------------------------------------------
 # 存储常量
@@ -69,6 +72,8 @@ ORD_GAP = 1024
 
 
 def _conn() -> sqlite3.Connection:
+    # data/ 目录惰性创建：目录缺失时 sqlite3.connect 无法建库文件
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     # WAL：写不阻塞读。每轮回答结束会把新增消息增量落盘（save_messages），

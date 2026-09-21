@@ -1,6 +1,6 @@
 """
 瞬态错误退避重试 + tools/tool_choice 配对约束的单元测试
-（cd backend && python3 -m unittest test_retry -v）
+（cd backend && python3 -m unittest tests.test_retry -v）
 ================================================================================
 
 1. _http_post_json 的错误转译：HTTPError → ApiHTTPError（带 status / Retry-After /

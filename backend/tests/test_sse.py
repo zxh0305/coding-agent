@@ -2,7 +2,7 @@
 常驻事件流（SSE 断线重连）纯逻辑的单元测试
 ==========================================
 
-cd backend && python3 -m unittest test_sse -v
+cd backend && python3 -m unittest tests.test_sse -v
 
 覆盖 events.SessionEvents 与 seq 持久化的核心不变式（跑在临时库里，不碰
 项目根的 agent_data.db）：

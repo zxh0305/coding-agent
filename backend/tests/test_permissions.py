@@ -1,5 +1,5 @@
 """
-最小权限闸门的单元测试（cd backend && python3 -m unittest test_permissions -v）
+最小权限闸门的单元测试（cd backend && python3 -m unittest tests.test_permissions -v）
 ================================================================================
 
 覆盖验收要求的六类场景：

@@ -2,7 +2,7 @@
 记忆系统真机手测（mock LLM，不发真实网络请求）
 ================================================
 
-python3 backend/manual_memory_check.py
+python3 backend/manual/manual_memory_check.py
 
 起一套真实环境做端到端验收：临时 SQLite 库 + 临时工作区 + 真实 app.py
 HTTP 服务（ThreadingHTTPServer）+ 本脚本内起的 mock LLM 服务（纯标准库）。
@@ -30,7 +30,7 @@ from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-BACKEND_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = Path(__file__).resolve().parent.parent  # 脚本在 manual/ 子目录，退两级到 backend/
 sys.path.insert(0, str(BACKEND_DIR))
 
 import db        # noqa: E402  （先插 sys.path 再 import，与 app.py 同一运行方式）

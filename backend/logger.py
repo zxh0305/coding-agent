@@ -4,15 +4,15 @@
 
 标准库 logging 的"双通道"输出，这是生产项目的标准做法：
 
-  * logs/agent.log —— 当天的日志（DEBUG 级全量记录：用户的每次提问、每轮
+  * data/logs/agent.log —— 当天的日志（DEBUG 级全量记录：用户的每次提问、每轮
     发给 LLM 的完整 payload、LLM 原始返回、工具调用与结果、错误堆栈）。
-    每天零点自动切分：昨天的变成 logs/agent.log.2026-09-19 这样的日期文件，
+    每天零点自动切分：昨天的变成 data/logs/agent.log.2026-09-19 这样的日期文件，
     默认保留 14 天（LOG_KEEP_DAYS 可调），过期的自动清理。
   * 终端 —— Web 版运行时实时滚动 INFO 级关键事件（提问/工具调用/回答），
     看起来是"实时"的；命令行版本身就有彩色打印，关闭终端通道避免重复。
 
 要点：print 和 logging 的分工 —— print 是"给人看的界面"，
-logging 是"给机器/给自己查的档案"。tail -f logs/agent.log 可实时追看。
+logging 是"给机器/给自己查的档案"。tail -f data/logs/agent.log 可实时追看。
 """
 
 import logging
@@ -20,8 +20,8 @@ import os
 import shutil
 from logging.handlers import TimedRotatingFileHandler
 
-# 日志文件夹固定在项目根目录下（logger.py 位于 backend/ 下，往上跳一级），
-# 不受从哪个目录启动命令影响
+# 日志文件夹固定在项目根目录的 data/ 下（logger.py 位于 backend/ 下，往上跳一级），
+# 与数据库、artifacts 同址，不受从哪个目录启动命令影响
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _FMT = "%(asctime)s [%(levelname)s] %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
@@ -34,7 +34,7 @@ def setup_logging(console: bool = False) -> str:
     文件级别 LOG_LEVEL（默认 DEBUG 全量）。console=True 时终端同步输出
     INFO 级以上事件（Web 版用）。
     """
-    log_dir = os.environ.get("LOG_DIR") or os.path.join(_PROJECT_DIR, "logs")
+    log_dir = os.environ.get("LOG_DIR") or os.path.join(_PROJECT_DIR, "data", "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "agent.log")
 

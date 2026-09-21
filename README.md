@@ -81,12 +81,12 @@ Agent 的工作区默认是项目根目录的 `workspace/`（首次运行会自�
 
 ## 数据存储在哪
 
-全部落盘在项目根目录的 **`agent_data.db`**（SQLite 单文件数据库，标准库 `sqlite3`，无额外依赖）：
+全部落盘在 **`data/agent_data.db`**（SQLite 单文件数据库，标准库 `sqlite3`，无额外依赖）：
 
 | 表 | 存什么 |
 |---|---|
 | `sessions` | 任务列表：标题、创建/更新时间、归属用户、各自的工作区 |
-| `messages` | 消息历史：**稳定身份 `mid`（uuid4）+ 显示序 `ord` + 正文**。每轮只增量写入新消息（按内容指纹跳过已落盘的，不再整表重写）；压缩后额外含 `role=compact` 的边界标记消息，被压缩的原文仍在，不删。单条序列化超 64KB 时正文外置到 `artifacts/<会话>/<mid>.json`，行内只留 head/tail 摘要（模型视图按需还原，看到的内容不变） |
+| `messages` | 消息历史：**稳定身份 `mid`（uuid4）+ 显示序 `ord` + 正文**。每轮只增量写入新消息（按内容指纹跳过已落盘的，不再整表重写）；压缩后额外含 `role=compact` 的边界标记消息，被压缩的原文仍在，不删。单条序列化超 64KB 时正文外置到 `data/artifacts/<会话>/<mid>.json`，行内只留 head/tail 摘要（模型视图按需还原，看到的内容不变） |
 | `message_usage` | 消息级统计（prompt/completion/cached tokens 可查询列 + 完整 `_stats` JSON），与消息正文分离存储 |
 | `providers` | 模型供应商：名称 / Base URL / API Key / 启用状态 / 默认上下文窗口（模型级自填优先） |
 | `provider_models` | 供应商下的模型：模型名 / 上下文窗口 / 启用状态 |
@@ -94,7 +94,7 @@ Agent 的工作区默认是项目根目录的 `workspace/`（首次运行会自�
 
 schema 升级用 `PRAGMA user_version` + 有序迁移列表（`db.MIGRATIONS`）管理，启动时只补执行未到达版本；会话恢复按窗口加载（压缩边界之前的消息不进内存，内存占用与当前窗口成正比）。ord 显示序留 1024 间隔、压缩边界取两侧中点实现零重写；间隔耗尽（同一对消息被反复插入）时自动整会话重编号兜底，并推 `history_renumbered` 事件让前端重拉时间线（分页游标失效）。
 
-首次启动会把 `.env` 里的 LLM_* 配置自动导入为"默认"供应商；此后在网页「管理模型」里的改动都写入数据库（"默认"供应商的 Base URL/Key 改动会同步回 `.env`，保证命令行版一致）。API Key 以明文存本机库中（学习项目的务实选择），接口回显一律打码；`agent_data.db` 已加入 `.gitignore`。
+首次启动会把 `.env` 里的 LLM_* 配置自动导入为"默认"供应商；此后在网页「管理模型」里的改动都写入数据库（"默认"供应商的 Base URL/Key 改动会同步回 `.env`，保证命令行版一致）。API Key 以明文存本机库中（学习项目的务实选择），接口回显一律打码；`data/` 整体已加入 `.gitignore`。
 
 ## HTTP API 一览（`backend/app.py`）
 
@@ -135,21 +135,21 @@ schema 升级用 `PRAGMA user_version` + 有序迁移列表（`db.MIGRATIONS`）
 5. **`max_rounds` 兜底 + 收尾轮（默认 40）**——上限不再"强制砍停"：跑满后注入一条合成 user 指令（`_synthetic` 标记：发给模型保留、落库/记忆提取跳过、不发事件），以 `tools=None` 再请求一轮，回合以模型自己的真实总结 + `done(stopped_reason="max_rounds")` 收场。防死循环另有**指纹提醒**：同一工具+相同参数连续 3 次注入"换做法"提醒、轮数到 `max_rounds-10`/`-4` 注入"收敛"提醒，每回合总预算 3 条——参照 ZCode 的哲学：防失控靠模式检测 + 提醒让模型自纠，不靠计数砍停。
 6. **calculator 不用 `eval`**——用 ast 白名单只允许四则运算，防止模型（或注入）执行任意代码。
 7. **前端一律用 `textContent` 渲染**——不拼 `innerHTML`，天然防 XSS。
-8. **流式链路（四层各有关卡）**——① LLM 层：`stream: true` 时工具调用是**分片**到达的，必须按 `index` 累积拼接 arguments；`stream_options: include_usage` 拿 token 用量（服务商不支持时自动降级重试）；`tool_choice` 必须与 `tools` 成对出现（只发前者会 400，收尾轮/记忆提取都是无工具的纯对话请求）；瞬态错误（429 限流 / 5xx / 连接失败）在请求发出前退避重试（优先 `Retry-After` 封顶 30s，否则 2s/4s，最坏新增 6s；等待期间可被「停止」打断），`tool_choice` 配对约束见 `backend/test_retry.py`；② Agent 层：核心循环重构为 `run()` 生成器，边跑边产出事件，usage 跨轮累计；③ 后端：SSE 推送，刻意用 HTTP/1.0"关闭连接即结束"语义，免写 chunked 分块，且 `wbufsize=0` 保证每次 write 直接到网络；④ 前端：EventSource 常驻连接 events 通道（浏览器自动重连并携带 Last-Event-ID），本地 localStorage 记每会话最近 seq，刷新后 `?since=` 补发接上进行中的回合；delta 按消息 mid 归并进同一气泡。
+8. **流式链路（四层各有关卡）**——① LLM 层：`stream: true` 时工具调用是**分片**到达的，必须按 `index` 累积拼接 arguments；`stream_options: include_usage` 拿 token 用量（服务商不支持时自动降级重试）；`tool_choice` 必须与 `tools` 成对出现（只发前者会 400，收尾轮/记忆提取都是无工具的纯对话请求）；瞬态错误（429 限流 / 5xx / 连接失败）在请求发出前退避重试（优先 `Retry-After` 封顶 30s，否则 2s/4s，最坏新增 6s；等待期间可被「停止」打断），`tool_choice` 配对约束见 `backend/tests/test_retry.py`；② Agent 层：核心循环重构为 `run()` 生成器，边跑边产出事件，usage 跨轮累计；③ 后端：SSE 推送，刻意用 HTTP/1.0"关闭连接即结束"语义，免写 chunked 分块，且 `wbufsize=0` 保证每次 write 直接到网络；④ 前端：EventSource 常驻连接 events 通道（浏览器自动重连并携带 Last-Event-ID），本地 localStorage 记每会话最近 seq，刷新后 `?since=` 补发接上进行中的回合；delta 按消息 mid 归并进同一气泡。
 9. **工作区按任务隔离 + ToolContext 注入**——每个任务的工作区解析链是"任务自选 → 用户默认 → `.env` 的 `WORKSPACE_DIR` / 项目 `workspace/`"，结果不进全局环境变量，而是随 `ToolContext`（工作区、本轮图片、看图后端）注入到每次工具调用——切换某个任务的工作区不影响其他正在跑的任务，并发会话也不会串图片数据。选目录的接口只做最小校验（存在、非根目录），因为它的前提是"本机信任圈工具"。
 10. **上下文容量估算**——没有本地分词器，用"服务商返回的真实 prompt_tokens ÷ 上次请求总字符数"校准出每字符 token 系数，再按 系统提示词/工具定义/用户消息/助手回复/工具结果 的字符占比分摊——估算值，但量级和占比可信；缓存命中率直接用 DeepSeek 返回的 `prompt_cache_hit_tokens / prompt_cache_miss_tokens`。
 11. **任务（多会话）**——每个任务一个独立 Agent 实例（独立对话历史），标题取第一条提问；模型配置变更后按需重建实例但保留历史。任务、消息（含每条助手消息的耗时/token 统计，存在消息的 `_stats` 内部字段里）都落盘 SQLite，重启不丢；发给模型前会剥离 `_` 前缀的内部字段（部分服务商会拒绝未知字段）。
-12. **上下文压缩（两套视图一个真相）**——一轮回答完全结束后，若估算的 prompt tokens 超过窗口 80%（窗口解析链：模型自填 → 供应商默认列 → `.env`，供应商列由幂等 `ALTER TABLE` 补上、默认 128000），就把"除首条用户消息外的中段历史"交给同一个 LLM 压成一条中文摘要（必保任务目标/已完成改动/关键文件路径/未完成事项/用户偏好五要素），保留最近 6 条不总结。**数据库和前端时间线永远保留完整历史**——压缩只在 `_messages_for_model()` 构建的模型视图里生效：往历史插入一条 `role=compact` 的边界标记（`is_compact_boundary` + `_stats.compacted` 元数据），构建视图时遇边界就用摘要替代之前的段落；首条用户消息（原始需求）逐字保留，连续压缩只认最后一条边界（旧摘要并入新摘要）。两个暗坑都有防护：①切点必须落在完整对话回合之间（保留段不能以悬空 `tool` 结果开头、被压缩段不能以带 `tool_calls` 的 assistant 结尾，否则 400），`_compact_split` 会左移到合法位置；②压缩后缓存的每字符 token 校准系数作废（摘要的 token 密度与原始历史完全不同），退回粗略系数、等下一轮真实 usage 重校准。压缩那次 LLM 调用不产生回答流（前端只收到 `compacted` 事件渲染"以上已压缩"分隔卡片，点开可查摘要原文）；失败（网络错误）跳过、下一轮自动重试，用户中途停止的回答不压缩。纯函数测试见 `backend/test_compact.py`。
+12. **上下文压缩（两套视图一个真相）**——一轮回答完全结束后，若估算的 prompt tokens 超过窗口 80%（窗口解析链：模型自填 → 供应商默认列 → `.env`，供应商列由幂等 `ALTER TABLE` 补上、默认 128000），就把"除首条用户消息外的中段历史"交给同一个 LLM 压成一条中文摘要（必保任务目标/已完成改动/关键文件路径/未完成事项/用户偏好五要素），保留最近 6 条不总结。**数据库和前端时间线永远保留完整历史**——压缩只在 `_messages_for_model()` 构建的模型视图里生效：往历史插入一条 `role=compact` 的边界标记（`is_compact_boundary` + `_stats.compacted` 元数据），构建视图时遇边界就用摘要替代之前的段落；首条用户消息（原始需求）逐字保留，连续压缩只认最后一条边界（旧摘要并入新摘要）。两个暗坑都有防护：①切点必须落在完整对话回合之间（保留段不能以悬空 `tool` 结果开头、被压缩段不能以带 `tool_calls` 的 assistant 结尾，否则 400），`_compact_split` 会左移到合法位置；②压缩后缓存的每字符 token 校准系数作废（摘要的 token 密度与原始历史完全不同），退回粗略系数、等下一轮真实 usage 重校准。压缩那次 LLM 调用不产生回答流（前端只收到 `compacted` 事件渲染"以上已压缩"分隔卡片，点开可查摘要原文）；失败（网络错误）跳过、下一轮自动重试，用户中途停止的回答不压缩。纯函数测试见 `backend/tests/test_compact.py`。
 
 ## 日志
 
-终端输出之外，所有事件完整写入 **`logs/agent.log`**（Web 版和 CLI 版共用）：你的每次提问、每轮发给 LLM 的完整 payload、LLM 原始返回、工具调用、错误堆栈。
+终端输出之外，所有事件完整写入 **`data/logs/agent.log`**（Web 版和 CLI 版共用）：你的每次提问、每轮发给 LLM 的完整 payload、LLM 原始返回、工具调用、错误堆栈。
 
-- **按天切分**：每天零点自动归档为 `logs/agent.log.2026-09-19` 这样的日期文件，当天日志始终在 `logs/agent.log`；
+- **按天切分**：每天零点自动归档为 `data/logs/agent.log.2026-09-19` 这样的日期文件，当天日志始终在 `data/logs/agent.log`；
 - **自动清理**：默认保留最近 14 天（`.env` 里 `LOG_KEEP_DAYS` 可调）；
 - **可调项**：`LOG_DIR` 换文件夹、`LOG_LEVEL=INFO` 关掉 payload 全量记录。
 
-日志包含对话内容，别原样贴到公开场合；`logs/` 已加入 `.gitignore`。实时追看：`tail -f logs/agent.log`。
+日志包含对话内容，别原样贴到公开场合；`data/` 整体已加入 `.gitignore`。实时追看：`tail -f data/logs/agent.log`。
 
 ## 常见问题
 
@@ -179,25 +179,34 @@ schema 升级用 `PRAGMA user_version` + 有序迁移列表（`db.MIGRATIONS`）
 ## 目录结构
 
 ```
-agent_demo/
-├── backend/
-│   ├── app.py        # Web 服务：API 路由 + 静态托管（纯标准库）
+coding-agent/
+├── backend/          # 后端源码平铺，tests/ 与 manual/ 分类收纳
+│   ├── app.py        # Web 服务：API 路由 + SSE 事件流 + 静态托管（纯标准库）
 │   ├── cli.py        # 命令行版入口
 │   ├── agent.py      # ★ Agent 核心循环
 │   ├── code_tools.py # ★ coding 工具集：工作区 + 读写/patch/grep/bash
-│   ├── llm_client.py # LLM API 客户端（OpenAI 兼容）+ .env 读写
+│   ├── llm_client.py # LLM API 客户端（OpenAI 兼容 + Anthropic）+ .env 读写
 │   ├── tools.py      # 工具注册与统一执行器（合并通用工具和 coding 工具）
-│   ├── logger.py     # 日志配置（logs/ 文件夹，按天切分，自动清理）
-│   ├── test_compact.py # 上下文压缩单元测试（cd backend && python3 -m unittest test_compact）
-│   └── ui.py         # 终端彩色输出（CLI 用）
+│   ├── db.py         # SQLite 存储层（data/agent_data.db，超大正文外置）
+│   ├── events.py     # 每会话事件总线（SSE 常驻事件流 + 断线补发）
+│   ├── memory.py     # 持久记忆（<workspace>/.agent-memory/，索引/正文分离）
+│   ├── permissions.py # 最小权限闸门（allow/deny/ask 三态规则）
+│   ├── logger.py     # 日志配置（data/logs/，按天切分，自动清理）
+│   ├── ui.py         # 终端彩色输出（CLI 用）
+│   ├── tests/        # 单元测试（cd backend && python3 -m unittest discover -s tests -t .）
+│   └── manual/       # 真机手测脚本 + 迁移演练（临时库，可重复跑）
 ├── frontend/
 │   ├── index.html    # 页面结构：对话区 + 配置面板
 │   ├── app.js        # 前端逻辑：fetch API、渲染、配置
 │   └── style.css     # 样式
+├── data/             # 全部运行时数据（不进 git）
+│   ├── agent_data.db # SQLite 数据库：任务、消息历史、供应商与模型配置
+│   ├── artifacts/    # 超大消息正文的外置 JSON（跟随库文件所在目录）
+│   ├── logs/         # 运行日志（按天切分：agent.log + agent.log.日期）
+│   └── backups/      # 手工备份（如迁移前的库快照）
 ├── workspace/        # Agent 的默认工作区（自动生成；每个任务可单独切换到任意本地文件夹）
-├── agent_data.db     # SQLite 数据库：任务、消息历史、供应商与模型配置
 ├── docs/             # 调研笔记（coding agent 选型报告）
-├── logs/             # 运行日志（按天切分：agent.log + agent.log.日期）
+├── share.sh          # 一键启停：后端 + Cloudflare 公网隧道
 ├── .env              # 你的私密配置（不进 git）
 ├── .env.example      # 配置模板
 └── .gitignore

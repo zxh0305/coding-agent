@@ -2,7 +2,7 @@
 持久记忆的单元测试（纯标准库 unittest，不碰网络与真实 LLM）
 ============================================================
 
-cd backend && python3 -m unittest test_memory -v
+cd backend && python3 -m unittest tests.test_memory -v
 
 覆盖五块：
 1. 文件名校验（非法字符 / ../ / 绝对路径 / 非 .md 全拒绝）与 frontmatter

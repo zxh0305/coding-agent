@@ -1,5 +1,5 @@
 """
-会话存储改造的单元测试（cd backend && python3 -m unittest test_storage -v）
+会话存储改造的单元测试（cd backend && python3 -m unittest tests.test_storage -v）
 ================================================================================
 
 覆盖四块改造的核心不变式（全部跑在临时库里，不碰项目根的 agent_data.db）：

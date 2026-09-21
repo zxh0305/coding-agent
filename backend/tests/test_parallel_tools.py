@@ -1,5 +1,5 @@
 """
-工具并行执行的单元测试（cd backend && python3 -m unittest test_parallel_tools -v）
+工具并行执行的单元测试（cd backend && python3 -m unittest tests.test_parallel_tools -v）
 ================================================================================
 
 覆盖三件事：

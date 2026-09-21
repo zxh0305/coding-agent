@@ -2,7 +2,7 @@
 收尾轮 / 瞬态重试的真机手测（假 server，不发真实外网请求）
 ============================================================
 
-python3 backend/manual_wrapup_check.py
+python3 backend/manual/manual_wrapup_check.py
 
 起一套真实环境做端到端验收：临时 SQLite 库 + 临时工作区 + 本脚本内起的
 mock LLM 服务（纯标准库 HTTP server，说 OpenAI 兼容的 SSE 协议）+ 真实的
@@ -27,7 +27,7 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-BACKEND_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = Path(__file__).resolve().parent.parent  # 脚本在 manual/ 子目录，退两级到 backend/
 sys.path.insert(0, str(BACKEND_DIR))
 
 import db        # noqa: E402  （先插 sys.path 再 import，与 app.py 同一运行方式）
