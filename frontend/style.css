@@ -448,6 +448,30 @@ button.primary:hover { background: #3d69d8; }
   max-width: 220px; max-height: 180px;
   border-radius: 8px; margin-top: 6px; display: block;
 }
+
+/* 可点击放大的图片：hover 光标与轻微提示 */
+.msg-img.clickable { cursor: zoom-in; transition: filter .15s; }
+.msg-img.clickable:hover { filter: brightness(1.05); }
+
+/* 图片灯箱：点气泡里的缩略图后全屏查看 + 复制 */
+.lightbox {
+  position: fixed; inset: 0; z-index: 300;
+  background: rgba(0, 0, 0, .78);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 14px; padding: 24px;
+}
+.lightbox img {
+  max-width: 92vw; max-height: 78vh;
+  border-radius: 8px; box-shadow: 0 8px 40px rgba(0, 0, 0, .5);
+}
+.lightbox-actions { display: flex; gap: 10px; }
+.lightbox-actions button {
+  padding: 7px 16px; border: none; border-radius: 8px;
+  background: rgba(255, 255, 255, .14); color: #fff; font-size: 13.5px;
+  cursor: pointer;
+}
+.lightbox-actions button:hover { background: rgba(255, 255, 255, .26); }
+.lightbox-hint { color: rgba(255, 255, 255, .55); font-size: 12.5px; }
 .bubble.user .att-file { color: rgba(255, 255, 255, 0.92); }
 
 /* 生成期间排队的消息卡片 */

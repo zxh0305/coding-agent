@@ -537,6 +537,60 @@ function compactCard(summary) {
   return d;
 }
 
+// ---------- 图片灯箱：点气泡里的缩略图 → 全屏查看 + 复制 ----------
+// 全局单例：任意消息（实时/历史/归档还原）里的 .msg-img 点击后都进这里。
+// 复制优先 Clipboard API 的 image/png；失败降级为「已打开图片，可右键复制」。
+function openLightbox(src) {
+  closeLightbox();
+  const box = document.createElement("div");
+  box.className = "lightbox";
+  const img = document.createElement("img");
+  img.src = src;
+  const actions = document.createElement("div");
+  actions.className = "lightbox-actions";
+  const hint = document.createElement("div");
+  hint.className = "lightbox-hint";
+  hint.textContent = "点击空白处或按 Esc 关闭";
+  const copy = document.createElement("button");
+  copy.textContent = "📋 复制图片";
+  copy.addEventListener("click", async () => {
+    try {
+      // data URI → blob（png/jpeg 都转成 png 写剪贴板，应用通用）
+      const blob = await (await fetch(src)).blob();
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type || "image/png"]: blob })]);
+      copy.textContent = "✓ 已复制";
+      setTimeout(() => (copy.textContent = "📋 复制图片"), 1500);
+    } catch {
+      // 剪贴板不可用（权限拒绝/非安全上下文/类型不支持）：退回提示手动复制
+      hint.textContent = "自动复制不可用：可右键图片选择「复制图片」";
+      hint.style.color = "rgba(255,255,255,.85)";
+    }
+  });
+  const close = document.createElement("button");
+  close.textContent = "✕ 关闭";
+  close.addEventListener("click", closeLightbox);
+  actions.append(copy, close);
+  box.append(img, actions, hint);
+  box.addEventListener("click", (e) => { if (e.target === box) closeLightbox(); });
+  document.addEventListener("keydown", lightboxEsc);
+  document.body.appendChild(box);
+}
+function lightboxEsc(e) { if (e.key === "Escape") closeLightbox(); }
+function closeLightbox() {
+  document.querySelector(".lightbox")?.remove();
+  document.removeEventListener("keydown", lightboxEsc);
+}
+
+// 气泡里的消息图片统一走这里：带点击放大 + 复制
+function msgImage(src) {
+  const img = document.createElement("img");
+  img.src = src;
+  img.className = "msg-img clickable";
+  img.title = "点击放大";
+  img.addEventListener("click", () => openLightbox(src));
+  return img;
+}
+
 // 带附件的用户气泡：文字 + 图片缩略图/文件名
 function buildUserBubble(text, atts) {
   const div = document.createElement("div");
@@ -548,10 +602,7 @@ function buildUserBubble(text, atts) {
   }
   for (const a of atts || []) {
     if (a.kind === "image" && a.preview) {
-      const img = document.createElement("img");
-      img.src = a.preview;
-      img.className = "msg-img";
-      div.appendChild(img);
+      div.appendChild(msgImage(a.preview));
     } else {
       const f = document.createElement("div");
       f.className = "att-file";
@@ -1538,10 +1589,7 @@ function queueMessage(text, payloadAtts) {
   wrap.appendChild(t);
   for (const a of payloadAtts) {
     if (a.kind === "image") {
-      const img = document.createElement("img");
-      img.className = "msg-img";
-      img.src = `data:${a.mime};base64,${a.data}`;
-      wrap.appendChild(img);
+      wrap.appendChild(msgImage(`data:${a.mime};base64,${a.data}`));
     }
   }
   const actions = document.createElement("div");
@@ -1593,7 +1641,7 @@ function dispatchNextQueued() {
     kind: a.kind, name: a.name,
     preview: a.kind === "image" ? `data:${a.mime};base64,${a.data}` : "",
   }));
-  userBubble(item.text, outAtts);
+  userBubble(item.text, outAtts);  // buildUserBubble 内部走 msgImage：可点放大
   performSend(item);
 }
 
