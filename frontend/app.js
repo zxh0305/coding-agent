@@ -1342,18 +1342,36 @@ function ensureTrace() {
   if (traceEl) return;
   traceEl = document.createElement("details");
   traceEl.className = "trace";
-  traceEl.open = true;  // 执行期间展开，实时看过程
+  // 默认收起：执行痕迹不是回答，正文区只给答案；点折叠条才展开过程。
+  // 生成中实时更新秒数（见 traceTick / appendTrace），结束时按 elapsed 定格。
+  traceEl.open = false;
   const summary = document.createElement("summary");
-  summary.textContent = "执行过程";
+  summary.textContent = "已思考 0 秒";
   traceEl.appendChild(summary);
   chatEl.appendChild(traceEl);
+}
+
+// 生成中的折叠条文案：有工具步（traceSteps>0）显示"已工作"，纯思考阶段
+// （reasoning 流不算步）显示"已思考"。
+function fmtElapsed(sec) {
+  const n = Number(sec) || 0;
+  return n < 60 ? `${n.toFixed(n < 10 ? 1 : 0)} 秒`
+    : `${Math.floor(n / 60)} 分 ${Math.round(n % 60)} 秒`;
+}
+
+function traceTick() {
+  if (!traceEl) return;
+  const label = traceSteps > 0 ? `已工作 ${fmtElapsed((Date.now() - qStart) / 1000)}`
+                                : `已思考 ${fmtElapsed((Date.now() - qStart) / 1000)}`;
+  traceEl.querySelector("summary").textContent =
+    `${label} · ${traceSteps} 步`;
 }
 
 function appendTrace(el) {
   ensureTrace();
   traceEl.appendChild(el);
   traceSteps += 1;
-  traceEl.querySelector("summary").textContent = `执行过程（${traceSteps} 步）`;
+  traceTick();
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
@@ -1589,6 +1607,7 @@ function applyEvent(evt, seq) {
     clearInterval(metaTimer);
     metaTimer = setInterval(() => {
       if (metaEl && streaming) metaEl.textContent = metaText(((Date.now() - qStart) / 1000).toFixed(1), usageNow);
+      if (traceEl && streaming) traceTick();  // 折叠条秒数实时跳动
     }, 100);
     setStreaming(true);
     loadSessions();  // 新任务/新标题此刻才在服务端落定，列表刷新
@@ -1633,7 +1652,8 @@ function applyEvent(evt, seq) {
     if (evt.mid) historyMids.add(evt.mid);  // 已在屏上：防后续补发重复渲染
     if (traceEl) {
       traceEl.open = false;  // 执行完收起，保持对话清爽；点开可回看全过程
-      traceEl.querySelector("summary").textContent = `执行过程（${traceSteps} 步 · ${evt.elapsed_s}s）`;
+      traceEl.querySelector("summary").textContent =
+        `已工作 ${fmtElapsed(evt.elapsed_s)} · ${traceSteps} 步`;
     }
     chatEl.scrollTop = chatEl.scrollHeight;
     loadSessions();  // 任务时间/排序刷新
@@ -1673,7 +1693,8 @@ function applyEvent(evt, seq) {
   } else if (t === "error") {
     flushStreamBuffers();  // 已生成的部分内容留在气泡里，再显示错误
     retireLiveBubble();
-    if (traceEl) traceEl.querySelector("summary").textContent = `执行过程（${traceSteps} 步 · 出错）`;
+    if (traceEl) traceEl.querySelector("summary").textContent =
+      `已工作 ${fmtElapsed((Date.now() - qStart) / 1000)} · 出错`;
     bubble("assistant error", "❌ " + evt.message);
     // 生成中状态不在这里复位：turn_end 紧随 error 事件到达，由它统一收尾
   }
