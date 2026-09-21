@@ -698,23 +698,15 @@ function openLightbox(src, gallery, idx) {
   box.className = "lightbox";
   const img = document.createElement("img");
   img.className = "lb-img";
-  const actions = document.createElement("div");
-  actions.className = "lightbox-actions";
-  const hint = document.createElement("div");
-  hint.className = "lightbox-hint";
 
   const apply = () => {
     img.src = list[cur];
     img.style.transform = `scale(${lbScale})`;
-    const n = list.length > 1 ? `（${cur + 1}/${list.length}）` : "";
-    hint.textContent = `${Math.round(lbScale * 100)}%${n} · 点击图片或空白处恢复，Esc 关闭，←/→ 切换`;
-    prev.style.visibility = list.length > 1 ? "visible" : "hidden";
-    next.style.visibility = list.length > 1 ? "visible" : "hidden";
   };
   const setScale = (s) => { lbScale = Math.min(5, Math.max(0.2, s)); apply(); };
   const step = (d) => { cur = (cur + d + list.length) % list.length; lbScale = 1; apply(); };
 
-  // 左右切换箭头（多图才显示）
+  // 左右切换箭头（多图才显示）。缩放走滚轮，复制走右键菜单——不放工具条
   const mkNav = (label, d) => {
     const b = document.createElement("button");
     b.className = "lb-nav";
@@ -724,31 +716,7 @@ function openLightbox(src, gallery, idx) {
   };
   const prev = mkNav("‹", -1), next = mkNav("›", 1);
 
-  const copy = document.createElement("button");
-  copy.textContent = "📋 复制图片";
-  copy.addEventListener("click", async (e) => {
-    e.stopPropagation();
-    try {
-      // data URI → blob（png/jpeg 都转成 png 写剪贴板，应用通用）
-      const blob = await (await fetch(list[cur])).blob();
-      await navigator.clipboard.write([new ClipboardItem({ [blob.type || "image/png"]: blob })]);
-      copy.textContent = "✓ 已复制";
-      setTimeout(() => (copy.textContent = "📋 复制图片"), 1500);
-    } catch {
-      // 剪贴板不可用（权限拒绝/非安全上下文/类型不支持）：退回提示手动复制
-      hint.textContent = "自动复制不可用：可右键图片选择「复制图片」";
-      hint.style.color = "rgba(255,255,255,.85)";
-    }
-  });
-  const zoomOut = document.createElement("button");
-  zoomOut.textContent = "−";
-  zoomOut.addEventListener("click", (e) => { e.stopPropagation(); setScale(lbScale - 0.25); });
-  const zoomIn = document.createElement("button");
-  zoomIn.textContent = "＋";
-  zoomIn.addEventListener("click", (e) => { e.stopPropagation(); setScale(lbScale + 0.25); });
-
-  actions.append(zoomOut, copy, zoomIn);
-  box.append(prev, img, next, actions, hint);
+  box.append(prev, img, next);
   // 点放大的图片本身恢复原样；空白处关闭；滚轮缩放
   img.addEventListener("click", () => closeLightbox());
   box.addEventListener("click", (e) => { if (e.target === box) closeLightbox(); });

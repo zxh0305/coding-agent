@@ -528,7 +528,8 @@ button.primary:hover { background: #3d69d8; }
 .msg-img.clickable { cursor: zoom-in; transition: filter .15s; }
 .msg-img.clickable:hover { filter: brightness(1.05); }
 
-/* 图片灯箱：点气泡里的缩略图后全屏查看 + 复制 */
+/* ---------- 图片灯箱：点气泡里的缩略图 → 全屏查看 ---------- */
+/* 缩放走滚轮，复制走右键菜单；不设工具条 */
 .lightbox {
   position: fixed; inset: 0; z-index: 300;
   background: rgba(0, 0, 0, .78);
@@ -550,14 +551,6 @@ button.primary:hover { background: #3d69d8; }
 .lb-nav:hover { background: rgba(255, 255, 255, .3); }
 .lb-nav:first-child { left: 18px; }
 .lb-nav:nth-child(3) { right: 18px; }  /* prev, img, next 固定次序 */
-.lightbox-actions { display: flex; gap: 10px; }
-.lightbox-actions button {
-  padding: 7px 14px; border: none; border-radius: 8px;
-  background: rgba(255, 255, 255, .14); color: #fff; font-size: 14px;
-  cursor: pointer; min-width: 40px;
-}
-.lightbox-actions button:hover { background: rgba(255, 255, 255, .26); }
-.lightbox-hint { color: rgba(255, 255, 255, .55); font-size: 12.5px; }
 .bubble.user .att-file { color: rgba(255, 255, 255, 0.92); }
 
 /* 生成期间排队的消息卡片 */
