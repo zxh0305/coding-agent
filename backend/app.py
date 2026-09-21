@@ -80,6 +80,7 @@ from code_tools import prepare_workspace
 from events import SSE_HEARTBEAT, SessionEvents, sse_frame
 from llm_client import create_client, load_env_file, save_env_values
 from logger import setup_logging
+from memory import memory_dir, recent_user_texts, run_extraction_async
 from tools import TOOL_SCHEMAS
 
 log = logging.getLogger("app")
@@ -119,6 +120,23 @@ def _event_bus(sid: str) -> SessionEvents:
                                 persist=lambda seq, _sid=sid: db.set_last_seq(_sid, seq))
             _buses[sid] = bus
         return bus
+
+
+def _spawn_memory_extraction(sid: str, agent: Agent) -> None:
+    """轮末记忆提取的启动点（必须在 worker 线程内、turn_end 发布之后调用）。
+
+    触发点选在这里而不是 POST handler：POST 立即返回，那里没有"回答完成"
+    时机；turn_end 发布时落盘已完成，此刻的额外工作不再影响本回合。启动
+    线程前先把输入快照成不可变值（用户发言的纯字符串列表）——提取线程绝不
+    共享 agent.history（下一个回合立刻会改它），也不持有会话锁（worker 要
+    拿锁跑下一回合）。启动失败只进日志，绝不影响回合收尾。
+    """
+    try:
+        texts = recent_user_texts(list(agent.history))  # 快照：线程内只用字符串
+        # 传 chat() 方法本身（memory 约定 chat(messages, temperature=0) 可调用）
+        run_extraction_async(sid, memory_dir(agent.ctx.workspace), agent.llm.chat, texts)
+    except Exception:
+        log.exception("[会话 %s] 记忆提取线程启动失败（忽略，不影响回合）", sid)
 
 
 def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
@@ -190,6 +208,12 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             user_mid = next((m.get("_mid") for m in reversed(agent.history)
                              if m.get("role") == "user"), None)
             bus.publish({"type": "turn_end", "user_mid": user_mid})
+            # 轮末自动提取（memory.py）：daemon 线程异步跑，绝不阻塞 worker
+            # 返回与下一个回合。全程静默——不发 SSE 事件、不写数据库：记忆是
+            # 后台维护动作，用户无需感知，推送事件反而会进环形缓冲、打扰所有
+            # 订阅页的时间线；失败只进日志，下轮自然重试。出错的回合不走这里
+            # （内容不完整，避免把半截对话提炼成错误记忆），最终兜底路径同理。
+            _spawn_memory_extraction(sid, agent)
         except Exception:
             # 最后一道兜底：连收尾都炸了也要把回合关掉，绝不挂起订阅页
             log.exception("[会话 %s] 回合线程收尾异常", sid)

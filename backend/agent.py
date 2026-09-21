@@ -30,6 +30,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from code_tools import prepare_workspace
+from memory import memory_dir, system_memory_block
 from tools import TOOL_SCHEMAS, ToolContext, execute_tool, is_read_only
 from ui import colored
 
@@ -143,6 +144,21 @@ class Agent:
         """发给模型前剥离内部字段（_stats 等下划线前缀），部分服务商会拒绝未知字段。"""
         return {k: v for k, v in m.items() if not k.startswith("_")}
 
+    def _system_content(self) -> str:
+        """实际发给模型的 system 内容 = 基础提示 + 持久记忆段（memory.py）。
+
+        关键不变式：记忆只进 system 消息，绝不进消息历史——上下文压缩只重写
+        消息历史的模型视图（_visible_history）、从不修改 system，因此 compact
+        之后记忆原样保留，也不会被重复注入；这也是零改动压缩逻辑的原因。
+        索引每次组装时从磁盘现读（模型/提取线程刚写的记忆下一轮立即可见），
+        读失败由 memory 层降级为空，绝不阻塞主循环。
+        CLI（cli.py）构造 Agent 走同一个方法，注入自动生效；轮末【自动提取】
+        目前只挂在 Web worker（app.py _run_round 收尾处），CLI 不触发——CLI
+        没有回合收尾时机，后续要挂时调 memory.run_extraction_async 即可，
+        是同一个钩子。
+        """
+        return self.system_prompt + system_memory_block(memory_dir(self.ctx.workspace))
+
     def _visible_history(self) -> list[dict]:
         """模型视图的"该看哪些消息"——压缩的唯一生效点（纯函数，测试覆盖）。
 
@@ -236,7 +252,9 @@ class Agent:
         2. 校准系数缓存在 self._token_ratio（回答结束后的压缩判断靠它），压缩后作废。
         """
         view = self._messages_for_model()
-        sys_chars = len(self.system_prompt)
+        # system 口径必须与实际请求一致：含记忆段（契约 + 索引），否则记忆
+        # 越攒越多时压缩触发线会被系统性低估
+        sys_chars = len(self._system_content())
         tool_chars = len(json.dumps(TOOL_SCHEMAS, ensure_ascii=False))
         buckets = {"user": 0, "assistant": 0, "tool": 0}
         for m in view:
@@ -334,7 +352,10 @@ class Agent:
             # 每轮都重发【系统提示 + 完整历史】—— 这就是 LLM 的全部"记忆"。
             # 主模型不支持视觉时，先把历史里的图片剥离成文字提示（图片数据留在
             # self.ctx.images，由 analyze_image 工具借视觉模型识别）。
-            messages = [{"role": "system", "content": self.system_prompt}, *self._messages_for_model()]
+            # system 末尾追加持久记忆段（契约 + 索引），不变式见 _system_content：
+            # 记忆只进 system，绝不进消息历史（compact 后原样保留、不重复注入）。
+            messages = [{"role": "system", "content": self._system_content()},
+                        *self._messages_for_model()]
             # 完整 payload 进日志（DEBUG 级）：排错时能看到模型到底"看到"了什么
             log.debug("第 %d 轮请求 payload:\n%s", round_no,
                       json.dumps(messages, ensure_ascii=False, indent=2))

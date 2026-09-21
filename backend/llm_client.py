@@ -146,13 +146,20 @@ class OpenAIChatClient:
             self.timeout,
         )
 
-    def chat(self, messages: list, tools: list | None = None) -> dict:
-        """非流式：发送对话历史 + 工具清单，一次性返回 LLM 的下一条 message。"""
+    def chat(self, messages: list, tools: list | None = None,
+             temperature: float | None = None) -> dict:
+        """非流式：发送对话历史 + 工具清单，一次性返回 LLM 的下一条 message。
+
+        temperature：可选采样温度（如记忆提取传 0 要确定性输出）。None = 不传，
+        服务商用默认值——主对话不该在这里悄悄改采样行为。
+        """
         payload = {
             "model": self.model,
             "messages": messages,
             "tool_choice": "auto",  # 让模型自己决定：直接回答 or 调用工具
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
         if tools:
             payload["tools"] = tools
         start = time.time()
@@ -402,9 +409,13 @@ class AnthropicMessagesClient:
                  "total_tokens": u.get("input_tokens", 0) + u.get("output_tokens", 0)}
         return message, usage
 
-    def chat(self, messages: list, tools: list | None = None) -> dict:
-        """非流式：一次拿到完整 message（OpenAI 格式）。"""
+    def chat(self, messages: list, tools: list | None = None,
+             temperature: float | None = None) -> dict:
+        """非流式：一次拿到完整 message（OpenAI 格式）。temperature 语义同
+        OpenAIChatClient.chat（记忆提取传 0，None = 不传该字段）。"""
         body = self._to_anthropic(messages, tools)
+        if temperature is not None:
+            body["temperature"] = temperature
         with self._post(body) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         if data.get("type") == "error":
