@@ -203,13 +203,34 @@ MIGRATIONS: list[tuple[int, str | None]] = [
         "    trace_json TEXT NOT NULL,\n"
         "    PRIMARY KEY(session_id, mid)\n"
         ")"),
+    # 10~14：REAL 时间戳的人类可读镜像列 *_txt（生成列，要求 SQLite ≥ 3.31）。
+    #    动机：直接用 DataGrip 等工具查库时能并排看到 'YYYY-MM-DD HH:MM:SS'，
+    #    原始 REAL 列原样保留（排序、精度、代码读写都不受影响）。用 GENERATED
+    #    ALWAYS AS VIRTUAL 而非普通 TEXT 列：读取时实时计算——旧数据无需回填、
+    #    今后所有 INSERT/UPDATE（尤其 sessions.updated 每轮活跃都在变）都不用
+    #    记得同步赋值，不存在"新写入点忘了维护"的问题。
+    #    时区固定 '+8 hours'（东八区）而非 'localtime'：后者依赖运行环境时区，
+    #    属非确定性表达式，SQLite 明确禁止用于生成列（建列能过、查询即报错）。
+    #    库与使用方都在东八区，固定偏移反而保证任何机器上打开都是同一显示。
+    (10, "ALTER TABLE users ADD COLUMN created_txt TEXT "
+         "GENERATED ALWAYS AS (datetime(created, 'unixepoch', '+8 hours')) VIRTUAL"),
+    (11, "ALTER TABLE auth_tokens ADD COLUMN created_txt TEXT "
+         "GENERATED ALWAYS AS (datetime(created, 'unixepoch', '+8 hours')) VIRTUAL"),
+    (12, "ALTER TABLE sessions ADD COLUMN created_txt TEXT "
+         "GENERATED ALWAYS AS (datetime(created, 'unixepoch', '+8 hours')) VIRTUAL"),
+    (13, "ALTER TABLE sessions ADD COLUMN updated_txt TEXT "
+         "GENERATED ALWAYS AS (datetime(updated, 'unixepoch', '+8 hours')) VIRTUAL"),
+    (14, "ALTER TABLE providers ADD COLUMN created_txt TEXT "
+         "GENERATED ALWAYS AS (datetime(created, 'unixepoch', '+8 hours')) VIRTUAL"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    # 必须用 table_xinfo 而非 table_info：后者不列出 VIRTUAL 生成列（迁移 10~14
+    # 的 *_txt 列会因此被探针判为"未应用"，重放 ALTER 直接报 duplicate column）。
+    return {r["name"] for r in conn.execute(f"PRAGMA table_xinfo({table})")}
 
 
 def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
@@ -235,6 +256,11 @@ def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
     if version == 9:           # session_traces 表
         return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                                  "AND name='session_traces'").fetchone())
+    if version in (10, 11, 12, 13, 14):   # *_txt 生成列（users/auth_tokens/sessions/providers）
+        table = {10: "users", 11: "auth_tokens", 12: "sessions",
+                 13: "sessions", 14: "providers"}[version]
+        col = "updated_txt" if version == 13 else "created_txt"
+        return col in _table_columns(conn, table)
     return False
 
 
