@@ -1039,6 +1039,14 @@ class Handler(SimpleHTTPRequestHandler):
                 # 助手消息带回耗时/token 统计（回放渲染用，来自 message_usage 表）
                 item = {"role": role, "content": m["content"], "ord": m["_ord"],
                         "mid": m["_mid"], "stats": m.get("_stats")}
+                # 带 tool_calls 的中间 assistant 消息必须把这个字段带出去：它的
+                # 正文只是"过程说明"（如"现在开始改"），已随最终回答的 trace 落库
+                # （type=process_text），前端 historyNode 靠 tool_calls 判断"这条
+                # 不进时间线"，否则回放时每段过程说明都变回一张正文卡片——与实时
+                # 视图（降级进执行过程面板）割裂，时间线被大量碎句刷屏。
+                # 曾经漏带：前端拿不到 tool_calls，判空恒成立，过滤形同虚设。
+                if m.get("tool_calls"):
+                    item["tool_calls"] = m["tool_calls"]
                 items.append(item)
         # 执行过程轨迹按本页的 mid 批量取（只有最终回答消息才有）：前端历史
         # 回放渲染折叠条，点开可看当时每一步做了什么
