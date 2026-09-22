@@ -254,8 +254,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 _turn_status.pop(sid, None)
             bus.publish({"type": "turn_start", "nonce": nonce, "input": plain, "atts": atts})
             log.info("[会话 %s] 用户提问: %s", sid, plain)
-            seg_mid = None  # 当前回答段落的 mid（每个 round 事件换一段）
-            final_mid = None  # 最终回答段落的 mid（轨迹落库的键）
+            seg_mid = None  # 当前回答段落的 SSE 气泡 mid（每个 round 事件换一段，仅事件流用）
             error = None
             try:
                 for kind, payload in agent.run(plain, user_message):
@@ -274,7 +273,6 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                     if kind in ("usage", "compacted"):  # 最新上下文容量，供 /api/context
                         _ctx[sid] = payload
                     if kind == "done":
-                        final_mid = seg_mid
                         log.info("[会话 %s] 最终回答: %s", sid, str(payload.get("answer"))[:200])
             except RuntimeError as e:
                 log.exception("LLM 请求失败")
@@ -291,13 +289,24 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             written = db.save_messages(sid, agent.history, agent.saved)
             db.touch_session(sid)
             log.info("[会话 %s] 本轮落盘 %d 行", sid, written)
-            if final_mid and error is None:
-                # 执行过程轨迹随最终回答落库：切换会话/刷新后历史回放仍能
-                # 展开看"当时每一步做了什么、改了哪些文件"。失败不阻塞收尾。
-                try:
-                    _persist_trace(sid, final_mid, agent.trace)
-                except Exception:
-                    log.exception("[会话 %s] 轨迹落库失败（忽略）", sid)
+            # 轨迹的落库键必须是【最终回答消息落库后的真实 mid】——不能用上面
+            # 事件流里的 seg_mid。seg_mid 是 _run_round 现生成的 12 位短 id，
+            # 只服务于前端把同一段回答的 delta 归并进一个气泡，它从不写进
+            # agent.history；而消息的真实 mid 是 save_messages 分配的 32 位
+            # uuid（见 db.save_messages）。用 seg_mid 落轨迹，get_traces 按
+            # 消息 mid 永远查不到——回放时「执行过程」折叠条永不出现。
+            # save_messages 就地给每条消息写回了 _mid，所以这里能从历史里取到：
+            # 取最后一条落库的 assistant 消息（收尾答案），跳过 _synthetic。
+            if error is None:
+                answer_mid = next((m.get("_mid") for m in reversed(agent.history)
+                                   if m.get("role") == "assistant" and not m.get("_synthetic")), None)
+                if answer_mid:
+                    # 执行过程轨迹随最终回答落库：切换会话/刷新后历史回放仍能
+                    # 展开看"当时每一步做了什么、改了哪些文件"。失败不阻塞收尾。
+                    try:
+                        _persist_trace(sid, answer_mid, agent.trace)
+                    except Exception:
+                        log.exception("[会话 %s] 轨迹落库失败（忽略）", sid)
             # 记下本轮结局，供任务列表徽标用（"跑过且正常结束"= done 绿点、
             # 出错 = error 红点）。用户主动停止不算错——stopped 走的是正常收尾
             # 路径（error 为 None），与旧行为一致地显示为 done。
