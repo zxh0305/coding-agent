@@ -1045,6 +1045,13 @@ button.primary:hover { background: #3d69d8; }
   color: var(--text-3); font-size: 14px; cursor: pointer; padding: 2px 4px;
 }
 .git-x:hover { color: var(--text-1); }
+/* 浮窗头部的"当前项目文件夹"行：明确这份提交列表读的是哪个目录 */
+.git-scope {
+  padding: 6px 16px 0; font-size: 11px; color: var(--text-3);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.git-scope:empty { display: none; }
 
 .git-filter { display: flex; gap: 6px; align-items: center; padding: 8px 16px 6px; }
 .git-fbtn {

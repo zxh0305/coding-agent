@@ -2924,21 +2924,56 @@ function gitQs(extra = {}) {
   return qs.toString();
 }
 
+// 浮窗 / 分支按钮背后的目录名（取路径末段），未绑定时为空串。
+// 注意 wsCustom 只代表"当前视图是否已绑定项目"：新任务态选了项目但还没
+// 发出首条消息时，会话尚未创建，后端仍会答 no_workspace——文案靠下面的
+// pendingProjectPath 区分"还没建任务"和"真的没绑项目"。
+function gitWsName() {
+  if (!wsCustom) return "";
+  const path = $("ws-pick") ? $("ws-pick").title : "";
+  return (path || "").replace(/\/+$/, "").split("/").pop() || "";
+}
+
+// 未绑定项目时给可操作的引导（而不是干巴巴一句"没有绑定"）：新任务已预选
+// 项目 → 让用户先把消息发出去；否则 → 提示点工具栏选目录。
+function gitPickHint() {
+  if (!wsCustom) return pendingProjectPath
+    ? "项目已选好，发送第一条消息后即可查看提交记录"
+    : "这个任务还没有项目文件夹：点输入框上方的「📁 选择项目」选一个目录，再点这里就能看提交记录";
+  return "";
+}
+
+// 浮窗在任务尚未创建时打开（工具栏预选了项目还没发消息）：此时没有
+// session_id，后端无从解析工作区，列表注定是空的——直接显示引导。
+function renderGitNoSession() {
+  $("git-body").innerHTML =
+    `<div class="git-empty">${esc(gitPickHint() || "任务还没有创建，发送第一条消息后再查看提交记录")}</div>`;
+}
+
 // 把分支名写进右上角触发按钮。传空串 = 不是仓库/未绑定项目，按钮退回
 // 只显示 "Git"，并去掉 warn 之外的状态。
 function setGitChipBranch(branch) {
   const el = $("git-chip-branch");
   if (!el) return;
-  el.textContent = branch || "Git";
-  $("git-chip").title = branch
-    ? `当前分支：${branch}（点击查看提交记录）`
+  // 标签只写"目录名 @ 分支"：此前只写分支名，多个项目都在 main 上时根本
+  // 看不出这个按钮说的是哪个仓库；长目录名在 CSS 里截断（.git-chip-branch）。
+  const wsName = branch ? gitWsName() : "";
+  el.textContent = branch ? (wsName ? `${wsName} @ ${branch}` : branch) : "Git";
+  el.title = branch
+    ? `当前项目文件夹：${$("ws-pick").title}（分支 ${branch}，点击查看提交记录）`
     : "查看当前项目文件夹的 Git 提交记录";
 }
 
 // 后台轻量刷新按钮上的分支名：不需要打开浮窗也能看到"我在哪个分支"。
 // 只在已绑定项目时发请求；失败静默（不是仓库属正常状态，不该弹错）。
 async function refreshGitChip() {
-  if (!currentSession) { setGitChipBranch(""); return; }
+  if (!currentSession) {
+    // 新任务态：还没有会话，后端解析不出工作区（no_workspace）。预选了项目
+    // 也只是待绑定，这里同样不画分支名，只把按钮恢复成中性态。
+    setGitChipBranch("");
+    $("git-chip").classList.remove("warn");
+    return;
+  }
   try {
     const d = await api("/api/git/summary?" + gitQs());
     setGitChipBranch(d.ok ? d.branch : "");
@@ -2956,6 +2991,7 @@ function toggleGitPop() {
   gitWho = "all";
   syncGitFilter();
   gitOffset = 0;
+  if (!currentSession) { renderGitNoSession(); return; }
   loadGitList(true);
 }
 
@@ -2999,6 +3035,12 @@ function renderGitList(data, reset) {
   branchBtn.textContent = (data.branch || "") + " ▾";
   branchBtn.classList.toggle("hidden", !data.ok || !data.branch);
   $("git-chip").classList.toggle("warn", !data.ok);
+  // 头部标出这份列表读的是哪个项目文件夹：多个任务各绑不同项目时，
+  // 只靠分支名分不清是哪个仓库（都在 main 上时尤其明显）。
+  const scope = $("git-scope");
+  const wsPath = $("ws-pick") ? $("ws-pick").title : "";
+  scope.textContent = data.ok && wsPath ? `📁 ${wsPath}` : "";
+  scope.title = scope.textContent;
   setGitChipBranch(data.ok ? data.branch : "");
   // 底部身份行：告诉用户"我"是按哪个 git 身份判定的
   const id = data.identity || {};
@@ -3006,8 +3048,11 @@ function renderGitList(data, reset) {
   $("git-dirty").textContent = data.dirty ? `${data.dirty} 处未提交改动` : "";
 
   if (!data.ok) {
-    // not_repo / no_workspace：都是正常状态，给引导文案而非报错
-    body.innerHTML = `<div class="git-empty">${esc(data.error || "无法读取 Git 信息")}</div>`;
+    // not_repo / no_workspace：都是正常状态，给引导文案而非报错。
+    // 未绑定项目时后端只回一句"还没有绑定项目文件夹"，用户看不出下一步该
+    // 干什么——这里换成可操作提示（选目录 / 先把首条消息发出去）。
+    const hint = data.reason === "no_workspace" ? gitPickHint() : "";
+    body.innerHTML = `<div class="git-empty">${esc(hint || data.error || "无法读取 Git 信息")}</div>`;
     return;
   }
   const commits = data.commits || [];

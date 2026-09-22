@@ -238,6 +238,9 @@
       <button id="git-branch" class="git-branch mono" title="点击切换分支"></button>
       <button id="git-close" class="git-x" title="关闭">✕</button>
     </div>
+    <!-- 这个列表读的是「当前任务绑定的项目文件夹」里的仓库，不是服务进程的
+         cwd——多个任务各自绑不同项目时，这里显示的是当前任务那个 -->
+    <div id="git-scope" class="git-scope mono"></div>
     <div class="git-filter">
       <button class="git-fbtn active" data-who="all">全部</button>
       <button class="git-fbtn" data-who="me">我</button>
