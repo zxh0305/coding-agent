@@ -28,11 +28,15 @@
 
   <div class="layout hidden" id="layout">
 
+    <!-- 侧栏收起时的左边缘热区：鼠标滑到这里自动弹出悬浮的会话栏（见 app.js） -->
+    <div id="side-hover" class="side-hover hidden" title="悬停显示会话栏"></div>
+
     <!-- 左侧：任务列表 + 配置 -->
     <aside class="sidebar">
       <div class="side-head">
         <span class="brand">小牛coding</span>
         <button id="new-task" class="new-task" title="新建任务">＋ 新任务</button>
+        <button id="side-collapse" class="side-collapse" title="收起侧栏">⇤</button>
       </div>
       <div class="task-label">任务</div>
       <ul id="task-list" class="task-list"></ul>

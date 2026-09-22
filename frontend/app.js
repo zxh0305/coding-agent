@@ -3300,6 +3300,7 @@ function boot() {  // 登录成功（或刷新后 token 仍有效）后的页面
   restoreDocsWidth();       // 恢复上次的文档栏宽度
   restoreDocsListState();   // 恢复文档列表的折叠态
   bindDocsResizer();        // 文档栏左缘的拖拽把手
+  initSidebar();            // 侧栏收起/展开 + 收起后左缘悬浮唤出
 }
 
 (async () => {
@@ -3312,6 +3313,64 @@ function boot() {  // 登录成功（或刷新后 token 仍有效）后的页面
   boot();
 })();
 refreshCtx();
+
+// ---------- 左侧会话栏：收起/展开 + 收起后的悬浮唤出 ----------
+// 展开态：正常占位（flex 一列），点标题栏的 ⇤ 收起。
+// 收起态：宽度收 0 让出空间，并在左边缘留一条热区；鼠标滑到最左侧
+//         → 会话栏以悬浮层滑入（浮在主区之上，不挤压对话区），
+//         鼠标移出（热区或悬浮层）→ 自动滑走。
+const SIDE_COLLAPSED_KEY = "sidebarCollapsed";
+const SIDE_LEAVE_DELAY = 260;   // 鼠标移出后延迟收起：给"滑向悬浮层"留出过渡时间
+
+function sidebarEl() { return document.querySelector(".sidebar"); }
+
+function initSidebar() {
+  const side = sidebarEl();
+  const btn = $("side-collapse");
+  const hover = $("side-hover");
+  if (!side || !btn || !hover) return;
+
+  const setCollapsed = (collapsed) => {
+    side.classList.toggle("collapsed", collapsed);
+    // 收起态才让悬浮层生效；展开态清掉 floating/peek，回到普通占位布局
+    if (!collapsed) side.classList.remove("floating", "peek");
+    else side.classList.add("floating");
+    hover.classList.toggle("hidden", !collapsed);
+    btn.textContent = collapsed ? "⇥" : "⇤";
+    btn.title = collapsed ? "展开侧栏" : "收起侧栏";
+    localStorage.setItem(SIDE_COLLAPSED_KEY, collapsed ? "1" : "0");
+  };
+
+  const isCollapsed = () => side.classList.contains("collapsed");
+  const peek = () => { if (isCollapsed()) side.classList.add("peek"); };
+  const unpeek = () => side.classList.remove("peek");
+
+  btn.addEventListener("click", () => setCollapsed(!isCollapsed()));
+
+  // 鼠标进入左缘热区 → 弹出
+  hover.addEventListener("mouseenter", peek);
+  // 鼠标进入悬浮层 → 保持展开（取消可能已排队的收起）
+  let leaveTimer = null;
+  const cancelLeave = () => { if (leaveTimer) { clearTimeout(leaveTimer); leaveTimer = null; } };
+  const scheduleLeave = () => {
+    cancelLeave();
+    leaveTimer = setTimeout(() => { unpeek(); leaveTimer = null; }, SIDE_LEAVE_DELAY);
+  };
+  hover.addEventListener("mouseleave", scheduleLeave);
+  side.addEventListener("mouseenter", cancelLeave);
+  side.addEventListener("mouseleave", () => { if (isCollapsed()) scheduleLeave(); });
+  // 在悬浮层里点了某条任务/新任务后立刻收起，别挡住对话
+  side.addEventListener("click", (e) => {
+    if (!isCollapsed()) return;
+    if (e.target.closest(".task") || e.target.closest("#new-task")) unpeek();
+  });
+  // Esc 收起悬浮层
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && isCollapsed()) unpeek();
+  });
+
+  setCollapsed(localStorage.getItem(SIDE_COLLAPSED_KEY) === "1");
+}
 
 // ---------- 右侧文档栏 ----------
 // 展示本会话 agent 生成的 Markdown 文档：列表 + 渲染。入口是工具栏的

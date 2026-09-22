@@ -18,7 +18,7 @@ body {
   height: 100vh;
 }
 
-.layout { display: flex; height: 100vh; }
+.layout { display: flex; height: 100vh; position: relative; }
 .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
 .grow { flex: 1; }
 .hidden { display: none !important; }
@@ -28,11 +28,51 @@ body {
   width: 264px; flex-shrink: 0;
   background: #fafbfd; border-right: 1px solid var(--border);
   display: flex; flex-direction: column;
+  /* 收起/展开用过渡而不是 display:none：是"滑走/滑回"而不是"啪一下不见" */
+  overflow: hidden;
+  transition: width .26s ease, border-right-width .26s ease;
 }
+/* 收起：宽度收 0 让出空间（悬浮层由 .floating 接管） */
+.sidebar.collapsed {
+  width: 0; border-right-width: 0;
+}
+/* 收起后作为悬浮层出现：脱离文档流浮在主区之上，不挤压对话区。
+   默认留在屏幕外（transform 左移自身宽度），鼠标滑到左边缘时滑入。 */
+.sidebar.collapsed.floating {
+  position: absolute; left: 0; top: 0; bottom: 0; z-index: 30;
+  width: 264px;
+  border-right: 1px solid var(--border);
+  box-shadow: 0 0 0 1px rgba(20, 25, 40, .04), 12px 0 32px rgba(20, 25, 40, .14);
+  transform: translateX(-100%);
+  transition: transform .22s ease;
+}
+.sidebar.collapsed.floating.peek {
+  transform: translateX(0);
+}
+@media (prefers-reduced-motion: reduce) {
+  .sidebar, .sidebar.collapsed.floating { transition: none; }
+}
+
+/* 左边缘热区：只在侧栏收起时出现，鼠标进入即弹出悬浮会话栏。 */
+.side-hover {
+  position: fixed; left: 0; top: 0; bottom: 0; width: 14px; z-index: 29;
+}
+.side-hover.hidden { display: none; }
+
+.side-collapse {
+  flex-shrink: 0; margin-left: 4px;
+  border: 1px solid var(--border); border-radius: 7px;
+  background: #fff; color: var(--text-3);
+  font-size: 12px; line-height: 1; padding: 5px 7px; cursor: pointer;
+}
+.side-collapse:hover { background: #eef3ff; color: var(--accent); border-color: #c5d4f7; }
+
 .side-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 14px 14px 10px;
 }
+/* 收起态的悬浮层里给头部多留一点左右内边距，避免贴边 */
+.sidebar.floating .side-head { padding-right: 10px; }
 .brand { font-weight: 600; font-size: 14px; }
 .new-task {
   font-size: 12px; padding: 5px 10px;
@@ -832,6 +872,10 @@ button.primary:hover { background: #3d69d8; }
 @media (max-width: 720px) {
   .layout { flex-direction: column; }
   .sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--border); max-height: 40vh; }
+  /* 窄屏下侧栏本就在顶部，不启用收起/悬浮（hover 热区在触屏也没意义） */
+  .sidebar.collapsed { width: 100%; border-bottom-width: 1px; }
+  .sidebar.collapsed.floating { position: static; transform: none; box-shadow: none; }
+  .side-hover { display: none !important; }
   .composer { margin: 0 4% 12px; }
   .chat { padding: 16px 4%; }
 }
