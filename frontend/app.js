@@ -2692,7 +2692,11 @@ function gitRow(c) {
     subj.appendChild(stat);
   }
   row.append(l1, subj);
-  row.onclick = () => openGitDetail(c.hash);
+  // stopPropagation：阻止冒泡到 document 的"点浮层外关闭"处理器。
+  // 行内是 <span>，点它们时 e.target 是 span 而非按钮本身——虽然
+  // closest()/contains() 理论上能兜住，但显式停掉冒泡最稳妥：
+  // 详情视图就在同一个浮窗里切换，绝不该因为一次点击把浮窗关掉。
+  row.onclick = (e) => { e.stopPropagation(); openGitDetail(c.hash); };
   return row;
 }
 
