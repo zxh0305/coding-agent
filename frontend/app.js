@@ -2036,7 +2036,8 @@ function demoteLiveBubbleToTrace() {
 // 这是"先小字流出、完成后升级"的落点——升级只发生一次，且是"小→大"的揭晓，
 // 不像旧实现每段都"大→小"地缩一次。
 function finalizeAnswer(el, text) {
-  el.classList.remove("streaming", "process-text", "demoted");  // 去掉过程小字样式与「💬 说明」标记，换成正文卡  el.classList.add("bubble", "assistant");
+  el.classList.remove("streaming", "process-text", "demoted");  // 去掉过程小字样式与「💬 说明」标记，换成正文卡
+  el.classList.add("bubble", "assistant");
   traceEl.after(el);  // 紧跟折叠条：答案在执行过程之后，符合阅读顺序
   renderIntoBubble(el, text);
 }
