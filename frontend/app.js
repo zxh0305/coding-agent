@@ -567,6 +567,8 @@ async function doDeleteSession(id) {
     resetStreamState();
     chatEl.innerHTML = "";
     welcome();
+    railItems = [];
+    rebuildRail();  // 当前任务被删：导航条收起
     refreshCtx();
     closeEvents();
     historyMids = new Set();
@@ -576,6 +578,7 @@ async function doDeleteSession(id) {
 
 async function newTask(presetProject = null) {
   // presetProject = 项目组头「＋」传入的绝对路径：新建即绑定该项目
+  saveDraft(currentSession);   // 离开当前会话前存草稿
   currentSession = null;
   confirmingDelete = null;
   pendingProjectPath = presetProject;
@@ -583,6 +586,9 @@ async function newTask(presetProject = null) {
   closeEvents();      // 旧任务的事件流断开：新任务未建，第一条消息发出后再连
   chatEl.innerHTML = "";
   welcome();
+  railItems = [];
+  rebuildRail();       // 新任务时间线为空：导航条收起
+  restoreDraft(null);  // 新任务自己的草稿位（__new__）
   usageNow = null;
   updateCtxChip();
   if (presetProject) {
@@ -599,16 +605,205 @@ async function newTask(presetProject = null) {
   await loadSessions();  // 重新拉取列表：旧任务仍显示，只是没有选中项；首条消息后新任务才出现
 }
 
+// ---------- 输入框草稿：按会话归属 ----------
+// 输入框是全局唯一的 DOM 元素，切换会话时若不处理，A 会话打的字会原样留在
+// 框里、看起来像"被带到了 B 会话"。这里以会话 id 为 key 把草稿存进 localStorage：
+// 切走时存旧会话、切入时载新会话，各会话互不干扰（新任务用 __new__ 占位）。
+// 只做文本草稿——附件是内存对象（含 base64），跨会话恢复成本高且易误发，暂不处理。
+const DRAFT_NEW = "__new__";
+const draftKey = (sid) => `draft_${sid || DRAFT_NEW}`;
+
+function saveDraft(sid) {
+  const text = inputEl.value;
+  if (text) localStorage.setItem(draftKey(sid), text);
+  else localStorage.removeItem(draftKey(sid));  // 空草稿不留残留，避免下次误恢复
+}
+
+function restoreDraft(sid) {
+  inputEl.value = localStorage.getItem(draftKey(sid)) || "";
+}
+
+// 边打字边存草稿：防抖 300ms，避免每个按键都写 localStorage。
+let draftTimer = null;
+inputEl.addEventListener("input", () => {
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(() => saveDraft(currentSession), 300);
+});
+
+// ---------- 会话缩略导航条（minimap rail） ----------
+// 只画【用户提问】：条目来自服务端返回的全量 user_index（mid+ord），因此进入
+// 会话即显示整个会话的提问分布，不受"时间线只加载最近 N 条"的窗口限制。
+// 每条横线点击时：已在 DOM 里就直接滚动定位，否则先按 around_ord 把那一页
+// 历史加载进来再定位（精确跳转）。横线外观统一，不区分已加载/未加载。
+const railEl = $("msg-rail");
+let railItems = [];      // 全量用户提问索引 [{mid, ord}]（服务端给，按 ord 升序）
+let railTicks = [];      // [{el, item}]：与 railItems 一一对应的横线元素
+let railScheduled = false;
+
+// 给一个消息节点打锚（幂等）：mid 用于跳转查找，role 用于 rail 过滤与样式。
+// 返回原节点，方便在 return 语句里链式包一层。
+function railTag(node, mid, role) {
+  if (!node || !node.classList || !node.classList.contains("bubble") &&
+      !node.classList.contains("artifact")) return node;
+  if (mid) node.dataset.mid = mid;
+  if (role) node.dataset.role = role;
+  return node;
+}
+
+// 按 mid 在已加载的 DOM 里找用户气泡；没加载过则返回 null。
+// 历史回放的用户消息可能包在 display:contents 的 holder 里，故用 querySelector 下钻。
+function railFindNode(mid) {
+  if (!mid) return null;
+  const esc = (window.CSS && CSS.escape) ? CSS.escape(mid) : mid.replace(/"/g, '\\"');
+  const inner = chatEl.querySelector(`[data-role="user"][data-mid="${esc}"]`);
+  if (inner) return inner;
+  // 兜底：mid 未回填时，按已加载用户气泡的顺序与索引位置近似对应
+  return null;
+}
+
+// 重建导航条：条目 = 全量用户提问索引；为空（新会话/无提问）时整条隐藏。
+function rebuildRail() {
+  if (!railEl) return;
+  railEl.innerHTML = "";
+  railTicks = [];
+  if (!railItems.length) { railEl.classList.add("hidden"); return; }
+  railEl.classList.remove("hidden");
+  const frag = document.createDocumentFragment();
+  for (const item of railItems) {
+    const tick = document.createElement("div");
+    tick.className = "rail-tick";
+    tick.title = railPreview(item);
+    tick.addEventListener("click", () => jumpToItem(item));
+    frag.appendChild(tick);
+    railTicks.push({ el: tick, item });
+  }
+  railEl.appendChild(frag);
+  syncRailActive();
+}
+
+// 条目摘要（hover 提示）：优先取已加载气泡的文本，未加载则显示序号提示。
+function railPreview(item) {
+  const node = railFindNode(item.mid);
+  if (node) {
+    const text = (node.textContent || "").replace(/\s+/g, " ").trim();
+    if (text) return text.length > 60 ? text.slice(0, 60) + "…" : text;
+  }
+  return `第 ${railItems.indexOf(item) + 1} 条提问（点击定位）`;
+}
+
+// 滚动高亮：取视口纵向中线所在的那条已加载提问，对应横线加深。
+// 未加载的条目按 ord 比例估算，保证横线高亮不跳空。
+function syncRailActive() {
+  if (!railTicks.length) return;
+  const mid = chatEl.scrollTop + chatEl.clientHeight / 2;
+  let active = 0;
+  let best = -Infinity;
+  railTicks.forEach((t, i) => {
+    const node = railFindNode(t.item.mid);
+    if (!node) return;
+    if (node.offsetTop <= mid && node.offsetTop > best) { best = node.offsetTop; active = i; }
+  });
+  if (best === -Infinity) {
+    // 没有任何已加载提问在视口上方：按滚动比例粗定位，避免高亮停在第 0 条
+    const pct = chatEl.scrollHeight > chatEl.clientHeight
+      ? chatEl.scrollTop / (chatEl.scrollHeight - chatEl.clientHeight) : 0;
+    active = Math.round(pct * (railTicks.length - 1));
+  }
+  railTicks.forEach((t, i) => t.el.classList.toggle("active", i === active));
+}
+
+// 跳转：已在 DOM 里直接滚动；否则先加载该 ord 所在的一页历史，再滚动定位。
+async function jumpToItem(item) {
+  let node = railFindNode(item.mid);
+  if (!node) {
+    await loadWindowAround(item.ord);
+    node = railFindNode(item.mid);
+  }
+  if (!node) { toast("这条消息还没加载出来，请稍后重试"); return; }
+  const top = Math.max(0, node.offsetTop - chatEl.clientHeight / 3);
+  chatEl.scrollTo({ top, behavior: "smooth" });
+  node.classList.remove("rail-hit");
+  void node.offsetWidth;          // 强制重排，让动画能重复触发
+  node.classList.add("rail-hit");
+  setTimeout(() => node.classList.remove("rail-hit"), 3000);
+}
+
+// 加载目标 ord 所在的一页（around_ord）：把该窗口的历史插进时间线。
+// 取回的是窗口内 mid/ord/role 索引，正文仍由常规分页接口提供——这里按窗口
+// 下界做一次 before_ord 分页，把整页拉回来（复用手头已有的渲染路径）。
+async function loadWindowAround(ord) {
+  try {
+    const qs = new URLSearchParams({ around_ord: String(ord), limit: "50" });
+    const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?` + qs);
+    const win = data.window || [];
+    if (!win.length) return;
+    // 该窗口下界之前的消息也一并取回，保证目标条能连续渲染
+    const lower = win[0].ord;
+    const page = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?` +
+      new URLSearchParams({ before_ord: String(lower), limit: "100" }));
+    insertHistoryBefore(page.messages || []);
+    histHasMore = !!page.has_more || (page.messages || []).length > 0;
+    updateLoadOlder();
+    scheduleRail();
+  } catch (e) {
+    console.error("加载目标消息窗口失败", e);
+  }
+}
+
+// 把一页历史插到时间线的最前面（复用向上翻页的插入位置与滚动补偿逻辑）。
+function insertHistoryBefore(messages) {
+  if (!messages.length) return;
+  const frag = document.createDocumentFragment();
+  for (const m of messages) {
+    if (m.mid) historyMids.add(m.mid);
+    frag.appendChild(historyNode(m));
+  }
+  const btn = $("load-older");
+  const prevHeight = chatEl.scrollHeight, prevTop = chatEl.scrollTop;
+  if (btn) btn.after(frag); else chatEl.insertBefore(frag, chatEl.children[1] || null);
+  chatEl.scrollTop = prevTop + (chatEl.scrollHeight - prevHeight);
+}
+
+// 拉取最新的全量用户提问索引（回合结束后调用：本轮提问此刻才落库）。
+async function refreshUserIndex() {
+  if (!currentSession) return;
+  try {
+    const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?limit=1`);
+    if (Array.isArray(data.user_index)) { railItems = data.user_index; scheduleRail(); }
+  } catch (e) { /* 静默：导航条不是关键路径，失败不影响对话 */ }
+}
+
+// 合并短时间内的多次重建请求（流式期间 done/turn_end 会连着触发）。
+function scheduleRail() {
+  if (railScheduled) return;
+  railScheduled = true;
+  requestAnimationFrame(() => { railScheduled = false; rebuildRail(); });
+}
+
+// 回填「最后一个还没打锚的用户气泡」的 mid：本 tab 自己发消息时 mid 未知，
+// 服务端在 turn_end 才给。锚点回填后 rail 才认得出这条消息。
+function tagLastUntaggedUser(mid) {
+  const users = [...chatEl.querySelectorAll('[data-role="user"]')];
+  const last = users[users.length - 1];
+  if (last && !last.dataset.mid) { last.dataset.mid = mid; scheduleRail(); }
+}
+
+chatEl.addEventListener("scroll", syncRailActive, { passive: true });
+
 // ---------- 历史消息回放（分页加载 + 外置归档） ----------
 let histOldestOrd = null;  // 已加载最旧一条消息的 ord（向上翻页游标）
 let histHasMore = false;   // 其上是否还有更早的消息
 
 async function switchSession(id) {
   if (id === currentSession) return;
+  saveDraft(currentSession);     // 离开前：把输入框内容存进旧会话的草稿
   currentSession = id;
   resetStreamState();  // 旧会话的事件流已断，流式状态必须随之复位
   chatEl.innerHTML = "";
   welcome();
+  railItems = [];                 // 上一个会话的提问索引作废
+  rebuildRail();                  // 时间线已清空：导航条随之收起（等历史装载后再出现）
+  restoreDraft(id);              // 进入后：载入该会话自己的草稿（不串到别的会话）
   histOldestOrd = null;
   histHasMore = false;
   historyMids = new Set();        // 补发去重基准随任务重建
@@ -645,6 +840,11 @@ async function loadHistoryPage() {
     if (histOldestOrd != null) qs.set("before_ord", histOldestOrd);
     const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?` + qs);
     histHasMore = !!data.has_more;
+    // 全量用户提问索引：导航条据此一次性画出整个会话的提问（含尚未加载的）
+    if (Array.isArray(data.user_index)) {
+      railItems = data.user_index;
+      scheduleRail();
+    }
     if (!data.messages.length) { updateLoadOlder(); return; }
     histOldestOrd = data.messages[0].ord;
     const frag = document.createDocumentFragment();
@@ -664,7 +864,17 @@ async function loadHistoryPage() {
       chatEl.scrollTop = chatEl.scrollHeight;
     }
     updateLoadOlder();
-  } catch (e) { /* 历史拉取失败不阻塞 */ }
+    scheduleRail();  // 历史装载完毕：导航条按新消息重建
+  } catch (e) {
+    // 历史拉取失败不能静默：以前这里是空 catch，任何渲染/接口异常都被吞掉，
+    // 表现成"点进会话一片空白且控制台无痕"，排查代价极高。现在至少留痕 + 给
+    // 用户一条可见提示，不再让故障隐形。
+    console.error("历史消息加载失败", e);
+    const err = document.createElement("div");
+    err.className = "bubble error";
+    err.textContent = "历史消息加载失败：" + (e && e.message ? e.message : e);
+    chatEl.appendChild(err);
+  }
 }
 
 function updateLoadOlder() {
@@ -684,7 +894,7 @@ function updateLoadOlder() {
 function historyNode(m) {
   // 外置归档消息：库行内只有 head 预览（超大正文存 artifacts 文件），
   // 展示"内容过大已归档"标记，点开按需拉取全文
-  if (m.artifact) return artifactCard(m);
+  if (m.artifact) return railTag(artifactCard(m), m.mid, "user");
   if (m.role === "compact") return compactCard(m.content);
   if (m.role === "user" && Array.isArray(m.content)) {
     const text = m.content
@@ -694,7 +904,7 @@ function historyNode(m) {
     const imgs = m.content
       .filter(p => p.type === "image_url")
       .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
-    return buildUserBubble(text, imgs);
+    return railTag(buildUserBubble(text, imgs), m.mid, "user");
   }
   // 用 fragment 直接把气泡/meta 挂进 #chat：外面包一层普通 div 会让
   // .bubble.user 的 align-self 失效（父级不是 flex），用户消息就会挤到左侧
@@ -713,7 +923,9 @@ function historyNode(m) {
     const tr = traceFromHistory(m.trace, m.stats?.elapsed_s);
     if (tr) frag.appendChild(tr);
   }
-  frag.appendChild(buildBubble(m.role === "user" ? "user" : "assistant", m.content || ""));
+  // 主消息气泡：打上 mid 与角色锚，供左侧导航条定位（rail 只画 user/assistant 两类）
+  frag.appendChild(railTag(buildBubble(m.role === "user" ? "user" : "assistant", m.content || ""),
+                          m.mid, m.role === "user" ? "user" : "assistant"));
   // 历史消息也带回当时的耗时/token 统计（message_usage 表随消息附带）
   if (m.role === "assistant" && m.stats) {
     const meta = document.createElement("div");
@@ -1003,6 +1215,12 @@ function traceFromHistory(entries, elapsed) {
   const d = document.createElement("details");
   d.className = "trace";
   d.open = false;
+  // <summary> 必须在这里建好：详情折叠条的摘要行是它唯一的固定子元素，
+  // 缺了它下面的 d.querySelector("summary") 会拿到 null、赋值即抛 TypeError，
+  // 而异常发生在 historyNode 内、被 loadHistoryPage 的 catch 吞掉——结果是
+  // 整批历史一条都渲染不出来（点进会话只剩欢迎语的直接原因）。摘要文案要等
+  // 循环统计完 steps 才知道，所以先建空元素、循环后再填文本。
+  d.appendChild(document.createElement("summary"));
   const list = Array.isArray(entries) ? entries : [];
   let steps = 0;
   let lastWriteCard = null;  // 历史回放：待回填徽章的写入调用卡
@@ -1079,8 +1297,8 @@ function buildUserBubble(text, atts) {
   return div;
 }
 
-function userBubble(text, atts) {
-  chatEl.appendChild(buildUserBubble(text, atts));
+function userBubble(text, atts, mid) {
+  chatEl.appendChild(railTag(buildUserBubble(text, atts), mid, "user"));
   scrollBottom(true);  // 用户自己的消息永远贴底（同时恢复跟随）
 }
 
@@ -2052,11 +2270,12 @@ function demoteLiveBubbleToTrace() {
 // 正文区（折叠条之后）、升级为正常字号，并做 Markdown 渲染。
 // 这是"先小字流出、完成后升级"的落点——升级只发生一次，且是"小→大"的揭晓，
 // 不像旧实现每段都"大→小"地缩一次。
-function finalizeAnswer(el, text) {
+function finalizeAnswer(el, text, mid) {
   el.classList.remove("streaming", "process-text", "demoted");  // 去掉过程小字样式与「💬 说明」标记，换成正文卡
   el.classList.add("bubble", "assistant");
   traceEl.after(el);  // 紧跟折叠条：答案在执行过程之后，符合阅读顺序
   renderIntoBubble(el, text);
+  railTag(el, mid, "assistant");  // 仍打锚（保留 mid 标识），但导航条只画用户提问
 }
 
 // 流式增量按帧合并：delta 到达频率远高于屏幕刷新率，逐条 textContent += 和
@@ -2106,7 +2325,9 @@ function applyEvent(evt, seq) {
     // 原文补画（附件只带名字：图片 base64 不该进环形缓冲占容量）
     if (!evt.nonce || evt.nonce !== myNonce) {
       userBubble(evt.input || "（仅附件）",
-        (evt.atts || []).map(a => ({ kind: a.kind, name: a.name, preview: "" })));
+        (evt.atts || []).map(a => ({ kind: a.kind, name: a.name, preview: "" })),
+        evt.user_mid);
+      scheduleRail();  // 补画的用户消息也要进导航条
     }
     // 回合级状态复位（原在 performSend 里；改为事件驱动后，刷新页面接上
     // 正在进行的回合也走同一套初始化）
@@ -2173,20 +2394,20 @@ function applyEvent(evt, seq) {
       // 正文为空：保留已流出的增量（若有），一条都没有则不留空白气泡
       b.text = b.text || "";
       if (!b.text) b.el.remove();
-      else finalizeAnswer(b.el, b.text);
+      else finalizeAnswer(b.el, b.text, evt.mid);
     } else if (authoritative === b.text) {
-      finalizeAnswer(b.el, b.text);  // 与增量一致：照常定稿
+      finalizeAnswer(b.el, b.text, evt.mid);  // 与增量一致：照常定稿
     } else if (b.text && !authoritative.includes(b.text)) {
       // 服务端正文与已渲染增量对不上（疑似推理混入/乱序）：保留用户已看到的
       // 流式内容，不整体覆盖，并留一行提示便于排查
-      finalizeAnswer(b.el, b.text);
+      finalizeAnswer(b.el, b.text, evt.mid);
       const warn = document.createElement("div");
       warn.className = "meta";
       warn.textContent = "（本轮回答与流式内容不一致，已保留流式版本）";
       chatEl.appendChild(warn);
     } else {
       b.text = authoritative;
-      finalizeAnswer(b.el, authoritative);
+      finalizeAnswer(b.el, authoritative, evt.mid);
     }
     clearInterval(metaTimer);
     metaEl.textContent = metaText(evt.elapsed_s, evt.usage);
@@ -2211,6 +2432,10 @@ function applyEvent(evt, seq) {
     // 回合结束（服务端已落盘）：驱动排队队列推进的唯一信号——原来靠 POST
     // 收尾推进，现在 POST 立即返回，队列只能跟着回合生命周期走
     if (evt.user_mid) historyMids.add(evt.user_mid);
+    // 本 tab 自己发消息时画的气泡当时还没有 mid（服务端此刻才落定）：回填锚点，
+    // 否则这条用户消息在导航条里永远缺席（其他标签页/刷新路径在 turn_start 已带上）
+    if (evt.user_mid) tagLastUntaggedUser(evt.user_mid);
+    refreshUserIndex();  // 本轮提问此刻才落库：导航条补上这一条
     clearInterval(metaTimer);
     setStreaming(false);
     myNonce = null;
@@ -2230,6 +2455,8 @@ function applyEvent(evt, seq) {
     resetStreamState();
     chatEl.innerHTML = "";
     welcome();
+    railItems = [];
+    rebuildRail();  // 会话已清空：导航条收起
     loadSessions();
     toast("该任务已在其他窗口被删除");
   } else if (t === "error") {
@@ -2301,6 +2528,8 @@ function send() {
   const payloadAtts = attachments.map(a => ({ kind: a.kind, name: a.name, mime: a.mime, data: a.data }));
   const outAtts = attachments.map(a => ({ kind: a.kind, name: a.name, preview: a.preview }));
   inputEl.value = "";
+  clearTimeout(draftTimer);      // 已发出：取消待写的防抖存盘
+  saveDraft(currentSession);     // 并立即清掉该会话草稿（此刻输入框已空 → 删除）
   attachments = [];
   renderAttachTray();
 
@@ -2411,6 +2640,7 @@ async function performSend(item) {
       // 新任务的第一次发送：创建任务 + 入队一步完成
       const data = await api(`/api/sessions`, { method: "POST", body });
       currentSession = data.session_id;
+      localStorage.removeItem(draftKey(null));  // 新任务已实体化：清掉 __new__ 草稿位
       openEvents(currentSession);  // 立刻接事件流：turn_start 可能已在缓冲里等着补发
       loadWorkspace();             // 新任务按用户默认解析了自己的工作区，工具栏对齐
       // 新任务时在下拉里选过权限模式：建会话后写入（按工作区记忆）
@@ -2930,6 +3160,8 @@ function boot() {
   currentSession = null;
   chatEl.innerHTML = "";
   historyMids = new Set();  // 上一个用户/任务的去重基准作废
+  railItems = [];
+  rebuildRail();            // 现场已清：导航条收起
   $("login-page").classList.add("hidden");   // 离开登录页
   $("layout").classList.remove("hidden");    // 进入对话页
   setWho(who);

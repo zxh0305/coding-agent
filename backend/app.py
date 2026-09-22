@@ -1039,6 +1039,17 @@ class Handler(SimpleHTTPRequestHandler):
             before_ord = int(raw_before) if raw_before is not None else None
         except (TypeError, ValueError):
             return self._json({"error": "before_ord 须为整数"}, 400)
+        # around_ord：导航条跳到「窗口之外」的消息时用——以该 ord 为中心取一页，
+        # 前端据此把它所在的窗口加载进时间线（返回的是窗口内 mid/ord/role 索引，
+        # 正文仍走常规分页，避免在这里重复实现一套渲染数据组装）。
+        raw_around = qs.get("around_ord", [None])[0]
+        try:
+            around_ord = int(raw_around) if raw_around is not None else None
+        except (TypeError, ValueError):
+            return self._json({"error": "around_ord 须为整数"}, 400)
+        if around_ord is not None:
+            win = db.window_around_ord(sid, around_ord, before=limit, after=limit)
+            return self._json({"window": win, "user_index": db.user_message_index(sid)})
         msgs = db.get_messages(sid, before_ord=before_ord, limit=limit)
         items = []
         for m in msgs:
@@ -1074,7 +1085,11 @@ class Handler(SimpleHTTPRequestHandler):
                 it["trace"] = traces[it["mid"]]
         # has_more：本页最小 ord 之前还有更早的消息（向上翻页入口的显隐依据）
         has_more = bool(items) and db.has_messages_before(sid, items[0]["ord"])
-        self._json({"messages": items, "has_more": has_more})
+        # user_index：本会话【全部】用户提问的轻量索引（mid+ord，不含正文）。
+        # 左侧导航条用它一次性画出整个会话的提问分布，不受「只加载最近 N 条」
+        # 的窗口限制；点击某条时若尚未加载，再用 before_ord 分页把那一页取回来。
+        self._json({"messages": items, "has_more": has_more,
+                    "user_index": db.user_message_index(sid)})
 
     def _handle_git(self, path: str):
         """Git 浮窗数据源：/api/git/log、/api/git/show、/api/git/summary。

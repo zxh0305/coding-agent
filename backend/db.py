@@ -501,6 +501,8 @@ def delete_session(sid: str) -> None:
         conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
     # artifacts/<sid>/ 整棵删掉（该任务全部外置正文，随会话一起消失）
     shutil.rmtree(_artifacts_dir() / sid, ignore_errors=True)
+    # docs/<sid>/ 同理：该任务生成的文档随会话一起消失，避免留下孤儿文件
+    shutil.rmtree(_docs_dir() / sid, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +513,102 @@ def _artifacts_dir() -> Path:
     # 跟着库文件走（DB_PATH.parent/artifacts）：测试重定向 DB_PATH 时，
     # 归档目录也随行到临时目录，不污染项目根。
     return DB_PATH.parent / "artifacts"
+
+
+# ---------------------------------------------------------------------------
+# 文档存储：agent 生成的 Markdown 文档，按会话隔离存放
+# ---------------------------------------------------------------------------
+# 路径与 artifacts 平行（DB_PATH.parent/docs），同样跟随库文件走、便于测试重定向。
+# 每会话一个子目录：data/docs/<session_id>/<name>.md。docs/ 落在 data/ 下，
+# 已被 .gitignore 忽略，不会进版本库。
+
+# 单份文档的大小上限（字节）。文档是给模型一次性写入的产物，正常几 KB~几十 KB；
+# 上限设得宽松只为拦住异常写入（比如模型把整段历史塞进来），不限制合理使用。
+MAX_DOC_BYTES = 2 * 1024 * 1024
+
+
+def _docs_dir() -> Path:
+    """文档根目录（跟随库文件所在目录，测试重定向 DB_PATH 时随之重定向）。"""
+    return DB_PATH.parent / "docs"
+
+
+def _safe_doc_name(name: str) -> str:
+    """把用户/模型给的文件名归一成安全的单段文件名，返回 <name>.md。
+
+    拒绝：空名、含路径分隔符（/ \\）、'..'、以及任何会逃出会话目录的形态。
+    只接受纯文件名，扩展名统一为 .md（本期只支持 Markdown）。名字里允许中文、
+    空格、点等常见字符——它们不构成逃逸风险，真正的防线是下面的 resolve 校验。
+    """
+    if not name or not isinstance(name, str):
+        raise ValueError("文档名不能为空")
+    raw = name.strip()
+    # 去掉可能自带的 .md 后缀再统一补，避免 "a.md.md"
+    if raw.lower().endswith(".md"):
+        raw = raw[:-3]
+    if not raw or raw in (".", "..") or "/" in raw or "\\" in raw:
+        raise ValueError("文档名不合法：不能包含路径分隔符")
+    return raw + ".md"
+
+
+def _doc_path(sid: str, name: str) -> Path:
+    """解析某会话下一份文档的绝对路径，并做越界白名单校验。
+
+    与 read_artifact 同一套思路：name 是不可信输入（来自模型/前端），
+    resolve() 消解 ../ 与软链后，结果必须严格位于 docs/<sid>/ 之内，
+    且以 .md 结尾。不满足即拒绝并记日志（防路径逃逸、跨会话读取）。
+    """
+    base = (_docs_dir() / sid).resolve()
+    p = (base / name).resolve()
+    if p == base or base not in p.parents or p.suffix.lower() != ".md":
+        log.warning("文档路径拒绝越界: sid=%r name=%r", sid, name)
+        raise ValueError("非法的文档路径")
+    return p
+
+
+def list_docs(sid: str) -> list[dict]:
+    """列出某会话的全部文档，按修改时间降序（最近生成的在前）。"""
+    d = _docs_dir() / sid
+    if not d.is_dir():
+        return []
+    out = []
+    for p in d.glob("*.md"):
+        if not p.is_file():
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        out.append({"name": p.name, "bytes": st.st_size, "mtime": st.st_mtime})
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return out
+
+
+def read_doc(sid: str, name: str) -> str:
+    """读取某会话下一份文档的原文。"""
+    p = _doc_path(sid, name)
+    if not p.is_file():
+        raise FileNotFoundError(f"文档不存在: {name}")
+    return p.read_text(encoding="utf-8")
+
+
+def write_doc(sid: str, name: str, content: str) -> dict:
+    """写入/覆盖一份文档，返回 {name, bytes, lines}。
+
+    同名即覆盖（=更新）。先写 .tmp 再 os.replace 原子改名，与 _write_artifact
+    一致：避免半截文件。超过 MAX_DOC_BYTES 直接拒绝，不落盘。
+    """
+    safe = _safe_doc_name(name)
+    data = content if isinstance(content, str) else str(content)
+    nbytes = len(data.encode("utf-8"))
+    if nbytes > MAX_DOC_BYTES:
+        raise ValueError(f"文档过大（{nbytes} 字节），上限 {MAX_DOC_BYTES} 字节")
+    d = _docs_dir() / sid
+    d.mkdir(parents=True, exist_ok=True)
+    path = _doc_path(sid, safe)
+    tmp = path.with_suffix(".md.tmp")
+    tmp.write_text(data, encoding="utf-8")
+    os.replace(tmp, path)
+    return {"name": safe, "bytes": nbytes, "lines": len(data.splitlines())}
 
 
 def _storable_body(m: dict) -> dict:
@@ -868,6 +966,36 @@ def has_messages_before(sid: str, ord_value: int) -> bool:
     with _conn() as conn:
         return bool(conn.execute("SELECT 1 FROM messages WHERE session_id=? AND ord<? LIMIT 1",
                                  (sid, ord_value)).fetchone())
+
+
+def user_message_index(sid: str) -> list[dict]:
+    """本会话全部【用户提问】的轻量索引（mid + ord），按 ord 升序。
+
+    只取两列、走 (session_id, ord) 索引，不含正文——供左侧导航条一次性画出
+    整个会话的提问分布（不受\"时间线只加载最近 N 条\"的窗口限制）。
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT mid, ord FROM messages WHERE session_id=? AND role='user' "
+            "ORDER BY ord, rowid", (sid,)).fetchall()
+    return [{"mid": r["mid"], "ord": r["ord"]} for r in rows]
+
+
+def window_around_ord(sid: str, ord_value: int, before: int = 50, after: int = 50) -> list[dict]:
+    """取目标 ord 前后各若干条消息（供导航条\"跳到未加载的消息\"用）。
+
+    返回 [{mid, ord, role}]，按 ord 升序。不取正文：前端拿到窗口边界后，
+    再用现有的 before_ord 分页把该窗口加载进时间线。
+    """
+    with _conn() as conn:
+        lo = conn.execute(
+            "SELECT mid, ord, role FROM messages WHERE session_id=? AND ord<=? "
+            "ORDER BY ord DESC, rowid DESC LIMIT ?", (sid, ord_value, int(before))).fetchall()
+        hi = conn.execute(
+            "SELECT mid, ord, role FROM messages WHERE session_id=? AND ord>? "
+            "ORDER BY ord, rowid LIMIT ?", (sid, ord_value, int(after))).fetchall()
+    rows = list(reversed(lo)) + list(hi)
+    return [{"mid": r["mid"], "ord": r["ord"], "role": r["role"]} for r in rows]
 
 
 # ---------------------------------------------------------------------------

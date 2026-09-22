@@ -114,6 +114,36 @@ body {
 }
 .bubble.error { background: #fdecec; border: 1px solid #f2b8b5; color: #b3261e; }
 
+/* ---------- 会话缩略导航条（minimap rail） ---------- */
+/* 贴在聊天区左边缘：纵向铺满消息区，每条主消息一根短横线，点线即定位。
+   定位方式为 absolute，不参与 .main 的纵向 flex 排布，不挤占消息与输入框。 */
+.msg-rail {
+  position: absolute; left: 6px; top: 64px; bottom: 96px;
+  width: 22px; z-index: 5;
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 5px;
+  overflow: hidden;
+}
+/* 单条用户消息的横线：长度与粗细完全统一（只有"当前视口"那条加深），
+   不做角色区分——导航条只画用户提问。 */
+.rail-tick {
+  width: 18px; height: 3px; border-radius: 2px; background: #cfd6e4;
+  flex-shrink: 0; cursor: pointer; transition: background .12s;
+}
+.rail-tick:hover { background: var(--accent); }
+/* 当前视口所在的消息：加深（尺寸不变，保持整体整齐），滚动时随之移动 */
+.rail-tick.active { background: var(--text); }
+/* 跳转后短暂闪烁，帮用户确认落点 */
+.rail-tick.flash { background: var(--accent); }
+
+/* 消息定位高亮：点击导航条后目标气泡闪一下 */
+@keyframes rail-flash {
+  0% { box-shadow: 0 0 0 3px rgba(79, 124, 240, .55); }
+  100% { box-shadow: 0 0 0 3px rgba(79, 124, 240, 0); }
+}
+.rail-hit { animation: rail-flash 1.4s ease-out 2; }
+@media (prefers-reduced-motion: reduce) { .rail-hit { animation: none; } }
+
 /* ---------- 回答气泡里的 Markdown 排版 ---------- */
 /* 目的：让长回答有可扫读的骨架。之前所有内容都是 pre-wrap 纯文本，
    标题/列表/代码块全退化成同字号同颜色的行——"看不到重点"的根因之一。
