@@ -1204,28 +1204,53 @@ body.docs-resizing .docs-panel { transition: none; }
   flex: 0 0 auto;
 }
 .docs-head b { font-size: 14px; }
-/* 标题栏右侧两个图标按钮：收起列表 / 关闭面板 */
-.docs-toggle, .docs-x {
-  border: none; background: transparent;
-  color: var(--text-3); cursor: pointer;
-  border-radius: 6px; line-height: 1;
+.docs-x {
+  margin-left: auto; border: none; background: transparent;
+  color: var(--text-3); font-size: 14px; cursor: pointer;
+  border-radius: 6px; line-height: 1; padding: 2px 6px;
 }
-.docs-toggle {
-  margin-left: auto; font-size: 12px; padding: 4px 7px;
-}
-.docs-x { font-size: 14px; padding: 2px 6px; }
-.docs-toggle:hover, .docs-x:hover { background: #f0f2f8; color: var(--text-1); }
+.docs-x:hover { background: #f0f2f8; color: var(--text-1); }
 .docs-body { flex: 1 1 auto; display: flex; min-height: 0; }
+/* 列表区：左列是「目录」标题行 + 文档列表，标题行右侧放折叠按钮 */
+.docs-side {
+  flex: 0 0 auto; display: flex; flex-direction: column; min-width: 0;
+  width: 200px; border-right: 1px solid var(--border);
+  transition: width .22s ease, opacity .18s ease;
+}
+.docs-side-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 8px 7px 12px; flex: 0 0 auto;
+  border-bottom: 1px solid #f0f2f8;
+  transition: opacity .16s ease;
+}
+.docs-side-title { font-size: 11.5px; color: var(--text-3); }
+.docs-toggle {
+  margin-left: auto; flex-shrink: 0;
+  border: none; background: transparent; color: var(--text-3);
+  cursor: pointer; border-radius: 6px; line-height: 1;
+  font-size: 12px; padding: 3px 6px;
+  transition: background .12s, color .12s, padding .22s;
+}
+.docs-toggle:hover { background: #eef1f7; color: var(--accent); }
 .docs-list {
-  flex: 0 0 auto; width: 200px; margin: 0; padding: 8px; list-style: none;
+  flex: 1 1 auto; margin: 0; padding: 8px; list-style: none;
   overflow-y: auto; overflow-x: hidden;
-  border-right: 1px solid var(--border);
-  transition: width .22s ease, padding .22s ease, opacity .18s ease;
+  transition: opacity .16s ease;
 }
-/* 收起态：列表宽度收 0（标题栏按钮随时可展开） */
-.docs-panel.list-collapsed .docs-list {
-  width: 0; padding-left: 0; padding-right: 0; opacity: 0; border-right-width: 0;
+/* 收起态：整列（标题行 + 列表）宽度收 0，按钮浮在正文左缘仍可点击。
+   注意 opacity 只压在标题行与列表上——若压整列会把按钮一起透明掉。 */
+.docs-panel.list-collapsed .docs-side {
+  width: 0; border-right-width: 0; position: relative;
 }
+.docs-panel.list-collapsed .docs-side-head,
+.docs-panel.list-collapsed .docs-list { opacity: 0; pointer-events: none; }
+.docs-panel.list-collapsed .docs-toggle {
+  position: absolute; left: 0; top: 6px; z-index: 3;
+  margin: 0; opacity: 1; pointer-events: auto;
+  background: #fafbfd; border: 1px solid var(--border); border-left: none;
+  border-radius: 0 8px 8px 0; padding: 8px 4px;
+}
+.docs-panel.list-collapsed .docs-toggle:hover { background: #eef1f7; }
 @media (prefers-reduced-motion: reduce) {
   .docs-panel, .docs-list { transition: none; }
 }

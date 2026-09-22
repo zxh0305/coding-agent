@@ -83,11 +83,16 @@
       <div id="docs-resizer" class="docs-resizer" title="拖动调整宽度"></div>
       <div class="docs-head">
         <b>📄 文档</b>
-        <button id="docs-toggle" class="docs-toggle" title="收起/展开文档列表">⇤</button>
         <button id="docs-close" class="docs-x" title="关闭">✕</button>
       </div>
       <div class="docs-body">
-        <ul id="docs-list" class="docs-list"></ul>
+        <div class="docs-side">
+          <div class="docs-side-head">
+            <span class="docs-side-title">目录</span>
+            <button id="docs-toggle" class="docs-toggle" title="收起文档列表">⇤</button>
+          </div>
+          <ul id="docs-list" class="docs-list"></ul>
+        </div>
         <div id="docs-view" class="docs-view"></div>
       </div>
     </aside>
