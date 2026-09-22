@@ -1763,10 +1763,58 @@ function makeToolCallLine(name, argsStr) {
   d.className = "tl" + (isWrite ? " write card" : "");
   const summary = document.createElement("summary");
   summary.textContent = `${TOOL_ICONS[name] || "🔧"} ${kind}${kind ? " " : ""}${main}`;
+  d.append(summary, buildArgsBody(name, a, argsStr));
+  return d;
+}
+
+// 调用卡的展开正文。apply_patch 渲染成红（删除）/绿（新增）的 diff——直接
+// 展示原始参数 JSON 的话，用户看到的是转义成一行的 \n 字符串，完全看不出
+// 改了什么（这正是"展开也不清楚"的根源）。write_file 没有旧文可对比，按
+// 新增（全绿）展示。其余工具照旧回退到格式化 JSON。
+function buildArgsBody(name, a, argsStr) {
+  if (name === "apply_patch" && typeof a.search === "string" && typeof a.replace === "string") {
+    return buildDiffBody(a.search, a.replace);
+  }
+  if (name === "write_file" && typeof a.content === "string") {
+    return buildDiffBody("", a.content);
+  }
   const pre = document.createElement("pre");
   pre.textContent = prettyJson(argsStr);
-  d.append(summary, pre);
-  return d;
+  return pre;
+}
+
+// 逐行 diff 视图：删除行红底、新增行绿底，行首 −/+ 前缀。
+// 不做 LCS 精细对齐——apply_patch 的语义本就是"整段 search 换成整段 replace"，
+// 按块展示（先整块红、再整块绿）比逐行交错更贴合它的实际行为，也更好读。
+function buildDiffBody(search, replace) {
+  const wrap = document.createElement("div");
+  wrap.className = "diff";
+  const push = (text, cls, sign) => {
+    if (!text) return;
+    // 末尾换行会产生一个多余空行，去掉（不代表真实内容）
+    const lines = text.replace(/\n$/, "").split("\n");
+    for (const ln of lines) {
+      const row = document.createElement("div");
+      row.className = "diff-line " + cls;
+      const mark = document.createElement("span");
+      mark.className = "diff-sign";
+      mark.textContent = sign;
+      const body = document.createElement("span");
+      body.className = "diff-text";
+      body.textContent = ln || " ";
+      row.append(mark, body);
+      wrap.appendChild(row);
+    }
+  };
+  push(search, "del", "−");
+  push(replace, "add", "+");
+  if (!wrap.childElementCount) {
+    const empty = document.createElement("div");
+    empty.className = "diff-line";
+    empty.textContent = "（无内容）";
+    wrap.appendChild(empty);
+  }
+  return wrap;
 }
 
 // 从工具参数里取一个适合放进摘要行的短标签（"正在 run_bash xxx"）

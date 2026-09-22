@@ -312,7 +312,28 @@ body {
   max-height: 240px; overflow: auto;
   white-space: pre-wrap; word-break: break-all;
 }
-
+/* 写入卡的 diff 视图：删除行红、新增行绿，行首 −/+ 前缀。
+   之前展开是原始参数 JSON（\n 被转义成一行），看不出改了什么；
+   现在按"整块 search 红、整块 replace 绿"展示，改动一目了然。 */
+.diff {
+  margin-top: 4px; border: 1px solid #dde3ef; border-radius: 6px;
+  background: #fff; max-height: 260px; overflow: auto;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px; line-height: 1.55;
+}
+.diff-line {
+  display: flex; align-items: flex-start;
+  padding: 0 8px 0 0; white-space: pre-wrap; word-break: break-word;
+}
+.diff-sign {
+  flex: 0 0 16px; text-align: center; user-select: none;
+  opacity: .75; font-weight: 700;
+}
+.diff-text { flex: 1 1 auto; white-space: pre-wrap; word-break: break-word; }
+.diff-line.del { background: #fdecea; color: #a0211a; }
+.diff-line.del .diff-sign { color: #c0392b; }
+.diff-line.add { background: #e8f6ec; color: #17663a; }
+.diff-line.add .diff-sign { color: #1e874b; }
 /* 回答尾部的耗时 / token 统计 */
 /* 弱化：统计是次要信息，默认很浅，鼠标移到回答上才明显——不与正文争注意力 */
 .meta {
