@@ -627,6 +627,7 @@ function closeGitPop() {
   const pop = $("git-pop");
   if (!pop) return;
   pop.classList.add("hidden");
+  $("git-branch-pop").classList.add("hidden");  // 分支面板随之收起
   $("git-body").innerHTML = "";
   $("git-branch").textContent = "";
   $("git-identity").textContent = "";
@@ -2799,6 +2800,92 @@ for (const b of document.querySelectorAll(".git-fbtn")) {
 window.addEventListener("resize", () => {
   if (!$("git-pop").classList.contains("hidden")) positionGitPop();
 });
+
+// ---------- 分支切换 ----------
+// 点浮窗头部的分支名弹出小面板；选中即调 /api/git/checkout 真实切分支。
+// checkout 是本功能唯一的 git 写操作（会改工作区文件），因此：
+//   * 分支名后端会做本地分支白名单校验，这里不做任何拼接；
+//   * 有未提交改动时 git 会拒绝，错误原话直接 toast 给用户，不静默处理。
+function toggleBranchPop() {
+  const pop = $("git-branch-pop");
+  if (!pop.classList.contains("hidden")) { pop.classList.add("hidden"); return; }
+  positionBranchPop();
+  pop.classList.remove("hidden");
+  loadBranches();
+}
+
+function positionBranchPop() {
+  const pop = $("git-branch-pop"), btn = $("git-branch");
+  const rect = btn.getBoundingClientRect();
+  pop.style.left = Math.max(8, rect.left) + "px";
+  pop.style.top = (rect.bottom + 6) + "px";
+}
+
+async function loadBranches() {
+  const list = $("git-branch-list");
+  list.innerHTML = '<div class="git-loading">加载中…</div>';
+  try {
+    const data = await api("/api/git/branches?" + gitQs());
+    list.innerHTML = "";
+    if (!data.ok) {
+      list.innerHTML = `<div class="git-empty">${esc(data.error || "无法读取分支")}</div>`;
+      return;
+    }
+    for (const b of data.branches || []) list.appendChild(branchItem(b));
+  } catch (e) {
+    list.innerHTML = `<div class="git-empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function branchItem(b) {
+  const el = document.createElement("button");
+  el.className = "gbp-item" + (b.current ? " current" : "");
+  el.textContent = b.name;
+  if (b.current) {
+    const tick = document.createElement("span");
+    tick.className = "tick";
+    tick.textContent = "✓";
+    el.appendChild(tick);
+  }
+  // 当前分支不可点（切自己无意义）；其余点击即切换
+  el.onclick = b.current ? null : () => doCheckout(b.name, el);
+  return el;
+}
+
+async function doCheckout(branch, el) {
+  el.classList.add("busy");
+  try {
+    const r = await api("/api/git/checkout", {
+      method: "POST",
+      body: JSON.stringify({ session_id: currentSession, branch }),
+    });
+    if (!r.ok) {
+      // git 拒绝（未提交改动冲突等）：把原话给用户看
+      toast("切换失败：" + (r.error || "未知原因"));
+      el.classList.remove("busy");
+      return;
+    }
+    $("git-branch-pop").classList.add("hidden");
+    toast(`已切换到分支 ${branch}`);
+    // 分支变了：提交列表与分支徽章都要重拉
+    gitOffset = 0;
+    loadGitList(true);
+  } catch (e) {
+    toast("切换失败：" + e.message);
+    el.classList.remove("busy");
+  }
+}
+
+// 点分支面板外任意处关闭（与其它浮层一致）
+document.addEventListener("click", (e) => {
+  const pop = $("git-branch-pop");
+  if (pop.classList.contains("hidden")) return;
+  if (!pop.contains(e.target) && !e.target.closest?.("#git-branch")) {
+    pop.classList.add("hidden");
+  }
+});
+$("git-branch").addEventListener("click", (e) => { e.stopPropagation(); toggleBranchPop(); });
+
 // ---------- 启动 ----------
 function boot() {
   // 登录成功（或刷新后 token 仍有效）后的页面初始化；切用户时先清现场
