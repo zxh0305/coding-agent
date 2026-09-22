@@ -806,11 +806,29 @@ async function loadWindowAround(ord) {
     const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?` + qs);
     const win = data.window || [];
     if (!win.length) return;
-    // 该窗口下界之前的消息也一并取回，保证目标条能连续渲染
+    // 窗口下界之前的一页：保证目标条之前的上下文连续（向上翻页入口也能用）
     const lower = win[0].ord;
     const page = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?` +
       new URLSearchParams({ before_ord: String(lower), limit: "100" }));
-    insertHistoryBefore(page.messages || []);
+    // 关键：目标 ord 所在的那页（win）本身必须插进 DOM，否则 railFindNode 永远
+    // 找不到目标 mid。之前只插了 before_ord 页（窗口之前），目标消息从未进入
+    // 时间线——这正是「点击定位条提示还没加载出来」的根因。
+    // 合并两段、按 ord 升序、按 mid 去重（避免与已加载区间重叠重复渲染）。
+    const merged = [...(page.messages || []), ...win];
+    const seen = new Set();
+    const toAdd = [];
+    for (const m of merged) {
+      if (m.mid && (historyMids.has(m.mid) || seen.has(m.mid))) continue;
+      if (m.mid) seen.add(m.mid);
+      toAdd.push(m);
+    }
+    toAdd.sort((a, b) => (a.ord ?? 0) - (b.ord ?? 0));
+    insertHistoryBefore(toAdd);
+    // 同步向上翻页游标：插入了更早的消息后，histOldestOrd 要跟着前移，
+    // 否则后续「加载更早」会用错误游标漏读或重复。
+    if (toAdd.length && (histOldestOrd == null || toAdd[0].ord < histOldestOrd)) {
+      histOldestOrd = toAdd[0].ord;
+    }
     histHasMore = !!page.has_more || (page.messages || []).length > 0;
     updateLoadOlder();
     scheduleRail();
