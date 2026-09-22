@@ -1237,16 +1237,23 @@ body.docs-resizing .docs-panel { transition: none; }
   overflow-y: auto; overflow-x: hidden;
   transition: opacity .16s ease;
 }
-/* 收起态：整列（标题行 + 列表）宽度收 0，按钮浮在正文左缘仍可点击。
-   注意 opacity 只压在标题行与列表上——若压整列会把按钮一起透明掉。 */
+/* 收起态：整列宽度收 0，仅折叠按钮浮在正文左缘（唯一可见的展开入口）。
+   关键：opacity 会连同子元素一起合成，不能加在按钮的祖先上——
+   否则按钮写 opacity:1 也会被父级的 0 乘没。故这里只隐藏文字与列表。 */
 .docs-panel.list-collapsed .docs-side {
   width: 0; border-right-width: 0; position: relative;
 }
-.docs-panel.list-collapsed .docs-side-head,
-.docs-panel.list-collapsed .docs-list { opacity: 0; pointer-events: none; }
+.docs-panel.list-collapsed .docs-side-title,
+.docs-panel.list-collapsed .docs-list {
+  visibility: hidden; pointer-events: none;
+}
+.docs-panel.list-collapsed .docs-side-head {
+  /* 标题行本身保留（按钮在里面），只去掉占位与分隔线 */
+  padding: 0; border-bottom: none; height: 0;
+}
 .docs-panel.list-collapsed .docs-toggle {
   position: absolute; left: 0; top: 6px; z-index: 3;
-  margin: 0; opacity: 1; pointer-events: auto;
+  margin: 0;
   background: #fafbfd; border: 1px solid var(--border); border-left: none;
   border-radius: 0 8px 8px 0; padding: 8px 4px;
 }
