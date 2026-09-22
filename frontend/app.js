@@ -2653,7 +2653,7 @@ function renderGitList(data, reset) {
     const more = document.createElement("button");
     more.className = "git-row git-more";
     more.textContent = "加载更多…";
-    more.onclick = () => loadGitList(false);
+    more.onclick = (e) => { e.stopPropagation(); loadGitList(false); };
     body.appendChild(more);
   }
 }
@@ -2741,7 +2741,7 @@ function gitDetailHead(data) {
   const back = document.createElement("button");
   back.className = "git-back";
   back.textContent = "← 返回";
-  back.onclick = () => { gitOffset = 0; loadGitList(true); };
+  back.onclick = (e) => { e.stopPropagation(); gitOffset = 0; loadGitList(true); };
   const meta = document.createElement("span");
   meta.className = "git-detail-meta";
   meta.textContent = `${data.short} · ${data.author} · ${gitTimeAgo(data.date)}`;
@@ -2877,8 +2877,10 @@ function branchItem(b) {
     tick.textContent = "✓";
     el.appendChild(tick);
   }
-  // 当前分支不可点（切自己无意义）；其余点击即切换
-  el.onclick = b.current ? null : () => doCheckout(b.name, el);
+  // 当前分支不可点（切自己无意义）；其余点击即切换。
+  // stopPropagation：分支面板在 git-pop 之外，不拦的话这次点击会被
+  // document 的"点浮层外关闭"处理器认作点了外部，把 git-pop 一起关掉。
+  el.onclick = b.current ? null : (e) => { e.stopPropagation(); doCheckout(b.name, el); };
   return el;
 }
 
