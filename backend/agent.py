@@ -140,7 +140,7 @@ class Agent:
     def __init__(self, llm, system_prompt: str = SYSTEM_PROMPT,
                  max_rounds: int = 40, verbose: bool = True, vision_supported: bool = True,
                  workspace=None, vision_backend=None, context_window: int = 0,
-                 artifact_reader=None, permission_gate=None):
+                 artifact_reader=None, permission_gate=None, session_id=None):
         # max_rounds=40：上限只是兜底（真失控另有指纹提醒拦截），合法的长任务
         # （读代码→改→跑验证→再修）经常要几十轮，40 是给它们的余量；到限走
         # 收尾轮（_wrap_up_round）而不是"强制停止"。
@@ -169,6 +169,7 @@ class Agent:
         # 工具执行上下文：工作区 + 看图后端随 Agent 实例走；images 每轮提问时更新。
         # 状态挂在实例上而不是模块级全局，两个会话并发执行工具才不会串数据。
         self.ctx = ToolContext(workspace=prepare_workspace(workspace), vision_backend=vision_backend)
+        self.ctx.session_id = session_id  # 文档工具据此确定文档归属（会话隔离）
         self.cancel_event: threading.Event | None = None  # 本轮生成的停止开关（stop() 置位）
         # 权限闸门（permissions.py）：挂实例而非模块级——规则里的工作区边界、
         # 会话内记住的 ask 决定都按会话隔离，两个会话并发各判各的。
@@ -928,6 +929,17 @@ class Agent:
             group = [items[i]["call"] for i in range(idx, end)]
             for call, result in zip(group, self._run_tool_group(group)):
                 yield self._backfill_tool_result(call, result)
+                # create_doc 成功：额外产出一条 doc_created 事件（走 app.py 的
+                # else 分支进 SSE 总线），前端据此自动弹出右侧文档面板。
+                # 失败（result 含 error）不推——没生成成功没什么可弹的。
+                name = (call.get("function") or {}).get("name", "")
+                if name == "create_doc" and '"error"' not in result:
+                    try:
+                        info = json.loads(result)
+                        if info.get("ok") and info.get("name"):
+                            yield "doc_created", {"name": info["name"]}
+                    except (json.JSONDecodeError, TypeError):
+                        pass
             idx = end
 
     def _backfill_tool_result(self, call: dict, result: str):

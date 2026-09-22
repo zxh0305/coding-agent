@@ -113,10 +113,12 @@ ENV_FILE = PROJECT_DIR / ".env"
 _agents: dict[str, Agent] = {}
 _sigs: dict[str, str] = {}
 _ctx: dict[str, dict] = {}  # sid -> 最近一次上下文统计（非关键数据，只存内存）
-# 最近一轮的结局：sid -> "done" | "error"（只存内存）。用于列表状态徽标区分
-# "跑过且正常结束"（绿点）与"上一轮出错"（红点）；没有记录 = 从没跑过（不显示）。
+# 最近一轮的结局：sid -> {"outcome": "done"|"error", "seen": bool}（只存内存）。
+# 语义是"未读标记"：回合跑完时若用户不在这个会话里，就置 seen=False，列表亮
+# 绿点（done）/红点（error）提示"有新结果"；用户切进去看过即置 seen=True，
+# 徽标消失。用户正看着的会话前台跑完，会被前端立即标记已读，因此不亮。
 # 不落库：进程重启后没有"上一轮"可言，退回无状态是正确的。
-_turn_status: dict[str, str] = {}
+_turn_status: dict[str, dict] = {}
 _lock = threading.Lock()    # 全局锁：只保护上面的共享 dict 和模型配置的短临界区
 _session_locks: dict[str, threading.Lock] = {}  # 每个任务一把锁（见 _session_lock）
 
@@ -150,9 +152,9 @@ def _session_state(sid: str) -> str:
 
       running  回合进行中（turn_start 已发、turn_end 未到）
       waiting  回合进行中且卡在权限闸门等用户确认（比 running 更该提醒）
-      done     跑过且最近一轮正常结束（列表显示绿点）
-      error    最近一轮出错（列表显示红点）
-      none     从没跑过（不显示状态）
+      done     跑过且最近一轮正常结束、"你还没看过这次结果"（列表显示绿点）
+      error    最近一轮出错、"你还没看过这次结果"（列表显示红点）
+      none     从没跑过，或最近一轮的结果已被查看过（不显示状态）
 
     没有 bus 的会话必然没在跑：bus 惰性创建，此处只读不建——为列表展示
     凭空造 bus 会白占内存、还会把 last_seq 从库里读出来。
@@ -165,8 +167,11 @@ def _session_state(sid: str) -> str:
         if agent is not None and agent.permissions.pending_count > 0:
             return "waiting"
         return "running"
-    # 不在跑：按"最近一轮的结局"给徽标；从没跑过（无记录）则无状态。
-    return last or "none"
+    # 不在跑：绿/红点只在"结果未被查看过"时亮（未读标记语义）；看过或从没
+    # 跑过都退化成无状态，不画点。
+    if last and not last.get("seen"):
+        return last.get("outcome") or "none"
+    return "none"
 
 
 # ask 等待用户决定的上限（秒）。超时不是安全边界——超时按拒绝处理，本来就
@@ -320,10 +325,14 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                     except Exception:
                         log.exception("[会话 %s] 轨迹落库失败（忽略）", sid)
             # 记下本轮结局，供任务列表徽标用（"跑过且正常结束"= done 绿点、
-            # 出错 = error 红点）。用户主动停止不算错——stopped 走的是正常收尾
-            # 路径（error 为 None），与旧行为一致地显示为 done。
+            # 出错 = error 红点）。seen=False = 未读：徽标只在"用户不在这个会话
+            # 里跑完"时亮，用户切进去看过即置 seen=True 清掉（前端在切会话 /
+            # 前台跑完的 turn_end 处调用 POST /api/sessions/<id>/seen）。
+            # 用户主动停止不算错——stopped 走的是正常收尾路径（error 为 None），
+            # 与旧行为一致地显示为 done。
             with _lock:
-                _turn_status[sid] = "error" if error is not None else "done"
+                _turn_status[sid] = {"outcome": "error" if error is not None else "done",
+                                     "seen": False}
             if error is not None:
                 db.renumbered_sessions.discard(sid)  # 错误路径不带重编号信号（与旧行为一致）
                 bus.publish({"type": "error", "message": error})
@@ -542,7 +551,8 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
                           workspace=workspace, vision_backend=_vision_backend,
                           context_window=_active_window(),  # 压缩触发线的基准（切换模型后重建实例即更新）
                           artifact_reader=db.read_artifact,  # 外置大消息的还原器（模型视图用）
-                          permission_gate=_build_permission_gate(workspace))
+                          permission_gate=_build_permission_gate(workspace),
+                          session_id=sid)  # 文档工具据此确定文档归属
             # 窗口恢复：从未压缩 = 全量；压缩过 = 锚点 + 最后一条边界及其之后
             # （边界摘要是后续再压缩的输入）。内存占用与当前窗口成正比，而非
             # 全会话长度；模型视图与全量恢复逐字节一致。
@@ -711,6 +721,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._handle_session_artifact(sid)
             if sub == "events":
                 return self._handle_session_events(sid)
+            if sub == "docs":
+                return self._handle_session_docs(sid)
             return self._handle_session_messages(sid)
         elif self.path.startswith("/api/context"):
             sid = (self._query().get("session_id") or [""])[0]
@@ -774,6 +786,12 @@ class Handler(SimpleHTTPRequestHandler):
                 if db.session_owner(sid) != self.user["id"]:
                     return self._json({"error": "任务不存在或不属于当前用户"}, 404)
                 self._handle_perm_mode(sid)
+            elif re.fullmatch(r"/api/sessions/[^/]+/seen", path):
+                # 标记该会话的绿/红点已读（清掉未读徽标）
+                sid = path.split("/")[3]
+                if db.session_owner(sid) != self.user["id"]:
+                    return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+                self._handle_session_seen(sid)
             elif self.path == "/api/workspace":
                 self._handle_workspace_set()
             elif self.path == "/api/git/checkout":
@@ -1182,6 +1200,22 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json({"error": "归档文件缺失或损坏"}, 404)
         self._json({"message": msg})
 
+    def _handle_session_docs(self, sid: str):
+        """本会话的文档：无 name 参数 = 列出全部；带 name = 读单个 md 原文。
+
+        归属已在上层校验（session_owner）。name 是不可信输入，db 层做 realpath
+        白名单校验（防 ../ 逃逸、跨会话、非 .md），越界即 400。"""
+        name = (self._query().get("name") or [""])[0]
+        if not name:
+            return self._json({"docs": db.list_docs(sid)})
+        try:
+            content = db.read_doc(sid, name)
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        except (OSError, FileNotFoundError):
+            return self._json({"error": "文档不存在"}, 404)
+        self._json({"name": name, "content": content})
+
     # ---------- 模型供应商 ----------
 
     def _handle_active_model(self):
@@ -1306,6 +1340,18 @@ class Handler(SimpleHTTPRequestHandler):
             db.set_setting(f"perm_mode:{ws}", mode)
             log.info("[会话 %s] 权限模式切换为 %s（工作区 %s）", sid, mode, ws or "无")
         self._json({"mode": db.get_setting(f"perm_mode:{ws}", "confirm")})
+
+    def _handle_session_seen(self, sid: str):
+        """把某会话的绿/红点标记为"已读"（清掉未读徽标）。
+
+        未读标记语义：回合在"用户不在这个会话里"时跑完才亮绿/红点，用户切进去
+        看过就清掉。前端在 switchSession 与前台跑完的 turn_end 处调用本接口。
+        只改内存态：进程重启后标记本就该归零。"""
+        with _lock:
+            st = _turn_status.get(sid)
+            if st is not None:
+                st["seen"] = True
+        self._json({"ok": True})
 
     def _handle_workspace_set(self):
         """切换工作区（按任务隔离，替代曾经的"全局环境变量 + 写回 .env"）：

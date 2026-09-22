@@ -116,8 +116,9 @@ async function api(path, options = {}) {
 // 行内语法 → DocumentFragment。先按标记切分，再逐段构造节点。
 function renderInline(text) {
   const frag = document.createDocumentFragment();
-  // 用一条正则同时匹配 `code`、**bold**、*italic*；未匹配部分原样成文本节点。
-  const re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*\n]+\*)/g;
+  // 用一条正则同时匹配 `code`、**bold**、*italic*、![img](src)、[link](url)；
+  // 未匹配部分原样成文本节点。图片放在链接之前，避免 ![...](...) 被链接规则先吃掉。
+  const re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*\n]+\*|!\[[^\]]*\]\([^)]+\)|\[[^\]]+\]\([^)]+\))/g;
   let last = 0, m;
   while ((m = re.exec(text)) !== null) {
     if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
@@ -130,6 +131,32 @@ function renderInline(text) {
       const b = document.createElement("strong");
       b.textContent = tok.slice(2, -2);
       frag.appendChild(b);
+    } else if (tok.startsWith("![")) {
+      const mm = tok.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
+      const src = mm ? mm[2].trim() : "";
+      if (isSafeUrl(src)) {
+        const img = document.createElement("img");
+        img.src = src;
+        img.alt = mm[1] || "";
+        frag.appendChild(img);
+      } else {
+        frag.appendChild(document.createTextNode(tok));  // 不安全：原样文本
+      }
+    } else if (tok.startsWith("[")) {
+      const mm = tok.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+      const url = mm ? mm[2].trim() : "";
+      const label = mm ? mm[1] : tok;
+      if (isSafeUrl(url)) {
+        const a = document.createElement("a");
+        a.href = url;
+        a.textContent = label;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        frag.appendChild(a);
+      } else {
+        // 非 http/https（如 javascript:）：降级为纯文本，绝不生成可点击的链接
+        frag.appendChild(document.createTextNode(label));
+      }
     } else {
       const i = document.createElement("em");
       i.textContent = tok.slice(1, -1);
@@ -139,6 +166,15 @@ function renderInline(text) {
   }
   if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
   return frag;
+}
+
+// 链接/图片地址白名单：只放行 http/https（以及站内相对路径），拦截
+// javascript:、data: 等可执行/注入协议。模型输出是外部内容，必须校验。
+function isSafeUrl(url) {
+  const u = String(url || "").trim();
+  if (!u) return false;
+  if (/^(https?:)?\/\//i.test(u) || /^(\.{0,2}\/|#)/.test(u)) return true;
+  return false;
 }
 
 // 整段 Markdown → DocumentFragment。按行扫描，块级元素与行内元素分工明确。
@@ -246,9 +282,42 @@ function renderMarkdown(src) {
       continue;
     }
 
+    // 表格：| a | b | 表头 + |---|---| 分隔行 + 数据行
+    if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length
+        && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      flushPara();
+      const parseRow = (ln) => ln.trim().replace(/^\|/, "").replace(/\|$/, "")
+        .split("|").map((c) => c.trim());
+      const tbl = document.createElement("table");
+      tbl.className = "md-table";
+      const thead = document.createElement("thead");
+      const htr = document.createElement("tr");
+      for (const cell of parseRow(line)) {
+        const th = document.createElement("th");
+        th.appendChild(renderInline(cell));
+        htr.appendChild(th);
+      }
+      thead.appendChild(htr);
+      tbl.appendChild(thead);
+      const tbody = document.createElement("tbody");
+      i += 2;  // 跳过表头与分隔行
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) {
+        const tr = document.createElement("tr");
+        for (const cell of parseRow(lines[i])) {
+          const td = document.createElement("td");
+          td.appendChild(renderInline(cell));
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+        i += 1;
+      }
+      tbl.appendChild(tbody);
+      root.appendChild(tbl);
+      continue;
+    }
+
     // 空行：段落分隔
     if (!line.trim()) { flushPara(); i += 1; continue; }
-
     para.push(line);
     i += 1;
   }
@@ -589,6 +658,7 @@ async function newTask(presetProject = null) {
   railItems = [];
   rebuildRail();       // 新任务时间线为空：导航条收起
   restoreDraft(null);  // 新任务自己的草稿位（__new__）
+  loadDocsList();      // 新任务态：文档计数清零
   usageNow = null;
   updateCtxChip();
   if (presetProject) {
@@ -604,7 +674,6 @@ async function newTask(presetProject = null) {
   renderWsChip();
   await loadSessions();  // 重新拉取列表：旧任务仍显示，只是没有选中项；首条消息后新任务才出现
 }
-
 // ---------- 输入框草稿：按会话归属 ----------
 // 输入框是全局唯一的 DOM 元素，切换会话时若不处理，A 会话打的字会原样留在
 // 框里、看起来像"被带到了 B 会话"。这里以会话 id 为 key 把草稿存进 localStorage：
@@ -794,10 +863,19 @@ chatEl.addEventListener("scroll", syncRailActive, { passive: true });
 let histOldestOrd = null;  // 已加载最旧一条消息的 ord（向上翻页游标）
 let histHasMore = false;   // 其上是否还有更早的消息
 
+// 清掉某会话的未读徽标（绿/红点）：告诉服务端"这个任务的结果我已经看过了"。
+// 未读标记语义——回合在用户不在这个会话时跑完才亮徽标，切进去看过就清。
+// fire-and-forget：失败不打扰（顶多是列表上多留一个点，下次切换会再试）。
+function markSessionSeen(id) {
+  if (!id) return;
+  api(`/api/sessions/${encodeURIComponent(id)}/seen`, { method: "POST" }).catch(() => {});
+}
+
 async function switchSession(id) {
   if (id === currentSession) return;
   saveDraft(currentSession);     // 离开前：把输入框内容存进旧会话的草稿
   currentSession = id;
+  markSessionSeen(id);            // 进入即视为已读：清掉该任务的未读徽标
   resetStreamState();  // 旧会话的事件流已断，流式状态必须随之复位
   chatEl.innerHTML = "";
   welcome();
@@ -815,6 +893,7 @@ async function switchSession(id) {
   closeGitPop();    // 工作区变了，旧的提交列表不再对应当前项目
   refreshGitChip(); // 按钮上的分支名随任务的工作区更新
   dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
+  loadDocsList();        // 刷新文档计数（切会话后 chip 上的数字跟着变）
 }
 
 // 关闭 Git 浮窗并清掉上一次的内容：切换任务/工作区后，列表已失效。
@@ -2439,6 +2518,9 @@ function applyEvent(evt, seq) {
     clearInterval(metaTimer);
     setStreaming(false);
     myNonce = null;
+    // 本会话就在前台跑完：用户亲眼看到了结果，立即标记已读——否则服务端刚置的
+    // 未读标记会让它在任务列表上亮起绿/红点（"你不在时才提醒"的语义下不该亮）。
+    markSessionSeen(currentSession);
     dispatchNextQueued();
   } else if (t === "history_renumbered") {
     // 服务端 ord 间隔耗尽兜底：整会话重编号过，before_ord 游标指向的旧序号
@@ -2448,6 +2530,9 @@ function applyEvent(evt, seq) {
     const keep = currentSession;
     currentSession = null;
     switchSession(keep);
+  } else if (t === "doc_created") {
+    // agent 生成了一份文档：刷新列表、展开右侧面板并打开新文档
+    onDocCreated(evt.name);
   } else if (t === "session_deleted") {
     // 其他标签页删掉了这个任务：收摊回到新建态
     closeEvents();
@@ -2457,6 +2542,7 @@ function applyEvent(evt, seq) {
     welcome();
     railItems = [];
     rebuildRail();  // 会话已清空：导航条收起
+    closeDocsPanel();  // 会话没了，文档抽屉一并收起
     loadSessions();
     toast("该任务已在其他窗口被删除");
   } else if (t === "error") {
@@ -2686,6 +2772,8 @@ bind("p-save", "click", saveProv);
 bind("p-test", "click", testProv);
 bind("p-delete", "click", deleteProv);
 bind("ws-pick", "click", openPicker);
+bind("docs-chip", "click", toggleDocsPanel);
+bind("docs-close", "click", closeDocsPanel);
 bind("m-cancel", "click", () => $("modal").classList.add("hidden"));
 // 「不绑定项目」：清掉预绑的项目（chip 回到"选择项目"），新任务将落进"其他"组；
 // 之后再想绑定，点工具栏项目 chip 选一次即可
@@ -3155,8 +3243,7 @@ document.addEventListener("click", (e) => {
 $("git-branch").addEventListener("click", (e) => { e.stopPropagation(); toggleBranchPop(); });
 
 // ---------- 启动 ----------
-function boot() {
-  // 登录成功（或刷新后 token 仍有效）后的页面初始化；切用户时先清现场
+function boot() {  // 登录成功（或刷新后 token 仍有效）后的页面初始化；切用户时先清现场
   currentSession = null;
   chatEl.innerHTML = "";
   historyMids = new Set();  // 上一个用户/任务的去重基准作废
@@ -3182,3 +3269,109 @@ function boot() {
   boot();
 })();
 refreshCtx();
+
+// ---------- 右侧文档面板 ----------
+// 展示本会话 agent 生成的 Markdown 文档：列表 + 渲染。入口是工具栏的
+// 📄 文档 chip；生成完成（doc_created 事件）时自动展开并打开新文档。
+function docsPanelEl() { return $("docs-panel"); }
+
+function toggleDocsPanel() {
+  const p = docsPanelEl();
+  if (!p) return;
+  if (p.classList.contains("hidden")) {
+    p.classList.remove("hidden");
+    loadDocsList();
+  } else {
+    p.classList.add("hidden");
+  }
+}
+
+function closeDocsPanel() {
+  const p = docsPanelEl();
+  if (p) p.classList.add("hidden");
+}
+
+// 拉取当前会话文档列表，刷新列表与计数。会话为空（新任务态）时清空。
+async function loadDocsList() {
+  const list = $("docs-list");
+  const countEl = $("docs-count");
+  if (!list) return;
+  if (!currentSession) {
+    list.innerHTML = "";
+    if (countEl) countEl.textContent = "0";
+    renderDocsEmpty("本会话还没有文档，试试让 agent 生成一份。");
+    return;
+  }
+  try {
+    const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}/docs`);
+    const docs = data.docs || [];
+    if (countEl) countEl.textContent = String(docs.length);
+    list.innerHTML = "";
+    if (!docs.length) {
+      renderDocsEmpty("本会话还没有文档，试试让 agent 生成一份。");
+      return;
+    }
+    for (const d of docs) {
+      const li = document.createElement("li");
+      li.className = "docs-item";
+      li.dataset.name = d.name;
+      const name = document.createElement("span");
+      name.textContent = d.name;
+      const meta = document.createElement("span");
+      meta.className = "docs-meta";
+      meta.textContent = `${fmtBytes(d.bytes)} · ${fmtDocTime(d.mtime)}`;
+      li.append(name, meta);
+      li.addEventListener("click", () => openDoc(d.name));
+      list.appendChild(li);
+    }
+  } catch (e) {
+    renderDocsEmpty("文档列表加载失败：" + e.message);
+  }
+}
+
+function renderDocsEmpty(msg) {
+  const view = $("docs-view");
+  const list = $("docs-list");
+  if (list) {
+    const li = document.createElement("li");
+    li.className = "docs-empty";
+    li.textContent = msg;
+    list.appendChild(li);
+  }
+  if (view) view.innerHTML = "";
+}
+
+function fmtDocTime(t) {
+  if (!t) return "";
+  const d = new Date(t * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// 打开一份文档：拉原文 → 渲染到右侧视图，并高亮列表项。
+async function openDoc(name) {
+  if (!currentSession) return;
+  const view = $("docs-view");
+  if (!view) return;
+  try {
+    const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}`
+      + `/docs/content?name=${encodeURIComponent(name)}`);
+    view.replaceChildren(renderMarkdown(data.content || ""));
+  } catch (e) {
+    const err = document.createElement("div");
+    err.className = "docs-empty";
+    err.textContent = "文档打开失败：" + e.message;
+    view.replaceChildren(err);
+  }
+  document.querySelectorAll(".docs-item").forEach((el) => {
+    el.classList.toggle("active", el.dataset.name === name);
+  });
+}
+
+// doc_created 事件：刷新列表、展开面板、打开新文档。
+function onDocCreated(name) {
+  const p = docsPanelEl();
+  if (p) p.classList.remove("hidden");
+  loadDocsList().then(() => { if (name) openDoc(name); });
+  if (name) toast(`已生成文档《${name}》`);
+}

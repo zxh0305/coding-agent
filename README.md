@@ -106,6 +106,7 @@ schema 升级用 `PRAGMA user_version` + 有序迁移列表（`db.MIGRATIONS`）
 | `/api/sessions` | GET / DELETE | 任务列表（id/标题/更新时间）；`?session_id=` 删除任务 |
 | `/api/sessions/<id>/messages` | GET | 某任务的历史消息（分页回放，默认最近 100 条；`?before_ord=&limit=` 向上翻页；助手消息附带当时的耗时/token 统计；归档消息带 `artifact/path/head` 摘要字段） |
 | `/api/sessions/<id>/artifact` | GET | `?path=` 读取外置归档消息的完整原文（realpath 白名单校验，防路径逃逸与跨任务读取） |
+| `/api/sessions/<id>/docs` | GET | 本会话的文档列表（`{name,bytes,mtime}`）；带 `?name=` 读单个 md 原文（realpath 白名单校验，仅 .md） |
 | `/api/context` | GET | `?session_id=` 当前上下文容量（token 数 + 构成占比 + 缓存命中率） |
 | `/api/models` | GET | 可用模型列表（各供应商已启用的模型，供工具栏切换） |
 | `/api/active-model` | POST | 切换激活模型 `{"provider_id", "model"}` |

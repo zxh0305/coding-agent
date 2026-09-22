@@ -65,6 +65,7 @@
           <button id="perm-chip" class="chip" title="权限模式：只读 = 写入和命令逐次确认；确认 = 高危操作才确认；完全访问 = 全部放行">🛡 <span id="perm-label">确认</span></button>
           <button id="ctx-chip" class="chip" title="上下文容量">⛁ —</button>
           <button id="ws-pick" class="chip" title="选择工作区文件夹">📁 <span id="ws-short">工作区</span></button>
+          <button id="docs-chip" class="chip" title="查看本会话生成的文档">📄 文档 <span id="docs-count">0</span></button>
           <button id="model-chip" class="chip" title="切换模型 / 管理模型">⚙️ <span id="model-label">模型</span></button>
           <span class="grow"></span>
           <button id="send" class="primary send-btn">发送</button>
@@ -73,6 +74,18 @@
     </main>
 
   </div>
+
+  <!-- 右侧文档抽屉：展示本会话 agent 生成的 Markdown 文档 -->
+  <aside id="docs-panel" class="docs-panel hidden">
+    <div class="docs-head">
+      <b>📄 文档</b>
+      <button id="docs-close" class="docs-x" title="关闭">✕</button>
+    </div>
+    <div class="docs-body">
+      <ul id="docs-list" class="docs-list"></ul>
+      <div id="docs-view" class="docs-view"></div>
+    </div>
+  </aside>
 
   <!-- 模型切换气泡：按供应商分组列出已启用模型 -->
   <div id="model-pop" class="model-pop hidden">

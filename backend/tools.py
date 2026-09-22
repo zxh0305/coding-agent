@@ -174,7 +174,7 @@ class ToolContext:
     workspace: Path | None = None               # 本会话的工作区（文件/命令工具的边界）
     images: list = field(default_factory=list)  # 本轮用户消息附带的图片（OpenAI content 部分）
     vision_backend: object = None               # fn(image_parts, question) -> str，由 app.py 注入
-
+    session_id: str | None = None               # 本会话 id（文档工具据此确定文档归属）
 
 TOOL_REGISTRY = {
     "calculator": calculator,
@@ -242,6 +242,12 @@ TOOL_SCHEMAS.append({
 })
 TOOL_REGISTRY["analyze_image"] = analyze_image
 
+# ---- 文档工具（doc_tools.py）：agent 生成 Markdown 文档 ----
+from doc_tools import DOC_TOOL_REGISTRY, DOC_TOOL_READ_ONLY, DOC_TOOL_SCHEMAS
+
+TOOL_SCHEMAS += DOC_TOOL_SCHEMAS
+TOOL_REGISTRY.update(DOC_TOOL_REGISTRY)
+
 # ---------------------------------------------------------------------------
 # 工具元数据：read_only（是否只读、能否并行）
 #
@@ -260,7 +266,7 @@ TOOL_READ_ONLY = {
     "analyze_image": False,
 }
 TOOL_READ_ONLY.update(CODE_TOOL_READ_ONLY)  # 并入 coding 工具的标记（同样的合并方式）
-
+TOOL_READ_ONLY.update(DOC_TOOL_READ_ONLY)   # 并入文档工具（create_doc 为非只读，走串行）
 
 def is_read_only(name: str) -> bool:
     """name 是否只读工具。未知工具返回 False——没有元数据就当写操作走串行，永远站在安全侧。"""

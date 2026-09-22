@@ -236,7 +236,11 @@ _PARSE_FAIL_KEY = ("run_bash", "<unparseable>")
 _READONLY_MODE_KEY_PREFIX = "<readonly_mode>"
 
 READONLY_TOOLS = {"read_file", "list_dir", "grep", "calculator",
-                  "current_time", "analyze_image", "get_weather"}
+                  "current_time", "analyze_image", "get_weather",
+                  # create_doc 并非真的只读，但文档生成视为【低危】：无论哪种权限
+                  # 模式都直接放行、不弹确认卡。放进本集合即达成——只读模式下的
+                  # "非本集合工具一律 ask"（见 check）不再对它生效。
+                  "create_doc"}
 
 
 def _builtin_verdict(tool: str, arguments: dict, workspace: Path) -> Verdict:
