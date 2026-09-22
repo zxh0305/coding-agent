@@ -471,33 +471,115 @@ button.primary:hover { background: #3d69d8; }
 /* ---------- 工作区选择弹窗 ---------- */
 .modal {
   position: fixed; inset: 0; z-index: 30;
-  background: rgba(20, 25, 40, 0.45);
+  background: rgba(20, 25, 40, 0.42);
+  backdrop-filter: blur(2px);
   display: flex; align-items: center; justify-content: center;
+  animation: modal-fade .16s ease-out;
 }
 .modal.hidden { display: none; }
+@keyframes modal-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modal-rise {
+  from { opacity: 0; transform: translateY(8px) scale(.99); }
+  to   { opacity: 1; transform: none; }
+}
+
 .modal-box {
-  background: #fff; border-radius: 12px; padding: 16px;
-  width: min(560px, 92vw); max-height: 84vh;
-  display: flex; flex-direction: column; gap: 10px;
+  background: #fff; border-radius: 14px; padding: 18px 18px 14px;
+  width: min(580px, 92vw); max-height: 84vh;
+  display: flex; flex-direction: column; gap: 12px;
+  box-shadow: 0 18px 50px rgba(20, 25, 40, .22), 0 2px 8px rgba(20, 25, 40, .08);
+  animation: modal-rise .2s cubic-bezier(.2, .8, .3, 1);
 }
-.modal-box h3 { font-size: 15px; }
+@media (prefers-reduced-motion: reduce) {
+  .modal, .modal-box { animation: none; }
+}
+
+/* 标题栏：标题 + 副标题 + 关闭按钮 */
+.m-head { display: flex; align-items: flex-start; gap: 10px; }
+.m-title-wrap { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.m-head h3 { font-size: 15.5px; margin: 0; }
+.m-sub { font-size: 11.5px; color: var(--text-3); line-height: 1.4; }
+.m-close {
+  margin-left: auto; flex-shrink: 0;
+  width: 28px; height: 28px; border-radius: 8px;
+  border: none; background: transparent; color: var(--text-3);
+  font-size: 13px; cursor: pointer; line-height: 1;
+}
+.m-close:hover { background: #f0f2f8; color: var(--text-1); }
+
+/* 当前位置：图标 + 标签 + 等宽路径（长路径横向滚动不折行） */
+.m-cwd {
+  display: flex; align-items: center; gap: 8px;
+  background: #f4f6fb; border: 1px solid var(--border); border-radius: 9px;
+  padding: 8px 11px;
+}
+.m-cwd-icon { font-size: 13px; flex-shrink: 0; }
+.m-cwd-label { font-size: 11px; color: var(--text-3); flex-shrink: 0; }
 .m-path {
-  font-size: 12px; color: #37415a;
-  background: #eef1f7; border-radius: 6px;
-  padding: 6px 8px; word-break: break-all;
+  font-size: 12px; color: #37415a; min-width: 0;
+  overflow-x: auto; white-space: nowrap; scrollbar-width: thin;
 }
+
+/* 目录列表：行高更舒展，去掉硬分隔线，hover 左侧强调条 + 箭头右移 */
 .m-list {
-  list-style: none; max-height: 300px; overflow: auto;
-  border: 1px solid var(--border); border-radius: 8px;
+  list-style: none; margin: 0; padding: 4px;
+  max-height: 320px; overflow: auto;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: #fcfdff;
 }
-.m-list li { padding: 7px 10px; font-size: 13px; cursor: pointer; border-bottom: 1px solid #f0f2f8; }
-.m-skip { color: var(--text-2); font-size: 12.5px; background: transparent; border: 1px dashed var(--border); border-radius: 8px; padding: 6px 10px; cursor: pointer; }
-.m-skip:hover { color: var(--text-1); border-color: var(--text-3); }
+.m-list li {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 10px; font-size: 13.5px; cursor: pointer;
+  border-radius: 8px; position: relative;
+  transition: background .12s ease;
+}
+.m-list li::before {
+  content: ""; position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+  width: 2px; height: 0; border-radius: 2px; background: var(--accent);
+  transition: height .14s ease;
+}
 .m-list li:hover { background: #eef3ff; }
-.m-list li.empty { color: var(--text-3); cursor: default; }
+.m-list li:hover::before { height: 60%; }
+.m-dir-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-dir-go {
+  flex-shrink: 0; color: var(--text-3); font-size: 14px;
+  opacity: 0; transform: translateX(-4px);
+  transition: opacity .14s ease, transform .14s ease;
+}
+.m-list li:hover .m-dir-go { opacity: 1; transform: none; }
+.m-list li.empty {
+  color: var(--text-3); cursor: default; justify-content: center;
+  font-size: 12.5px; padding: 22px 10px;
+}
 .m-list li.empty:hover { background: none; }
-.m-actions { display: flex; gap: 8px; align-items: center; }
-.choose-btn { width: auto; }
+.m-list li.empty::before { display: none; }
+
+/* 底部操作区：不绑定（左）｜ 导航组 ｜ 决定组（右） */
+.m-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.m-nav, .m-decide { display: flex; gap: 8px; align-items: center; }
+.m-btn {
+  font-size: 12.5px; padding: 7px 13px; border-radius: 8px;
+  border: 1px solid var(--border); background: #fff;
+  color: var(--text-1); cursor: pointer; white-space: nowrap;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.m-btn:hover:not(:disabled) { background: #f0f3fa; border-color: #c8d1e2; }
+.m-btn:disabled { color: var(--text-3); cursor: not-allowed; opacity: .55; }
+.m-skip {
+  color: var(--text-2); font-size: 12.5px;
+  background: transparent; border: 1px dashed var(--border);
+  border-radius: 8px; padding: 7px 11px; cursor: pointer;
+}
+.m-skip:hover { color: var(--text-1); border-color: var(--text-3); background: #fafbfd; }
+.choose-btn { width: auto; padding: 7px 18px; font-size: 12.5px; border-radius: 8px; }
+
+/* 底部警示：弱化但可读，与按钮区之间加细分隔线 */
+.m-warn {
+  display: flex; align-items: flex-start; gap: 6px;
+  margin: 0; padding-top: 10px; border-top: 1px solid #f0f2f8;
+  font-size: 11.5px; color: var(--text-3); line-height: 1.6;
+}
+.m-warn span { flex-shrink: 0; }
 
 /* ---------- 提示浮条 ---------- */
 .toast {

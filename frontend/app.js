@@ -1733,14 +1733,23 @@ async function navTo(path) {
   ul.innerHTML = "";
   for (const name of info.dirs) {
     const li = document.createElement("li");
-    li.textContent = "📁 " + name;
+    const icon = document.createElement("span");
+    icon.className = "m-dir-icon";
+    icon.textContent = "📁";
+    const label = document.createElement("span");
+    label.className = "m-dir-name";
+    label.textContent = name;
+    const go = document.createElement("span");
+    go.className = "m-dir-go";
+    go.textContent = "›";
+    li.append(icon, label, go);
     li.addEventListener("click", () => navTo((mCwd.endsWith("/") ? mCwd : mCwd + "/") + name));
     ul.appendChild(li);
   }
   if (!info.dirs.length) {
     const li = document.createElement("li");
     li.className = "empty";
-    li.textContent = "（没有子目录了）";
+    li.textContent = "📂 这里没有子目录了";
     ul.appendChild(li);
   }
   $("m-up").disabled = !info.parent;
@@ -1755,6 +1764,11 @@ async function openPicker() {
   } catch (e) {
     await navTo(undefined);
   }
+}
+
+// 关闭选择弹窗：✕ / 取消 / Esc / 点遮罩空白处都走这里
+function closePicker() {
+  $("modal").classList.add("hidden");
 }
 
 async function chooseWorkspace() {
@@ -2793,11 +2807,18 @@ bind("ws-pick", "click", openPicker);
 bind("docs-chip", "click", toggleDocsPanel);
 bind("docs-close", "click", closeDocsPanel);
 bind("docs-toggle", "click", toggleDocsList);
-bind("m-cancel", "click", () => $("modal").classList.add("hidden"));
+bind("m-cancel", "click", closePicker);
+bind("m-close", "click", closePicker);
+// 点遮罩空白处关闭（只在点到遮罩本身时，点弹窗内部不关）
+bind("modal", "click", (e) => { if (e.target === $("modal")) closePicker(); });
+// Esc 关闭：只在弹窗打开时响应，避免影响输入框等其他键盘行为
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("modal").classList.contains("hidden")) closePicker();
+});
 // 「不绑定项目」：清掉预绑的项目（chip 回到"选择项目"），新任务将落进"其他"组；
 // 之后再想绑定，点工具栏项目 chip 选一次即可
 bind("m-skip", "click", () => {
-  $("modal").classList.add("hidden");
+  closePicker();
   pendingProjectPath = null;
   wsCustom = false;
   renderWsChip();

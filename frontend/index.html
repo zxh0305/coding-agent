@@ -164,19 +164,37 @@
 
   <!-- 选择工作区的弹窗：逐级浏览本地文件夹 -->
   <div id="modal" class="modal hidden">
-    <div class="modal-box">
-      <h3>选择工作区文件夹</h3>
-      <div id="m-path" class="m-path mono"></div>
-      <ul id="m-list" class="m-list"></ul>
-      <div class="m-actions">
-        <button id="m-skip" class="m-skip">不绑定项目（放进其他）</button>
-        <span class="grow"></span>
-        <button id="m-up">← 上级</button>
-        <button id="m-home">🏠 主目录</button>
-        <button id="m-cancel">取消</button>
-        <button id="m-choose" class="primary choose-btn">选择此目录</button>
+    <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="m-title">
+      <div class="m-head">
+        <div class="m-title-wrap">
+          <h3 id="m-title">选择工作区文件夹</h3>
+          <span class="m-sub">Agent 将在此文件夹内读写文件、执行命令</span>
+        </div>
+        <button id="m-close" class="m-close" title="关闭（Esc）" aria-label="关闭">✕</button>
       </div>
-      <p class="hint">Agent 将获得该文件夹内完整的读写与命令执行权限，请勿选择系统目录。</p>
+
+      <div class="m-cwd">
+        <span class="m-cwd-icon" aria-hidden="true">📍</span>
+        <span class="m-cwd-label">当前位置</span>
+        <span id="m-path" class="m-path mono"></span>
+      </div>
+
+      <ul id="m-list" class="m-list"></ul>
+
+      <div class="m-actions">
+        <button id="m-skip" class="m-skip" title="不绑定具体项目，新任务放进「其他」分组">不绑定项目（放进其他）</button>
+        <span class="grow"></span>
+        <div class="m-nav">
+          <button id="m-up" class="m-btn">← 上级</button>
+          <button id="m-home" class="m-btn">🏠 主目录</button>
+        </div>
+        <div class="m-decide">
+          <button id="m-cancel" class="m-btn">取消</button>
+          <button id="m-choose" class="primary choose-btn">选择此目录</button>
+        </div>
+      </div>
+
+      <p class="m-warn"><span aria-hidden="true">⚠️</span> Agent 将获得该文件夹内完整的读写与命令执行权限，请勿选择系统目录。</p>
     </div>
   </div>
 
