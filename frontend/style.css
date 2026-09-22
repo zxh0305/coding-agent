@@ -259,6 +259,17 @@ body {
   margin: 6px 0 0 2px; white-space: pre-wrap; word-break: break-word;
   color: #98a0b3;
 }
+/* 「💬 说明」标记：把过程性正文与它上方的思考流（.think-line）区分开。
+   两者字号/灰度接近，而轨迹里 reasoning 条目可能缺失，正文就直接跟在
+   「🧠 思考 · 第 N 轮」标题下面——不加标记会被当成该轮的推理内容。
+   只在 .demoted（已确认是过程说明）上加：流式期间那段文字仍可能是最终
+   答案，此时不该贴"说明"标签（done 会把它升级为正文卡）。 */
+.process-text.demoted::before {
+  content: "💬 说明";
+  display: block;
+  font-size: 10px; letter-spacing: .04em;
+  color: #b9c0d0; margin-bottom: 2px;
+}
 /* 流式中的过程正文：尾部光标——面板收起时也看得到它在动，不会以为卡死 */
 .process-text.streaming::after {
   content: "▍"; color: var(--accent);

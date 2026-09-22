@@ -1016,8 +1016,11 @@ function traceFromHistory(entries, elapsed) {
     } else if (e.type === "process_text") {
       // 中间轮次的过程说明正文：与实时降级同一套 .process-text 渲染，
       // 折叠面板收起时默认看不到，展开才显示"当时说了什么"。
+      // demoted 带上「💬 说明」标记（见 style.css）：轨迹里 reasoning 条目
+      // 可能缺失，这段正文就紧跟「🧠 思考 · 第 N 轮」标题，无标记会被读成
+      // 该轮的思考内容——过程说明冒充推理。
       const div = document.createElement("div");
-      div.className = "process-text";
+      div.className = "process-text demoted";
       div.textContent = e.text || "";
       d.appendChild(div);
     } else if (e.type === "system_reminder") {
@@ -1974,7 +1977,10 @@ function demoteLiveBubbleToTrace() {
   const el = liveBubble;
   if (!el) return;
   el.classList.remove("streaming");
-  if (!el.textContent.trim()) el.remove();
+  if (!el.textContent.trim()) { el.remove(); return; }
+  // 确认是过程说明：补上「💬 说明」标记（.demoted），与上方思考流区分开。
+  // 与历史回放（traceFromHistory 的 process_text 分支）保持同一副面孔。
+  el.classList.add("demoted");
 }
 
 // 最终答案定稿：把流式期间挂在执行过程面板里的那个气泡【移出面板】，插到
@@ -1982,8 +1988,7 @@ function demoteLiveBubbleToTrace() {
 // 这是"先小字流出、完成后升级"的落点——升级只发生一次，且是"小→大"的揭晓，
 // 不像旧实现每段都"大→小"地缩一次。
 function finalizeAnswer(el, text) {
-  el.classList.remove("streaming", "process-text");  // 去掉过程小字样式，换成正文卡
-  el.classList.add("bubble", "assistant");
+  el.classList.remove("streaming", "process-text", "demoted");  // 去掉过程小字样式与「💬 说明」标记，换成正文卡  el.classList.add("bubble", "assistant");
   traceEl.after(el);  // 紧跟折叠条：答案在执行过程之后，符合阅读顺序
   renderIntoBubble(el, text);
 }
