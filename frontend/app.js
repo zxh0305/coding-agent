@@ -2792,6 +2792,7 @@ bind("p-delete", "click", deleteProv);
 bind("ws-pick", "click", openPicker);
 bind("docs-chip", "click", toggleDocsPanel);
 bind("docs-close", "click", closeDocsPanel);
+bind("docs-toggle", "click", toggleDocsList);
 bind("m-cancel", "click", () => $("modal").classList.add("hidden"));
 // 「不绑定项目」：清掉预绑的项目（chip 回到"选择项目"），新任务将落进"其他"组；
 // 之后再想绑定，点工具栏项目 chip 选一次即可
@@ -3275,6 +3276,9 @@ function boot() {  // 登录成功（或刷新后 token 仍有效）后的页面
   loadWorkspace();
   loadSessions();
   startStatePolling();  // 列表状态徽标的低频刷新（见 startStatePolling）
+  restoreDocsWidth();       // 恢复上次的文档栏宽度
+  restoreDocsListState();   // 恢复文档列表的折叠态
+  bindDocsResizer();        // 文档栏左缘的拖拽把手
 }
 
 (async () => {
@@ -3288,10 +3292,85 @@ function boot() {  // 登录成功（或刷新后 token 仍有效）后的页面
 })();
 refreshCtx();
 
-// ---------- 右侧文档面板 ----------
+// ---------- 右侧文档栏 ----------
 // 展示本会话 agent 生成的 Markdown 文档：列表 + 渲染。入口是工具栏的
 // 📄 文档 chip；生成完成（doc_created 事件）时自动展开并打开新文档。
+// 面板与主区【并列】（不是浮层），宽度由 CSS 变量 --docs-w 驱动，
+// 展开/收起/拖拽都只改这个变量，主区 flex:1 自动跟着压缩或变宽。
 function docsPanelEl() { return $("docs-panel"); }
+
+// 文档栏宽度的取值区间与持久化：全局记忆（不按会话），下次打开保持。
+const DOCS_W_MIN = 360;
+const DOCS_W_MAX_RATIO = 0.88;   // 最宽不超过视口的 88%
+const DOCS_W_KEY = "docsWidth";
+const DOCS_LIST_KEY = "docsListCollapsed";
+
+function docsMaxWidth() { return Math.round(window.innerWidth * DOCS_W_MAX_RATIO); }
+
+function clampDocsWidth(w) {
+  return Math.max(DOCS_W_MIN, Math.min(docsMaxWidth(), Math.round(w)));
+}
+
+// 把宽度写进 CSS 变量（面板与主区随之变化）
+function applyDocsWidth(w) {
+  const px = clampDocsWidth(w);
+  document.documentElement.style.setProperty("--docs-w", px + "px");
+  return px;
+}
+
+function restoreDocsWidth() {
+  const saved = parseInt(localStorage.getItem(DOCS_W_KEY) || "", 10);
+  applyDocsWidth(Number.isFinite(saved) ? saved : 620);
+}
+
+// 文档列表折叠态：只切换面板上的 class，CSS 负责宽度过渡
+function restoreDocsListState() {
+  const p = docsPanelEl();
+  if (!p) return;
+  p.classList.toggle("list-collapsed", localStorage.getItem(DOCS_LIST_KEY) === "1");
+}
+
+function toggleDocsList() {
+  const p = docsPanelEl();
+  if (!p) return;
+  const collapsed = p.classList.toggle("list-collapsed");
+  localStorage.setItem(DOCS_LIST_KEY, collapsed ? "1" : "0");
+  const btn = $("docs-toggle");
+  if (btn) btn.textContent = collapsed ? "⇥" : "⇤";
+  if (btn) btn.title = collapsed ? "展开文档列表" : "收起文档列表";
+}
+
+// 拖拽把手：按下后跟手改宽度，松开结束。拖拽期间禁用过渡（见 CSS）。
+function bindDocsResizer() {
+  const handle = $("docs-resizer");
+  const p = docsPanelEl();
+  if (!handle || !p) return;
+  handle.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = p.getBoundingClientRect().width;
+    document.body.classList.add("docs-resizing");
+    const onMove = (ev) => {
+      // 向左拖（clientX 变小）→ 变宽，所以用 startX - ev.clientX
+      applyDocsWidth(startW + (startX - ev.clientX));
+    };
+    const onUp = () => {
+      document.body.classList.remove("docs-resizing");
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      const cur = clampDocsWidth(p.getBoundingClientRect().width);
+      localStorage.setItem(DOCS_W_KEY, String(cur));
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+  // 视口变窄时把过宽的面板收进合法区间
+  window.addEventListener("resize", () => {
+    const cur = parseInt(getComputedStyle(document.documentElement)
+      .getPropertyValue("--docs-w"), 10);
+    if (Number.isFinite(cur)) applyDocsWidth(cur);
+  });
+}
 
 function toggleDocsPanel() {
   const p = docsPanelEl();

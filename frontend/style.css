@@ -1039,15 +1039,36 @@ button.primary:hover { background: #3d69d8; }
   background: #f4f6fa; color: var(--text-2); font-size: 12px; line-height: 1.6;
 }
 
-/* ---------- 右侧文档抽屉 ---------- */
-/* 从主区右侧滑出的面板，与对话并存、可关闭。fixed 定位贴在视口右侧。 */
+/* ---------- 右侧文档栏 ---------- */
+/* 与主区【并列】的一列（不是浮层）：展开时主区真的变窄，而不是被盖住。
+   宽度由 --docs-w 驱动并做过渡，所以开合时主区平滑压缩；隐藏态收成 0 宽。 */
+:root { --docs-w: 620px; }
+
 .docs-panel {
-  position: fixed; top: 0; right: 0; z-index: 31;
-  width: 620px; max-width: 92vw; height: 100vh;
+  position: relative; z-index: 20;
+  flex: 0 0 auto;
+  width: var(--docs-w); min-width: 0; height: 100vh;
   display: flex; flex-direction: column;
   background: #fff; border-left: 1px solid var(--border);
-  box-shadow: -8px 0 30px rgba(20, 25, 40, 0.12);
+  overflow: hidden;
+  transition: width .28s ease;
 }
+/* 隐藏：宽度收 0（配合 overflow:hidden 完全消失），保持过渡而不是 display:none，
+   这样关闭也是"滑走"而非"啪一下不见"。 */
+.docs-panel.hidden {
+  display: flex !important;
+  width: 0; border-left-width: 0;
+}
+/* 面板左边缘的拖拽把手：贴在最左侧，光标提示可横向拉伸 */
+.docs-resizer {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 6px;
+  cursor: col-resize; z-index: 2;
+}
+.docs-resizer:hover { background: rgba(79, 124, 240, .18); }
+/* 拖拽期间：禁用过渡（否则跟手会滞后）并禁止选中文字 */
+body.docs-resizing { user-select: none; cursor: col-resize; }
+body.docs-resizing .docs-panel { transition: none; }
+
 .docs-head {
   display: flex; align-items: center; gap: 8px;
   padding: 14px 18px 12px; border-bottom: 1px solid var(--border);
@@ -1060,9 +1081,26 @@ button.primary:hover { background: #3d69d8; }
 }
 .docs-x:hover { color: var(--text-1); }
 .docs-body { flex: 1 1 auto; display: flex; min-height: 0; }
+/* 列表区外壳：折叠按钮固定在左，列表本身宽度过渡到 0 即"收进去" */
+.docs-side { display: flex; flex: 0 0 auto; min-width: 0; }
+.docs-toggle {
+  flex: 0 0 auto; width: 22px; align-self: stretch;
+  border: none; border-right: 1px solid var(--border);
+  background: #fafbfd; color: var(--text-3);
+  cursor: pointer; font-size: 11px; padding: 0;
+}
+.docs-toggle:hover { background: #eef1f7; color: var(--accent); }
 .docs-list {
-  flex: 0 0 200px; margin: 0; padding: 8px; list-style: none;
-  overflow-y: auto; border-right: 1px solid var(--border);
+  flex: 0 0 auto; width: 200px; margin: 0; padding: 8px; list-style: none;
+  overflow-y: auto; overflow-x: hidden; border-right: 1px solid var(--border);
+  transition: width .22s ease, padding .22s ease, opacity .18s ease;
+}
+/* 收起态：列表宽度收 0（按钮仍在，随时可展开） */
+.docs-panel.list-collapsed .docs-list {
+  width: 0; padding-left: 0; padding-right: 0; opacity: 0; border-right-width: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .docs-panel, .docs-list { transition: none; }
 }
 .docs-item {
   padding: 8px 10px; border-radius: 8px; cursor: pointer;
