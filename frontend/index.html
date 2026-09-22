@@ -47,7 +47,10 @@
 
     <!-- 主区：对话 + 输入框工具栏 -->
     <main class="main">
-      <button id="git-chip" class="git-chip" title="查看当前项目文件夹的 Git 提交记录">🌿 <span>Git</span></button>
+      <button id="git-chip" class="git-chip" title="查看当前项目文件夹的 Git 提交记录">
+        <span class="git-chip-icon">🌿</span>
+        <span id="git-chip-branch" class="git-chip-branch mono">Git</span>
+      </button>
       <div id="chat" class="chat"></div>
 
       <div class="composer">

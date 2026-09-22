@@ -841,19 +841,27 @@ button.primary:hover { background: #3d69d8; }
 .perm-note.resolved { color: #2e7d32; }
 
 /* ---------- Git 提交记录浮窗 ---------- */
-/* 右上角触发按钮：常驻但不抢注意力（低饱和、悬停才明显） */
+/* 右上角触发按钮：显示当前分支，做得比其它 chip 明显一些——它是进入
+   Git 视图的入口，用户要一眼看到"我在哪个分支上"。 */
 .git-chip {
   position: absolute; top: 12px; right: 16px; z-index: 15;
-  display: inline-flex; align-items: center; gap: 4px;
-  padding: 4px 10px; font-size: 12px;
-  background: rgba(255, 255, 255, 0.9); color: var(--text-2);
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 7px 15px; font-size: 13px;
+  background: rgba(255, 255, 255, 0.94); color: var(--text-1);
   border: 1px solid var(--border); border-radius: 999px;
   cursor: pointer; backdrop-filter: blur(4px);
-  transition: color .15s, border-color .15s;
+  box-shadow: 0 1px 3px rgba(20, 25, 40, 0.06);
+  transition: color .15s, border-color .15s, box-shadow .15s;
 }
-.git-chip:hover { color: var(--text-1); border-color: #c3cbd9; }
+.git-chip:hover { border-color: #c3cbd9; box-shadow: 0 3px 10px rgba(20, 25, 40, 0.1); }
 .git-chip.warn { color: #b45309; border-color: #f2d9b0; }
-
+.git-chip-icon { font-size: 15px; line-height: 1; }
+/* 分支名：等宽字体、限宽省略——长分支名不能把按钮撑到盖住工具栏 */
+.git-chip-branch {
+  max-width: 180px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 12.5px;
+}
+.git-chip.warn .git-chip-branch { color: #b45309; }
 .git-pop {
   position: fixed; z-index: 30;
   width: 720px; max-width: calc(100vw - 32px);

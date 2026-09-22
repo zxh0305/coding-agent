@@ -618,6 +618,7 @@ async function switchSession(id) {
   await refreshCtx();
   loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换（内部顺带拉权限模式）
   closeGitPop();    // 工作区变了，旧的提交列表不再对应当前项目
+  refreshGitChip(); // 按钮上的分支名随任务的工作区更新
   dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
 }
 
@@ -2550,6 +2551,30 @@ function gitQs(extra = {}) {
   return qs.toString();
 }
 
+// 把分支名写进右上角触发按钮。传空串 = 不是仓库/未绑定项目，按钮退回
+// 只显示 "Git"，并去掉 warn 之外的状态。
+function setGitChipBranch(branch) {
+  const el = $("git-chip-branch");
+  if (!el) return;
+  el.textContent = branch || "Git";
+  $("git-chip").title = branch
+    ? `当前分支：${branch}（点击查看提交记录）`
+    : "查看当前项目文件夹的 Git 提交记录";
+}
+
+// 后台轻量刷新按钮上的分支名：不需要打开浮窗也能看到"我在哪个分支"。
+// 只在已绑定项目时发请求；失败静默（不是仓库属正常状态，不该弹错）。
+async function refreshGitChip() {
+  if (!currentSession) { setGitChipBranch(""); return; }
+  try {
+    const d = await api("/api/git/summary?" + gitQs());
+    setGitChipBranch(d.ok ? d.branch : "");
+    $("git-chip").classList.toggle("warn", !d.ok);
+  } catch (e) {
+    setGitChipBranch("");
+  }
+}
+
 function toggleGitPop() {
   const pop = $("git-pop");
   if (!pop.classList.contains("hidden")) { pop.classList.add("hidden"); return; }
@@ -2599,6 +2624,7 @@ function renderGitList(data, reset) {
   branchBtn.textContent = (data.branch || "") + " ▾";
   branchBtn.classList.toggle("hidden", !data.ok || !data.branch);
   $("git-chip").classList.toggle("warn", !data.ok);
+  setGitChipBranch(data.ok ? data.branch : "");
   // 底部身份行：告诉用户"我"是按哪个 git 身份判定的
   const id = data.identity || {};
   $("git-identity").textContent = id.email ? `本机身份：${id.name || id.email}` : "";
