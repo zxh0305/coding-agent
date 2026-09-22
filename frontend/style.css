@@ -144,6 +144,9 @@ body {
   max-width: 76%; padding: 10px 14px; border-radius: 12px;
   font-size: 14px; line-height: 1.65; white-space: pre-wrap; word-break: break-word;
 }
+/* 空气泡兜底：padding + border 会把"无内容的 .bubble"渲染成一个白色圆角空盒子
+   （点定位条回放历史时曾成排出现）。这里让它彻底不占位，防其它路径再漏。 */
+.bubble:empty { display: none; }
 .bubble.user {
   align-self: flex-end; background: var(--accent); color: #fff;
   border-bottom-right-radius: 4px;
@@ -1201,31 +1204,27 @@ body.docs-resizing .docs-panel { transition: none; }
   flex: 0 0 auto;
 }
 .docs-head b { font-size: 14px; }
-.docs-x {
-  margin-left: auto; border: none; background: transparent;
-  color: var(--text-3); font-size: 14px; cursor: pointer; padding: 2px 6px;
+/* 标题栏右侧两个图标按钮：收起列表 / 关闭面板 */
+.docs-toggle, .docs-x {
+  border: none; background: transparent;
+  color: var(--text-3); cursor: pointer;
+  border-radius: 6px; line-height: 1;
 }
-.docs-x:hover { color: var(--text-1); }
-.docs-body { flex: 1 1 auto; display: flex; min-height: 0; }
-/* 列表区外壳：列表在左、折叠按钮紧贴其右缘（按钮在列表与正文之间），
-   这样 ⇤ 的收起方向与位置一致；列表宽度过渡到 0 即"收进去"。 */
-.docs-side { display: flex; flex: 0 0 auto; min-width: 0; }
 .docs-toggle {
-  flex: 0 0 auto; width: 22px; align-self: stretch;
-  border: none; border-left: 1px solid var(--border);
-  border-right: 1px solid var(--border);
-  background: #fafbfd; color: var(--text-3);
-  cursor: pointer; font-size: 11px; padding: 0;
+  margin-left: auto; font-size: 12px; padding: 4px 7px;
 }
-.docs-toggle:hover { background: #eef1f7; color: var(--accent); }
+.docs-x { font-size: 14px; padding: 2px 6px; }
+.docs-toggle:hover, .docs-x:hover { background: #f0f2f8; color: var(--text-1); }
+.docs-body { flex: 1 1 auto; display: flex; min-height: 0; }
 .docs-list {
   flex: 0 0 auto; width: 200px; margin: 0; padding: 8px; list-style: none;
   overflow-y: auto; overflow-x: hidden;
+  border-right: 1px solid var(--border);
   transition: width .22s ease, padding .22s ease, opacity .18s ease;
 }
-/* 收起态：列表宽度收 0（按钮仍在，随时可展开） */
+/* 收起态：列表宽度收 0（标题栏按钮随时可展开） */
 .docs-panel.list-collapsed .docs-list {
-  width: 0; padding-left: 0; padding-right: 0; opacity: 0;
+  width: 0; padding-left: 0; padding-right: 0; opacity: 0; border-right-width: 0;
 }
 @media (prefers-reduced-motion: reduce) {
   .docs-panel, .docs-list { transition: none; }

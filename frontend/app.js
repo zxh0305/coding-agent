@@ -658,6 +658,7 @@ async function newTask(presetProject = null) {
   railItems = [];
   rebuildRail();       // 新任务时间线为空：导航条收起
   restoreDraft(null);  // 新任务自己的草稿位（__new__）
+  resetDocsPanel();    // 新任务态：收起文档栏并清空内容
   loadDocsList();      // 新任务态：文档计数清零
   usageNow = null;
   updateCtxChip();
@@ -911,6 +912,7 @@ async function switchSession(id) {
   closeGitPop();    // 工作区变了，旧的提交列表不再对应当前项目
   refreshGitChip(); // 按钮上的分支名随任务的工作区更新
   dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
+  resetDocsPanel();      // 上一个会话的文档栏不留给新会话：收起并清空
   loadDocsList();        // 刷新文档计数（切会话后 chip 上的数字跟着变）
 }
 
@@ -1020,9 +1022,15 @@ function historyNode(m) {
     const tr = traceFromHistory(m.trace, m.stats?.elapsed_s);
     if (tr) frag.appendChild(tr);
   }
-  // 主消息气泡：打上 mid 与角色锚，供左侧导航条定位（rail 只画 user/assistant 两类）
-  frag.appendChild(railTag(buildBubble(m.role === "user" ? "user" : "assistant", m.content || ""),
-                          m.mid, m.role === "user" ? "user" : "assistant"));
+  // 主消息气泡：打上 mid 与角色锚，供左侧导航条定位（rail 只画 user/assistant 两类）。
+  // 助手消息正文为空时【不画气泡】：.bubble 有 padding + border，空 div 会渲染成
+  // 一个 padding 撑起来的白色圆角空盒子——点定位条批量回放历史（loadWindowAround）
+  // 时这类空正文消息成排出现，视觉上就是"一堆空白方块"。无正文的消息不该占位。
+  const text = m.content || "";
+  if (m.role === "user" || text) {
+    frag.appendChild(railTag(buildBubble(m.role === "user" ? "user" : "assistant", text),
+                            m.mid, m.role === "user" ? "user" : "assistant"));
+  }
   // 历史消息也带回当时的耗时/token 统计（message_usage 表随消息附带）
   if (m.role === "assistant" && m.stats) {
     const meta = document.createElement("div");
@@ -3407,7 +3415,17 @@ function restoreDocsWidth() {
 function restoreDocsListState() {
   const p = docsPanelEl();
   if (!p) return;
-  p.classList.toggle("list-collapsed", localStorage.getItem(DOCS_LIST_KEY) === "1");
+  const collapsed = localStorage.getItem(DOCS_LIST_KEY) === "1";
+  p.classList.toggle("list-collapsed", collapsed);
+  syncDocsToggleBtn(collapsed);   // 图标/title 与恢复的折叠态保持一致
+}
+
+// 让标题栏折叠按钮的图标与提示跟随折叠态
+function syncDocsToggleBtn(collapsed) {
+  const btn = $("docs-toggle");
+  if (!btn) return;
+  btn.textContent = collapsed ? "⇥" : "⇤";
+  btn.title = collapsed ? "展开文档列表" : "收起文档列表";
 }
 
 function toggleDocsList() {
@@ -3415,9 +3433,7 @@ function toggleDocsList() {
   if (!p) return;
   const collapsed = p.classList.toggle("list-collapsed");
   localStorage.setItem(DOCS_LIST_KEY, collapsed ? "1" : "0");
-  const btn = $("docs-toggle");
-  if (btn) btn.textContent = collapsed ? "⇥" : "⇤";
-  if (btn) btn.title = collapsed ? "展开文档列表" : "收起文档列表";
+  syncDocsToggleBtn(collapsed);
 }
 
 // 拖拽把手：按下后跟手改宽度，松开结束。拖拽期间禁用过渡（见 CSS）。
@@ -3466,6 +3482,21 @@ function toggleDocsPanel() {
 function closeDocsPanel() {
   const p = docsPanelEl();
   if (p) p.classList.add("hidden");
+}
+
+// 切会话/新建任务时把文档栏彻底复位：清空列表与内容区并收起面板。
+// 为什么必须显式收起：loadDocsList 在新会话无文档时会清空内容区，
+// 但不会把面板藏起来——若上一个会话正开着文档栏，切过来就会看到
+// 一个「已展开却是空白」的文档栏（像凭空弹出一个空 tab）。
+function resetDocsPanel() {
+  const p = docsPanelEl();
+  if (p) p.classList.add("hidden");
+  const list = $("docs-list");
+  if (list) list.innerHTML = "";
+  const view = $("docs-view");
+  if (view) view.innerHTML = "";
+  const countEl = $("docs-count");
+  if (countEl) countEl.textContent = "0";
 }
 
 // 拉取当前会话文档列表，刷新列表与计数。会话为空（新任务态）时清空。
