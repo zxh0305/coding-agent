@@ -361,6 +361,44 @@ class TestWindowedLoading(StorageTestBase):
         self._seed(5)
         self.assertEqual(len(db.restore_window("s1")), 5)
 
+    def test_window_around_ord_is_index_only(self):
+        """around_ord 窗口【只回 mid/ord/role 三个字段】，绝不带正文。
+
+        这是前端"点定位条冒出一堆空白方块"的契约根源：window 只是定位窗口边界的
+        索引，前端不能拿它直接渲染（content 为空会渲染成 padding 撑起的空气泡，
+        role="tool" 的条目也会漏进时间线）。前端改为按窗口上下界各走一次常规分页，
+        由后端完成过滤与字段组装。此处钉死该契约，防止有人"顺手"把正文塞进来或
+        前端又改回直接渲染 window。
+        """
+        history = []
+        for i in range(6):
+            history.append(user(f"问{i}"))
+            history.append({"role": "assistant", "content": "",
+                            "tool_calls": [{"id": f"c{i}", "type": "function"}]})
+            history.append({"role": "tool", "content": f"结果{i}"})
+            history.append(asst(f"答{i}"))
+        saved = {}
+        db.save_messages("s1", history, saved)
+        target = [m for m in db.get_messages("s1") if m["content"] == "问3"][0]["_ord"]
+
+        win = db.window_around_ord("s1", target, before=5, after=5)
+        self.assertTrue(win)
+        # 每个条目恰好只有这三个键——没有 content/tool_calls/stats/trace
+        for item in win:
+            self.assertEqual(set(item.keys()), {"mid", "ord", "role"})
+        # ord 升序，且窗口内确实混有 tool / 无正文 assistant（正是会变空气泡的那些）
+        self.assertEqual([w["ord"] for w in win], sorted(w["ord"] for w in win))
+        self.assertIn("tool", {w["role"] for w in win})
+
+        # 常规分页（前端实际用来渲染的路径）必须把这些不可渲染条目过滤掉
+        lower, upper = win[0]["ord"], win[-1]["ord"]
+        page = db.get_messages("s1", before_ord=upper + 1, limit=100)
+        renderable = [m for m in page if m.get("role") in ("user", "assistant", "compact")]
+        self.assertEqual({m["role"] for m in renderable}, {"user", "assistant"})
+        # 覆盖窗口下界（前端还要再补一页 lower 之前的上下文）
+        self.assertTrue(any(m["_ord"] == target for m in page))
+        self.assertLessEqual(lower, target)
+
 
 class TestModelViewExpansion(StorageTestBase):
     """模型视图不变式：外置只影响存储与前端，不改变模型看到的内容。"""
