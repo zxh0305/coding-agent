@@ -187,19 +187,25 @@
   <div id="git-pop" class="git-pop hidden">
     <div class="git-head">
       <b>🌿 提交记录</b>
-      <span id="git-branch" class="git-branch mono"></span>
+      <button id="git-branch" class="git-branch mono" title="点击切换分支"></button>
       <button id="git-close" class="git-x" title="关闭">✕</button>
     </div>
     <div class="git-filter">
       <button class="git-fbtn active" data-who="all">全部</button>
       <button class="git-fbtn" data-who="me">我</button>
       <button class="git-fbtn" data-who="other">他人</button>
+      <span id="git-dirty" class="git-dirty"></span>
     </div>
     <div id="git-body" class="git-body"></div>
     <div class="git-foot">
       <span id="git-identity" class="git-id mono"></span>
-      <span id="git-dirty" class="git-dirty"></span>
     </div>
+  </div>
+
+  <!-- 分支切换：浮窗内的二级小面板 -->
+  <div id="git-branch-pop" class="git-branch-pop hidden">
+    <div class="gbp-head">切换分支</div>
+    <div id="git-branch-list" class="gbp-list"></div>
   </div>
 
   <div id="toast" class="toast hidden"></div>

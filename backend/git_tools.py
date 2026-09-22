@@ -105,6 +105,46 @@ def repo_summary(ws: Path) -> dict:
     return {"branch": branch, "dirty": dirty}
 
 
+def branches(ws: Path) -> dict:
+    """本地分支列表 + 当前分支（供浮窗切换）。
+
+    for-each-ref 的 %(refname:short) 给出分支名，%(HEAD) 标出当前分支（"*"）。
+    只列本地分支：远端分支（origin/xxx）数量可能很多，且直接切过去会进
+    分离头指针状态，对"看看代码"这个场景是噪声。
+    """
+    out = _run(ws, ["for-each-ref", "--format=%(HEAD)%(refname:short)",
+                    "refs/heads/"])
+    items, current = [], ""
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        mark, name = line[0], line[1:].strip()
+        if not name:
+            continue
+        if mark == "*":
+            current = name
+        items.append({"name": name, "current": mark == "*"})
+    # 当前分支排最前，其余按名字排序——常用项不用翻
+    items.sort(key=lambda b: (not b["current"], b["name"]))
+    return {"branches": items, "current": current}
+
+
+def checkout(ws: Path, branch: str) -> dict:
+    """切换到指定本地分支。
+
+    这是本模块唯一的【写操作】（会改工作树的 HEAD 与文件）。因此：
+    1. 分支名必须已在本地分支白名单里——不接受任意字符串，杜绝
+       "git checkout <用户输入>" 被当作选项注入（如 -B 新建/覆盖分支）；
+    2. 工作树有未提交改动时 git 自己会拒绝（冲突），错误原样抛给用户看；
+    3. 不做 --force：绝不静默丢弃用户没提交的改动。
+    """
+    names = {b["name"] for b in branches(ws)["branches"]}
+    if branch not in names:
+        raise GitError(f"本地没有分支 {branch}")
+    _run(ws, ["checkout", branch])
+    return {"branch": branch}
+
+
 def _shortstat(text: str) -> tuple[int, int]:
     """从 --shortstat 输出里抠出 (新增行数, 删除行数)。
 
@@ -221,9 +261,25 @@ def show(ws: Path, commit_hash: str) -> dict:
     full, short, an, ae, date, body = parts
     me = identity(ws).get("email", "").lower()
 
-    # --format= 让正文只输出 patch，不带提交头；-U3 是三行上下文的常规 diff
-    patch = _run(ws, ["show", "--format=", "--no-color", "-U3", commit_hash])
+    # --format= 让正文只输出 patch，不带提交头；-U3 是三行上下文的常规 diff。
+    # 关键：merge 提交默认【不产出任何 patch】（git 无法替你在两条父链之间选
+    # 一侧对比），于是详情页空白、用户以为"点了没反应"。用 --first-parent
+    # 取"相对第一父提交"的差异——正是这个分支合并进来带来的改动，符合直觉。
+    # 普通提交加这个选项无副作用。
+    try:
+        patch = _run(ws, ["show", "--format=", "--no-color", "-U3",
+                          "--first-parent", commit_hash])
+    except GitError:
+        patch = ""
     files = _parse_patch(patch)
+
+    # 是否为 merge 提交：%p 是父提交列表，两个以上 = merge
+    try:
+        parents = _run(ws, ["show", "-s", "--pretty=format:%p", commit_hash]).split()
+    except GitError:
+        parents = []
+    is_merge = len(parents) > 1
+
     total = len(files)
     files = files[:MAX_FILES_PER_COMMIT]
 
@@ -235,4 +291,6 @@ def show(ws: Path, commit_hash: str) -> dict:
         "files": files,
         "file_count": total,
         "files_truncated": total > MAX_FILES_PER_COMMIT,
+        "is_merge": is_merge,
+        "parents": parents,
     }

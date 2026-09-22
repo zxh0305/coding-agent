@@ -856,27 +856,30 @@ button.primary:hover { background: #3d69d8; }
 
 .git-pop {
   position: fixed; z-index: 30;
-  width: 460px; max-width: calc(100vw - 32px);
-  max-height: 70vh; display: flex; flex-direction: column;
+  width: 720px; max-width: calc(100vw - 32px);
+  height: min(78vh, 760px); display: flex; flex-direction: column;
   background: #fff; border: 1px solid var(--border); border-radius: 12px;
   box-shadow: 0 10px 36px rgba(20, 25, 40, 0.16);
 }
 .git-head {
   display: flex; align-items: center; gap: 8px;
-  padding: 12px 14px 10px; border-bottom: 1px solid var(--border);
+  padding: 12px 16px 10px; border-bottom: 1px solid var(--border);
 }
-.git-head b { font-size: 13.5px; }
+.git-head b { font-size: 14px; }
+/* 分支名做成可点按钮：点击弹出分支列表切换 */
 .git-branch {
-  font-size: 11px; color: var(--text-3); background: #f2f5fa;
-  padding: 1px 7px; border-radius: 999px;
+  font-size: 11.5px; color: #2c5bd1; background: #eef2ff;
+  padding: 2px 9px; border-radius: 999px; cursor: pointer;
+  border: 1px solid transparent; font-family: ui-monospace, Menlo, Consolas, monospace;
 }
+.git-branch:hover { background: #e2e9fb; border-color: #cdd9f7; }
 .git-x {
   margin-left: auto; border: none; background: transparent;
   color: var(--text-3); font-size: 14px; cursor: pointer; padding: 2px 4px;
 }
 .git-x:hover { color: var(--text-1); }
 
-.git-filter { display: flex; gap: 6px; padding: 8px 14px 4px; }
+.git-filter { display: flex; gap: 6px; align-items: center; padding: 8px 16px 6px; }
 .git-fbtn {
   padding: 3px 10px; font-size: 12px; cursor: pointer;
   background: #f4f6fa; color: var(--text-2);
@@ -955,8 +958,39 @@ button.primary:hover { background: #3d69d8; }
 
 .git-foot {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 8px 14px; border-top: 1px solid var(--border);
+  padding: 8px 16px; border-top: 1px solid var(--border);
   font-size: 11px; color: var(--text-3);
 }
 .git-id { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.git-dirty { color: #b45309; }
+.git-dirty { color: #b45309; margin-left: auto; font-size: 11px; }
+
+/* 分支切换小面板：贴在分支按钮下方 */
+.git-branch-pop {
+  position: fixed; z-index: 40;
+  min-width: 200px; max-width: 320px; max-height: 300px;
+  display: flex; flex-direction: column;
+  background: #fff; border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(20, 25, 40, 0.16); overflow: hidden;
+}
+.gbp-head {
+  padding: 8px 12px 6px; font-size: 11.5px; color: var(--text-3);
+  border-bottom: 1px solid var(--border);
+}
+.gbp-list { overflow-y: auto; padding: 4px; }
+.gbp-item {
+  display: flex; align-items: center; gap: 6px;
+  width: 100%; text-align: left; padding: 6px 10px;
+  font-size: 12.5px; color: var(--text-1); cursor: pointer;
+  background: transparent; border: none; border-radius: 6px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+.gbp-item:hover { background: #f5f7fb; }
+.gbp-item.current { color: #2c5bd1; font-weight: 600; }
+.gbp-item .tick { margin-left: auto; color: #2c5bd1; }
+.gbp-item.busy { opacity: .55; cursor: default; }
+
+/* merge 提交提示：无 diff 时给出说明而不是空白 */
+.git-merge-note {
+  margin: 0 4px 10px; padding: 8px 10px; border-radius: 8px;
+  background: #f4f6fa; color: var(--text-2); font-size: 12px; line-height: 1.6;
+}

@@ -2564,7 +2564,7 @@ function toggleGitPop() {
 function positionGitPop() {
   const pop = $("git-pop"), btn = $("git-chip");
   const rect = btn.getBoundingClientRect();
-  const w = Math.min(460, innerWidth - 32);
+  const w = Math.min(720, innerWidth - 32);
   pop.style.width = w + "px";
   pop.style.left = Math.max(16, Math.min(rect.right - w, innerWidth - w - 16)) + "px";
   pop.style.top = (rect.bottom + 8) + "px";
@@ -2594,7 +2594,9 @@ async function loadGitList(reset = false) {
 
 function renderGitList(data, reset) {
   const body = $("git-body");
-  $("git-branch").textContent = data.branch || "";
+  const branchBtn = $("git-branch");
+  branchBtn.textContent = (data.branch || "") + " ▾";
+  branchBtn.classList.toggle("hidden", !data.ok || !data.branch);
   $("git-chip").classList.toggle("warn", !data.ok);
   // 底部身份行：告诉用户"我"是按哪个 git 身份判定的
   const id = data.identity || {};
@@ -2684,6 +2686,13 @@ async function openGitDetail(hash) {
     b.className = "git-detail-body";
     b.textContent = data.body;
     body.appendChild(b);
+  }
+  // merge 提交：git 默认不产出 patch，这里给出说明而不是留一片空白
+  if (data.is_merge && !(data.files || []).length) {
+    const n = document.createElement("div");
+    n.className = "git-merge-note";
+    n.textContent = `这是合并提交（${(data.parents || []).length} 个父提交）。git 无法自动选一侧对比，本次合并带来的改动请查看被合入的那条提交。`;
+    body.appendChild(n);
   }
   for (const f of data.files || []) body.appendChild(gitFileBlock(f));
   if (data.files_truncated) {
@@ -2790,7 +2799,6 @@ for (const b of document.querySelectorAll(".git-fbtn")) {
 window.addEventListener("resize", () => {
   if (!$("git-pop").classList.contains("hidden")) positionGitPop();
 });
-
 // ---------- 启动 ----------
 function boot() {
   // 登录成功（或刷新后 token 仍有效）后的页面初始化；切用户时先清现场

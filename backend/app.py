@@ -83,6 +83,8 @@ from agent import Agent
 from code_tools import prepare_workspace
 from events import SSE_HEARTBEAT, SessionEvents, sse_frame
 from git_tools import GitError, repo_summary
+from git_tools import branches as git_branches
+from git_tools import checkout as git_checkout
 from git_tools import identity as git_identity
 from git_tools import log as git_log
 from git_tools import show as git_show
@@ -774,6 +776,8 @@ class Handler(SimpleHTTPRequestHandler):
                 self._handle_perm_mode(sid)
             elif self.path == "/api/workspace":
                 self._handle_workspace_set()
+            elif self.path == "/api/git/checkout":
+                self._handle_git_checkout()
             else:
                 self._json({"error": "未知接口"}, 404)
         except json.JSONDecodeError as e:
@@ -1112,12 +1116,40 @@ class Handler(SimpleHTTPRequestHandler):
                 if not _GIT_HASH_RE.fullmatch(commit_hash):
                     return self._json({"error": "非法的提交 hash"}, 400)
                 return self._json({"ok": True, **git_show(ws, commit_hash)})
+            if path == "/api/git/branches":
+                return self._json({"ok": True, **git_branches(ws)})
             return self._json({"error": "未知的 git 接口"}, 404)
         except GitError as e:
             # 不是仓库 / 空仓库（无提交）等都从这里出去：前端显示提示文案，
             # 不是错误弹窗——"这个文件夹不是 git 仓库"是正常状态而非故障
             return self._json({"ok": False, "reason": "not_repo",
                                "error": str(e)}, 200)
+
+    def _handle_git_checkout(self):
+        """切换工作区所在仓库的分支（本模块唯一的 git 写操作）。
+
+        分支名必须已在本地分支白名单里（git_tools.checkout 里校验），因此
+        不接受任意字符串；工作树有未提交改动时 git 会拒绝并原样报错——
+        绝不 --force 丢弃用户的改动。
+        """
+        body = self._body()
+        sid = str(body.get("session_id") or "")
+        if sid and db.session_owner(sid) != self.user["id"]:
+            return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+        ws = _resolve_workspace(self.user["id"], sid)
+        if ws is None:
+            return self._json({"ok": False, "reason": "no_workspace",
+                               "error": "该任务还没有绑定项目文件夹"}, 200)
+        branch = str(body.get("branch") or "").strip()
+        if not branch:
+            return self._json({"error": "branch 不能为空"}, 400)
+        try:
+            git_checkout(ws, branch)
+            return self._json({"ok": True, **repo_summary(ws),
+                               **git_branches(ws)})
+        except GitError as e:
+            # 未提交改动冲突 / 分支不存在等：把 git 的原话给用户看
+            return self._json({"ok": False, "error": str(e)}, 200)
 
     def _handle_session_artifact(self, sid: str):
         """读取本任务外置归档的完整消息。路径校验双保险：
