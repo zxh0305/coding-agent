@@ -617,7 +617,22 @@ async function switchSession(id) {
   await loadSessions();
   await refreshCtx();
   loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换（内部顺带拉权限模式）
+  closeGitPop();    // 工作区变了，旧的提交列表不再对应当前项目
   dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
+}
+
+// 关闭 Git 浮窗并清掉上一次的内容：切换任务/工作区后，列表已失效。
+// 不保留滚动位置与筛选态——重新打开时重新拉，避免展示别的项目的提交。
+function closeGitPop() {
+  const pop = $("git-pop");
+  if (!pop) return;
+  pop.classList.add("hidden");
+  $("git-body").innerHTML = "";
+  $("git-branch").textContent = "";
+  $("git-identity").textContent = "";
+  $("git-dirty").textContent = "";
+  gitOffset = 0;
+  gitWho = "all";
 }
 
 async function loadHistoryPage() {
@@ -2493,7 +2508,7 @@ async function logoutNow() {
 }
 document.addEventListener("click", (e) => {
   // 点弹窗外空白处关闭浮动层
-  for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"]]) {
+  for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"]]) {
     const el = $(pop);
     if (!el.classList.contains("hidden") && !el.contains(e.target) && !e.target.closest?.("#" + btn)) {
       el.classList.add("hidden");
@@ -2517,6 +2532,264 @@ function addProv() {
   renderModelRows();
   $("p-name").focus();
 }
+
+// ---------- Git 提交记录浮窗 ----------
+// 数据源是后端 /api/git/*（只读，不过权限闸门）；工作区由 session_id 决定，
+// 所以浮窗看到的始终是"当前任务真正在操作的目录"。
+// 交互：列表 ↔ 详情两级，同一个浮窗内切换（返回按钮回到列表）。
+let gitWho = "all";        // 筛选：all | me | other
+let gitOffset = 0;         // 已加载条数（向上翻页游标）
+const GIT_PAGE = 30;
+let gitLoading = false;
+
+function gitQs(extra = {}) {
+  const qs = new URLSearchParams();
+  if (currentSession) qs.set("session_id", currentSession);
+  for (const [k, v] of Object.entries(extra)) qs.set(k, v);
+  return qs.toString();
+}
+
+function toggleGitPop() {
+  const pop = $("git-pop");
+  if (!pop.classList.contains("hidden")) { pop.classList.add("hidden"); return; }
+  positionGitPop();
+  pop.classList.remove("hidden");
+  gitWho = "all";
+  syncGitFilter();
+  gitOffset = 0;
+  loadGitList(true);
+}
+
+// 浮窗贴在触发按钮下方；右侧留 16px 边距，避免贴边
+function positionGitPop() {
+  const pop = $("git-pop"), btn = $("git-chip");
+  const rect = btn.getBoundingClientRect();
+  const w = Math.min(460, innerWidth - 32);
+  pop.style.width = w + "px";
+  pop.style.left = Math.max(16, Math.min(rect.right - w, innerWidth - w - 16)) + "px";
+  pop.style.top = (rect.bottom + 8) + "px";
+}
+
+function syncGitFilter() {
+  for (const b of document.querySelectorAll(".git-fbtn")) {
+    b.classList.toggle("active", b.dataset.who === gitWho);
+  }
+}
+
+async function loadGitList(reset = false) {
+  if (gitLoading) return;
+  gitLoading = true;
+  const body = $("git-body");
+  if (reset) body.innerHTML = '<div class="git-loading">加载中…</div>';
+  try {
+    const qs = gitQs({ limit: GIT_PAGE, offset: gitOffset, author: gitWho });
+    const data = await api("/api/git/log?" + qs);
+    renderGitList(data, reset);
+  } catch (e) {
+    body.innerHTML = `<div class="git-empty">加载失败：${esc(e.message)}</div>`;
+  } finally {
+    gitLoading = false;
+  }
+}
+
+function renderGitList(data, reset) {
+  const body = $("git-body");
+  $("git-branch").textContent = data.branch || "";
+  $("git-chip").classList.toggle("warn", !data.ok);
+  // 底部身份行：告诉用户"我"是按哪个 git 身份判定的
+  const id = data.identity || {};
+  $("git-identity").textContent = id.email ? `本机身份：${id.name || id.email}` : "";
+  $("git-dirty").textContent = data.dirty ? `${data.dirty} 处未提交改动` : "";
+
+  if (!data.ok) {
+    // not_repo / no_workspace：都是正常状态，给引导文案而非报错
+    body.innerHTML = `<div class="git-empty">${esc(data.error || "无法读取 Git 信息")}</div>`;
+    return;
+  }
+  const commits = data.commits || [];
+  if (reset) body.innerHTML = "";
+  if (!commits.length) {
+    const tip = gitWho === "me" ? "没有你提交的记录"
+              : gitWho === "other" ? "没有他人提交的记录"
+              : "这个仓库还没有提交";
+    body.innerHTML = `<div class="git-empty">${tip}</div>`;
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const c of commits) frag.appendChild(gitRow(c));
+  body.appendChild(frag);
+  gitOffset += commits.length;
+  // 还有更多就挂一个"加载更多"（滚到底自动触发）
+  if (commits.length >= GIT_PAGE) {
+    const more = document.createElement("button");
+    more.className = "git-row git-more";
+    more.textContent = "加载更多…";
+    more.onclick = () => loadGitList(false);
+    body.appendChild(more);
+  }
+}
+
+function gitRow(c) {
+  const row = document.createElement("button");
+  row.className = "git-row";
+  const l1 = document.createElement("div");
+  l1.className = "git-row-l1";
+  const hash = document.createElement("span");
+  hash.className = "git-row-hash";
+  hash.textContent = c.short;
+  const author = document.createElement("span");
+  author.className = "git-row-author";
+  author.textContent = c.author;
+  const date = document.createElement("span");
+  date.className = "git-row-date";
+  date.textContent = gitTimeAgo(c.date);
+  l1.append(hash, author);
+  if (c.mine) {
+    const mine = document.createElement("span");
+    mine.className = "git-mine";
+    mine.textContent = "我";
+    l1.appendChild(mine);
+  }
+  l1.appendChild(date);
+
+  const subj = document.createElement("div");
+  subj.className = "git-row-subj";
+  subj.textContent = c.subject || "(无提交信息)";
+  // 增删行数：贴在同一行右侧（小字、红绿）
+  if (c.added || c.removed) {
+    const stat = document.createElement("span");
+    stat.className = "git-row-stat";
+    stat.innerHTML = `<span class="add">+${c.added}</span> <span class="del">−${c.removed}</span>`;
+    subj.appendChild(stat);
+  }
+  row.append(l1, subj);
+  row.onclick = () => openGitDetail(c.hash);
+  return row;
+}
+
+async function openGitDetail(hash) {
+  const body = $("git-body");
+  body.innerHTML = '<div class="git-loading">加载提交详情…</div>';
+  let data;
+  try {
+    data = await api("/api/git/show?" + gitQs({ hash }));
+  } catch (e) {
+    body.innerHTML = `<div class="git-empty">加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  body.innerHTML = "";
+  body.appendChild(gitDetailHead(data));
+  if (data.body) {
+    const b = document.createElement("div");
+    b.className = "git-detail-body";
+    b.textContent = data.body;
+    body.appendChild(b);
+  }
+  for (const f of data.files || []) body.appendChild(gitFileBlock(f));
+  if (data.files_truncated) {
+    const m = document.createElement("div");
+    m.className = "git-more";
+    m.textContent = `（共 ${data.file_count} 个文件，仅显示前 ${(data.files || []).length} 个）`;
+    body.appendChild(m);
+  }
+  body.scrollTop = 0;
+}
+
+function gitDetailHead(data) {
+  const head = document.createElement("div");
+  head.className = "git-detail-head";
+  const back = document.createElement("button");
+  back.className = "git-back";
+  back.textContent = "← 返回";
+  back.onclick = () => { gitOffset = 0; loadGitList(true); };
+  const meta = document.createElement("span");
+  meta.className = "git-detail-meta";
+  meta.textContent = `${data.short} · ${data.author} · ${gitTimeAgo(data.date)}`;
+  head.append(back, meta);
+  return head;
+}
+
+// 单个文件的 diff 块：复用执行过程里那套 .diff / .diff-line 样式，
+// 保证"写入卡"和"提交详情"两处的红绿观感一致。
+function gitFileBlock(f) {
+  const box = document.createElement("div");
+  box.className = "git-file";
+  const head = document.createElement("div");
+  head.className = "git-file-head";
+  const p = document.createElement("span");
+  p.className = "path";
+  p.textContent = f.path;
+  const st = document.createElement("span");
+  st.className = "stat";
+  st.innerHTML = `<span class="add">+${f.added}</span> <span class="del">−${f.removed}</span>`;
+  head.append(p, st);
+  box.appendChild(head);
+
+  const diff = document.createElement("div");
+  diff.className = "diff";
+  for (const h of f.hunks || []) {
+    const hh = document.createElement("div");
+    hh.className = "git-hunk-head";
+    hh.textContent = h.header;
+    diff.appendChild(hh);
+    for (const ln of h.lines || []) {
+      const row = document.createElement("div");
+      row.className = "diff-line " + ln.t;
+      const mark = document.createElement("span");
+      mark.className = "diff-sign";
+      mark.textContent = ln.t === "add" ? "+" : ln.t === "del" ? "−" : " ";
+      const txt = document.createElement("span");
+      txt.className = "diff-text";
+      txt.textContent = ln.text || " ";
+      row.append(mark, txt);
+      diff.appendChild(row);
+    }
+  }
+  if (f.truncated) {
+    const t = document.createElement("div");
+    t.className = "git-more";
+    t.textContent = "（该文件改动过大，仅显示前部分）";
+    diff.appendChild(t);
+  }
+  box.appendChild(diff);
+  return box;
+}
+
+// 提交时间的相对表达：今天显示时刻，昨天/更早显示天数（git 给的是 ISO 串）
+function gitTimeAgo(iso) {
+  if (!iso) return "";
+  const t = new Date(iso);
+  if (isNaN(t)) return iso;
+  const diff = (Date.now() - t.getTime()) / 1000;
+  if (diff < 60) return "刚刚";
+  if (diff < 3600) return Math.floor(diff / 60) + " 分钟前";
+  if (diff < 86400) return Math.floor(diff / 3600) + " 小时前";
+  if (diff < 86400 * 7) return Math.floor(diff / 86400) + " 天前";
+  return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`;
+}
+
+// 纯文本转义：提交信息/文件名都是仓库里的外部内容，一律走 textContent 或
+// 转义后再拼——绝不把未转义字符串塞进 innerHTML。
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// 触发按钮与筛选按钮的事件绑定
+$("git-chip").addEventListener("click", toggleGitPop);
+$("git-close").addEventListener("click", () => $("git-pop").classList.add("hidden"));
+for (const b of document.querySelectorAll(".git-fbtn")) {
+  b.addEventListener("click", () => {
+    gitWho = b.dataset.who;
+    syncGitFilter();
+    gitOffset = 0;
+    loadGitList(true);
+  });
+}
+window.addEventListener("resize", () => {
+  if (!$("git-pop").classList.contains("hidden")) positionGitPop();
+});
 
 // ---------- 启动 ----------
 function boot() {

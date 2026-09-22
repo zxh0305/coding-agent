@@ -47,6 +47,7 @@
 
     <!-- 主区：对话 + 输入框工具栏 -->
     <main class="main">
+      <button id="git-chip" class="git-chip" title="查看当前项目文件夹的 Git 提交记录">🌿 <span>Git</span></button>
       <div id="chat" class="chat"></div>
 
       <div class="composer">
@@ -180,6 +181,25 @@
     <div class="perm-row" data-mode="readonly"><b>🔍 只读</b><span class="hint">看代码可以，写文件与执行命令每一步都先确认</span></div>
     <div class="perm-row" data-mode="confirm"><b>🛡 确认</b><span class="hint">日常操作自动放行，删除/推送等高危操作先确认</span></div>
     <div class="perm-row" data-mode="yolo"><b>⚡ 完全访问</b><span class="hint">全部放行，不再弹确认卡（工作区外的路径仍拒绝）</span></div>
+  </div>
+
+  <!-- Git 提交记录浮窗：右上角触发，列表 ↔ 详情两级 -->
+  <div id="git-pop" class="git-pop hidden">
+    <div class="git-head">
+      <b>🌿 提交记录</b>
+      <span id="git-branch" class="git-branch mono"></span>
+      <button id="git-close" class="git-x" title="关闭">✕</button>
+    </div>
+    <div class="git-filter">
+      <button class="git-fbtn active" data-who="all">全部</button>
+      <button class="git-fbtn" data-who="me">我</button>
+      <button class="git-fbtn" data-who="other">他人</button>
+    </div>
+    <div id="git-body" class="git-body"></div>
+    <div class="git-foot">
+      <span id="git-identity" class="git-id mono"></span>
+      <span id="git-dirty" class="git-dirty"></span>
+    </div>
   </div>
 
   <div id="toast" class="toast hidden"></div>
