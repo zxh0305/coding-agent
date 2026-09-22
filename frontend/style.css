@@ -962,8 +962,14 @@ button.primary:hover { background: #3d69d8; }
   font-size: 10.5px; color: #7b86a0; background: #f4f6fa;
   padding: 2px 8px; border-radius: 4px; margin: 6px 0 2px;
 }
-.git-more { font-size: 11px; color: var(--text-3); padding: 4px 8px; }
-
+.git-more {
+  display: block; width: 100%; text-align: center;
+  font-size: 11.5px; color: var(--text-3); padding: 8px;
+  background: transparent; border: none; border-radius: 8px; cursor: pointer;
+}
+.git-more:hover { background: #f5f7fb; color: var(--text-2); }
+/* 截断提示（文件数过多 / 单文件 diff 过长）：纯说明文字，不是按钮 */
+.git-more-note { font-size: 11px; color: var(--text-3); padding: 4px 8px; }
 .git-foot {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 16px; border-top: 1px solid var(--border);

@@ -2612,7 +2612,9 @@ async function loadGitList(reset = false) {
     const data = await api("/api/git/log?" + qs);
     renderGitList(data, reset);
   } catch (e) {
-    body.innerHTML = `<div class="git-empty">加载失败：${esc(e.message)}</div>`;
+    // 追加失败时不能把已有内容清空：只提示，保留用户已看到的列表
+    if (reset) body.innerHTML = `<div class="git-empty">加载失败：${esc(e.message)}</div>`;
+    else toast("加载更多失败：" + e.message);
   } finally {
     gitLoading = false;
   }
@@ -2644,14 +2646,18 @@ function renderGitList(data, reset) {
     body.innerHTML = `<div class="git-empty">${tip}</div>`;
     return;
   }
+  // 追加前先摘掉上一页遗留的"加载更多"：否则每次翻页都会再挂一个，
+  // 按钮越堆越多（旧按钮还指向过期的 offset）
+  const oldMore = body.querySelector(".git-more");
+  if (oldMore) oldMore.remove();
   const frag = document.createDocumentFragment();
   for (const c of commits) frag.appendChild(gitRow(c));
   body.appendChild(frag);
   gitOffset += commits.length;
-  // 还有更多就挂一个"加载更多"（滚到底自动触发）
+  // 本页取满一页才可能还有下一页（取不满说明已到尾部）
   if (commits.length >= GIT_PAGE) {
     const more = document.createElement("button");
-    more.className = "git-row git-more";
+    more.className = "git-more";
     more.textContent = "加载更多…";
     more.onclick = (e) => { e.stopPropagation(); loadGitList(false); };
     body.appendChild(more);
@@ -2728,7 +2734,7 @@ async function openGitDetail(hash) {
   for (const f of data.files || []) body.appendChild(gitFileBlock(f));
   if (data.files_truncated) {
     const m = document.createElement("div");
-    m.className = "git-more";
+    m.className = "git-more-note";
     m.textContent = `（共 ${data.file_count} 个文件，仅显示前 ${(data.files || []).length} 个）`;
     body.appendChild(m);
   }
@@ -2787,7 +2793,7 @@ function gitFileBlock(f) {
   }
   if (f.truncated) {
     const t = document.createElement("div");
-    t.className = "git-more";
+    t.className = "git-more-note";
     t.textContent = "（该文件改动过大，仅显示前部分）";
     diff.appendChild(t);
   }
