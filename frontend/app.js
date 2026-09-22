@@ -811,11 +811,18 @@ async function loadWindowAround(ord) {
     const lower = win[0].ord;
     const page = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?` +
       new URLSearchParams({ before_ord: String(lower), limit: "100" }));
-    // 关键：目标 ord 所在的那页（win）本身必须插进 DOM，否则 railFindNode 永远
-    // 找不到目标 mid。之前只插了 before_ord 页（窗口之前），目标消息从未进入
-    // 时间线——这正是「点击定位条提示还没加载出来」的根因。
+    // 目标所在的那一段必须也进 DOM，否则 railFindNode 永远找不到目标 mid。
+    // 注意：around_ord 返回的 window 每条只有 {mid, ord, role}——【没有正文、
+    // tool_calls、stats、trace】，它只是用来定位窗口边界的索引。绝不能把 win 直接
+    // 丢进渲染列表：那样每条都会因 content 为空渲染成空气泡（.bubble 的 padding
+    // 会撑出一个白色圆角方块），且 role="tool" 的条目也会漏进时间线——这正是
+    // 「点定位条冒出一堆空白方块」的根因。
+    // 正确做法：拿窗口上界再走一次常规分页，由后端完成与首屏一致的过滤与字段组装。
+    const upper = win[win.length - 1].ord;
+    const page2 = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?` +
+      new URLSearchParams({ before_ord: String(upper + 1), limit: "100" }));
     // 合并两段、按 ord 升序、按 mid 去重（避免与已加载区间重叠重复渲染）。
-    const merged = [...(page.messages || []), ...win];
+    const merged = [...(page.messages || []), ...(page2.messages || [])];
     const seen = new Set();
     const toAdd = [];
     for (const m of merged) {
