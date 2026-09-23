@@ -940,7 +940,12 @@ button.primary:hover { background: var(--accent-hover); }
 .lb-nav:hover { background: rgba(255, 255, 255, .3); }
 .lb-nav:first-child { left: 18px; }
 .lb-nav:nth-child(3) { right: 18px; }  /* prev, img, next 固定次序 */
-.bubble.user .att-file { color: rgba(255, 255, 255, 0.92); }
+/* 用户气泡（品牌色底）里的文件名：白字 + 胶囊卡片（见 .att-file.clickable）。
+   历史回放里 kind:"file" 的附件走同一 DOM 结构，同一套样式生效 */
+.bubble.user .att-file {
+  color: rgba(255, 255, 255, 0.95);
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.08);
+}
 
 /* 生成期间排队的消息卡片 */
 .bubble.user.queued { opacity: 0.88; border: 1px dashed rgba(255, 255, 255, 0.6); }
@@ -1123,6 +1128,8 @@ button.primary:hover { background: var(--accent-hover); }
   height: min(78vh, 760px); display: flex; flex-direction: column;
   background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
   box-shadow: var(--shadow-md);
+  /* 与 attach-pop 同一套打开动画（keyframes 定义在 .attach-pop 处） */
+  animation: attach-pop-in .16s ease-out;
 }
 .git-head {
   display: flex; align-items: center; gap: 8px;
@@ -1280,6 +1287,12 @@ button.primary:hover { background: var(--accent-hover); }
   height: min(72vh, 680px); display: flex; flex-direction: column;
   background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
   box-shadow: var(--shadow-md);
+  /* 打开时的"缓冲"：淡入 + 从下方 6px 浮起（160ms），关闭时无动画直接消失 */
+  animation: attach-pop-in .16s ease-out;
+}
+@keyframes attach-pop-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 .attach-head {
   display: flex; align-items: center; gap: 8px;
@@ -1322,9 +1335,27 @@ button.primary:hover { background: var(--accent-hover); }
 .attach-empty {
   font-size: 12.5px; color: var(--text-3); line-height: 1.7; padding: 8px 2px;
 }
-/* 气泡里的附件文件名做成可点（打开上面的浮窗） */
-.att-file.clickable { cursor: pointer; }
-.att-file.clickable:hover { color: var(--link); text-decoration: underline; }
+/* 气泡里的附件文件名做成可点的小卡片（打开上面的浮窗）：
+   半透明白底在蓝/白两种气泡底上都成立，比裸文本更像"一个东西" */
+.att-file.clickable {
+  cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-top: 7px; padding: 6px 12px;
+  max-width: 100%;
+  background: rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 8px;
+  font-size: 12.5px; line-height: 1.4;
+  transition: background .16s ease, border-color .16s ease,
+              transform .16s ease, box-shadow .16s ease;
+}
+.att-file.clickable:hover {
+  background: rgba(255, 255, 255, 0.26);
+  border-color: rgba(255, 255, 255, 0.45);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.10);
+}
+.att-file.clickable:active { transform: translateY(0); box-shadow: none; }
 
 /* ---------- 右侧文档栏 ---------- */
 /* 与主区【并列】的一列（不是浮层）：展开时主区真的变窄，而不是被盖住。
