@@ -286,13 +286,35 @@ function renderMarkdown(src) {
     if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length
         && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
       flushPara();
-      const parseRow = (ln) => ln.trim().replace(/^\|/, "").replace(/\|$/, "")
-        .split("|").map((c) => c.trim());
+      // 按 Markdown 规范切单元格：只有"裸"的 | 才是列分隔符。
+      // 两种情况下的 | 是字面量、不能切：① 被反斜杠转义的 \|；
+      // ② 处在行内代码 `...` 内部（如 `grep ERROR | sort`）。
+      // 早期版本直接 split("|")，会把代码里的管道符切成多余列，导致整行错位。
+      const parseRow = (ln) => {
+        const s = ln.trim();
+        const cells = [];
+        let buf = "", inCode = false;
+        // 去掉首尾的框线 |（若存在），逐字符扫描
+        const start = s.startsWith("|") ? 1 : 0;
+        const end = s.endsWith("|") && s.length - 1 > start ? s.length - 1 : s.length;
+        for (let k = start; k < end; k += 1) {
+          const ch = s[k];
+          if (ch === "\\" && s[k + 1] === "|") { buf += "|"; k += 1; continue; }
+          if (ch === "`") { inCode = !inCode; buf += ch; continue; }
+          if (ch === "|" && !inCode) { cells.push(buf.trim()); buf = ""; continue; }
+          buf += ch;
+        }
+        cells.push(buf.trim());
+        return cells;
+      };
+      // 表头列数作为基准，后续行按它补齐/截断，避免参差的行撑坏布局
+      const header = parseRow(line);
+      const ncol = header.length;
       const tbl = document.createElement("table");
       tbl.className = "md-table";
       const thead = document.createElement("thead");
       const htr = document.createElement("tr");
-      for (const cell of parseRow(line)) {
+      for (const cell of header) {
         const th = document.createElement("th");
         th.appendChild(renderInline(cell));
         htr.appendChild(th);
@@ -303,16 +325,21 @@ function renderMarkdown(src) {
       i += 2;  // 跳过表头与分隔行
       while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) {
         const tr = document.createElement("tr");
-        for (const cell of parseRow(lines[i])) {
+        const cells = parseRow(lines[i]);
+        for (let c = 0; c < ncol; c += 1) {
           const td = document.createElement("td");
-          td.appendChild(renderInline(cell));
+          td.appendChild(renderInline(cells[c] != null ? cells[c] : ""));
           tr.appendChild(td);
         }
         tbody.appendChild(tr);
         i += 1;
       }
       tbl.appendChild(tbody);
-      root.appendChild(tbl);
+      // 外层包一个滚动容器：列多/内容宽时横向滚动，避免把气泡撑破
+      const wrap = document.createElement("div");
+      wrap.className = "md-table-wrap";
+      wrap.appendChild(tbl);
+      root.appendChild(wrap);
       continue;
     }
 

@@ -245,6 +245,23 @@ body {
   user-select: none;
 }
 
+/* 表格：气泡宽度只有 76%，模型输出的表格列又常含长句。这里用 fixed 布局 +
+   按比例分配列宽 + 单元格内换行，让长内容在格内折行，而不是把表格撑出气泡。
+   外层用 .md-table-wrap 提供横向滚动兜底（列多时不挤压列宽）。 */
+.bubble.md .md-table-wrap { margin: 0 0 8px; overflow-x: auto; }
+.bubble.md .md-table {
+  border-collapse: collapse; width: 100%; font-size: 13px;
+  table-layout: fixed;
+}
+.bubble.md .md-table th,
+.bubble.md .md-table td {
+  border: 1px solid var(--border); padding: 5px 8px;
+  text-align: left; vertical-align: top;
+  word-break: break-word; overflow-wrap: anywhere;
+  white-space: normal;
+}
+.bubble.md .md-table th { background: #f4f6fa; font-weight: 600; }
+
 /* 空会话占位：居中浅色提示，不占对话气泡的视觉重量 */
 .empty-hint {
   align-self: center; margin-top: 18vh;
