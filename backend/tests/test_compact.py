@@ -317,5 +317,157 @@ class TestMaybeCompact(CompactTestBase):
         self.assertEqual(llm.calls, [])
 
 
+# ---------------------------------------------------------------------------
+# 分级压缩第一档：清旧工具结果（无损）
+# ---------------------------------------------------------------------------
+
+from agent import (CLEAR_TOOL_RESULTS_KEEP_RECENT, CLEARED_TOOL_RESULT_PLACEHOLDER,
+                   CLEAR_TOOL_RESULTS_MIN_SAVING)
+
+
+class ClearOldToolResultsTest(CompactTestBase):
+    """_clear_old_tool_results：只清较早的工具结果，保留骨架与最近几条。"""
+
+    def _history_with_tools(self, n_tools, body_len=1000):
+        """构造 n_tools 组「用户 → 助手调工具 → 工具结果」的历史。"""
+        hist = [user("开始干活")]
+        for i in range(n_tools):
+            hist.append(tool_call_asst(call_id=f"c{i}"))
+            hist.append(tool_result("x" * body_len, call_id=f"c{i}"))
+        return hist
+
+    def test_clears_old_keeps_recent(self):
+        """超出保留数的旧工具结果被清，最近 KEEP_RECENT 条原样保留。"""
+        n = CLEAR_TOOL_RESULTS_KEEP_RECENT + 3
+        hist = self._history_with_tools(n)
+        agent = self.make_agent(history=hist)
+
+        cleared = agent._clear_old_tool_results()
+        self.assertEqual(cleared, 3)
+
+        tool_msgs = [m for m in agent.history if m.get("role") == "tool"]
+        self.assertEqual(len(tool_msgs), n)  # 一条都没删（删了会 400）
+        cleared_msgs = [m for m in tool_msgs if m["content"] == CLEARED_TOOL_RESULT_PLACEHOLDER]
+        self.assertEqual(len(cleared_msgs), 3)  # 恰好清了最老 3 条
+        # 最近 KEEP_RECENT 条正文完好
+        for m in tool_msgs[-CLEAR_TOOL_RESULTS_KEEP_RECENT:]:
+            self.assertEqual(m["content"], "x" * 1000)
+
+    def test_keeps_skeleton_for_api_pairing(self):
+        """清的是 content，role/tool_call_id 必须原样——否则悬空消息被服务商拒收。"""
+        n = CLEAR_TOOL_RESULTS_KEEP_RECENT + 2
+        hist = self._history_with_tools(n)
+        agent = self.make_agent(history=hist)
+        agent._clear_old_tool_results()
+        for i, m in enumerate([m for m in agent.history if m.get("role") == "tool"]):
+            self.assertEqual(m["tool_call_id"], f"c{i}")
+            self.assertIn("role", m)
+
+    def test_cleared_marker_stripped_before_sending(self):
+        """清理标记 _tool_result_cleared 带下划线前缀，发给模型前必须被剥离。"""
+        n = CLEAR_TOOL_RESULTS_KEEP_RECENT + 2
+        hist = self._history_with_tools(n)
+        agent = self.make_agent(history=hist)
+        agent._clear_old_tool_results()
+        for m in agent._messages_for_model():
+            self.assertNotIn("_tool_result_cleared", m)
+            self.assertFalse(any(k.startswith("_") for k in m))
+
+    def test_idempotent(self):
+        """反复调用不重复计数、不破坏已清的占位符。"""
+        n = CLEAR_TOOL_RESULTS_KEEP_RECENT + 3
+        hist = self._history_with_tools(n)
+        agent = self.make_agent(history=hist)
+        first = agent._clear_old_tool_results()
+        second = agent._clear_old_tool_results()
+        self.assertEqual(first, 3)
+        self.assertEqual(second, 0)  # 已清过，无事可做
+
+    def test_too_few_tools_noop(self):
+        """工具结果不超过保留数：一条都不清。"""
+        hist = self._history_with_tools(CLEAR_TOOL_RESULTS_KEEP_RECENT)
+        agent = self.make_agent(history=hist)
+        self.assertEqual(agent._clear_old_tool_results(), 0)
+        self.assertTrue(all(m["content"] == "x" * 1000
+                            for m in agent.history if m.get("role") == "tool"))
+
+    def test_small_saving_noop(self):
+        """省的字符不到阈值：不动手，保护原始内容。"""
+        hist = self._history_with_tools(CLEAR_TOOL_RESULTS_KEEP_RECENT + 2, body_len=10)
+        agent = self.make_agent(history=hist)
+        self.assertEqual(agent._clear_old_tool_results(), 0)
+
+    def test_skips_messages_before_boundary(self):
+        """边界之前的工具结果本就不在模型视图里，不该被清（清了也白清）。"""
+        hist = self._history_with_tools(CLEAR_TOOL_RESULTS_KEEP_RECENT + 4)
+        hist.insert(1, boundary("旧摘要"))
+        agent = self.make_agent(history=hist)
+        agent._clear_old_tool_results()
+        # 边界之前的工具结果原样保留
+        before = [m for m in agent.history[2:] if m.get("role") == "tool"]
+        # 只统计边界之后的：清理只应发生在边界之后
+        idx_boundary = next(i for i, m in enumerate(agent.history) if m.get("role") == "compact")
+        after = [m for m in agent.history[idx_boundary + 1:] if m.get("role") == "tool"]
+        cleared_after = [m for m in after if m["content"] == CLEARED_TOOL_RESULT_PLACEHOLDER]
+        self.assertEqual(len(cleared_after), 4)
+        # 边界之前的（若存在）没被动过
+        for m in agent.history[:idx_boundary]:
+            if m.get("role") == "tool":
+                self.assertNotEqual(m["content"], CLEARED_TOOL_RESULT_PLACEHOLDER)
+
+    def test_invalidates_token_ratio(self):
+        """清理改变了字符量 → 校准系数作废（与压缩同一理由）。"""
+        n = CLEAR_TOOL_RESULTS_KEEP_RECENT + 3
+        hist = self._history_with_tools(n)
+        agent = self.make_agent(history=hist)
+        agent._token_ratio = 0.42
+        agent._clear_old_tool_results()
+        self.assertIsNone(agent._token_ratio)
+
+
+class TieredCompactionTest(CompactTestBase):
+    """_maybe_compact 的分级行为：能靠清工具结果解决就不动摘要。"""
+
+    def test_clear_alone_suffices_no_summary(self):
+        """清完工具结果就降到阈值以下 → 不调用 LLM 总结、不产 compressed 事件。"""
+        # 造一个"清掉工具结果就能达标"的场景：足够多的中等工具结果，
+        # 清掉较早那批后总量落到阈值以下（保留的最近 8 条仍占着）。
+        n = CLEAR_TOOL_RESULTS_KEEP_RECENT + 8   # 清 8 条、留 8 条
+        hist = [user("任务")]
+        for i in range(n):
+            hist.append(tool_call_asst(call_id=f"c{i}"))
+            hist.append(tool_result("x" * 3000, call_id=f"c{i}"))
+        llm = FakeLLM()
+        agent = self.make_agent(history=hist, llm=llm, context_window=27000)
+        agent.cancel_event = threading.Event()  # _maybe_compact 收尾会读它
+
+        est0 = sum(agent.context_stats().values())
+        self.assertGreater(est0, 27000 * 0.8, "前置：原始应超阈值")
+
+        result = agent._maybe_compact()
+        self.assertIsNone(result, "清工具结果已够，不该再摘要")
+        self.assertEqual(llm.calls, [], "不该发起总结调用")
+
+        # 确实清了较早那批
+        cleared = [m for m in agent.history
+                   if m.get("role") == "tool" and m["content"] == CLEARED_TOOL_RESULT_PLACEHOLDER]
+        self.assertEqual(len(cleared), 8)
+
+    def test_still_over_threshold_then_summarizes(self):
+        """清完仍超阈值 → 继续走摘要（有损那一档）。"""
+        hist = [user("任务")]
+        for i in range(12):
+            hist.append(tool_call_asst(call_id=f"c{i}"))
+            hist.append(tool_result("x" * 4000, call_id=f"c{i}"))
+        hist.append(asst("收尾说明" * 500))
+        llm = FakeLLM()
+        agent = self.make_agent(history=hist, llm=llm, context_window=2000)
+        agent.cancel_event = threading.Event()
+        result = agent._maybe_compact()
+        self.assertIsNotNone(result, "清完仍超阈值，应当摘要")
+        self.assertIn("summary", result)
+        self.assertTrue(llm.calls, "应当发起过总结调用")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

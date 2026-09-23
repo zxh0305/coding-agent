@@ -61,6 +61,20 @@ COMPACT_MIN_SEGMENT = 4   # 可压缩段最少几条消息：太短说明刚压�
 
 COMPACT_SUMMARY_NOTE = "【早期对话已压缩】以下是更早历史的摘要，替代原始消息（原文仍存于数据库）："
 
+# ── 分级压缩：先"清旧工具结果"（无损），仍超再摘要（有损）────────────────
+# 背景：工具结果（read_file 的全文、run_bash 的输出、grep 的命中列表）往往
+# 是上下文里最占地方的部分，但它们的价值随轮次迅速衰减——模型看完就用了，
+# 之后很少回头再读。相比之下，"摘要"会把任务目标、改动清单一起重写，是有损
+# 的。所以分级：超阈值先做便宜的清理，清理后仍超阈值才动摘要。
+#
+# 清理规则：保留最近 KEEP_RECENT 条工具结果原样（模型的工作记忆），更早的
+# 把正文换成一行占位符。注意【不能删消息本身】——tool 消息与前面的
+# assistant.tool_calls 是配对的，删了会出现"没有请求却冒出结果"的悬空消息，
+# 服务端直接 400。所以只换内容，保留 role/tool_call_id 骨架。
+CLEAR_TOOL_RESULTS_KEEP_RECENT = 8   # 最近的 N 条工具结果原样保留
+CLEAR_TOOL_RESULTS_MIN_SAVING = 2000  # 预估至少省这么多字符才值得动手（否则白折腾）
+CLEARED_TOOL_RESULT_PLACEHOLDER = "[较早的工具结果已清理以节省上下文；如需该内容请重新调用相应工具]"
+
 SUMMARIZE_PROMPT = """\
 你是对话压缩器。下面是本任务较早的对话记录（含工具调用与结果）。请把它压缩成一份 \
 给"之后继续这个任务的助手"看的中文备忘，它会替代原始历史发给模型。必须保留：
@@ -742,8 +756,71 @@ class Agent:
             lines.append(f"—— {label} ——\n" + ("\n".join(parts) if parts else "（无正文）"))
         return "\n\n".join(lines)
 
+    def _clear_old_tool_results(self, keep_recent: int = CLEAR_TOOL_RESULTS_KEEP_RECENT) -> int:
+        """分级压缩第一档（无损、便宜）：把较早的工具结果正文换成一行占位符。
+
+        为什么值得单独一档：工具结果（整文件内容、命令输出、搜索命中）通常是
+        上下文里最占地方的部分，而它们的价值随轮次迅速衰减。清掉它们**不丢
+        任何决策信息**（任务目标、改动清单都还在），比动摘要安全得多，也不花
+        一次 LLM 调用。所以超阈值时先做这一档，清完仍超才去摘要。
+
+        做法：只换 content，**保留消息骨架**（role / tool_call_id / 顺序）。
+        绝不能删消息——tool 消息与前面 assistant.tool_calls 配对，删了会出现
+        "没有请求却冒出结果"的悬空消息，服务端直接 400。
+
+        返回：实际清理的条数（0 = 没动，交给上层去摘要）。
+        本方法只改内存里的 self.history；DB 原文不受影响（与压缩同一口径：
+        存储永远完整，只有模型视图被瘦身）。
+        """
+        # 先找出所有"可清理"的工具结果下标：跳过已被摘要吸收的（边界之前）——
+        # 那些本来就不在模型视图里，清了也白清，还会误改 DB 待写的行。
+        last_boundary = -1
+        for i, m in enumerate(self.history):
+            if m.get("role") == "compact":
+                last_boundary = i
+        tool_idx = [i for i, m in enumerate(self.history)
+                    if i > last_boundary and m.get("role") == "tool"]
+        if len(tool_idx) <= keep_recent:
+            return 0  # 工具结果还不够多，清了也省不了多少
+
+        targets = tool_idx[:-keep_recent]  # 除最近 keep_recent 条外全清
+        # 先只统计能省多少，够本了才真动手——避免"清了又回滚"改坏原内容。
+        saved = 0
+        plan = []  # [(下标, 原正文)]
+        for i in targets:
+            m = self.history[i]
+            content = m.get("content")
+            if not isinstance(content, str) or not content:
+                continue  # 已经是占位符/空：跳过（幂等，可反复调用）
+            if content == CLEARED_TOOL_RESULT_PLACEHOLDER:
+                continue
+            saved += len(content)
+            plan.append((i, content))
+
+        if saved < CLEAR_TOOL_RESULTS_MIN_SAVING:
+            return 0  # 省的还不够塞牙缝，不值得动（保护原始内容）
+
+        cleared = 0
+        for i, _orig in plan:
+            m = self.history[i]
+            m["content"] = CLEARED_TOOL_RESULT_PLACEHOLDER
+            m["_tool_result_cleared"] = True  # 标记（下划线前缀，发给模型前会被剥离）
+            cleared += 1
+
+        if cleared:
+            # 清理改变了字符总量 → 校准系数作废（与压缩同一理由：系数是按
+            # 原始字符量校准的，内容换了密度就变了）。下轮真实 usage 重新校准。
+            self._token_ratio = None
+            log.info("分级压缩①：清理 %d 条较早工具结果（省约 %d 字符，保留最近 %d 条）",
+                     cleared, saved, keep_recent)
+        return cleared
+
     def _maybe_compact(self) -> dict | None:
         """回答结束后调用：估算超阈值就把中段历史压缩成一条边界标记。
+
+        分级：超阈值先试**无损**的"清旧工具结果"（_clear_old_tool_results），
+        清完重新估算；仍超阈值才做**有损**的摘要。这样能省下不少"本可不必
+        摘要"的场景——工具输出往往是上下文大头，清掉它经常就够了。
 
         返回给前端的事件载荷（未触发/失败返回 None）。任何异常都不往外抛——
         压缩是"锦上添花"，绝不能让它打断会话；失败就跳过，下一轮回答结束后
@@ -755,6 +832,17 @@ class Agent:
         est_before = sum(stats.values())
         if est_before <= self.context_window * COMPACT_THRESHOLD:
             return None
+
+        # ── 分级压缩第一档：先清较早的工具结果（无损、不花 LLM 调用）──
+        # 清完重新估算；降到阈值以下就直接收工，不必动摘要——省下一次有损
+        # 总结，也省一次 LLM 调用。前端不产卡片（没有语义损失，无需告知）。
+        if self._clear_old_tool_results():
+            stats = self.context_stats()
+            est_after_clear = sum(stats.values())
+            if est_after_clear <= self.context_window * COMPACT_THRESHOLD:
+                log.info("分级压缩①后已降至阈值以下（估算 %d → %d tokens），跳过摘要",
+                         est_before, est_after_clear)
+                return None
 
         view = self._messages_for_model()
         first_user, last_boundary = -1, -1
