@@ -30,6 +30,7 @@ seq 与 mid 是两套身份，绝不混用：seq 是【事件】在会话内单�
 import json
 import logging
 import threading
+import time
 from collections import deque
 from queue import Queue
 
@@ -76,6 +77,9 @@ class SessionEvents:
         # replay_plan 靠它们把"正在进行的回合"从起点整段补发。
         self.running = False
         self._round_seq: int | None = None  # 本回合 turn_start 的 seq
+        # 本回合 turn_start 的墙钟时刻（time.time()）：补发/重连的客户端没有
+        # 本地 qStart，只有它才能在摘要行继续显示「已工作 N 秒」而不是从 0 起。
+        self._round_started: float | None = None
 
     # ---------- 读取 ----------
 
@@ -83,6 +87,13 @@ class SessionEvents:
     def current_seq(self) -> int:
         with self._lock:
             return self._seq
+
+    @property
+    def round_started_at(self) -> float | None:
+        """进行中回合的起点墙钟时刻（无进行中回合则 None）。补发的客户端靠它
+        续算「已工作 N 秒」——它没有本地的计时起点。"""
+        with self._lock:
+            return self._round_started if self.running else None
 
     def buffered(self) -> list[tuple[int, dict]]:
         """缓冲快照（测试与补发计划用），按 seq 升序。"""
@@ -109,6 +120,10 @@ class SessionEvents:
             if etype == "turn_start":
                 self.running = True
                 self._round_seq = seq
+                # 取事件自带时刻（缺省才用当下）：补发段里 turn_start 的发布
+                # 时刻才是回合真正的起点，用「此刻」会把整段已过去的时间抹掉。
+                ts = event.get("started_at")
+                self._round_started = float(ts) if isinstance(ts, (int, float)) else time.time()
             elif etype == "turn_end":
                 self.running = False
             subs = list(self._subs)
@@ -143,6 +158,7 @@ class SessionEvents:
         with self._lock:
             subs, self._subs = self._subs, []
             self.running = False
+            self._round_started = None
         for q in subs:
             q.put(None)
 

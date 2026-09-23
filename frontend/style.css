@@ -80,7 +80,17 @@ body {
 .layout { display: flex; height: 100vh; position: relative; }
 .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
 .grow { flex: 1; }
+/* 通用隐藏类。浮层类（.docs-panel / .attach-pop / .git-pop / .ctx-pop）自带
+   display 值，会盖掉这一条 display:none（同为 !important 时后者胜出），
+   各自另有 .hidden 规则；这里只做兜底。 */
 .hidden { display: none !important; }
+/* 浮层隐藏时必须真正退出命中测试：只要还占位（哪怕宽度/透明度为 0），
+   它就会挡住下面的按钮——「图片点不了」正是这种浮层压住输入框所致。
+   与 .docs-panel.hidden 的宽度收起动画不冲突（那条自己置 display:flex）。 */
+.attach-pop.hidden, .git-pop.hidden, .git-branch-pop.hidden, .ctx-pop.hidden,
+.model-pop.hidden, .user-pop.hidden, .modal.hidden, .msg-rail.hidden {
+  display: none !important;
+}
 
 /* ---------- 左侧：任务列表 ---------- */
 .sidebar {
@@ -856,6 +866,10 @@ button.primary:hover { background: var(--accent-hover); }
 
 /* ---------- 附件托盘（输入框上方） ---------- */
 .attach-tray { display: flex; gap: 10px; flex-wrap: wrap; }
+/* 托盘只在有附件时才有高度；空托盘是 0 高度元素，若仍可命中点击，会吃掉
+   紧贴其下方那一行的点击（缩略图/工具栏按钮点不动）。隐藏态交给 .hidden
+   （display:none），有附件时自动恢复命中。 */
+.attach-tray:empty { pointer-events: none; }
 .att-card {
   position: relative; width: 64px; height: 64px;
   border: 1px solid var(--border); border-radius: 8px;
@@ -863,6 +877,8 @@ button.primary:hover { background: var(--accent-hover); }
   display: flex; align-items: center; justify-content: center;
 }
 .att-card img { width: 100%; height: 100%; object-fit: cover; border-radius: 8px; }
+.att-card.clickable { cursor: zoom-in; }
+.att-card.clickable:hover { border-color: var(--accent); }
 .att-file {
   font-size: 10px; color: var(--text-2);
   text-align: center; padding: 4px; word-break: break-all;
@@ -907,7 +923,9 @@ button.primary:hover { background: var(--accent-hover); }
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 14px; padding: 24px;
 }
-.lightbox img {
+/* 只作用于灯箱里的那张图：写成 .lightbox img 会命中灯箱内所有后代 img，
+   把 .att-card img / .msg-img 的尺寸规则一并覆盖掉。 */
+.lightbox > img {
   max-width: 92vw; max-height: 78vh;
   border-radius: 8px; box-shadow: 0 8px 40px rgba(0, 0, 0, .5);
   cursor: zoom-out;  /* 点放大的图片本身即恢复原样 */
@@ -1323,10 +1341,13 @@ button.primary:hover { background: var(--accent-hover); }
   transition: width .28s ease;
 }
 /* 隐藏：宽度收 0（配合 overflow:hidden 完全消失），保持过渡而不是 display:none，
-   这样关闭也是"滑走"而非"啪一下不见"。 */
+   这样关闭也是"滑走"而非"啪一下不见"。
+   注意：宽度 0 仍会留下 1px 左边框参与命中，所以隐藏态整体退出命中测试
+   （pointer-events:none），否则它会吃掉贴边内容的点击。 */
 .docs-panel.hidden {
   display: flex !important;
   width: 0; border-left-width: 0;
+  pointer-events: none;
 }
 /* 面板左边缘的拖拽把手：贴在最左侧，光标提示可横向拉伸 */
 .docs-resizer {

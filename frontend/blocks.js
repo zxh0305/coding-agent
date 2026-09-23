@@ -97,10 +97,15 @@
     let process = null;      // 当前 process 块（一个回合一个）
     let answer = null;       // 当前 answer 块（done 之前流式累积）
     let lastTool = null;     // 最近一个 running 的 tool 块，供 result 回填
+    let turnStartedAt = null;  // 本回合起点（秒，来自 turn_start.started_at）
 
     function ensureProcess() {
       if (!process) {
-        process = { kind: "process", steps: 0, elapsed: null, items: [] };
+        // running / startedAt：本回合还没见到 done，且知道它的起点。渲染层据此
+        // 现算「已工作 N 秒」——切会话/刷新回来时服务端的起点事件也走这里，
+        // 时间线里的过程折叠条因此不会显示成「没有秒数」再从 0 重数。
+        process = { kind: "process", steps: 0, elapsed: null, items: [],
+                    running: true, startedAt: turnStartedAt };
         blocks.push(process);
       }
       return process;
@@ -120,6 +125,9 @@
         process = null;
         answer = null;
         lastTool = null;
+        // 回合起点（秒）随事件到达：补发/刷新/多标签页路径下，本页没有自己的
+        // 计时起点，靠它把「已工作 N 秒」续上。缺失（老版本事件）则为 null。
+        turnStartedAt = Number(evt.started_at) > 0 ? Number(evt.started_at) : null;
         blocks.push({
           kind: "user",
           text: evt.input || "",
@@ -226,7 +234,10 @@
             answer = null;
           }
         }
-        if (process) process.elapsed = evt.elapsed_s != null ? evt.elapsed_s : process.elapsed;
+        if (process) {
+          process.elapsed = evt.elapsed_s != null ? evt.elapsed_s : process.elapsed;
+          process.running = false;  // 本轮定稿：秒数从此固定，不再跟着时钟走
+        }
         if (evt.usage || evt.elapsed_s != null) {
           blocks.push({ kind: "meta", elapsed: evt.elapsed_s != null ? evt.elapsed_s : null, usage: evt.usage || null });
         }
@@ -379,9 +390,10 @@
   function createLiveTracker() {
     let process = null;   // 当前回合的 process 记账
     let lastTool = null;  // 最近一个 running 的工具块
+    let startedAt = null;  // 本回合起点（秒，来自 turn_start.started_at）
 
     function ensureProcess() {
-      if (!process) process = { kind: "process", steps: 0, items: [] };
+      if (!process) process = { kind: "process", steps: 0, items: [], startedAt: startedAt };
       return process;
     }
 
@@ -403,6 +415,7 @@
 
       if (t === "turn_start") {
         reset();
+        startedAt = Number(evt.started_at) > 0 ? Number(evt.started_at) : null;
         return null;
       }
       if (t === "round") {

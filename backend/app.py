@@ -269,7 +269,10 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             # 上次的结局）。回合真结局在下面收尾处按 error 重新置位。
             with _lock:
                 _turn_status.pop(sid, None)
-            bus.publish({"type": "turn_start", "nonce": nonce, "input": plain, "atts": atts})
+            bus.publish({"type": "turn_start", "nonce": nonce, "input": plain, "atts": atts,
+                         # 回合真起点（秒）。补发/多标签页/刷新回来的客户端没有本地
+                         # 计时起点，靠它把「已工作 N 秒」接上，而不是从 0 重数。
+                         "started_at": time.time()})
             log.info("[会话 %s] 用户提问: %s", sid, plain)
             seg_mid = None  # 当前回答段落的 SSE 气泡 mid（每个 round 事件换一段，仅事件流用）
             error = None
@@ -994,7 +997,8 @@ class Handler(SimpleHTTPRequestHandler):
             for seq, event in items:
                 self.wfile.write(sse_frame(seq, event))
                 last_written = seq
-            self.wfile.write(sse_frame(None, {"type": "caught_up", "running": bus.running}))
+            self.wfile.write(sse_frame(None, {"type": "caught_up", "running": bus.running,
+                                              "started_at": bus.round_started_at}))
             while True:
                 try:
                     item = sub.get(timeout=15)

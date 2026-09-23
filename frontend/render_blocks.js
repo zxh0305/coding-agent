@@ -115,8 +115,21 @@
         d.appendChild(doc.createElement("summary"));
         for (const it of block.items) d.appendChild(renderProcessItem(it));
         const label = block.steps > 0 ? "已工作" : "已思考";
-        const t = block.elapsed != null ? ` ${deps.fmtElapsed ? deps.fmtElapsed(block.elapsed) : block.elapsed + "s"}` : "";
+        // 秒数：已定稿的回合用固定值；进行中的回合（block.running）现算——
+        // 它的起点来自服务端（补发/切会话路径），不现算就会显示成 0 秒。
+        const live = block.running && block.startedAt
+          ? Math.max(0, Date.now() / 1000 - block.startedAt) : null;
+        const secs = live != null ? live : block.elapsed;
+        const t = secs != null ? ` ${deps.fmtElapsed ? deps.fmtElapsed(secs) : secs + "s"}` : "";
         d.querySelector("summary").textContent = `${label}${t} · ${block.steps} 步`;
+        if (live != null) {
+          // 生成期间让秒数自己跳动（数据到齐，行为与实时折叠条一致）
+          const timer = setInterval(() => {
+            if (!d.isConnected) { clearInterval(timer); return; }
+            d.querySelector("summary").textContent =
+              `${label} ${deps.fmtElapsed ? deps.fmtElapsed(Math.max(0, Date.now() / 1000 - block.startedAt)) : Math.round(Date.now() / 1000 - block.startedAt) + "s"} · ${block.steps} 步`;
+          }, 200);
+        }
         return d;
       }
 

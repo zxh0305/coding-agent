@@ -706,10 +706,11 @@ async function newTask(presetProject = null) {
   await loadSessions();  // 重新拉取列表：旧任务仍显示，只是没有选中项；首条消息后新任务才出现
 }
 // ---------- 输入框草稿：按会话归属 ----------
-// 输入框是全局唯一的 DOM 元素，切换会话时若不处理，A 会话打的字会原样留在
-// 框里、看起来像"被带到了 B 会话"。这里以会话 id 为 key 把草稿存进 localStorage：
-// 切走时存旧会话、切入时载新会话，各会话互不干扰（新任务用 __new__ 占位）。
-// 只做文本草稿——附件是内存对象（含 base64），跨会话恢复成本高且易误发，暂不处理。
+// 输入框与附件托盘都是全局唯一的 DOM/内存状态，切换会话时若不处理，A 会话打的字、
+// 挂的图会原样留在框里、看起来像"被带到了 B 会话"（截图里的 image.png 就是这么来的）。
+// 文本草稿按会话 id 存 localStorage；附件是内存对象（含 base64，动辄几 MB），
+// 写 localStorage 会撑爆配额，所以按会话 id 存在内存表里，随会话切换存/取。
+// 新任务用 __new__ 占位，语义与文本草稿一致。
 const DRAFT_NEW = "__new__";
 const draftKey = (sid) => `draft_${sid || DRAFT_NEW}`;
 
@@ -717,10 +718,12 @@ function saveDraft(sid) {
   const text = inputEl.value;
   if (text) localStorage.setItem(draftKey(sid), text);
   else localStorage.removeItem(draftKey(sid));  // 空草稿不留残留，避免下次误恢复
+  saveAttachDraft(sid);                          // 附件与文本同一归属，一起存
 }
 
 function restoreDraft(sid) {
   inputEl.value = localStorage.getItem(draftKey(sid)) || "";
+  restoreAttachDraft(sid);                       // 并恢复该会话自己的附件托盘
 }
 
 // 边打字边存草稿：防抖 300ms，避免每个按键都写 localStorage。
@@ -1140,6 +1143,26 @@ function welcome() {
 // 都只存在数据库的消息里，不另外落盘。
 let attachments = [];  // {kind: "image"|"text", name, mime, data(base64), preview}
 
+// 附件草稿按会话归属（与文本草稿同一套 key 语义）。存内存不落 localStorage：
+// base64 图片几 MB，写进去会撑爆配额且每次切会话都要序列化。会话间存/取由
+// saveAttachDraft / restoreAttachDraft 在切会话的同一时点完成。
+const attachDrafts = new Map();  // sid(或 __new__) -> attachments 数组快照
+
+function saveAttachDraft(sid) {
+  const key = sid || DRAFT_NEW;
+  // 只存读好数据的附件：仍在读文件（data 为空）的占位不跨会话保留，
+  // 它的 FileReader 回调绑在旧列表上，带过去只会留下永远加载不出的空卡片。
+  const ready = attachments.filter(a => a.data);
+  if (ready.length) attachDrafts.set(key, ready);
+  else attachDrafts.delete(key);  // 空托盘不留残留，避免下次误恢复
+}
+
+function restoreAttachDraft(sid) {
+  const key = sid || DRAFT_NEW;
+  attachments = (attachDrafts.get(key) || []).slice();  // 浅拷贝：数组归属按会话
+  renderAttachTray();
+}
+
 const MAX_ATTACH = 6;
 
 function renderAttachTray() {
@@ -1169,11 +1192,21 @@ function renderAttachTray() {
     x.className = "att-del";
     x.textContent = "✕";
     x.title = "移除";
-    x.addEventListener("click", () => {
+    x.addEventListener("click", (e) => {
+      e.stopPropagation();  // 别让「移除」的点击顺带触发卡片的放大
       attachments.splice(i, 1);
       renderAttachTray();
     });
     card.appendChild(x);
+    // 点击卡片任意处也能放大：图片本身很小（64px 卡），只靠 img 的命中区
+    // 用户经常点空——点卡片主体同样打开灯箱。删除按钮已在上方 stopPropagation。
+    if (a.kind === "image" && a.preview) {
+      card.classList.add("clickable");
+      card.addEventListener("click", (e) => {
+        if (e.target.closest(".att-del")) return;
+        openLightbox(a.preview);
+      });
+    }
     tray.appendChild(card);
   });
 }
@@ -1932,6 +1965,12 @@ function onSSEEvent(e) {
 function finishBoot(caughtUp) {
   const buf = bootBuffer || [];
   bootBuffer = null;
+  // 服务端说回合还在跑：把它的真起点交给本 tab 当计时基准。切会话/刷新回来的
+  // 页面没有本地 qStart，不这么做摘要行就会从 0 重新数（秒数跳回 0.x 的由来）。
+  // 本 tab 自己发的回合 qStart 更早、更准，保留它（只在不早于服务端起点时覆盖，
+  // 避免服务端起点更早导致已显示的秒数倒退）。
+  const srvStart = Number(caughtUp && caughtUp.started_at) * 1000;
+  if (srvStart > 0 && (!qStart || srvStart > qStart)) qStart = srvStart;
   if (caughtUp && caughtUp.running === false && streaming) {
     // 连上时服务端已无进行中回合，而本页还挂在"生成中"：回合在断线/服务
     // 重启之间死掉了（未落盘）。手动收尾不挂起——手测②"刷新接上进行中
@@ -2045,6 +2084,21 @@ function fmtElapsed(sec) {
     : `${Math.floor(n / 60)} 分 ${Math.round(n % 60)} 秒`;
 }
 
+// 回合计时起点（毫秒时间戳）。优先本 tab 自己的 qStart；补发/刷新/切会话
+// 路径上没有它（qStart 为 0），退回服务端给的回合起点 startedAt——这样切回来
+// 时秒数接着数，而不是从 0 重新爬。
+function traceStart() {
+  const st = liveTracker.state();
+  return qStart || (st && st.startedAt) || 0;
+}
+
+// 从 turn_start 事件取回合起点（毫秒）。服务端 started_at 是秒（浮点）。
+// 没给（本 tab 自己发消息的正常路径）就取当下。
+function turnStartFromEvent(evt) {
+  const s = evt && Number(evt.started_at);
+  return s > 0 ? s * 1000 : Date.now();
+}
+
 // 摘要行 = 一行"当前状态"：正在跑的工具 + 已工作多久 + 步数。
 // 这是收起状态下用户唯一能看到的过程信息，必须把"此刻在干嘛"说清楚。
 // 步数与"正在跑什么"都取自 liveTracker（与回放同一套记账），不再另立计数器。
@@ -2052,7 +2106,7 @@ function traceTick() {
   if (!traceEl) return;
   const st = liveTracker.state();
   const steps = st ? st.steps : 0;
-  const el = fmtElapsed((Date.now() - qStart) / 1000);
+  const el = fmtElapsed((Date.now() - traceStart()) / 1000);
   // traceCurrent 是本 tab 自己发工具时设的即时值；补发/刷新场景下为空，
   // 此时从 tracker 记账里现取「正在跑的工具」——两处同源，不会各说各话。
   const cur = traceCurrent || traceCurrentFromTracker();
@@ -2357,7 +2411,7 @@ function ensureLiveMsg(mid) {
       metaEl = document.createElement("div");
       metaEl.className = "meta";
     }
-    metaEl.textContent = metaText(((Date.now() - qStart) / 1000).toFixed(1), usageNow);
+    metaEl.textContent = metaText(((Date.now() - traceStart()) / 1000).toFixed(1), usageNow);
     chatEl.appendChild(metaEl);  // 统计行留在正文区末尾，跟随最终答案
   }
   liveBubble = b.el;  // 兼容既有的"当前气泡"语义（retire/done 收尾用）
@@ -2458,10 +2512,13 @@ function applyEvent(evt, seq) {
     liveTracker.reset();  // 工具记账随回合重置（与 blocksFromEvents 的 turn_start 行为一致）
     permissionCards = new Map();  // 新回合的确认卡是新的请求：旧卡引用随时间线一起失效
     pendingDeltas = new Map(); pendingThink = "";
-    usageNow = null; curMid = null; qStart = Date.now();
+    usageNow = null; curMid = null;
+    // 计时起点：本 tab 自己发消息时不存在 evt.started_at（该字段是服务端给
+    // 补发/多标签页路径用的），取当下；有则用服务端给的回合真起点。
+    qStart = turnStartFromEvent(evt);
     clearInterval(metaTimer);
     metaTimer = setInterval(() => {
-      if (metaEl && streaming) metaEl.textContent = metaText(((Date.now() - qStart) / 1000).toFixed(1), usageNow);
+      if (metaEl && streaming) metaEl.textContent = metaText(((Date.now() - traceStart()) / 1000).toFixed(1), usageNow);
       if (traceEl && streaming) traceTick();  // 折叠条秒数实时跳动
     }, 100);
     setStreaming(true);
@@ -2481,6 +2538,11 @@ function applyEvent(evt, seq) {
     // 把推理归并进回答气泡——思考过程冒充正文正是要杜绝的那个 bug。
     if (!thinkEl) {
       ensureTrace();
+      // 本轮已经有过工具调用（在收起面板里跑完了一堆步骤）——说明用户是在
+      // 生成中途切回/刷新回来的，此刻补发的推理流属于「过去」。这时不再强制
+      // 展开面板：否则切会话的瞬间会看到过程面板"啪"地弹开、正文区跟着跳一下。
+      // 当前正在产出的推理会实时填进去，用户点开折叠条一样能看到。
+      if (!liveTracker.state()?.steps) traceEl.open = true;
       thinkEl = document.createElement("div");
       thinkEl.className = "think-line";
       traceEl.appendChild(thinkEl);  // 不走 appendTrace：思考流不算一步
@@ -2600,7 +2662,7 @@ function applyEvent(evt, seq) {
     if (traceEl) {
       traceEl.open = false;  // 出错同样收起过程；点开可排查卡在哪一步
       traceEl.querySelector("summary").textContent =
-        `已工作 ${fmtElapsed((Date.now() - qStart) / 1000)} · 出错`;
+        `已工作 ${fmtElapsed((Date.now() - traceStart()) / 1000)} · 出错`;
     }
     bubble("assistant error", "❌ " + evt.message);
     // 生成中状态不在这里复位：turn_end 紧随 error 事件到达，由它统一收尾
@@ -2635,6 +2697,7 @@ function resetStreamState() {
   permissionCards = new Map();
   pendingDeltas = new Map(); pendingThink = "";
   curMid = null; usageNow = null;
+  qStart = 0;  // 计时起点随会话一起作废：否则切回来的新回合会接着上一个会话的时间数
 }
 
 async function stopGeneration() {
