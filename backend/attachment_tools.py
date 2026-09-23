@@ -104,9 +104,9 @@ def _archive_read_result(info: dict, sid: str) -> dict:
 def extract_attachment(name: str, ctx=None) -> str:
     """解压当前会话中的一个压缩包附件，返回解压目录与文件清单。
 
-    解压后的文件落在会话附件区的 _extracted/<附件名>/ 下，并通过工作区里的
-    .coding-agent/attachments/ 软链接对 agent 可达——之后可用 read_file 读取、
-    用 grep/run_bash 分析。带输出总量与成员数上限，防压缩炸弹。
+    解压后的文件落在工作区 .coding-agent/attachments/_extracted/<附件名>/ 下
+    （附件本身也在工作区内），之后可用 read_file 读取、用 grep/run_bash 分析。
+    带输出总量与成员数上限，防压缩炸弹。
     """
     sid = getattr(ctx, "session_id", None) if ctx is not None else None
     if not sid:
@@ -136,15 +136,14 @@ def extract_attachment(name: str, ctx=None) -> str:
     if skipped:
         lines.append("")
         lines.append(f"（{len(skipped)} 个成员被跳过：{skipped[0].get('skipped')}）")
-    # 桥接路径：agent 用工作区内相对路径访问（若桥接已建立）
-    ws = getattr(ctx, "workspace", None) if ctx is not None else None
+    # 解压目录在工作区内：给 agent 可直接使用的相对路径
     rel = result.get("rel_dir")
-    if ws and rel:
-        bridge_rel = f".coding-agent/attachments/{rel}"
+    if rel:
+        dir_rel = f"{db.ATTACH_DIR_NAME}/{rel}"
         lines.append("")
-        lines.append(f"解压目录（工作区内）：{bridge_rel}")
-        lines.append(f"例：read_file {{\"path\": \"{bridge_rel}/{files[0]['name']}\"}}"
-                     if files else "")
+        lines.append(f"解压目录（工作区内）：{dir_rel}")
+        if files:
+            lines.append(f"例：read_file {{\"path\": \"{dir_rel}/{files[0]['name']}\"}}")
     return _ok({**result, "result": "\n".join(lines)})
 
 

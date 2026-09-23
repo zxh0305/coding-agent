@@ -204,5 +204,65 @@ class TestDeleteAndCleanup(AttachTestBase):
         self.assertEqual(db.cleanup_orphan_attachments(), 0)
 
 
+class TestWorkspacePlacement(AttachTestBase):
+    """附件落工作区 + 绑定工作区后迁移（2026-09-23 起的默认行为）。
+
+    为什么改：附件原先一律落 data/attachments/，在 agent 工作区之外——
+    run_bash 的 cwd 锁在工作区、read_file 有越界校验，压缩包类附件因此
+    完全没法用。改为落工作区后，附件是普通文件，一切文件能力自然可用。
+    """
+
+    def _mk_ws(self, name="proj"):
+        ws = Path(self.tmp) / name
+        ws.mkdir()
+        return ws
+
+    def test_falls_back_to_data_without_workspace(self):
+        """未绑定工作区时仍落 data/attachments，附件不丢。"""
+        info = db.save_attachment("s1", "a.txt", b"x")
+        self.assertIn("attachments", info["path"])
+        self.assertNotIn("proj", info["path"])
+
+    def test_lands_in_workspace_when_bound(self):
+        """已绑定工作区：附件直接落工作区 .coding-agent/attachments/。"""
+        ws = self._mk_ws()
+        db.set_session_workspace("s1", str(ws))
+        info = db.save_attachment("s1", "a.txt", b"x")
+        self.assertTrue((ws / db.ATTACH_DIR_NAME / "a.txt").exists())
+        self.assertEqual(db.read_attachment_text("s1", "a.txt")["content"], "x")
+
+    def test_migrate_moves_preexisting(self):
+        """先上传（落 data/）后绑定工作区 → 迁移到工作区。"""
+        db.save_attachment("s1", "a.txt", b"hello")
+        ws = self._mk_ws()
+        db.set_session_workspace("s1", str(ws))
+        moved = db.migrate_attachments_to_workspace("s1")
+        self.assertEqual(moved, 1)
+        self.assertTrue((ws / db.ATTACH_DIR_NAME / "a.txt").exists())
+        self.assertEqual(db.read_attachment_text("s1", "a.txt")["content"], "hello")
+
+    def test_migrate_does_not_overwrite_workspace_copy(self):
+        """工作区已有同名附件时不覆盖（保留用户后来上传的那份）。"""
+        ws = self._mk_ws()
+        db.set_session_workspace("s1", str(ws))
+        db.save_attachment("s1", "a.txt", b"new-in-ws")
+        # 手工在 data/ 放一份同名的旧文件，模拟"迁移前遗留"
+        old = db._attachments_dir() / "s1"
+        old.mkdir(parents=True, exist_ok=True)
+        (old / "a.txt").write_bytes(b"stale")
+        db.migrate_attachments_to_workspace("s1")
+        self.assertEqual((ws / db.ATTACH_DIR_NAME / "a.txt").read_bytes(), b"new-in-ws")
+
+    def test_delete_session_cleans_workspace_attach_dir(self):
+        """删除会话时清掉工作区里的附件目录，但不动工作区其它内容。"""
+        ws = self._mk_ws()
+        db.set_session_workspace("s1", str(ws))
+        db.save_attachment("s1", "a.txt", b"x")
+        (ws / "keep.txt").write_text("用户自己的文件")
+        db.delete_session("s1")
+        self.assertFalse((ws / db.ATTACH_DIR_NAME).exists())
+        self.assertTrue((ws / "keep.txt").exists())  # 工作区其它内容不受影响
+
+
 if __name__ == "__main__":
     unittest.main()

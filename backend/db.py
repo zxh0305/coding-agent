@@ -521,6 +521,9 @@ def list_sessions(user_id: int) -> list[dict]:
 
 def delete_session(sid: str) -> None:
     """删除任务：消息行、统计行、外置正文文件一起清理。"""
+    # 工作区路径必须在删 sessions 行之前取——删了就查不到了（附件现在
+    # 可能落在工作区里，清理它需要这个路径）。
+    ws = get_session_workspace(sid)
     with _conn() as conn:
         conn.execute("DELETE FROM messages WHERE session_id=?", (sid,))
         conn.execute("DELETE FROM message_usage WHERE session_id=?", (sid,))
@@ -531,6 +534,19 @@ def delete_session(sid: str) -> None:
     shutil.rmtree(_docs_dir() / sid, ignore_errors=True)
     # attachments/<sid>/ 同理：该任务上传的附件随会话一起消失（与 artifacts/docs 一致）
     shutil.rmtree(_attachments_dir() / sid, ignore_errors=True)
+    # 附件现在可能落在工作区 .coding-agent/attachments/（见 _session_attach_root）：
+    # 只清我们自己建的那个子目录，绝不碰用户工作区的其它内容。
+    if ws:
+        try:
+            sub = Path(ws).expanduser() / ATTACH_DIR_NAME
+            if sub.is_dir():
+                shutil.rmtree(sub, ignore_errors=True)
+                # 若 .coding-agent/ 已空则一并清掉，不留空壳
+                parent = sub.parent
+                if parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -664,14 +680,35 @@ def _attachments_dir() -> Path:
     return DB_PATH.parent / "attachments"
 
 
+# 工作区内的附件子目录名：附件直接落进用户工作区，agent 无需桥接即可
+# 用 read_file / run_bash / grep 直接访问（压缩包解压后就能分析）。
+ATTACH_DIR_NAME = ".coding-agent/attachments"
+
+
+def _session_attach_root(sid: str) -> Path:
+    """某会话附件存放的根目录：优先落进会话工作区，无工作区则回退 data/attachments。
+
+    为什么落工作区：附件在 data/ 下时，agent 的文件工具够不到（run_bash 的 cwd
+    锁在工作区、read_file 有越界校验），压缩包类附件因此没法用。落进工作区后，
+    附件变成"普通文件"，一切文件能力自然可用——这是 ZCode 的做法（附件即
+    workspace path）。工作区未绑定时仍回退 data/attachments，保证不丢附件。
+    """
+    ws = get_session_workspace(sid)
+    if ws:
+        base = Path(ws).expanduser()
+        if base.is_dir():
+            return base / ATTACH_DIR_NAME
+    return _attachments_dir() / sid
+
+
 def attachments_root() -> Path:
-    """附件根目录（对外只读入口，供工具层桥接给 agent 访问）。"""
+    """附件根目录（对外只读入口）。"""
     return _attachments_dir()
 
 
 def session_attachments_dir(sid: str) -> Path:
-    """某会话的附件目录（不存在也返回路径，由调用方决定是否创建）。"""
-    return _attachments_dir() / sid
+    """某会话的附件目录（工作区优先；不存在也返回路径，由调用方决定是否创建）。"""
+    return _session_attach_root(sid)
 
 
 def _safe_attach_name(name: str) -> str:
@@ -693,10 +730,10 @@ def _attach_path(sid: str, name: str) -> Path:
     """解析某会话下一个附件的绝对路径，并做越界白名单校验。
 
     与 _doc_path / read_artifact 同一套思路：name 是不可信输入（来自前端），
-    resolve() 消解 ../ 与软链后，结果必须严格位于 attachments/<sid>/ 之内。
+    resolve() 消解 ../ 与软链后，结果必须严格位于会话附件根目录之内。
     不满足即拒绝并记日志（防路径逃逸、跨会话读取）。
     """
-    base = (_attachments_dir() / sid).resolve()
+    base = _session_attach_root(sid).resolve()
     p = (base / name).resolve()
     if p == base or base not in p.parents:
         log.warning("附件路径拒绝越界: sid=%r name=%r", sid, name)
@@ -706,7 +743,7 @@ def _attach_path(sid: str, name: str) -> Path:
 
 def _session_attach_bytes(sid: str) -> int:
     """本会话已有附件的总字节数（用于总量上限校验）。"""
-    d = _attachments_dir() / sid
+    d = _session_attach_root(sid)
     if not d.is_dir():
         return 0
     total = 0
@@ -720,7 +757,7 @@ def _session_attach_bytes(sid: str) -> int:
 
 
 def save_attachment(sid: str, name: str, data: bytes) -> dict:
-    """把一份附件写入 attachments/<sid>/，返回 {name, bytes}。
+    """把一份附件写入会话附件目录（工作区优先），返回 {name, bytes, path}。
 
     同名即覆盖（用户重传同名文件）。先写 .tmp 再 os.replace 原子改名，与
     write_doc / _write_artifact 一致：避免半截文件。超单文件上限直接拒绝；
@@ -733,7 +770,7 @@ def save_attachment(sid: str, name: str, data: bytes) -> dict:
     nbytes = len(blob)
     if nbytes > MAX_ATTACH_BYTES:
         raise ValueError(f"附件过大（{nbytes} 字节），上限 {MAX_ATTACH_BYTES} 字节")
-    d = _attachments_dir() / sid
+    d = _session_attach_root(sid)
     d.mkdir(parents=True, exist_ok=True)
     path = _attach_path(sid, safe)
     old = path.stat().st_size if path.is_file() else 0
@@ -742,16 +779,17 @@ def save_attachment(sid: str, name: str, data: bytes) -> dict:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_bytes(blob)
     os.replace(tmp, path)
-    return {"name": safe, "bytes": nbytes}
+    return {"name": safe, "bytes": nbytes, "path": str(path)}
 
 
 def list_attachments(sid: str) -> list[dict]:
     """列出某会话的全部附件，按修改时间降序（最近上传的在前）。"""
-    d = _attachments_dir() / sid
+    d = _session_attach_root(sid)
     if not d.is_dir():
         return []
     out = []
     for p in d.iterdir():
+        # 跳过临时文件与解压目录（_extracted 是派生产物，不算附件本身）
         if not p.is_file() or p.name.endswith(".tmp"):
             continue
         try:
@@ -829,13 +867,55 @@ def extract_attachment(sid: str, name: str) -> dict:
     p = _attach_path(sid, _safe_attach_name(name))
     if not p.is_file():
         raise FileNotFoundError(f"附件不存在: {name}")
-    dest = _attachments_dir() / sid / "_extracted" / p.name
+    dest = _session_attach_root(sid) / "_extracted" / p.name
     result = archive_tools.extract_archive(p, dest)
     if result.get("ok"):
-        result["rel_dir"] = str(dest.relative_to(_attachments_dir()))
+        result["rel_dir"] = str(dest.relative_to(_session_attach_root(sid)))
         result["abs_dir"] = str(dest)
         result.pop("extracted_dir", None)  # Path 对象不可 JSON 序列化，去掉
     return result
+
+
+def migrate_attachments_to_workspace(sid: str) -> int:
+    """把会话此前落在 data/attachments/<sid>/ 的附件迁移到工作区附件目录。
+
+    为什么需要：上传发生在会话绑定工作区之前（见 app.py 的请求顺序），那时
+    只能落 data/。工作区绑定后调用本函数搬过去，之后 agent 就能用文件工具
+    直接访问。同名文件以工作区已有者为准（不覆盖用户后来上传的），迁移后
+    清理空的旧目录。返回迁移的文件数。
+    """
+    ws = get_session_workspace(sid)
+    if not ws:
+        return 0
+    base = Path(ws).expanduser()
+    if not base.is_dir():
+        return 0
+    old_dir = _attachments_dir() / sid
+    if not old_dir.is_dir():
+        return 0
+    new_dir = base / ATTACH_DIR_NAME
+    new_dir.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for p in list(old_dir.iterdir()):
+        if not p.is_file() or p.name.endswith(".tmp"):
+            continue
+        target = new_dir / p.name
+        if target.exists():
+            continue  # 工作区已有同名：保留工作区那份
+        try:
+            shutil.move(str(p), str(target))
+            moved += 1
+        except OSError as e:
+            log.warning("附件迁移失败 sid=%r name=%r: %s", sid, p.name, e)
+    # 旧目录只剩空壳时清掉
+    try:
+        if old_dir.is_dir() and not any(old_dir.iterdir()):
+            old_dir.rmdir()
+    except OSError:
+        pass
+    if moved:
+        log.info("附件迁移到工作区：sid=%r %d 个", sid, moved)
+    return moved
 
 
 def cleanup_orphan_attachments() -> int:
