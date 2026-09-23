@@ -689,6 +689,7 @@ async function newTask(presetProject = null) {
   restoreDraft(null);  // 新任务自己的草稿位（__new__）
   resetDocsPanel();    // 新任务态：收起文档栏并清空内容
   loadDocsList();      // 新任务态：文档计数清零
+  resetAttachPop();    // 新任务态：附件浮窗收起、计数清零
   usageNow = null;
   updateCtxChip();
   if (presetProject) {
@@ -950,6 +951,8 @@ async function switchSession(id) {
   dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
   resetDocsPanel();      // 上一个会话的文档栏不留给新会话：收起并清空
   loadDocsList();        // 刷新文档计数（切会话后 chip 上的数字跟着变）
+  resetAttachPop();      // 同理：上一个会话的附件浮窗收起并清空
+  loadAttachments();     // 刷新附件计数
 }
 
 // 关闭 Git 浮窗并清掉上一次的内容：切换任务/工作区后，列表已失效。
@@ -1351,9 +1354,17 @@ function buildUserBubble(text, atts) {
     if (a.kind === "image" && a.preview) {
       div.appendChild(msgImage(a.preview, sources));
     } else {
+      // 文件名可点：直接打开会话附件浮窗并定位到这份文件——否则附件发出去
+      // 之后就只剩这行死文本，用户想再看一眼只能去翻磁盘。
       const f = document.createElement("div");
-      f.className = "att-file";
+      f.className = "att-file clickable";
       f.textContent = "📄 " + a.name;
+      f.title = "点击查看这份附件";
+      f.addEventListener("click", () => {
+        const pop = $("attach-pop");
+        if (pop.classList.contains("hidden")) toggleAttachPop();
+        openAttachment(a.name);
+      });
       div.appendChild(f);
     }
   }
@@ -2767,12 +2778,15 @@ async function performSend(item) {
       localStorage.removeItem(draftKey(null));  // 新任务已实体化：清掉 __new__ 草稿位
       openEvents(currentSession);  // 立刻接事件流：turn_start 可能已在缓冲里等着补发
       loadWorkspace();             // 新任务按用户默认解析了自己的工作区，工具栏对齐
+      loadAttachments();           // 新任务的附件计数（刚发送的附件此时已落盘）
       // 新任务时在下拉里选过权限模式：建会话后写入（按工作区记忆）
       if (permMode !== "confirm") {
         api(`/api/sessions/${encodeURIComponent(currentSession)}/perm_mode`,
           { method: "POST", body: JSON.stringify({ mode: permMode }) }).catch(() => {});
       }
     }
+    // 附件落盘发生在后端组装消息时，这里补刷一次计数（新建/追问都适用）
+    if (item.payloadAtts && item.payloadAtts.some(a => a.kind !== "image")) loadAttachments();
   } catch (e) {
     // 命令没送出去（后端不可达/登录失效）：回合不会开始，本地复位。
     // 已发出的消息不放回队列（与旧行为一致：旧版 finally 里也是直接结束）
@@ -2819,6 +2833,8 @@ bind("p-test", "click", testProv);
 bind("p-delete", "click", deleteProv);
 bind("ws-pick", "click", openPicker);
 bind("docs-chip", "click", toggleDocsPanel);
+bind("attach-chip", "click", toggleAttachPop);
+bind("attach-close", "click", () => $("attach-pop").classList.add("hidden"));
 bind("docs-close", "click", closeDocsPanel);
 bind("docs-toggle", "click", toggleDocsList);
 bind("m-cancel", "click", closePicker);
@@ -2885,7 +2901,7 @@ async function logoutNow() {
 }
 document.addEventListener("click", (e) => {
   // 点弹窗外空白处关闭浮动层
-  for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"]]) {
+  for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"]]) {
     const el = $(pop);
     if (!el.classList.contains("hidden") && !el.contains(e.target) && !e.target.closest?.("#" + btn)) {
       el.classList.add("hidden");
@@ -3432,6 +3448,168 @@ function initSidebar() {
   });
 
   setCollapsed(localStorage.getItem(SIDE_COLLAPSED_KEY) === "1");
+}
+
+// ---------- 会话附件浮窗 ----------
+// 用户视角的查看器：只看【已经上传并落盘】的文件类附件（data/attachments 或
+// 工作区 .coding-agent/attachments）。与工具栏 📎 的区别是语义，不是位置：
+//   📎 + attach-tray = 上传动作与待发队列（本地 → 会话，发送后清空）；
+//   本浮窗          = 会话里已有什么（只读，不能上传/删除/编辑）。
+// 图片附件不落盘（走 base64 直接进消息），因此不在本浮窗内——这里只列文件类。
+let attachItems = [];        // 当前会话的附件列表缓存 [{name, bytes, mtime}]
+let attachActive = "";       // 当前打开的文件名（列表高亮用）
+
+async function loadAttachments() {
+  const countEl = $("attach-count");
+  if (!currentSession) {
+    attachItems = [];
+    if (countEl) countEl.textContent = "0";
+    return;
+  }
+  try {
+    const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}/attachments`);
+    attachItems = data.attachments || [];
+    if (countEl) countEl.textContent = String(attachItems.length);
+  } catch (e) { /* 计数是次要信息，失败不打扰用户 */ }
+}
+
+// 切会话/新任务时复位：收起浮窗并清空内容（对齐 resetDocsPanel 的做法）
+function resetAttachPop() {
+  const pop = $("attach-pop");
+  if (pop) pop.classList.add("hidden");
+  const list = $("attach-list");
+  if (list) list.innerHTML = "";
+  const view = $("attach-view");
+  if (view) view.innerHTML = "";
+  attachItems = [];
+  attachActive = "";
+  const countEl = $("attach-count");
+  if (countEl) countEl.textContent = "0";
+}
+
+function toggleAttachPop() {
+  const pop = $("attach-pop");
+  if (!pop) return;
+  if (!pop.classList.contains("hidden")) { pop.classList.add("hidden"); return; }
+  $("git-pop").classList.add("hidden");  // 与 git 浮窗互斥，不叠层
+  positionAttachPop();
+  pop.classList.remove("hidden");
+  renderAttachList();
+}
+
+// 贴在触发按钮下方；右侧留 16px 边距，避免贴边（与 positionGitPop 同套路）
+function positionAttachPop() {
+  const pop = $("attach-pop"), btn = $("attach-chip");
+  if (!pop || !btn) return;
+  const rect = btn.getBoundingClientRect();
+  const w = Math.min(760, innerWidth - 32);
+  pop.style.width = w + "px";
+  pop.style.left = Math.max(16, Math.min(rect.left, innerWidth - w - 16)) + "px";
+  pop.style.top = (rect.bottom + 8) + "px";
+}
+
+function renderAttachList() {
+  const list = $("attach-list");
+  const view = $("attach-view");
+  if (!list) return;
+  list.innerHTML = "";
+  $("attach-scope").textContent = attachItems.length
+    ? `${attachItems.length} 个文件 · ${fmtBytes(attachItems.reduce((s, a) => s + a.bytes, 0))}`
+    : "";
+  if (!currentSession) {
+    view.innerHTML = '<div class="attach-empty">任务还没有创建，发送第一条消息后再查看附件</div>';
+    return;
+  }
+  if (!attachItems.length) {
+    view.innerHTML = '<div class="attach-empty">本会话还没有上传过文件附件。'
+      + '图片附件直接随消息发送，不会出现在这里。</div>';
+    return;
+  }
+  for (const it of attachItems) {
+    const li = document.createElement("li");
+    li.className = "attach-item";
+    li.dataset.name = it.name;
+    const name = document.createElement("span");
+    name.className = "attach-name";
+    name.textContent = it.name;
+    name.title = it.name;
+    const meta = document.createElement("span");
+    meta.className = "attach-meta";
+    meta.textContent = `${fmtBytes(it.bytes)} · ${fmtDocTime(it.mtime)}`;
+    li.append(name, meta);
+    li.addEventListener("click", () => openAttachment(it.name));
+    list.appendChild(li);
+  }
+  if (attachActive) openAttachment(attachActive);
+}
+
+// 打开一份附件：文本按原文渲染（等宽 <pre>，不解析 Markdown——看日志与代码
+// 就该是原样）；压缩包列成员清单；二进制明确说"不能在这儿看"。
+async function openAttachment(name) {
+  if (!currentSession) return;
+  const view = $("attach-view");
+  if (!view) return;
+  attachActive = name;
+  document.querySelectorAll(".attach-item").forEach((el) => {
+    el.classList.toggle("active", el.dataset.name === name);
+  });
+  view.innerHTML = '<div class="attach-empty">加载中…</div>';
+  try {
+    const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}`
+      + `/attachments?name=${encodeURIComponent(name)}`);
+    view.innerHTML = "";
+    if (data.kind === "archive") {
+      view.appendChild(renderArchiveInfo(data));
+    } else if (data.kind === "binary") {
+      const d = document.createElement("div");
+      d.className = "attach-empty";
+      d.textContent = `《${data.name}》是二进制文件，无法在页面上预览。`
+        + "附件已落盘，可用本地编辑器打开。";
+      view.appendChild(d);
+    } else {
+      const head = document.createElement("div");
+      head.className = "attach-file-head";
+      head.textContent = `${data.name}　第 ${data.offset + 1}~${data.offset + data.lines} 行`
+        + `（共 ${data.total_lines} 行）`;
+      const pre = document.createElement("pre");
+      pre.className = "attach-text mono";
+      pre.textContent = data.content || "（空文件）";
+      view.append(head, pre);
+      if (data.truncated) {
+        const more = document.createElement("div");
+        more.className = "attach-more";
+        more.textContent = "…内容过长，仅显示前 2000 行。完整文件请用本地编辑器打开。";
+        view.appendChild(more);
+      }
+    }
+  } catch (e) {
+    view.innerHTML = `<div class="attach-empty">打开失败：${esc(e.message)}</div>`;
+  }
+}
+
+// 压缩包：只列成员清单（与 agent 的 read_attachment 看到的一致）
+function renderArchiveInfo(data) {
+  const wrap = document.createElement("div");
+  const head = document.createElement("div");
+  head.className = "attach-file-head";
+  head.textContent = `${data.name}　压缩包（${data.archive_kind || "未知格式"}），`
+    + `含 ${data.file_count} 个成员`;
+  wrap.appendChild(head);
+  const ul = document.createElement("ul");
+  ul.className = "attach-members";
+  for (const m of (data.members || []).slice(0, 200)) {
+    const li = document.createElement("li");
+    li.textContent = m.note ? `${m.name}　${m.note}` : m.name;
+    ul.appendChild(li);
+  }
+  wrap.appendChild(ul);
+  if (data.file_count > 200) {
+    const more = document.createElement("div");
+    more.className = "attach-more";
+    more.textContent = `…还有 ${data.file_count - 200} 个成员`;
+    wrap.appendChild(more);
+  }
+  return wrap;
 }
 
 // ---------- 右侧文档栏 ----------

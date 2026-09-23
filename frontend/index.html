@@ -55,6 +55,12 @@
         <span class="git-chip-icon">🌿</span>
         <span id="git-chip-branch" class="git-chip-branch mono">Git</span>
       </button>
+      <!-- 会话附件浮窗的入口：只看【已经上传落盘】的附件（用户视角的查看器），
+           与工具栏的 📎（选本地文件、待发队列）是两回事，所以图标与位置都分开。 -->
+      <button id="attach-chip" class="git-chip" title="查看本会话上传的附件文件">
+        <span class="git-chip-icon">🗂</span>
+        <span class="git-chip-branch mono">附件 <span id="attach-count">0</span></span>
+      </button>
       <div id="chat" class="chat"></div>
       <!-- 会话缩略导航条（minimap）：只画用户提问与助手回答两类主消息，点击定位 -->
       <div id="msg-rail" class="msg-rail hidden"></div>
@@ -250,6 +256,20 @@
     <div id="git-body" class="git-body"></div>
     <div class="git-foot">
       <span id="git-identity" class="git-id mono"></span>
+    </div>
+  </div>
+
+  <!-- 会话附件浮窗：左侧文件清单 + 右侧内容预览。只读查看器——不提供上传/
+       删除/编辑，那些动作属于工具栏的 📎 与待发托盘（attach-tray）。 -->
+  <div id="attach-pop" class="attach-pop hidden">
+    <div class="attach-head">
+      <b>🗂 会话附件</b>
+      <span id="attach-scope" class="attach-scope"></span>
+      <button id="attach-close" class="git-x" title="关闭">✕</button>
+    </div>
+    <div class="attach-body">
+      <ul id="attach-list" class="attach-list"></ul>
+      <div id="attach-view" class="attach-view"></div>
     </div>
   </div>
 

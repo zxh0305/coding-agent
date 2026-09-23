@@ -732,6 +732,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._handle_session_events(sid)
             if sub == "docs":
                 return self._handle_session_docs(sid)
+            if sub == "attachments":
+                return self._handle_session_attachments(sid)
             return self._handle_session_messages(sid)
         elif self.path.startswith("/api/context"):
             sid = (self._query().get("session_id") or [""])[0]
@@ -1228,6 +1230,44 @@ class Handler(SimpleHTTPRequestHandler):
         except (OSError, FileNotFoundError):
             return self._json({"error": "文档不存在"}, 404)
         self._json({"name": name, "content": content})
+
+    def _handle_session_attachments(self, sid: str):
+        """本会话的附件（用户上传、已落盘的文件类附件）：列表 / 读单个。
+
+        无 name 参数 = 列出全部；带 name = 读该附件内容。与 docs 接口同构，
+        但只读——浮窗是「查看器」，不提供上传/删除/编辑（上传仍走 📎 与
+        /api/sessions/<sid>/messages 的 attachments 字段）。
+
+        只回文本：二进制与压缩包不给字节流（base64 会把响应撑大好几倍，
+        而且任意字节不该直接进 DOM），改为回结构描述——压缩包列成员清单，
+        二进制只报类型，让用户知道"这是什么、能不能在这儿看"。
+
+        归属已在上层校验（session_owner）。name 是不可信输入，db._attach_path
+        做 realpath 白名单校验（防 ../ 逃逸、跨会话），越界即 400。
+        """
+        name = (self._query().get("name") or [""])[0]
+        if not name:
+            items = db.list_attachments(sid)
+            return self._json({"attachments": items,
+                               "total_bytes": sum(it["bytes"] for it in items)})
+        qs = self._query()
+        try:
+            offset = max(0, int((qs.get("offset") or ["0"])[0]))
+            limit = min(5000, max(1, int((qs.get("limit") or ["2000"])[0])))
+        except ValueError:
+            return self._json({"error": "offset/limit 须为整数"}, 400)
+        try:
+            info = db.read_attachment_text(sid, name, offset=offset, limit=limit)
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        except FileNotFoundError:
+            return self._json({"error": "附件不存在"}, 404)
+        except OSError as e:
+            return self._json({"error": f"附件读取失败：{e}"}, 500)
+        # 归档 / 二进制：只回描述，不回内容
+        if info.get("kind") in ("archive", "binary"):
+            return self._json(info)
+        self._json(info)
 
     # ---------- 模型供应商 ----------
 
