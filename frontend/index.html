@@ -260,6 +260,10 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
+  <!-- 消息语义块：先把「实时事件 / 历史回放」归一化成同构 Block，再统一渲染。
+       放在 app.js 之前，app.js 里直接用全局 CodingAgentBlocks / CodingAgentRenderBlocks。 -->
+  <script src="blocks.js"></script>
+  <script src="render_blocks.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

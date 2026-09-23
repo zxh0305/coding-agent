@@ -1026,55 +1026,36 @@ function updateLoadOlder() {
 }
 
 // 单条历史消息 → DOM 节点（与实时对话一致的渲染规则）
+// ---------- 二期：统一渲染器接线 ----------
+// blocks.js / render_blocks.js 在 index.html 里先于 app.js 加载，挂全局。
+// 这里把 app.js 现成的零件注入渲染器（不重写、不复制），保证渲染结果与
+// 改造前逐字节一致——渲染器只负责「按 Block 结构决定拼装顺序」。
+const blocksFromEvents = window.CodingAgentBlocks.blocksFromEvents;
+const blocksFromHistory = window.CodingAgentBlocks.blocksFromHistory;
+const blocksRenderer = window.CodingAgentRenderBlocks.createRenderer({
+  doc: document,
+  buildBubble: buildBubble,
+  buildUserBubble: buildUserBubble,
+  railTag: railTag,
+  makeToolCallLine: makeToolCallLine,
+  makeToolResultLine: makeToolResultLine,
+  decorateWriteCard: decorateWriteCard,
+  metaText: metaText,
+  compactCard: compactCard,
+  fmtElapsed: fmtElapsed,
+});
+
+// 历史回放：单条存储消息 → DOM 节点。
+// 二期起改为「消息 → Block → 统一渲染器」两步走：Block 由 blocks.js 归一化
+// （与实时事件流同一套结构），渲染由 render_blocks.js 统一负责——回放与实时
+// 不再各写一套，从根上消除"两边不同步"的 bug。
+// 仅两处留在本函数：外置归档消息（非 Block 语义）与带附件的用户消息（需先
+// 归一化，见下）。其余全部委托。
 function historyNode(m) {
   // 外置归档消息：库行内只有 head 预览（超大正文存 artifacts 文件），
   // 展示"内容过大已归档"标记，点开按需拉取全文
   if (m.artifact) return railTag(artifactCard(m), m.mid, "user");
-  if (m.role === "compact") return compactCard(m.content);
-  if (m.role === "user" && Array.isArray(m.content)) {
-    const text = m.content
-      .filter(p => p.type === "text")
-      .map(p => (p.text || "").length > 600 ? p.text.slice(0, 600) + "…[附件内容已折叠]" : p.text)
-      .join("\n");
-    const imgs = m.content
-      .filter(p => p.type === "image_url")
-      .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
-    return railTag(buildUserBubble(text, imgs), m.mid, "user");
-  }
-  // 用 fragment 直接把气泡/meta 挂进 #chat：外面包一层普通 div 会让
-  // .bubble.user 的 align-self 失效（父级不是 flex），用户消息就会挤到左侧
-  const frag = document.createDocumentFragment();
-  // 中间轮次的 assistant 消息（带 tool_calls）只承载"过程说明"正文，那段文字
-  // 已随最终回答的 trace 落库（type=process_text）。这里不再单独画成正文气泡——
-  // 否则回放时它又变回一张卡片，与实时视图（降级进执行过程面板）割裂。
-  // 依赖：trace 落库成功（后端 _run_round 里失败只记日志不阻断）。trace 万一
-  // 缺失，这条消息的正文在回放里就不显示——这是为"实时/回放一致"付出的代价，
-  // 只在 trace 落库失败或本次改动之前产生的旧历史里才可能发生。
-  if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-    return frag;  // 空 fragment：这条消息在时间线上不占位
-  }
-  // 落库的执行过程轨迹：折叠条插在回答气泡前（与实时视图的位置一致）
-  if (m.role === "assistant" && m.trace) {
-    const tr = traceFromHistory(m.trace, m.stats?.elapsed_s);
-    if (tr) frag.appendChild(tr);
-  }
-  // 主消息气泡：打上 mid 与角色锚，供左侧导航条定位（rail 只画 user/assistant 两类）。
-  // 助手消息正文为空时【不画气泡】：.bubble 有 padding + border，空 div 会渲染成
-  // 一个 padding 撑起来的白色圆角空盒子——点定位条批量回放历史（loadWindowAround）
-  // 时这类空正文消息成排出现，视觉上就是"一堆空白方块"。无正文的消息不该占位。
-  const text = m.content || "";
-  if (m.role === "user" || text) {
-    frag.appendChild(railTag(buildBubble(m.role === "user" ? "user" : "assistant", text),
-                            m.mid, m.role === "user" ? "user" : "assistant"));
-  }
-  // 历史消息也带回当时的耗时/token 统计（message_usage 表随消息附带）
-  if (m.role === "assistant" && m.stats) {
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = metaText(m.stats.elapsed_s, m.stats.usage);
-    frag.appendChild(meta);
-  }
-  return frag;
+  return blocksRenderer.renderBlocks(blocksFromHistory([m]));
 }
 
 // 外置归档消息：超大正文不随时间线整页带回，用户要看时才走 artifact 接口取。
@@ -1350,68 +1331,9 @@ function msgImage(src, gallery) {
   return img;
 }
 
-// 历史回放的执行过程折叠条：由落库的轨迹 JSON 重建（与实时版同一套行渲染）。
-// 默认收起；elapsed 用来在摘要里显示"已工作 N 秒"（没有就只显示步数）。
-function traceFromHistory(entries, elapsed) {
-  const d = document.createElement("details");
-  d.className = "trace";
-  d.open = false;
-  // <summary> 必须在这里建好：详情折叠条的摘要行是它唯一的固定子元素，
-  // 缺了它下面的 d.querySelector("summary") 会拿到 null、赋值即抛 TypeError，
-  // 而异常发生在 historyNode 内、被 loadHistoryPage 的 catch 吞掉——结果是
-  // 整批历史一条都渲染不出来（点进会话只剩欢迎语的直接原因）。摘要文案要等
-  // 循环统计完 steps 才知道，所以先建空元素、循环后再填文本。
-  d.appendChild(document.createElement("summary"));
-  const list = Array.isArray(entries) ? entries : [];
-  let steps = 0;
-  let lastWriteCard = null;  // 历史回放：待回填徽章的写入调用卡
-  for (const e of list) {
-    if (!e || typeof e !== "object") continue;
-    if (e.type === "round") {
-      const div = document.createElement("div");
-      div.className = "trace-line";
-      div.textContent = `🧠 思考 · 第 ${e.round} 轮${e.wrap_up ? "（收尾）" : ""}`;
-      d.appendChild(div);
-    } else if (e.type === "tool_call") {
-      const line = makeToolCallLine(e.name, e.arguments || "{}");
-      d.appendChild(line);
-      // 落库轨迹里 tool_result 紧跟 tool_call：把写入类调用暂存，等结果回填徽章
-      if (line.classList.contains("card")) lastWriteCard = line;
-      steps += 1;
-    } else if (e.type === "tool_result") {
-      if (lastWriteCard) { decorateWriteCard(lastWriteCard, e.result || ""); lastWriteCard = null; }
-      d.appendChild(makeToolResultLine(e.name, e.result || ""));
-    } else if (e.type === "reasoning") {
-      // 落库的思考过程：与实时流同一套 .think-line 渲染（纯文本，pre-wrap）
-      if (e.text) {
-        const div = document.createElement("div");
-        div.className = "think-line";
-        div.textContent = e.text;
-        d.appendChild(div);
-      }
-    } else if (e.type === "process_text") {
-      // 中间轮次的过程说明正文：与实时降级同一套 .process-text 渲染，
-      // 折叠面板收起时默认看不到，展开才显示"当时说了什么"。
-      // demoted 带上「💬 说明」标记（见 style.css）：轨迹里 reasoning 条目
-      // 可能缺失，这段正文就紧跟「🧠 思考 · 第 N 轮」标题，无标记会被读成
-      // 该轮的思考内容——过程说明冒充推理。
-      const div = document.createElement("div");
-      div.className = "process-text demoted";
-      div.textContent = e.text || "";
-      d.appendChild(div);
-    } else if (e.type === "system_reminder") {
-      const div = document.createElement("div");
-      div.className = "trace-line";
-      div.textContent = "🔔 系统提醒";
-      d.appendChild(div);
-    }
-  }
-  if (!list.length) return null;  // 空轨迹不渲染
-  const label = steps > 0 ? "已工作" : "已思考";
-  const t = elapsed != null ? ` ${fmtElapsed(elapsed)}` : "";
-  d.querySelector("summary").textContent = `${label}${t} · ${steps} 步`;
-  return d;
-}
+// 注：历史回放的执行过程折叠条（原 traceFromHistory）已由二期统一渲染器接管——
+// 见 blocks.js 的 blocksFromHistory + render_blocks.js 的 process 分支。
+// 此处不再保留旧实现：同一语义只留一处，避免两边再次不同步。
 
 // 带附件的用户气泡：文字 + 图片缩略图（多图走 2 列网格）/文件名
 function buildUserBubble(text, atts) {
@@ -2417,7 +2339,7 @@ function demoteLiveBubbleToTrace() {
   el.classList.remove("streaming");
   if (!el.textContent.trim()) { el.remove(); return; }
   // 确认是过程说明：补上「💬 说明」标记（.demoted），与上方思考流区分开。
-  // 与历史回放（traceFromHistory 的 process_text 分支）保持同一副面孔。
+  // 与历史回放（blocks.js 的 process_text → note.demoted）保持同一副面孔。
   el.classList.add("demoted");
 }
 
