@@ -62,11 +62,16 @@ class TestWriteRead(AttachTestBase):
         names = [a["name"] for a in db.list_attachments("s1")]
         self.assertIn("build.log", names)
 
-    def test_binary_decoded_with_replace(self):
-        """二进制内容不抛错，按 errors='replace' 退回文本。"""
+    def test_binary_returns_structured_kind(self):
+        """二进制内容不再按 errors='replace' 吐乱码，而是返回 kind='binary'。
+
+        行为变更（2026-09-23）：二进制/压缩包按文本解码只会得到一屏乱码，
+        模型拿不到任何有用信息。改为返回结构化描述，让模型知道"这是什么、
+        下一步怎么做"。文本附件仍是 kind='text'（见 test_write_read）。"""
         db.save_attachment("s1", "b.bin", bytes([0xff, 0xfe, 0x41]))
         got = db.read_attachment_text("s1", "b.bin")
-        self.assertIn("A", got["content"])
+        self.assertEqual(got["kind"], "binary")
+        self.assertEqual(got["content"], "")
 
 
 class TestPaging(AttachTestBase):

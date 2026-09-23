@@ -117,13 +117,105 @@ def _resolve(path: str, ws: Path) -> Path:
 
     这是本模块最重要的一道防线：resolve() 消解掉 ../ 和符号链接之后，
     再校验目标必须仍在工作区之内。ws 是【本次调用】的工作区，由 ctx 注入。
+
+    唯一的受控例外：工作区内 .coding-agent/attachments 软链接指向本会话
+    附件区（见 ensure_attachment_bridge）。resolve() 会把它消解成附件区
+    真实路径（在工作区外），因此这里按【未消解路径】放行这一条白名单。
     """
     if not path or not isinstance(path, str):
         raise ValueError("path 不能为空")
-    target = (ws / path).resolve()
+    raw = (ws / path)
+    target = raw.resolve()
     if target != ws and ws not in target.parents:
+        # 白名单：路径字面量落在工作区的 .coding-agent/attachments 之下，
+        # 且该前缀确实是软链接（不是用户自建真目录的越界尝试）。
+        try:
+            bridge = (ws / ATTACH_BRIDGE_DIR / "attachments").resolve()
+            lit = (ws / ATTACH_BRIDGE_DIR / "attachments")
+            if (ws / ATTACH_BRIDGE_DIR).is_dir():
+                import os as _os
+                # 用未消解的字面路径判断：必须在 .coding-agent/attachments 之内
+                literal = _os.path.normpath(str(raw))
+                prefix = _os.path.normpath(str(lit))
+                if literal == prefix or literal.startswith(prefix + _os.sep):
+                    if target == bridge or bridge in target.parents:
+                        return target
+        except (OSError, ValueError):
+            pass
         raise ValueError(f"路径越界：{path} 位于工作区之外，Agent 只能访问工作区内的文件")
     return target
+
+
+# ---------------------------------------------------------------------------
+# 附件桥接：让 agent 能用文件工具访问会话附件区
+# ---------------------------------------------------------------------------
+# 为什么需要：附件存在 data/attachments/<sid>/，在工作区之外——run_bash 的 cwd
+# 锁在工作区，read_file/grep 又被 _resolve 的越界校验挡住，模型只能靠
+# read_attachment 一页页读文本。压缩包（运维日志的常态）因此彻底没法用。
+#
+# 做法：在会话工作区内建一个【软链接】 .coding-agent/attachments -> 附件区。
+# 于是 agent 可以直接：
+#   run_bash: tar -xzf .coding-agent/attachments/xxx.tar.gz -C /tmp/...
+#   read_file: .coding-agent/attachments/xxx.log
+# 不复制文件、不占额外空间，附件仍按会话隔离存放。
+#
+# 为什么用软链接而不是真目录：附件区要跟随 DB 文件走（测试重定向、库迁移），
+# 软链接自动跟随，不会留下过期的副本。建不成软链接（如 Windows 无权限）时
+# 静默降级——桥接是增强，不是必需能力。
+
+ATTACH_BRIDGE_DIR = ".coding-agent"
+ATTACH_BRIDGE_PATH = f"{ATTACH_BRIDGE_DIR}/attachments"
+
+
+def ensure_attachment_bridge(ws: Path, sid: str | None) -> Path | None:
+    """在工作区里确保附件桥接存在，返回桥接路径；不适用时返回 None。
+
+    幂等：已存在且指向正确就跳过；指向别处则重建。同时把 .coding-agent/
+    写进工作区的 .gitignore（不存在则创建/追加），避免污染用户的版本库。
+    """
+    if not sid:
+        return None
+    import db
+
+    src = db.session_attachments_dir(sid)
+    if not src.is_dir():
+        return None  # 本会话还没有附件，无需桥接
+    link = ws / ATTACH_BRIDGE_DIR / "attachments"
+    try:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink():
+            if link.resolve() == src.resolve():
+                _ensure_gitignore_entry(ws)
+                return link
+            link.unlink()
+        elif link.exists():
+            # 已有一个同名真目录：不动它（用户可能自己建的），放弃桥接
+            return None
+        link.symlink_to(src)
+        _ensure_gitignore_entry(ws)
+        return link
+    except OSError:
+        return None  # 建不了软链接（权限/文件系统不支持）→ 静默降级
+
+
+def _ensure_gitignore_entry(ws: Path) -> None:
+    """把 .coding-agent/ 追加进工作区的 .gitignore（幂等）。"""
+    gi = ws / ".gitignore"
+    entry = f"{ATTACH_BRIDGE_DIR}/"
+    try:
+        if gi.exists():
+            text = gi.read_text(encoding="utf-8", errors="replace")
+            if entry in text.splitlines():
+                return
+            if text and not text.endswith("\n"):
+                text += "\n"
+            gi.write_text(text + f"\n# 豆沙包coding 会话附件桥接（自动生成）\n{entry}\n",
+                          encoding="utf-8")
+        else:
+            gi.write_text(f"# 豆沙包coding 会话附件桥接（自动生成）\n{entry}\n",
+                          encoding="utf-8")
+    except OSError:
+        pass  # gitignore 写不进去不影响功能
 
 
 # ---------------------------------------------------------------------------

@@ -54,6 +54,8 @@ def read_attachment(name: str, offset: int = 0, limit: int = 2000, ctx=None) -> 
     name 是附件文件名（见消息里的附件清单或 list_attachments）；offset 是
     起始行号（0 起），limit 是最多读取的行数。文件很长时返回 truncated=true，
     模型可继续用更大的 offset 读下一段——不要一次拉取整个大文件。
+
+    压缩包不会返回乱码：会返回成员清单，提示用 extract_attachment 解压。
     """
     sid = getattr(ctx, "session_id", None) if ctx is not None else None
     if not sid:
@@ -67,11 +69,83 @@ def read_attachment(name: str, offset: int = 0, limit: int = 2000, ctx=None) -> 
         return _err(f"附件不存在：{name}", "先用 list_attachments 查看本会话有哪些附件，核对文件名")
     except OSError as e:
         return _err(f"附件读取失败：{e}", "稍后重试")
+
+    # 归档：返回成员清单 + 下一步指引（不解压、不吐乱码）
+    if info.get("kind") == "archive":
+        return _ok(_archive_read_result(info, sid))
+    # 二进制（非归档）：明确告知不能按文本读
+    if info.get("kind") == "binary":
+        return _ok({**info, "result":
+                    f"《{info['name']}》是二进制文件，无法按文本读取。\n"
+                    f"若这是压缩包，请确认扩展名；也可用 list_attachments 核对。"})
+
     head = (f"《{info['name']}》第 {info['offset'] + 1}~{info['offset'] + info['lines']} 行"
             f"（共 {info['total_lines']} 行）")
     tail = ("\n…[还有后续内容，用更大的 offset 继续读取]"
             if info["truncated"] else "")
     return _ok({**info, "result": f"{head}\n\n{info['content']}{tail}"})
+
+
+def _archive_read_result(info: dict, sid: str) -> dict:
+    """压缩包读取结果：成员清单 + 解压指引（含桥接路径，若有）。"""
+    lines = [f"《{info['name']}》是压缩包（{info.get('archive_kind') or '未知格式'}），"
+             f"含 {info['file_count']} 个成员："]
+    for m in info["members"][:30]:
+        note = m.get("note") or (f"{m['bytes']} 字节" if m.get("bytes") is not None else "")
+        lines.append(f"  - {m['name']}  {note}")
+    if info["file_count"] > 30:
+        lines.append(f"  …还有 {info['file_count'] - 30} 个成员")
+    lines.append("")
+    lines.append("下一步：用 extract_attachment 解压后，再用 read_file / run_bash 读取"
+                 "解压出的文件（解压目录会出现在工作区 .coding-agent/attachments/ 下）。")
+    return {**info, "result": "\n".join(lines)}
+
+
+def extract_attachment(name: str, ctx=None) -> str:
+    """解压当前会话中的一个压缩包附件，返回解压目录与文件清单。
+
+    解压后的文件落在会话附件区的 _extracted/<附件名>/ 下，并通过工作区里的
+    .coding-agent/attachments/ 软链接对 agent 可达——之后可用 read_file 读取、
+    用 grep/run_bash 分析。带输出总量与成员数上限，防压缩炸弹。
+    """
+    sid = getattr(ctx, "session_id", None) if ctx is not None else None
+    if not sid:
+        return _err("当前会话未知，无法确定附件归属（系统内部问题）",
+                    "请重试；若持续失败请联系服务部署者")
+    try:
+        result = db.extract_attachment(sid, name)
+    except ValueError as e:
+        return _err(f"附件解压被拒：{e}", "文件名应为纯文件名；可先用 list_attachments 查看")
+    except FileNotFoundError:
+        return _err(f"附件不存在：{name}", "先用 list_attachments 查看本会话有哪些附件，核对文件名")
+    except OSError as e:
+        return _err(f"附件解压失败：{e}", "稍后重试")
+
+    if not result.get("ok"):
+        return _err(f"解压失败：{result.get('error')}",
+                    "若这不是压缩包，可直接用 read_attachment 读取（文本文件）")
+
+    files = [m for m in result["members"] if "skipped" not in m]
+    skipped = [m for m in result["members"] if "skipped" in m]
+    lines = [f"已解压《{name}》（{result.get('kind')}），共 {len(files)} 个文件，"
+             f"{result.get('total_bytes', 0)} 字节。", ""]
+    for m in files[:40]:
+        lines.append(f"  - {m['name']}  ({m.get('bytes', 0)} 字节)")
+    if len(files) > 40:
+        lines.append(f"  …还有 {len(files) - 40} 个文件")
+    if skipped:
+        lines.append("")
+        lines.append(f"（{len(skipped)} 个成员被跳过：{skipped[0].get('skipped')}）")
+    # 桥接路径：agent 用工作区内相对路径访问（若桥接已建立）
+    ws = getattr(ctx, "workspace", None) if ctx is not None else None
+    rel = result.get("rel_dir")
+    if ws and rel:
+        bridge_rel = f".coding-agent/attachments/{rel}"
+        lines.append("")
+        lines.append(f"解压目录（工作区内）：{bridge_rel}")
+        lines.append(f"例：read_file {{\"path\": \"{bridge_rel}/{files[0]['name']}\"}}"
+                     if files else "")
+    return _ok({**result, "result": "\n".join(lines)})
 
 
 ATTACH_TOOL_SCHEMAS = [
@@ -109,15 +183,38 @@ ATTACH_TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "extract_attachment",
+            "description": "解压当前会话中的一个压缩包附件（.tar.gz/.zip/.gz 等），"
+                           "返回解压目录与文件清单。什么时候用：read_attachment 提示"
+                           "某个附件是压缩包时（运维日志包很常见）。解压后文件出现在"
+                           "工作区 .coding-agent/attachments/ 下，可用 read_file 读取、"
+                           "用 grep/run_bash 分析。带输出总量与成员数上限，防压缩炸弹。"
+                           "示例：{\\\"name\\\": \\\"logs.tar.gz\\\"}。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string",
+                             "description": "压缩包附件的文件名（纯文件名，不含路径）"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 ATTACH_TOOL_REGISTRY = {
     "list_attachments": list_attachments,
     "read_attachment": read_attachment,
+    "extract_attachment": extract_attachment,
 }
 
-# 两个工具都是只读：只打开附件文件读，不改任何状态，可与其它只读工具并行。
+# list/read 只读：只打开附件文件读，不改任何状态，可与其它只读工具并行。
+# extract 会写磁盘（解压产物），不算只读——不进并行只读集合，走串行执行。
 ATTACH_TOOL_READ_ONLY = {
     "list_attachments": True,
     "read_attachment": True,
+    "extract_attachment": False,
 }

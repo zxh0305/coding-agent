@@ -664,6 +664,16 @@ def _attachments_dir() -> Path:
     return DB_PATH.parent / "attachments"
 
 
+def attachments_root() -> Path:
+    """附件根目录（对外只读入口，供工具层桥接给 agent 访问）。"""
+    return _attachments_dir()
+
+
+def session_attachments_dir(sid: str) -> Path:
+    """某会话的附件目录（不存在也返回路径，由调用方决定是否创建）。"""
+    return _attachments_dir() / sid
+
+
 def _safe_attach_name(name: str) -> str:
     """把用户/模型给的文件名归一成安全的单段文件名。
 
@@ -759,11 +769,33 @@ def read_attachment_text(sid: str, name: str, offset: int = 0,
 
     返回 {name, total_lines, offset, lines, content, truncated}。按行分页：
     5MB 附件可能有几十万行，模型一次拉不完也不该拉完——offset/limit 让它
-    像翻书一样分段读。二进制文件（解码失败）退回 errors="replace"，不抛错。
+    像翻书一样分段读。
+
+    压缩包与二进制文件不按文本解码（那只会得到一屏乱码），而是返回
+    {kind:"archive"|"binary", ...} 的结构描述，让模型知道"这是什么、
+    里面有什么、下一步该怎么做"——见 archive_tools。
     """
+    import archive_tools
+
     p = _attach_path(sid, _safe_attach_name(name))
     if not p.is_file():
         raise FileNotFoundError(f"附件不存在: {name}")
+
+    # 归档：只列清单，不吐乱码（解压交给 read_attachment 的 extract 动作）
+    kind = archive_tools.detect_archive(p)
+    if kind:
+        info = archive_tools.describe_archive(p)
+        return {"name": p.name, "kind": "archive", "archive_kind": kind,
+                "members": info["members"], "file_count": info["file_count"],
+                "total_lines": 0, "offset": 0, "lines": 0,
+                "content": "", "truncated": False}
+
+    # 二进制（非归档）：明确告诉模型不能按文本读
+    if archive_tools.is_probably_binary(p):
+        return {"name": p.name, "kind": "binary", "archive_kind": None,
+                "members": [], "file_count": 0, "total_lines": 0,
+                "offset": 0, "lines": 0, "content": "", "truncated": False}
+
     text = p.read_bytes().decode("utf-8", errors="replace")
     all_lines = text.splitlines()
     total = len(all_lines)
@@ -773,12 +805,37 @@ def read_attachment_text(sid: str, name: str, offset: int = 0,
     end = start + len(chunk)
     return {
         "name": p.name,
+        "kind": "text",
+        "archive_kind": None,
+        "members": [],
+        "file_count": 0,
         "total_lines": total,
         "offset": start,
         "lines": len(chunk),
         "content": "\n".join(chunk),
         "truncated": end < total,
     }
+
+
+def extract_attachment(sid: str, name: str) -> dict:
+    """把一个归档附件解压到 attachments/<sid>/_extracted/<附件名>/。
+
+    返回 {ok, kind, members, file_count, total_bytes, extracted_dir, rel_dir}。
+    失败返回 {ok: False, error}。rel_dir 是解压目录相对【附件区根】的路径，
+    供 agent 通过桥接路径访问（见 code_tools 的附件桥接）。
+    """
+    import archive_tools
+
+    p = _attach_path(sid, _safe_attach_name(name))
+    if not p.is_file():
+        raise FileNotFoundError(f"附件不存在: {name}")
+    dest = _attachments_dir() / sid / "_extracted" / p.name
+    result = archive_tools.extract_archive(p, dest)
+    if result.get("ok"):
+        result["rel_dir"] = str(dest.relative_to(_attachments_dir()))
+        result["abs_dir"] = str(dest)
+        result.pop("extracted_dir", None)  # Path 对象不可 JSON 序列化，去掉
+    return result
 
 
 def cleanup_orphan_attachments() -> int:

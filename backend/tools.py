@@ -296,6 +296,17 @@ def execute_tool(name: str, arguments: dict, ctx: ToolContext | None = None) -> 
     func = TOOL_REGISTRY.get(name)
     if func is None:
         return error_result(f"未知工具：{name}", "确认工具名是否在系统提供的工具清单里（区分大小写）")
+    # 文件/命令类工具执行前，确保工作区里的"附件桥接"就绪：让 agent 能用
+    # run_bash/read_file 直接访问本会话附件（含解压压缩包）。幂等且失败静默，
+    # 只对声明了 ctx 的工具做（纯函数工具不碰文件系统）。
+    if ctx is not None and "ctx" in inspect.signature(func).parameters:
+        try:
+            import code_tools
+            ws = getattr(ctx, "workspace", None)
+            if ws:
+                code_tools.ensure_attachment_bridge(Path(ws), getattr(ctx, "session_id", None))
+        except Exception:
+            pass  # 桥接是增强能力，任何失败都不该影响工具本身
     try:
         if "ctx" in inspect.signature(func).parameters:
             return func(**arguments, ctx=ctx)
