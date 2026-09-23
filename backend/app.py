@@ -455,15 +455,20 @@ def _vision_backend(image_parts: list, question: str) -> str:
 
 
 MAX_IMAGE_B64 = 6_000_000   # 单张图片 base64 长度上限（约 4.5MB 原图）
-MAX_TEXT_FILE = 200_000     # 文本附件解码后的字符上限
 
 
-def _build_user_message(body: dict) -> tuple[str, dict | None]:
+def _build_user_message(body: dict, sid: str) -> tuple[str, dict | None]:
     """把 {message, attachments} 组装成 OpenAI 格式的用户消息。
 
     图片 → image_url 视觉输入（需要所用模型支持视觉）；
-    文本文件 → 解码后以代码块注入消息正文，模型直接"读"到内容。
+    文本文件 → 落盘到会话附件区（data/attachments/<sid>/），消息里只注入
+    文件名与大小，模型用 read_attachment 工具按需分页读取。
     返回 (纯文本预览, 完整消息)；预览用于任务标题。
+
+    为什么文本附件不再注入正文：早期做法把全文解码后塞进消息，300KB 中文
+    就约 10 万 token，且随会话历史每轮重复携带，上限只能卡死在 300KB。改为
+    引用式后，上下文成本从"全文"降到"几十 token"，单文件上限放宽到 5MB，
+    模型还能通过分页覆盖全文。sid 用于确定附件归属，不可为空。
     """
     text = (body.get("message") or "").strip()
     parts: list[dict] = []
@@ -483,15 +488,19 @@ def _build_user_message(body: dict) -> tuple[str, dict | None]:
             names.append(name)
         else:
             try:
-                file_text = base64.b64decode(data).decode("utf-8", errors="replace")
+                blob = base64.b64decode(data)
             except Exception:
                 continue
-            if len(file_text) > MAX_TEXT_FILE:
-                file_text = file_text[:MAX_TEXT_FILE] + "\n...[文件过长已截断]"
-            file_notes.append(f"### 附件文件：{name}\n```\n{file_text}\n```")
-            names.append(name)
+            if not blob:
+                continue
+            info = db.save_attachment(sid, name, blob)  # 落盘；超限抛 ValueError
+            file_notes.append(
+                f"### 附件文件：{info['name']}（已存入附件区，共 {info['bytes']} 字节）\n"
+                f"请用 read_attachment 工具读取内容（支持 offset/limit 分页），"
+                f"不要假设已经看到全文。")
+            names.append(info["name"])
     if file_notes:
-        parts.append({"type": "text", "text": "用户附带了以下文件内容：\n\n" + "\n\n".join(file_notes)})
+        parts.append({"type": "text", "text": "用户附带了以下文件：\n\n" + "\n\n".join(file_notes)})
     if not parts:
         return "", None
     plain = text or ("[附件] " + "、".join(names))
@@ -884,7 +893,11 @@ class Handler(SimpleHTTPRequestHandler):
         nonce，会按事件里的原文补画）。
         """
         body = self._body()
-        plain, user_message = _build_user_message(body)
+        # 会话 id 要先拿到：文本附件需要按会话落盘（data/attachments/<sid>/）。
+        # get_session 内部只短持锁（见其注释）；本接口本身毫秒级返回，回合不在
+        # 本请求内执行，这里提前取不会拉长锁窗口。
+        sid, agent = get_session(sid_or_none, self.user["id"])
+        plain, user_message = _build_user_message(body, sid)
         if not plain:
             return self._json({"error": "输入不能为空"}, 400)
         # 新任务可随请求携带 workspace：创建即绑定项目。先校验目录再建会话，
@@ -898,9 +911,6 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json({"error": "工作目录不存在或不可用"}, 400)
             if sid_or_none:
                 return self._json({"error": "已存在的任务不支持随消息改绑目录，请用 /api/workspace"}, 400)
-        # get_session 内部只短持锁（见其注释）；这里不持全局锁——回合已不在
-        # 本请求内执行，本接口本身是毫秒级返回的。
-        sid, agent = get_session(sid_or_none, self.user["id"])
         if ws_target is not None:
             db.set_session_workspace(sid, str(ws_target))
             with _lock:
@@ -1420,6 +1430,7 @@ def _lan_ips() -> list[str]:
 def main():
     load_env_file(str(ENV_FILE))   # 读 .env（首库播种 / 默认供应商 / 默认工作区用）
     db.init_db()                   # 建表 + 播种（已初始化则跳过）
+    db.cleanup_orphan_attachments()  # 兜底：清理无主会话的附件目录（防 kill -9 残留）
     log_file = setup_logging(console=True)
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)

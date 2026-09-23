@@ -484,6 +484,8 @@ function taskRow(s, list) {
     inp.value = s.title || "";
     const done = () => submitRename(s.id, inp.value);
     inp.addEventListener("keydown", (e) => {
+      // IME 组合态：Enter 交给输入法选词，别当确认（否则拼音没上屏就提交了）
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === "Enter") done();
       if (e.key === "Escape") { renamingSession = null; renderSessions(sessionsCache); }
     });
@@ -1169,7 +1171,7 @@ function addFileToAttachments(file) {
   if (attachments.length >= MAX_ATTACH) { toast(`一次最多 ${MAX_ATTACH} 个附件`); return; }
   const isImage = file.type.startsWith("image/");
   if (isImage && file.size > 4 * 1024 * 1024) { toast(`图片超过 4MB`); return; }
-  if (!isImage && file.size > 300 * 1024) { toast(`文件超过 300KB（文本附件限制）`); return; }
+  if (!isImage && file.size > 5 * 1024 * 1024) { toast(`文件超过 5MB（附件限制）`); return; }
   if (isImage && !activeModelVision) {
     toast("当前模型未标注视觉能力，发送后将由 analyze_image 工具代为识别");
   }
@@ -2802,7 +2804,15 @@ function bind(id, event, fn) {
   el.addEventListener(event, fn);
 }
 
+// 输入法（IME）组合态标记：中文拼音/日文假名等未上屏时，Enter 应交给输入法
+// 选定候选词，绝不能触发发送。Safari 某些版本在 keydown 里 isComposing 不可靠，
+// 所以额外用 compositionstart/end 维护一个标记兜底。
+let imeComposing = false;
+bind("input", "compositionstart", () => { imeComposing = true; });
+bind("input", "compositionend", () => { imeComposing = false; });
 bind("input", "keydown", (e) => {
+  // e.isComposing 是标准属性；keyCode 229 是组合态下部分浏览器的兜底信号
+  if (e.isComposing || imeComposing || e.keyCode === 229) return;
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
 bind("attach-btn", "click", () => $("file-input").click());
@@ -2851,10 +2861,13 @@ bind("up-manage", "click", () => {
 });
 bind("login-submit", "click", submitLogin);
 bind("login-mode", "click", () => setLoginMode(loginMode === "login" ? "register" : "login"));
+// IME 组合态下 Enter 归输入法选词，不做跳转/提交
 bind("login-user", "keydown", (e) => {
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === "Enter") $("login-pass").focus();
 });
 bind("login-pass", "keydown", (e) => {
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === "Enter") submitLogin();
 });
 // ---------- 左下角用户设置面板 ----------

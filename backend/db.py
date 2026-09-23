@@ -529,6 +529,8 @@ def delete_session(sid: str) -> None:
     shutil.rmtree(_artifacts_dir() / sid, ignore_errors=True)
     # docs/<sid>/ 同理：该任务生成的文档随会话一起消失，避免留下孤儿文件
     shutil.rmtree(_docs_dir() / sid, ignore_errors=True)
+    # attachments/<sid>/ 同理：该任务上传的附件随会话一起消失（与 artifacts/docs 一致）
+    shutil.rmtree(_attachments_dir() / sid, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +637,172 @@ def write_doc(sid: str, name: str, content: str) -> dict:
     tmp.write_text(data, encoding="utf-8")
     os.replace(tmp, path)
     return {"name": safe, "bytes": nbytes, "lines": len(data.splitlines())}
+
+
+# ---------------------------------------------------------------------------
+# 附件存储：用户上传的文本文件，按会话隔离存放（引用式，不注入上下文）
+# ---------------------------------------------------------------------------
+# 与 docs/ 完全平行：路径与 artifacts/docs 同址（DB_PATH.parent/attachments），
+# 同样跟随库文件走、便于测试重定向；每会话一个子目录 attachments/<sid>/<name>。
+# attachments/ 落在 data/ 下，已被 .gitignore 忽略，不会进版本库，也不污染
+# 用户的工作区（用户的 WORKSPACE_DIR 是另一回事）。
+#
+# 为什么是"引用式"：早期附件把全文 base64 解码后直接注入消息正文，300KB 中文
+# 就约 10 万 token，且随会话历史每轮重复携带——上限只能卡死在 300KB。改为落盘
+# 后，消息里只带文件名与大小（几十 token），模型用 read_attachment 工具按需
+# 分页读取，单文件上限得以放宽到 5MB，模型还能覆盖全文。
+
+# 单个附件的大小上限（字节）。
+MAX_ATTACH_BYTES = 5 * 1024 * 1024
+# 单会话全部附件的总量上限（字节）：防"反复上传把磁盘写满"的防呆阀。
+# 前端一次最多 6 个附件（MAX_ATTACH），正常使用碰不到这个数。
+MAX_ATTACH_TOTAL_BYTES = 100 * 1024 * 1024
+
+
+def _attachments_dir() -> Path:
+    """附件根目录（跟随库文件所在目录，测试重定向 DB_PATH 时随之重定向）。"""
+    return DB_PATH.parent / "attachments"
+
+
+def _safe_attach_name(name: str) -> str:
+    """把用户/模型给的文件名归一成安全的单段文件名。
+
+    拒绝：空名、含路径分隔符（/ \\）、'.' / '..'。与 _safe_doc_name 同一套
+    思路，区别是不强制改扩展名（附件保留原始后缀，模型据此判断文件类型）。
+    真正的防线是下面 _attach_path 的 resolve 校验。
+    """
+    if not name or not isinstance(name, str):
+        raise ValueError("附件名不能为空")
+    raw = name.strip().replace("\n", " ").replace("\r", " ")
+    if not raw or raw in (".", "..") or "/" in raw or "\\" in raw:
+        raise ValueError("附件名不合法：不能包含路径分隔符")
+    return raw[:120]  # 文件名过长会撑爆路径，截断保平安
+
+
+def _attach_path(sid: str, name: str) -> Path:
+    """解析某会话下一个附件的绝对路径，并做越界白名单校验。
+
+    与 _doc_path / read_artifact 同一套思路：name 是不可信输入（来自前端），
+    resolve() 消解 ../ 与软链后，结果必须严格位于 attachments/<sid>/ 之内。
+    不满足即拒绝并记日志（防路径逃逸、跨会话读取）。
+    """
+    base = (_attachments_dir() / sid).resolve()
+    p = (base / name).resolve()
+    if p == base or base not in p.parents:
+        log.warning("附件路径拒绝越界: sid=%r name=%r", sid, name)
+        raise ValueError("非法的附件路径")
+    return p
+
+
+def _session_attach_bytes(sid: str) -> int:
+    """本会话已有附件的总字节数（用于总量上限校验）。"""
+    d = _attachments_dir() / sid
+    if not d.is_dir():
+        return 0
+    total = 0
+    for p in d.iterdir():
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def save_attachment(sid: str, name: str, data: bytes) -> dict:
+    """把一份附件写入 attachments/<sid>/，返回 {name, bytes}。
+
+    同名即覆盖（用户重传同名文件）。先写 .tmp 再 os.replace 原子改名，与
+    write_doc / _write_artifact 一致：避免半截文件。超单文件上限直接拒绝；
+    覆盖同名文件时，总量校验按"替换后"计算，不会因重传而被误拒。
+    """
+    if not sid:
+        raise ValueError("会话 id 不能为空")
+    safe = _safe_attach_name(name)
+    blob = data if isinstance(data, bytes) else bytes(data)
+    nbytes = len(blob)
+    if nbytes > MAX_ATTACH_BYTES:
+        raise ValueError(f"附件过大（{nbytes} 字节），上限 {MAX_ATTACH_BYTES} 字节")
+    d = _attachments_dir() / sid
+    d.mkdir(parents=True, exist_ok=True)
+    path = _attach_path(sid, safe)
+    old = path.stat().st_size if path.is_file() else 0
+    if _session_attach_bytes(sid) - old + nbytes > MAX_ATTACH_TOTAL_BYTES:
+        raise ValueError(f"本会话附件总量超过上限（{MAX_ATTACH_TOTAL_BYTES} 字节）")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(blob)
+    os.replace(tmp, path)
+    return {"name": safe, "bytes": nbytes}
+
+
+def list_attachments(sid: str) -> list[dict]:
+    """列出某会话的全部附件，按修改时间降序（最近上传的在前）。"""
+    d = _attachments_dir() / sid
+    if not d.is_dir():
+        return []
+    out = []
+    for p in d.iterdir():
+        if not p.is_file() or p.name.endswith(".tmp"):
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        out.append({"name": p.name, "bytes": st.st_size, "mtime": st.st_mtime})
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return out
+
+
+def read_attachment_text(sid: str, name: str, offset: int = 0,
+                         limit: int = 2000) -> dict:
+    """分页读取某会话下一份附件的文本内容。
+
+    返回 {name, total_lines, offset, lines, content, truncated}。按行分页：
+    5MB 附件可能有几十万行，模型一次拉不完也不该拉完——offset/limit 让它
+    像翻书一样分段读。二进制文件（解码失败）退回 errors="replace"，不抛错。
+    """
+    p = _attach_path(sid, _safe_attach_name(name))
+    if not p.is_file():
+        raise FileNotFoundError(f"附件不存在: {name}")
+    text = p.read_bytes().decode("utf-8", errors="replace")
+    all_lines = text.splitlines()
+    total = len(all_lines)
+    start = max(0, int(offset or 0))
+    count = max(1, int(limit or 2000))
+    chunk = all_lines[start:start + count]
+    end = start + len(chunk)
+    return {
+        "name": p.name,
+        "total_lines": total,
+        "offset": start,
+        "lines": len(chunk),
+        "content": "\n".join(chunk),
+        "truncated": end < total,
+    }
+
+
+def cleanup_orphan_attachments() -> int:
+    """清理孤儿附件目录：DB 里已无对应会话的 attachments/<sid>/ 整棵删除。
+
+    正常路径靠 delete_session 的 rmtree 就够；这里是兜底——进程被强杀
+    （kill -9）时 rmtree 不会执行，残留目录会永久占盘。启动时扫一遍即可。
+    返回清理掉的目录数。
+    """
+    root = _attachments_dir()
+    if not root.is_dir():
+        return 0
+    with _conn() as conn:
+        rows = conn.execute("SELECT id FROM sessions").fetchall()
+    alive = {r["id"] for r in rows}
+    removed = 0
+    for d in root.iterdir():
+        if not d.is_dir() or d.name in alive:
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        removed += 1
+    if removed:
+        log.info("清理孤儿附件目录 %d 个", removed)
+    return removed
 
 
 def _storable_body(m: dict) -> dict:

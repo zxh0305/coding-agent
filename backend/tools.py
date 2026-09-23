@@ -248,6 +248,13 @@ from doc_tools import DOC_TOOL_REGISTRY, DOC_TOOL_READ_ONLY, DOC_TOOL_SCHEMAS
 TOOL_SCHEMAS += DOC_TOOL_SCHEMAS
 TOOL_REGISTRY.update(DOC_TOOL_REGISTRY)
 
+# ---- 附件工具（attachment_tools.py）：读取用户上传的会话附件 ----
+from attachment_tools import (ATTACH_TOOL_REGISTRY, ATTACH_TOOL_READ_ONLY,
+                              ATTACH_TOOL_SCHEMAS)
+
+TOOL_SCHEMAS += ATTACH_TOOL_SCHEMAS
+TOOL_REGISTRY.update(ATTACH_TOOL_REGISTRY)
+
 # ---------------------------------------------------------------------------
 # 工具元数据：read_only（是否只读、能否并行）
 #
@@ -267,6 +274,7 @@ TOOL_READ_ONLY = {
 }
 TOOL_READ_ONLY.update(CODE_TOOL_READ_ONLY)  # 并入 coding 工具的标记（同样的合并方式）
 TOOL_READ_ONLY.update(DOC_TOOL_READ_ONLY)   # 并入文档工具（create_doc 为非只读，走串行）
+TOOL_READ_ONLY.update(ATTACH_TOOL_READ_ONLY)  # 并入附件工具（list/read_attachment 均只读）
 
 def is_read_only(name: str) -> bool:
     """name 是否只读工具。未知工具返回 False——没有元数据就当写操作走串行，永远站在安全侧。"""
