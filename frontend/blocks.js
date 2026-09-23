@@ -184,15 +184,19 @@
         }
         lastTool = null;
       } else if (t === "permission_request") {
-        // 确认卡挂在 process 里、对应工具位置：用 waiting 状态的 tool 块表示
+        // 确认卡挂在 process 里、对应工具位置：用 waiting 状态的 tool 块表示。
+        // 后端字段是 {id, tool, input, reason}（见 agent.py 的事件表），
+        // 不是 {request_id, name, arguments}——这里必须按真实字段读。
         pushItem({
           kind: "tool",
-          name: evt.name || "",
-          arguments: evt.arguments != null ? evt.arguments : "{}",
+          name: evt.tool || "",
+          arguments: evt.input != null
+            ? (typeof evt.input === "string" ? evt.input : JSON.stringify(evt.input))
+            : "{}",
           result: null,
           status: "waiting",
           permission: {
-            request_id: evt.request_id || null,
+            request_id: evt.id || null,
             reason: evt.reason || "",
           },
         });
@@ -351,9 +355,127 @@
     return blocks;
   }
 
+  // ---------- 实时追踪器（增量渲染用）----------
+  /*
+   * 实时路径不能像回放那样「一次性渲染」：它有打字机效果（rAF 合帧）、
+   * 气泡就地升级（流式小字 → done 时升级为正文卡）、摘要行秒数跳动等
+   * 按时间驱动的行为。若每条 delta 都重跑 blocksFromEvents→renderBlocks，
+   * 会每帧重建整个 DOM，打字机与滚动位置全毁。
+   *
+   * 所以实时路径保留增量 DOM 机制，但把「哪些工具在跑、配对到哪个结果、
+   * 什么状态」这类**易错的记账逻辑**收到这里——与 blocksFromEvents 用同一
+   * 套配对/状态判定，两路径不再各写一份（bug 温床正在这里）。
+   *
+   * 用法：每个回合 new 一个；feed(event) 逐条喂事件，返回本次产生的
+   * 增量信息（如「刚配对上结果的工具块」），DOM 层据此更新节点。
+   */
+  function createLiveTracker() {
+    let process = null;   // 当前回合的 process 记账
+    let lastTool = null;  // 最近一个 running 的工具块
+
+    function ensureProcess() {
+      if (!process) process = { kind: "process", steps: 0, items: [] };
+      return process;
+    }
+
+    function reset() {
+      process = null;
+      lastTool = null;
+    }
+
+    /*
+     * 喂一条事件。返回：
+     *   null                       该事件与工具记账无关
+     *   { kind:"tool_open", tool }  新工具开始跑（DOM 层画调用行）
+     *   { kind:"tool_close", tool } 工具拿到结果（DOM 层画结果行/回填徽章）
+     *   { kind:"tool_wait", tool }  权限确认（DOM 层画确认卡）
+     */
+    function feed(evt) {
+      if (!isObj(evt)) return null;
+      const t = evt.type;
+
+      if (t === "turn_start") {
+        reset();
+        return null;
+      }
+      if (t === "round") {
+        ensureProcess().items.push({ kind: "note", roundHead: true, text: `🧠 思考 · 第 ${evt.round} 轮` });
+        return null;
+      }
+      if (t === "reasoning_delta") {
+        return null;  // 思考流归 DOM 层的 thinkEl，不占步数
+      }
+      if (t === "tool_call") {
+        const tool = {
+          kind: "tool",
+          name: evt.name || "",
+          arguments: evt.arguments != null ? evt.arguments : "{}",
+          result: null,
+          status: "running",
+        };
+        ensureProcess().items.push(tool);
+        ensureProcess().steps += 1;
+        lastTool = tool;
+        return { kind: "tool_open", tool: tool };
+      }
+      if (t === "tool_result") {
+        // 与 blocksFromEvents 完全同一套配对规则：优先回填最近一个同名 running
+        const items = process ? process.items : [];
+        let target = null;
+        for (let i = items.length - 1; i >= 0; i--) {
+          const it = items[i];
+          if (it.kind === "tool" && it.status === "running" && (!evt.name || it.name === evt.name)) {
+            target = it;
+            break;
+          }
+        }
+        if (!target && lastTool && lastTool.status === "running") target = lastTool;
+        if (target) {
+          target.result = evt.result != null ? evt.result : "";
+          target.status = toolStatus(target.result);
+        } else {
+          target = {
+            kind: "tool",
+            name: evt.name || "",
+            arguments: "{}",
+            result: evt.result != null ? evt.result : "",
+            status: toolStatus(evt.result),
+            orphan: true,
+          };
+          ensureProcess().items.push(target);
+        }
+        lastTool = null;
+        return { kind: "tool_close", tool: target };
+      }
+      if (t === "permission_request") {
+        // 字段按后端真实事件体：{id, tool, input, reason}（见 agent.py）
+        const tool = {
+          kind: "tool",
+          name: evt.tool || "",
+          arguments: evt.input != null
+            ? (typeof evt.input === "string" ? evt.input : JSON.stringify(evt.input))
+            : "{}",
+          result: null,
+          status: "waiting",
+          permission: { request_id: evt.id || null, reason: evt.reason || "" },
+        };
+        ensureProcess().items.push(tool);
+        return { kind: "tool_wait", tool: tool };
+      }
+      return null;
+    }
+
+    function state() {
+      return process;
+    }
+
+    return { feed: feed, state: state, reset: reset };
+  }
+
   return {
     blocksFromEvents: blocksFromEvents,
     blocksFromHistory: blocksFromHistory,
+    createLiveTracker: createLiveTracker,
     // 导出给测试与渲染层复用
     _toolStatus: toolStatus,
     _parseResult: parseResult,

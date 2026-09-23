@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const { blocksFromEvents, blocksFromHistory } = require("./blocks.js");
+const { blocksFromEvents, blocksFromHistory, createLiveTracker } = require("./blocks.js");
 
 // 把块结构压成「形状签名」，便于跨路径比对（忽略具体文本差异）
 function shape(blocks) {
@@ -114,15 +114,17 @@ test("工具状态：只有请求没有结果 = running（流式进行中）", (
   assert.equal(tool.status, "running");
 });
 
-test("工具状态：权限确认卡 = waiting，并带请求信息", () => {
+test("工具状态：权限确认卡 = waiting（按后端真实字段 id/tool/input/reason）", () => {
   const blocks = blocksFromEvents([
     { type: "turn_start", input: "x", user_mid: "u1" },
-    { type: "permission_request", name: "run_bash", arguments: '{"command":"rm x"}', request_id: "req1", reason: "高危命令" },
+    { type: "permission_request", id: "req1", tool: "run_bash", input: { command: "rm x" }, reason: "高危命令" },
   ]);
   const tool = blocks.find((b) => b.kind === "process").items.find((i) => i.kind === "tool");
   assert.equal(tool.status, "waiting");
+  assert.equal(tool.name, "run_bash");
   assert.equal(tool.permission.request_id, "req1");
   assert.equal(tool.permission.reason, "高危命令");
+  assert.equal(tool.arguments, '{"command":"rm x"}'); // input 对象被序列化成 arguments 字符串
 });
 
 test("思考流不混入回答（曾经的真 bug：过程说明冒充思考）", () => {
@@ -211,4 +213,67 @@ test("边界：空输入不崩", () => {
   assert.deepEqual(blocksFromEvents(null), []);
   assert.deepEqual(blocksFromHistory([]), []);
   assert.deepEqual(blocksFromHistory(undefined), []);
+});
+
+// ---------- 实时追踪器（增量渲染共用配对逻辑）----------
+
+test("追踪器：tool_call → tool_open，tool_result → tool_close 并配对", () => {
+  const tr = createLiveTracker();
+  tr.feed({ type: "turn_start", input: "x" });
+  const open = tr.feed({ type: "tool_call", name: "read_file", arguments: "{}" });
+  assert.equal(open.kind, "tool_open");
+  assert.equal(open.tool.status, "running");
+
+  const close = tr.feed({ type: "tool_result", name: "read_file", result: '{"ok":true}' });
+  assert.equal(close.kind, "tool_close");
+  assert.equal(close.tool, open.tool); // 同一个块对象
+  assert.equal(close.tool.status, "ok");
+});
+
+test("追踪器：与 blocksFromEvents 配对结果一致（同一套逻辑）", () => {
+  const events = [
+    { type: "turn_start", input: "x" },
+    { type: "round", round: 1 },
+    { type: "tool_call", name: "grep", arguments: '{"pattern":"a"}' },
+    { type: "tool_result", name: "grep", result: '{"ok":false,"error":"权限拒绝：xx"}' },
+  ];
+  const tr = createLiveTracker();
+  for (const e of events) tr.feed(e);
+  const viaTracker = tr.state();
+
+  const viaPure = blocksFromEvents(events).find((b) => b.kind === "process");
+  // 步数、工具名、状态三者应完全一致
+  assert.equal(viaTracker.steps, viaPure.steps);
+  const t1 = viaTracker.items.find((i) => i.kind === "tool");
+  const t2 = viaPure.items.find((i) => i.kind === "tool");
+  assert.equal(t1.name, t2.name);
+  assert.equal(t1.status, t2.status);
+  assert.equal(t1.status, "denied");
+});
+
+test("追踪器：权限请求产 tool_wait（按后端真实字段）", () => {
+  const tr = createLiveTracker();
+  tr.feed({ type: "turn_start", input: "x" });
+  const w = tr.feed({ type: "permission_request", id: "r1", tool: "run_bash", input: { command: "rm x" }, reason: "高危" });
+  assert.equal(w.kind, "tool_wait");
+  assert.equal(w.tool.status, "waiting");
+  assert.equal(w.tool.name, "run_bash");
+  assert.equal(w.tool.permission.request_id, "r1");
+});
+
+test("追踪器：turn_start 重置上一回合的记账", () => {
+  const tr = createLiveTracker();
+  tr.feed({ type: "turn_start", input: "第一回合" });
+  tr.feed({ type: "tool_call", name: "read_file", arguments: "{}" });
+  assert.equal(tr.state().steps, 1);
+  tr.feed({ type: "turn_start", input: "第二回合" });
+  assert.equal(tr.state(), null); // 已重置
+});
+
+test("追踪器：无关事件返回 null，不误伤", () => {
+  const tr = createLiveTracker();
+  assert.equal(tr.feed({ type: "answer_delta", delta: "hi" }), null);
+  assert.equal(tr.feed({ type: "reasoning_delta", delta: "think" }), null);
+  assert.equal(tr.feed({ type: "done", answer: "x" }), null);
+  assert.equal(tr.feed(null), null);
 });

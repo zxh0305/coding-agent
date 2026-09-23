@@ -1032,6 +1032,7 @@ function updateLoadOlder() {
 // 改造前逐字节一致——渲染器只负责「按 Block 结构决定拼装顺序」。
 const blocksFromEvents = window.CodingAgentBlocks.blocksFromEvents;
 const blocksFromHistory = window.CodingAgentBlocks.blocksFromHistory;
+const createLiveTracker = window.CodingAgentBlocks.createLiveTracker;
 const blocksRenderer = window.CodingAgentRenderBlocks.createRenderer({
   doc: document,
   buildBubble: buildBubble,
@@ -2000,6 +2001,9 @@ let pendingCalls = [];  // 已发出但未见结果的工具调用（算持续�
 let permissionCards = new Map();  // permission id -> 卡片元素：补发重放同一请求时复用/整卡重画，不叠卡片
 let liveMsgs = new Map();  // mid -> {el, text}：事件流里同一 mid 的 delta 归并进同一气泡
 let curMid = null;         // 当前回答段落的 mid（round 事件切换）
+// 实时工具记账：与历史回放共用 blocks.js 的配对/状态逻辑（见 createLiveTracker），
+// 避免"哪些工具在跑、配到哪个结果"两路径各写一份而不同步。
+let liveTracker = createLiveTracker();
 let historyMids = new Set();  // 已从分页接口加载进时间线的消息 mid（补发去重基准）
 
 const TOOL_ICONS = {
@@ -2191,7 +2195,9 @@ function makeToolResultLine(name, resultStr, dur = "") {
   return d;
 }
 
-function toolResultLine(name, resultStr) {
+// tool 块（可选）：来自共用追踪器的配对结果，携带权威的工具状态。
+// 计时仍由 DOM 侧的 pendingCalls 负责（那是渲染关注点，与语义无关）。
+function toolResultLine(name, resultStr, tool) {
   // 持续时长：配对最近一次同名调用
   let dur = "";
   const idx = pendingCalls.map(c => c.name).lastIndexOf(name);
@@ -2201,7 +2207,14 @@ function toolResultLine(name, resultStr) {
     // 写入类：把结果里的增删行数回填成调用卡上的徽章，让"改了多大"一眼可见
     if (call.el && call.el.classList.contains("card")) decorateWriteCard(call.el, resultStr);
   }
-  appendTrace(makeToolResultLine(name, resultStr, dur));
+  const line = makeToolResultLine(name, resultStr, dur);
+  // 追踪器判定的状态落成 DOM 标记：denied（权限拒绝）与 err（失败）都标 err 样式，
+  // 与历史回放同一判据（blocks.js 的 toolStatus）——不再各判一次。
+  if (tool && (tool.status === "err" || tool.status === "denied")) {
+    const sum = line.querySelector("summary");
+    if (sum) sum.classList.add("err");
+  }
+  appendTrace(line);
   traceCurrent = "";  // 工具已返回：摘要行不再显示"正在…"
   traceTick();
 }
@@ -2411,6 +2424,7 @@ function applyEvent(evt, seq) {
     liveMsgs = new Map();
     liveBubble = null; traceEl = null; traceSteps = 0; traceCurrent = "";
     metaEl = null; thinkEl = null; pendingCalls = [];
+    liveTracker.reset();  // 工具记账随回合重置（与 blocksFromEvents 的 turn_start 行为一致）
     permissionCards = new Map();  // 新回合的确认卡是新的请求：旧卡引用随时间线一起失效
     pendingDeltas = new Map(); pendingThink = "";
     usageNow = null; curMid = null; qStart = Date.now();
@@ -2447,10 +2461,15 @@ function applyEvent(evt, seq) {
     flushStreamBuffers();
     // 调工具前输出的正文同样是过程说明（"我先看看这个文件…"），一并降级
     demoteLiveBubbleToTrace();
-    toolCallLine(evt.name, evt.arguments);
+    // 记账交给共用追踪器（与回放同一套配对逻辑），DOM 侧只负责画这一行
+    const act = liveTracker.feed(evt);
+    if (act && act.kind === "tool_open") toolCallLine(act.tool.name, act.tool.arguments);
+    else toolCallLine(evt.name, evt.arguments);  // 兜底：极端序列下仍画出来
   } else if (t === "tool_result") {
-    toolResultLine(evt.name, evt.result);
+    const act = liveTracker.feed(evt);
+    toolResultLine(evt.name, evt.result, act && act.kind === "tool_close" ? act.tool : null);
   } else if (t === "permission_request") {
+    liveTracker.feed(evt);  // 记账（tool_wait），DOM 由 showPermissionCard 画
     showPermissionCard(evt);
   } else if (t === "usage") {
     usageNow = evt;   // 供上下文气泡与统计行使用
