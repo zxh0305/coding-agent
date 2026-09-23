@@ -1995,7 +1995,7 @@ function handleResync(evt) {
 // ---------- 流式渲染：执行过程时间线 + 打字机回答 ----------
 let liveBubble = null, metaEl = null, metaTimer = null, qStart = 0;
 let thinkEl = null;  // 当前轮次的思考流块（思考模型的 reasoning_delta 实时显示用）
-let traceEl = null, traceSteps = 0;
+let traceEl = null;
 let traceCurrent = "";  // 当前正在执行的工具（收起状态下摘要行显示的"此刻在干嘛"）
 let pendingCalls = [];  // 已发出但未见结果的工具调用（算持续时长用）
 let permissionCards = new Map();  // permission id -> 卡片元素：补发重放同一请求时复用/整卡重画，不叠卡片
@@ -2026,8 +2026,8 @@ function ensureTrace() {
   chatEl.appendChild(traceEl);
 }
 
-// 生成中的折叠条文案：有工具步（traceSteps>0）显示"已工作"，纯思考阶段
-// （reasoning 流不算步）显示"已思考"。
+// 生成中的折叠条文案：有工具步显示"已工作"，纯思考阶段（reasoning 流不算步）
+// 显示"已思考"。步数取自 liveTracker.state().steps（见 traceTick）。
 function fmtElapsed(sec) {
   const n = Number(sec) || 0;
   return n < 60 ? `${n.toFixed(n < 10 ? 1 : 0)} 秒`
@@ -2036,19 +2036,25 @@ function fmtElapsed(sec) {
 
 // 摘要行 = 一行"当前状态"：正在跑的工具 + 已工作多久 + 步数。
 // 这是收起状态下用户唯一能看到的过程信息，必须把"此刻在干嘛"说清楚。
+// 步数与"正在跑什么"都取自 liveTracker（与回放同一套记账），不再另立计数器。
 function traceTick() {
   if (!traceEl) return;
+  const st = liveTracker.state();
+  const steps = st ? st.steps : 0;
   const el = fmtElapsed((Date.now() - qStart) / 1000);
-  const doing = traceCurrent ? `${traceCurrent} · ` : "";
-  const label = traceSteps > 0 ? "已工作" : "已思考";
+  // traceCurrent 是本 tab 自己发工具时设的即时值；补发/刷新场景下为空，
+  // 此时从 tracker 记账里现取「正在跑的工具」——两处同源，不会各说各话。
+  const cur = traceCurrent || traceCurrentFromTracker();
+  const doing = cur ? `${cur} · ` : "";
+  const label = steps > 0 ? "已工作" : "已思考";
   traceEl.querySelector("summary").textContent =
-    `${doing}${label} ${el} · ${traceSteps} 步`;
+    `${doing}${label} ${el} · ${steps} 步`;
 }
 
+// 追加一行执行痕迹。步数已由 liveTracker 记账（tool_call 时 +1），这里不再自增。
 function appendTrace(el) {
   ensureTrace();
   traceEl.appendChild(el);
-  traceSteps += 1;
   traceTick();
   scrollBottom();  // 执行步骤追加：只在用户本来贴底时跟随
 }
@@ -2147,6 +2153,20 @@ function toolCallLine(name, argsStr) {
   pendingCalls.push({ name, el: d, t: Date.now() });
   traceCurrent = toolDoingLabel(name, argsStr);  // 摘要行显示"此刻在跑什么"
   traceTick();
+}
+
+// 从 liveTracker 当前记账里取「正在跑的工具」标签（摘要行用）。
+// 与 toolCallLine 里设的值同源，但补发/刷新场景下 tracker 是权威。
+function traceCurrentFromTracker() {
+  const st = liveTracker.state();
+  if (!st) return "";
+  for (let i = st.items.length - 1; i >= 0; i--) {
+    const it = st.items[i];
+    if (it.kind === "tool" && it.status === "running") {
+      return toolDoingLabel(it.name, it.arguments || "{}");
+    }
+  }
+  return "";
 }
 
 // 构建工具结果行（游离节点）。dur：实时流配对调用算出的耗时；回放没有，传空。
@@ -2422,7 +2442,7 @@ function applyEvent(evt, seq) {
     // 回合级状态复位（原在 performSend 里；改为事件驱动后，刷新页面接上
     // 正在进行的回合也走同一套初始化）
     liveMsgs = new Map();
-    liveBubble = null; traceEl = null; traceSteps = 0; traceCurrent = "";
+    liveBubble = null; traceEl = null; traceCurrent = "";
     metaEl = null; thinkEl = null; pendingCalls = [];
     liveTracker.reset();  // 工具记账随回合重置（与 blocksFromEvents 的 turn_start 行为一致）
     permissionCards = new Map();  // 新回合的确认卡是新的请求：旧卡引用随时间线一起失效
@@ -2511,8 +2531,9 @@ function applyEvent(evt, seq) {
     if (traceEl) {
       // 做完任务自动折叠：正文回归"只要答案"；点折叠条仍可回看全过程
       traceEl.open = false;
+      const st = liveTracker.state();
       traceEl.querySelector("summary").textContent =
-        `已工作 ${fmtElapsed(evt.elapsed_s)} · ${traceSteps} 步`;
+        `已工作 ${fmtElapsed(evt.elapsed_s)} · ${st ? st.steps : 0} 步`;
     }
     scrollBottom();  // 回答完成：贴底用户直接看到答案，上滑用户不受打扰
     loadSessions();  // 任务时间/排序刷新
@@ -2598,7 +2619,7 @@ function resetStreamState() {
   setStreaming(false);
   myNonce = null;
   liveBubble = null; metaEl = null; thinkEl = null;
-  traceEl = null; traceSteps = 0;
+  traceEl = null;
   liveMsgs = new Map(); pendingCalls = [];
   permissionCards = new Map();
   pendingDeltas = new Map(); pendingThink = "";
