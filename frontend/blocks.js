@@ -157,13 +157,17 @@
         ensureProcess().steps += 1;
         lastTool = tool;
       } else if (t === "tool_result") {
-        // 回填最近一个同名 running 块；找不到（异常序列）就补一个孤儿块，
+        // 回填最近一个同名「未终态」块；找不到（异常序列）就补一个孤儿块，
         // 宁可多画一行也不静默丢信息。
+        // 未终态 = running（正常调用）或 waiting（权限确认中）——权限流程里
+        // 后端不发 tool_call，permission_request 自己建的块是 waiting 态，
+        // 结果回来时若只认 running 就会漏配、多出一个孤儿块（曾的真 bug）。
         let target = null;
         const items = process ? process.items : [];
         for (let i = items.length - 1; i >= 0; i--) {
           const it = items[i];
-          if (it.kind === "tool" && it.status === "running" && (!evt.name || it.name === evt.name)) {
+          if (it.kind === "tool" && (it.status === "running" || it.status === "waiting") &&
+              (!evt.name || it.name === evt.name)) {
             target = it;
             break;
           }
@@ -200,6 +204,9 @@
             reason: evt.reason || "",
           },
         });
+        // 权限确认也是一次工具调用（后端命中 ask 时不发 tool_call，只发它），
+        // 要算一步——否则摘要行会把它漏掉，与「已工作 N 步」的口径不符。
+        ensureProcess().steps += 1;
       } else if (t === "done") {
         // 定稿：answer 以 done.answer 为权威正文（非空时覆盖流式累积）
         const authoritative = typeof evt.answer === "string" ? evt.answer : "";
@@ -419,17 +426,21 @@
         return { kind: "tool_open", tool: tool };
       }
       if (t === "tool_result") {
-        // 与 blocksFromEvents 完全同一套配对规则：优先回填最近一个同名 running
+        // 与 blocksFromEvents 完全同一套配对规则：回填最近一个同名「未终态」
+        // 块（running 或 waiting）。waiting 也要认——权限流程里 permission_request
+        // 自己建块、后端不发 tool_call，只认 running 会漏配成孤儿块。
         const items = process ? process.items : [];
         let target = null;
         for (let i = items.length - 1; i >= 0; i--) {
           const it = items[i];
-          if (it.kind === "tool" && it.status === "running" && (!evt.name || it.name === evt.name)) {
+          if (it.kind === "tool" && (it.status === "running" || it.status === "waiting") &&
+              (!evt.name || it.name === evt.name)) {
             target = it;
             break;
           }
         }
-        if (!target && lastTool && lastTool.status === "running") target = lastTool;
+        if (!target && lastTool &&
+            (lastTool.status === "running" || lastTool.status === "waiting")) target = lastTool;
         if (target) {
           target.result = evt.result != null ? evt.result : "";
           target.status = toolStatus(target.result);
@@ -460,6 +471,8 @@
           permission: { request_id: evt.id || null, reason: evt.reason || "" },
         };
         ensureProcess().items.push(tool);
+        // 与 blocksFromEvents 同一口径：权限确认也算一步
+        ensureProcess().steps += 1;
         return { kind: "tool_wait", tool: tool };
       }
       return null;
