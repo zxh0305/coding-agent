@@ -1393,7 +1393,11 @@ function buildUserBubble(text, atts) {
       f.className = "att-file clickable";
       f.textContent = "📄 " + a.name;
       f.title = "点击查看这份附件";
-      f.addEventListener("click", () => {
+      f.addEventListener("click", (e) => {
+        // stopPropagation 必须加：点击会冒泡到 document 上的「点空白处关闭浮
+        // 窗」监听器——它看到目标既不在 attach-pop 内也不在 attach-chip 上，
+        // 会把刚打开的浮窗在同一瞬间关掉，表现就是"点了没反应"。
+        e.stopPropagation();
         const pop = $("attach-pop");
         if (pop.classList.contains("hidden")) toggleAttachPop();
         openAttachment(a.name);

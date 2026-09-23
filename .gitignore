@@ -6,6 +6,9 @@ __pycache__/
 data/
 # agent 记忆目录（WORKSPACE_DIR 指向项目根时会出现在项目根）
 .agent-memory/
+# agent 在用户工作区内的落盘目录：会话附件（attachments/）等运行时产物，
+# 不进版本库——用户要求附件上传不得引起 git 工作区变动
+.coding-agent/
 
 # 真机评估脚本的一次性结果
 backend/manual/eval_patch_*.json

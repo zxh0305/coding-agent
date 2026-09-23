@@ -334,13 +334,30 @@
         let text = "";
         let atts = [];
         if (Array.isArray(m.content)) {
+          // 文件附件在存储消息里是后端 _build_user_message 注入的一段文本
+          // （"用户附带了以下文件：\n\n### 附件文件：xxx（已存入附件区…）…"
+          // 整段作为一个 text part），不是结构化字段。历史回放要把它还原成
+          // 可点的文件附件，否则刷新后气泡里会出现一坨注入原文。
+          const isAttachNote = (t) => typeof t === "string"
+            && (t.indexOf("用户附带了以下文件：") === 0 || t.indexOf("### 附件文件：") === 0);
+          const fileAtts = m.content
+            .filter((p) => isObj(p) && p.type === "text" && isAttachNote(p.text))
+            .map((p) => {
+              const m2 = (p.text || "").match(/### 附件文件：(.+?)（/);
+              return m2 ? m2[1] : "";
+            })
+            .filter((name) => name)
+            .map((name) => ({ kind: "file", name: name, preview: "" }));
           text = m.content
             .filter((p) => isObj(p) && p.type === "text")
-            .map((p) => (typeof p.text === "string" && p.text.length > 600 ? p.text.slice(0, 600) + "…[附件内容已折叠]" : p.text || ""))
+            .map((p) => p.text || "")
+            .filter((t) => !isAttachNote(t))  // 注入的附件说明不进正文
+            .map((p) => (typeof p === "string" && p.length > 600 ? p.slice(0, 600) + "…[附件内容已折叠]" : p))
             .join("\n");
           atts = m.content
             .filter((p) => isObj(p) && p.type === "image_url")
             .map((p) => ({ kind: "image", name: "", preview: ((p.image_url || {}).url) || "" }));
+          atts = atts.concat(fileAtts);
         } else {
           text = typeof m.content === "string" ? m.content : "";
         }
