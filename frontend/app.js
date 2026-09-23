@@ -703,6 +703,7 @@ async function newTask(presetProject = null) {
     loadWorkspace();  // 回到"新任务"态：工具栏显示「选择项目」
   }
   renderWsChip();
+  refreshGitChip();    // 分支徽章随项目预选立即更新（新任务态也能显示目标项目的分支）
   await loadSessions();  // 重新拉取列表：旧任务仍显示，只是没有选中项；首条消息后新任务才出现
 }
 // ---------- 输入框草稿：按会话归属 ----------
@@ -1718,6 +1719,7 @@ async function loadWorkspace() {
     wsCustom = !!w.custom;
     setWsLabel(w.path);
     renderWsChip();
+    refreshGitChip();  // 工作区变了，分支徽章立刻跟着换（不等下一次切会话）
     loadPermMode();  // 工作区变了，权限模式跟着工作区走
   } catch (e) { /* 忽略 */ }
 }
@@ -2823,16 +2825,22 @@ async function performSend(item) {
      `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`);
   myNonce = item.nonce;
   const target = item.sessionId ?? currentSession;
-  // 新任务首次发送的绑定目录：选目录挂起流程带 chosenPath；项目组头「＋」
-  // 新建的带 pendingProjectPath。发出后即清，防串到别的会话。
-  const bindPath = item.chosenPath || (!target ? pendingProjectPath : null);
+  // 绑定目录只发生在【创建任务】的那次请求（创建即绑定，原子）：选目录挂起
+  // 流程带 chosenPath；项目组头「＋」新建的带 pendingProjectPath。
+  // 关键防线：已有会话的追问【绝不】带 workspace——pendingProjectPath 可能在
+  // "新任务预选了项目但没发消息、又切进已有会话"时残留，追问带上它会被后端
+  // 以"已存在的任务不支持随消息改绑目录"拒绝，消息发不出去（真实踩过的坑）。
+  const creating = !target;
+  const bindPath = creating
+    ? (item.chosenPath || pendingProjectPath || null)
+    : null;
   pendingProjectPath = null;
   const body = JSON.stringify({
     message: item.text,
     nonce: item.nonce,
     attachments: item.payloadAtts,
     // 创建即绑定项目（原子——回合启动前落库）
-    workspace: bindPath || undefined,
+    workspace: (creating && bindPath) || undefined,
   });
   try {
     if (target) {
@@ -3053,10 +3061,22 @@ function setGitChipBranch(branch) {
 // 只在已绑定项目时发请求；失败静默（不是仓库属正常状态，不该弹错）。
 async function refreshGitChip() {
   if (!currentSession) {
-    // 新任务态：还没有会话，后端解析不出工作区（no_workspace）。预选了项目
-    // 也只是待绑定，这里同样不画分支名，只把按钮恢复成中性态。
-    setGitChipBranch("");
-    $("git-chip").classList.remove("warn");
+    // 新任务态：会话未创建。预选了项目（组头「＋」/chip）时也立刻显示该项目
+    // 的分支名——后端支持 workspace 直传（仅预览，不用等首条消息建会话）。
+    const qs = new URLSearchParams();
+    if (pendingProjectPath) qs.set("workspace", pendingProjectPath);
+    if (!qs.toString()) {
+      setGitChipBranch("");
+      $("git-chip").classList.remove("warn");
+      return;
+    }
+    try {
+      const d = await api("/api/git/summary?" + qs.toString());
+      setGitChipBranch(d.ok ? d.branch : "");
+      $("git-chip").classList.toggle("warn", !d.ok);
+    } catch (e) {
+      setGitChipBranch("");
+    }
     return;
   }
   try {

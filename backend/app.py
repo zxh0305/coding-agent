@@ -1138,7 +1138,18 @@ class Handler(SimpleHTTPRequestHandler):
         sid = (self._query().get("session_id") or [""])[0]
         if sid and db.session_owner(sid) != self.user["id"]:
             return self._json({"error": "任务不存在或不属于当前用户"}, 404)
-        ws = _resolve_workspace(self.user["id"], sid)
+        # workspace 直传（新任务态）：会话还没创建时前端预选了项目，徽章/浮窗
+        # 也要能立刻显示该项目的分支名——传目录路径直接查询。目录必须真实存在，
+        # 且只允许绝对路径（与提交消息绑工作区同一套校验思路）；不传则走会话解析。
+        ws_req = (self._query().get("workspace") or [""])[0]
+        if ws_req and not sid:
+            ws_target = Path(ws_req).expanduser().resolve()
+            if not ws_target.is_dir() or ws_target == Path(ws_target.root):
+                return self._json({"ok": False, "reason": "no_workspace",
+                                   "error": "目录不存在或不可用"}, 200)
+            ws = ws_target
+        else:
+            ws = _resolve_workspace(self.user["id"], sid)
         if ws is None:
             return self._json({"ok": False, "reason": "no_workspace",
                                "error": "该任务还没有绑定项目文件夹"}, 200)
