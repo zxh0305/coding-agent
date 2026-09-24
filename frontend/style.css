@@ -1565,7 +1565,11 @@ body.docs-resizing .docs-panel { transition: none; }
   .docs-panel, .docs-list { transition: none; }
 }
 .docs-item {
-  padding: 8px 10px; border-radius: 8px; cursor: pointer;
+  /* position:relative：删除按钮（.docs-del-btn）绝对定位锚在这里，缺了它
+     按钮会飘到外层面板上，表现为"hover 时看不见删除按钮"（真实踩过的坑）。 */
+  position: relative;
+  /* 右侧 32px 常驻留给删除按钮（hover 才出现），长标题换行时不会被压住 */
+  padding: 8px 32px 8px 10px; border-radius: 8px; cursor: pointer;
   font-size: 13px; color: var(--text); line-height: 1.4; word-break: break-all;
 }
 .docs-item:hover { background: var(--hover-soft); }
