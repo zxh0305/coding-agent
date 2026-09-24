@@ -26,8 +26,14 @@ from pathlib import Path
 _PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_WORKSPACE = _PROJECT_DIR / "workspace"
 
-# 遍历时永远跳过的目录
-IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".idea", ".vscode"}
+# 遍历时永远跳过的目录。除通用噪音外，还包含 data/ 下的运行时产物目录：
+# browser-profiles（浏览器扩展源码含整张 TLD 域名表，曾被整读进历史后触发
+# 供应商风控、全会话 400）、logs（服务端日志里全是报错原文，读入即自我污染）、
+# backups / attachments / browser-shots / artifacts（二进制与大文件聚集地）。
+# 这些目录对编码任务没有价值，产出物却极易撑爆上下文。
+IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".idea", ".vscode",
+                "browser-profiles", "browser-shots", "attachments", "backups",
+                "artifacts", "logs"}
 
 MAX_READ_LINES = 2_000    # 单次 read_file 的行数上限：防止大文件一口气撑爆模型上下文。
                           # 行数而非字符数——行号展示与 offset/limit 分段都以"行"为轴，
