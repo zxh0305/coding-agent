@@ -4390,7 +4390,10 @@ function syncBrowser(url, note, shot) {
   if (urlEl) { urlEl.textContent = url || "—"; urlEl.title = url || ""; }
   if (noteEl) noteEl.textContent = note || "";
   const img = document.createElement("img");
-  img.src = shot + (shot.includes("?") ? "&" : "?") + "t=" + Date.now();  // 破缓存
+  // <img> 是浏览器原生请求，带不了 Authorization 头——token 走查询参数
+  // （与 SSE events 端点同一先例），服务端 _require_auth 对该端点放行。
+  // t= 破缓存：同一 n 的截图内容不会变，但保底避免历史帧被内存缓存干扰。
+  img.src = shot + (shot.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(authToken) + "&t=" + Date.now();
   img.alt = note || url || "浏览器截图";
   view.appendChild(img);
   view.scrollTop = view.scrollHeight;

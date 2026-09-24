@@ -651,10 +651,10 @@ class Handler(SimpleHTTPRequestHandler):
         """统一入口鉴权：/api/auth/* 放行，其余 /api/* 必须带有效 token。
 
         静态文件（前端页面本身）不拦——页面得先打开才能登录。
-        例外：events 端点额外接受 ?token= 查询参数鉴权——浏览器原生
-        EventSource 不支持自定义请求头，Authorization 带不进去。只对
-        events 开这一个口子：token 出现在 URL 里存在被代理日志记录的
-        暴露面，能窄则窄。
+        例外：events 与 browser/shot 端点额外接受 ?token= 查询参数鉴权——
+        浏览器原生的 EventSource / <img> 不支持自定义请求头，
+        Authorization 带不进去。只对这两个端点开这个口子：token 出现在
+        URL 里存在被代理日志记录的暴露面，能窄则窄。
         通过后把用户挂在 self.user 上，后续接口直接用。
         """
         path = urllib.parse.urlparse(self.path).path
@@ -662,7 +662,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.user = None
             return True
         user = self._auth_user()
-        if user is None and path.endswith("/events"):
+        token_in_url = path.endswith("/events") or path.endswith("/browser/shot")
+        if user is None and token_in_url:
             tok = (self._query().get("token") or [""])[0]
             if tok:
                 user = db.user_for_token(tok)
