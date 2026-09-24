@@ -30,9 +30,9 @@ import shutil
 import threading
 from pathlib import Path
 
-import tools as _tools_mod  # error_result（tools.py 先于本模块导入）
-
-# playwright 是可选依赖：导入失败不炸模块，工具调用时给出可读指引
+# playwright 是可选依赖
+# 注意：本模块绝不 import tools（tools.py 反向导入本模块，循环导入会炸）。
+# 失败信封用本文件自带的 _err/_ok，与 doc_tools 同一自足模式。：导入失败不炸模块，工具调用时给出可读指引
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     _PW_AVAILABLE = True
