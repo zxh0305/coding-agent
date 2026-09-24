@@ -2005,6 +2005,13 @@ function finishBoot(caughtUp) {
   // 避免服务端起点更早导致已显示的秒数倒退）。
   const srvStart = Number(caughtUp && caughtUp.started_at) * 1000;
   if (srvStart > 0 && (!qStart || srvStart > qStart)) qStart = srvStart;
+  // 服务端说回合仍在跑：强制进入"生成中"。不能依赖补发段里的 turn_start 来
+  // 置位——超长回合（事件量 > 环形缓冲 500）会把 turn_start 挤出缓冲，
+  // replay_plan 退化为"尽力补尾巴"（events.py），补发段没有 turn_start，
+  // streaming 就永远丢了：按钮停在"发送"态，点击变成再发一条消息进队列，
+  // 而不是停止。running===true 时提前置位是幂等的（turn_start 正常到达时
+  // 再置一次无副作用），只覆盖"丢了 turn_start"的退化路径。
+  if (caughtUp && caughtUp.running === true) setStreaming(true);
   if (caughtUp && caughtUp.running === false && streaming) {
     // 连上时服务端已无进行中回合，而本页还挂在"生成中"：回合在断线/服务
     // 重启之间死掉了（未落盘）。手动收尾不挂起——手测②"刷新接上进行中
