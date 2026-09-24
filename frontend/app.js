@@ -5,6 +5,27 @@ const $ = (id) => document.getElementById(id);
 const chatEl = $("chat");
 const inputEl = $("input");
 
+// ---------- 设备模式（桌面 / 手机） ----------
+// 判定逻辑与 html[data-mode] 由 mode.js 负责（<head> 里先于本文件同步加载，
+// 保证首帧渲染就带对模式），这里只读，不重复判定规则。
+function isMobileMode() {
+  const m = document.documentElement.dataset.mode;
+  if (m) return m === "mobile";
+  return window.CodingAgentMode ? window.CodingAgentMode.isMobile() : window.innerWidth <= 720;
+}
+
+// 输入框提示语随模式切换：手机没有 Shift 键，写"Shift+Enter 换行"只会让人困惑
+const INPUT_PLACEHOLDER = {
+  desktop: "输入问题或任务，Enter 发送（Shift+Enter 换行）",
+  mobile: "输入问题或任务，点发送",
+};
+function applyPlaceholder() {
+  if (!inputEl) return;
+  inputEl.placeholder = INPUT_PLACEHOLDER[isMobileMode() ? "mobile" : "desktop"];
+}
+applyPlaceholder();
+document.addEventListener("modechange", applyPlaceholder);
+
 let currentSession = null;   // 当前任务（会话）id；null = 将开新任务
 let streaming = false;       // 正在生成回答：此时发送按钮变身停止按钮（由 turn_start/turn_end 事件驱动）
 let contextWindow = 262144;  // 上下文容量显示上限（/api/config 提供）
@@ -3608,6 +3629,8 @@ function initSidebar() {
   const side = sidebarEl();
   const btn = $("side-collapse");
   const hover = $("side-hover");
+  const mask = $("side-mask");
+  const nav = $("nav-toggle");
   if (!side || !btn || !hover) return;
 
   const setCollapsed = (collapsed) => {
@@ -3625,9 +3648,42 @@ function initSidebar() {
   const peek = () => { if (isCollapsed()) side.classList.add("peek"); };
   const unpeek = () => side.classList.remove("peek");
 
-  btn.addEventListener("click", () => setCollapsed(!isCollapsed()));
+  // ---------- 手机端：侧栏改成左滑抽屉 ----------
+  // 手机的交互与桌面不是一套：触屏没有 hover（桌面那套"左缘热区唤出"会失效，
+  // 而且 hover 在触屏上是"点了才粘住"），所以手机上走独立分支——
+  // ☰ 打开 / 点遮罩或选中任务后收起，不复用桌面的收起态。
+  const openDrawer = () => {
+    side.classList.add("drawer-open");
+    if (mask) mask.classList.remove("hidden");
+  };
+  const closeDrawer = () => {
+    side.classList.remove("drawer-open");
+    if (mask) mask.classList.add("hidden");
+  };
+  const isDrawerOpen = () => side.classList.contains("drawer-open");
 
-  // 鼠标进入左缘热区 → 弹出
+  // 模式切换（旋转屏幕 / 缩放窗口）时重排本侧交互：两套状态互不残留，
+  // 桌面切回桌面时回到用户上次保存的收起态。
+  const applyMode = () => {
+    closeDrawer();
+    if (isMobileMode()) {
+      side.classList.remove("collapsed", "floating", "peek");
+      hover.classList.add("hidden");
+      btn.textContent = "✕";
+      btn.title = "关闭任务列表";
+    } else {
+      setCollapsed(localStorage.getItem(SIDE_COLLAPSED_KEY) === "1");
+    }
+  };
+
+  btn.addEventListener("click", () => {
+    if (isMobileMode()) return closeDrawer();
+    setCollapsed(!isCollapsed());
+  });
+  if (nav) nav.addEventListener("click", () => (isDrawerOpen() ? closeDrawer() : openDrawer()));
+  if (mask) mask.addEventListener("click", closeDrawer);
+
+  // 鼠标进入左缘热区 → 弹出（触屏不会触发 mouseenter，无需在 JS 里分支）
   hover.addEventListener("mouseenter", peek);
   // 鼠标进入悬浮层 → 保持展开（取消可能已排队的收起）
   let leaveTimer = null;
@@ -3639,17 +3695,22 @@ function initSidebar() {
   hover.addEventListener("mouseleave", scheduleLeave);
   side.addEventListener("mouseenter", cancelLeave);
   side.addEventListener("mouseleave", () => { if (isCollapsed()) scheduleLeave(); });
-  // 在悬浮层里点了某条任务/新任务后立刻收起，别挡住对话
+  // 在侧栏里点了某条任务/新任务后立刻收起，别挡住对话（桌面=收起悬浮层，手机=关抽屉）
   side.addEventListener("click", (e) => {
+    const hit = e.target.closest(".task") || e.target.closest("#new-task");
+    if (isMobileMode()) { if (hit) closeDrawer(); return; }
     if (!isCollapsed()) return;
-    if (e.target.closest(".task") || e.target.closest("#new-task")) unpeek();
+    if (hit) unpeek();
   });
-  // Esc 收起悬浮层
+  // Esc 收起悬浮层 / 关抽屉
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && isCollapsed()) unpeek();
+    if (e.key !== "Escape") return;
+    if (isDrawerOpen()) return closeDrawer();
+    if (isCollapsed()) unpeek();
   });
 
-  setCollapsed(localStorage.getItem(SIDE_COLLAPSED_KEY) === "1");
+  applyMode();
+  document.addEventListener("modechange", applyMode);
 }
 
 // ---------- 侧栏宽度拖拽 ----------

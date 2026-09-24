@@ -2,8 +2,12 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- viewport-fit=cover：让页面铺满 iPhone 刘海/圆角屏，配合 CSS 里的
+       env(safe-area-inset-*) 内边距把输入框抬离底部横条 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>🥟 豆沙包coding</title>
+  <!-- 设备模式判定：同步加载且排在样式表之前，首帧就带上 html[data-mode] -->
+  <script src="mode.js"></script>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -51,18 +55,29 @@
     <!-- 侧栏右缘拖拽条：拖动改宽度（180~480px），窄屏媒体查询下隐藏 -->
     <div id="side-resizer" class="side-resizer" title="拖动调整侧栏宽度"></div>
 
+    <!-- 手机端抽屉遮罩：抽屉打开时压住主区，点它收起（桌面端始终 display:none） -->
+    <div id="side-mask" class="side-mask hidden"></div>
+
     <!-- 主区：对话 + 输入框工具栏 -->
     <main class="main">
-      <button id="git-chip" class="git-chip" title="查看当前项目文件夹的 Git 提交记录">
-        <span class="git-chip-icon">🌿</span>
-        <span id="git-chip-branch" class="git-chip-branch mono">Git</span>
-      </button>
-      <!-- 会话附件浮窗的入口：只看【已经上传落盘】的附件（用户视角的查看器），
-           与工具栏的 📎（选本地文件、待发队列）是两回事，所以图标与位置都分开。 -->
-      <button id="attach-chip" class="git-chip" title="查看本会话上传的附件文件">
-        <span class="git-chip-icon">🗂</span>
-        <span class="git-chip-branch mono">附件 <span id="attach-count">0</span></span>
-      </button>
+      <!-- 顶栏：桌面=浮在对话右上角的两枚胶囊；手机=主区顶部一行（☰ + 两枚胶囊）。
+           .top-bar 在桌面用 display:contents（不生成盒子），两枚胶囊仍各自绝对定位，
+           桌面版式一字不动；手机端才变成真正的 flex 一行（见 style.css 的 mobile 段）。 -->
+      <div class="top-bar">
+        <!-- 手机端唤出侧栏抽屉（任务列表）；桌面隐藏 -->
+        <button id="nav-toggle" class="nav-toggle" title="任务列表" aria-label="任务列表">☰</button>
+        <button id="git-chip" class="git-chip" title="查看当前项目文件夹的 Git 提交记录">
+          <span class="git-chip-icon">🌿</span>
+          <span id="git-chip-branch" class="git-chip-branch mono">Git</span>
+        </button>
+        <!-- 会话附件浮窗的入口：只看【已经上传落盘】的附件（用户视角的查看器），
+             与工具栏的 📎（选本地文件、待发队列）是两回事，所以图标与位置都分开。
+             "附件" 二字包在 .chip-label 里：手机顶栏太窄，只留 🗂 + 数字。 -->
+        <button id="attach-chip" class="git-chip" title="查看本会话上传的附件文件">
+          <span class="git-chip-icon">🗂</span>
+          <span class="git-chip-branch mono"><span class="chip-label">附件 </span><span id="attach-count">0</span></span>
+        </button>
+      </div>
       <div id="chat" class="chat"></div>
       <!-- 会话缩略导航条（minimap）：只画用户提问与助手回答两类主消息，点击定位 -->
       <div id="msg-rail" class="msg-rail hidden"></div>

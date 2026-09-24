@@ -84,6 +84,23 @@ body {
    display 值，会盖掉这一条 display:none（同为 !important 时后者胜出），
    各自另有 .hidden 规则；这里只做兜底。 */
 .hidden { display: none !important; }
+
+/* 主区顶栏容器：桌面是个"零尺寸锚点"——里面的胶囊各自绝对定位，相对它算出的
+   坐标与原来相对 .main 算出的完全一致（它就是 .main 右上角的 0×0 盒子），
+   所以桌面版式一字不动；手机端它才变成真正的一行（见文件里的 mobile 段）。 */
+.top-bar { position: absolute; top: 0; right: 0; width: 0; height: 0; }
+/* 手机端唤出侧栏抽屉的按钮：桌面不参与版面 */
+.nav-toggle {
+  display: none;
+  align-items: center; justify-content: center;
+  width: 34px; height: 34px; flex-shrink: 0;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel); color: var(--text-2);
+  font-size: 14px; line-height: 1; cursor: pointer;
+}
+/* 抽屉遮罩：只有手机端会显示，桌面恒不占位、不吃点击 */
+.side-mask { display: none; }
+
 /* 浮层隐藏时必须真正退出命中测试：只要还占位（哪怕宽度/透明度为 0），
    它就会挡住下面的按钮——「图片点不了」正是这种浮层压住输入框所致。
    与 .docs-panel.hidden 的宽度收起动画不冲突（那条自己置 display:flex）。 */
@@ -994,16 +1011,9 @@ button.primary:hover { background: var(--accent-hover); }
 .t-yes:hover { background: var(--danger-hover); }
 .t-no:hover { background: var(--hover); }
 
-@media (max-width: 720px) {
-  .layout { flex-direction: column; }
-  .sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--border); max-height: 40vh; }
-  /* 窄屏下侧栏本就在顶部，不启用收起/悬浮（hover 热区在触屏也没意义） */
-  .sidebar.collapsed { width: 100%; border-bottom-width: 1px; }
-  .sidebar.collapsed.floating { position: static; transform: none; box-shadow: none; }
-  .side-hover { display: none !important; }
-  .composer { margin: 0 4% 12px; }
-  .chat { padding: 16px 4%; }
-}
+/* 手机端适配统一放在文件末尾的「手机端（html[data-mode="mobile"]）」一节。
+   这里不再用 max-width 媒体查询：判定源是 mode.js——触屏设备（iPad 横屏
+   1024px）宽度够但同样该走手机端交互，媒体查询表达不了"是不是触屏"。 */
 
 /* ---------- 独立登录页 ---------- */
 .login-page {
@@ -1629,3 +1639,145 @@ body.docs-resizing .docs-panel { transition: none; }
   border: 1px solid var(--border); padding: 6px 10px; text-align: left;
 }
 .docs-view .md-table th { background: var(--bg); font-weight: 600; }
+
+/* ================= 手机端（html[data-mode="mobile"]） ================= */
+/* 判定源是 mode.js（视口 ≤720px，或触摸设备），不是媒体查询，所以本节统一用
+   [data-mode="mobile"] 前缀。桌面端不匹配本节任何一条选择器——这是"物理隔离"
+   而非"覆盖"，手机端的改动不会溢出到桌面。新增的手机端调整只往这一节里加。 */
+
+/* ---------- 顶栏：☰ + Git + 附件，一行排开 ---------- */
+[data-mode="mobile"] .top-bar {
+  display: flex; align-items: center; gap: 8px;
+  left: 0; right: 0; top: 0; width: auto; height: auto;
+  z-index: 16; padding: 8px 10px;
+  /* 渐隐底：胶囊压在对话上方时仍看得清，但不划一条硬分隔线 */
+  background: linear-gradient(var(--bg) 70%, rgba(244, 246, 250, 0));
+  pointer-events: none;          /* 容器不挡对话区，只有里面的按钮吃点击 */
+}
+[data-mode="mobile"] .top-bar > * { pointer-events: auto; }
+[data-mode="mobile"] .nav-toggle { display: inline-flex; }
+[data-mode="mobile"] .git-chip {
+  position: static;              /* 桌面是浮在右上角的 absolute，手机收进这一行 */
+  padding: 6px 11px; font-size: 12.5px; box-shadow: none;
+}
+[data-mode="mobile"] #git-chip { margin-left: auto; }   /* 两枚胶囊一起靠右 */
+[data-mode="mobile"] #git-chip-branch { max-width: 84px; }
+[data-mode="mobile"] .chip-label { display: none; }     /* 只留 🗂 + 数字，省宽度 */
+
+/* ---------- 布局：主区独占，侧栏改成覆盖式抽屉 ---------- */
+[data-mode="mobile"] body { height: 100dvh; -webkit-text-size-adjust: 100%; }
+[data-mode="mobile"] .layout { flex-direction: column; height: 100dvh; }
+[data-mode="mobile"] .sidebar {
+  position: fixed; left: 0; top: 0; bottom: 0; z-index: 40;
+  width: min(84vw, 320px); max-height: none;
+  border-right: 1px solid var(--border); border-bottom: none;
+  transform: translateX(-100%);          /* 默认停在屏幕外，由 .drawer-open 滑入 */
+  transition: transform .24s ease;
+  box-shadow: var(--shadow-lg);
+}
+/* 桌面的"收起态/悬浮态"两个修饰类在手机上不参与布局：抽屉只认 .drawer-open */
+[data-mode="mobile"] .sidebar.collapsed { width: min(84vw, 320px); border-right-width: 1px; }
+[data-mode="mobile"] .sidebar.collapsed.floating { position: fixed; }
+[data-mode="mobile"] .sidebar.drawer-open { transform: none !important; }
+/* 拖拽条与左缘热区在触屏上没有意义（热区还会抢走屏幕左缘的点击） */
+[data-mode="mobile"] .side-resizer,
+[data-mode="mobile"] .side-hover { display: none !important; }
+[data-mode="mobile"] .side-mask {
+  display: block; position: fixed; inset: 0; z-index: 39;
+  background: var(--mask);
+}
+
+/* ---------- 对话区 ---------- */
+[data-mode="mobile"] .main { min-height: 0; }
+/* 左内边距留给消息导航条（它贴在左缘，见下），右内边距只留一点点 */
+[data-mode="mobile"] .chat { padding: 58px 12px 12px 24px; }
+[data-mode="mobile"] .empty-hint { margin-top: 6vh; font-size: 13px; text-align: center; }
+[data-mode="mobile"] .bubble { max-width: 90%; font-size: 15px; }
+/* 导航条：3px 细线在指头上点不中，加粗加高；宽度收窄以让出正文空间 */
+[data-mode="mobile"] .msg-rail { left: 2px; top: 58px; bottom: 96px; width: 18px; gap: 7px; }
+[data-mode="mobile"] .rail-tick { width: 18px; height: 4px; }
+
+/* ---------- 输入区 ---------- */
+[data-mode="mobile"] .composer {
+  position: relative;
+  margin: 0 10px calc(10px + env(safe-area-inset-bottom, 0px));
+  padding: 10px 12px 8px; border-radius: 16px;
+}
+[data-mode="mobile"] .composer textarea { font-size: 16px; }  /* ≥16px：iOS 聚焦时不放大页面 */
+[data-mode="mobile"] .toolbar {
+  flex-wrap: nowrap; gap: 6px; overflow-x: auto;
+  padding-right: 76px;                    /* 给右下角固定的发送按钮留位 */
+  scrollbar-width: none; -webkit-overflow-scrolling: touch;
+}
+[data-mode="mobile"] .toolbar::-webkit-scrollbar { display: none; }
+[data-mode="mobile"] .toolbar .grow { display: none; }  /* 手机上不需要撑开 */
+[data-mode="mobile"] .chip { flex: 0 0 auto; font-size: 12px; padding: 6px 11px; }
+/* 发送按钮不跟 chip 一起横滚，钉在右下角——否则滑到一半就找不到它 */
+[data-mode="mobile"] .send-btn {
+  position: absolute; right: 10px; bottom: 8px; z-index: 2;
+  flex: 0 0 auto; white-space: nowrap; padding: 7px 16px;
+}
+
+/* ---------- 浮窗：不再是"贴按钮的小浮窗"，改成接近全屏的面板 ---------- */
+[data-mode="mobile"] .git-pop,
+[data-mode="mobile"] .attach-pop {
+  left: 8px !important; right: 8px !important; top: 52px !important; bottom: 8px !important;
+  width: auto !important; height: auto !important; max-width: none !important;
+  border-radius: 14px;
+}
+[data-mode="mobile"] .attach-list { flex: 0 0 40%; }       /* 桌面是 240px 定宽，窄屏按比例 */
+[data-mode="mobile"] .attach-item { padding-right: 64px; }  /* 常显的删除/目录按钮留位 */
+[data-mode="mobile"] .attach-view { padding: 12px; }
+/* 逐次拖拽改宽/改高在触屏上没有意义，热区还会挡到滑动 */
+[data-mode="mobile"] .pop-edge,
+[data-mode="mobile"] .attach-split,
+[data-mode="mobile"] .docs-resizer { display: none !important; }
+
+/* ---------- 文档栏 / 浏览器栏：全屏覆盖 ---------- */
+[data-mode="mobile"] .docs-panel {
+  position: fixed; left: 0; right: 0; top: 0; bottom: 0; z-index: 45;
+  width: 100% !important; height: 100dvh; border-left: none;
+}
+/* 隐藏态仍要"滑走"（宽度收 0）：这条必须比上面那条更具体，否则会盖住整屏 */
+[data-mode="mobile"] .docs-panel.hidden { width: 0 !important; }
+[data-mode="mobile"] .docs-side { width: 148px; }
+[data-mode="mobile"] .docs-view { padding: 10px 14px 20px; }
+
+/* ---------- 气泡类浮层：从底部弹出 ---------- */
+[data-mode="mobile"] .ctx-pop,
+[data-mode="mobile"] .model-pop,
+[data-mode="mobile"] .user-pop,
+[data-mode="mobile"] .attach-toc-pop {
+  left: 8px !important; right: 8px !important; top: auto !important;
+  bottom: calc(8px + env(safe-area-inset-bottom, 0px)) !important;
+  width: auto !important; max-width: none !important;
+  max-height: 62vh; overflow: auto; border-radius: 16px;
+  animation: sheet-rise .18s ease-out;
+}
+@keyframes sheet-rise {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* ---------- 弹窗 ---------- */
+[data-mode="mobile"] .modal-box { width: 94vw; max-height: 88dvh; padding: 14px 14px 12px; }
+[data-mode="mobile"] .m-list { max-height: 38dvh; }
+[data-mode="mobile"] .prov-box { width: 94vw; height: 88dvh; padding: 12px; }
+[data-mode="mobile"] .prov-body { flex-direction: column; }   /* 左右两栏改上下 */
+[data-mode="mobile"] .prov-left { width: auto; max-height: 24dvh; }
+[data-mode="mobile"] .login-card { width: 88vw; }
+
+/* ---------- 触屏没有 hover：桌面靠 hover 才露出的按钮改为常显 ---------- */
+[data-mode="mobile"] .t-del { opacity: .5; padding: 6px 4px; }
+[data-mode="mobile"] .group-head .gh-add { opacity: .7; padding: 4px 8px; }
+[data-mode="mobile"] .attach-del-btn,
+[data-mode="mobile"] .docs-del-btn,
+[data-mode="mobile"] .attach-toc-btn { display: block; }
+[data-mode="mobile"] .m-list li .m-dir-go { opacity: 1; transform: none; }
+
+/* ---------- 提示浮条：左右撑满，别贴着右缘被截断 ---------- */
+[data-mode="mobile"] .toast {
+  left: 12px; right: 12px;
+  bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  text-align: center;
+}
