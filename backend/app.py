@@ -11,9 +11,11 @@ Web 服务
   POST /api/auth/login            登录 {"username", "password"} → {token, username}
   POST /api/auth/logout           退出登录（作废当前 token）
   GET  /api/auth/me               当前登录用户（校验 token 是否有效）
-  GET  /api/config                当前激活模型信息（供应商/模型/Key 打码/上下文窗口）
-  GET  /api/models                可用模型列表（各供应商已启用的模型，供工具栏选择）
-  POST /api/active-model          切换激活模型 {"provider_id", "model"}
+  GET  /api/config?session_id=    激活模型信息（供应商/模型/Key 打码/上下文窗口）。
+                                  带 id = 该任务用的模型；不带 = 用户默认（新任务将用的）
+  GET  /api/models?session_id=    可用模型列表（各供应商已启用的模型，供工具栏选择）
+  POST /api/active-model          切换激活模型 {"provider_id", "model", "session_id"?}
+                                  （带 session_id 只改该任务；不带改默认 = 新任务初始模型）
   GET  /api/providers             供应商列表（含模型，Key 打码）
   POST /api/providers/save        新建/更新供应商
   POST /api/providers/delete      删除供应商（"默认"供应商不可删）
@@ -421,25 +423,48 @@ def _mask(key: str) -> str:
     return f"{key[:3]}***{key[-4:]}"
 
 
-def _resolve_active() -> tuple[dict, str]:
-    """当前激活模型 → (供应商, 模型名)。设置失效时自动回退到第一个可用项。"""
-    active = db.get_setting("active_model") or {}
-    prov = db.get_provider(active.get("provider_id", ""))
-    model = active.get("model", "")
+def _match_active(active: dict | None) -> tuple[dict, str] | None:
+    """把一条 {provider_id, model} 记录解析成具体的 (供应商, 模型名)；失效返回 None。
+
+    "失效"= 供应商被删或被禁用、或该供应商下一个启用的模型都没有。模型名本身
+    失效（改名/删除）但供应商还在时不算失效：回落到该供应商第一个启用的模型。
+    """
+    if not active:
+        return None
+    prov = db.get_provider(str(active.get("provider_id", "")))
     if prov is None or not prov["enabled"]:
-        provs = [p for p in db.list_providers() if p["enabled"]]
-        prov = provs[0] if provs else db.list_providers()[0]
-        model = ""
+        return None
     enabled_names = [m["name"] for m in prov["models"] if m["enabled"]]
-    if model not in enabled_names:
-        model = enabled_names[0] if enabled_names else ""
-    return prov, model
+    if not enabled_names:
+        return None
+    model = active.get("model", "")
+    return prov, (model if model in enabled_names else enabled_names[0])
 
 
-def _resolve_client() -> tuple[object, str, str, bool]:
+def _resolve_active(sid: str | None = None) -> tuple[dict, str]:
+    """当前激活模型 → (供应商, 模型名)。
+
+    解析链：**会话自选模型 → 全局默认**（settings.active_model，"新会话的初始
+    模型"）。会话自选失效时静默回落全局默认，全局也失效再退回第一个可用供应商。
+    sid 为 None（页面刚打开、新任务还没建会话）时只看全局默认。
+    """
+    hit = (_match_active(db.get_session_model(sid) if sid else None)
+           or _match_active(db.get_setting("active_model")))
+    if hit:
+        return hit
+    # 最后一档：全局默认也失效（没设过 / 供应商被删被停用）时，退回第一个启用的
+    # 供应商 + 它第一个启用的模型。模型名绝不能在这里留空——留空会让调用方
+    # 误判成"一个可用模型都没有"而拒绝服务，而实际上此刻是有模型的。
+    provs = [p for p in db.list_providers() if p["enabled"]] or db.list_providers()
+    prov = provs[0] if provs else {"id": "", "name": "", "api_key": "", "base_url": "", "models": []}
+    enabled = [m["name"] for m in prov.get("models", []) if m["enabled"]]
+    return prov, (enabled[0] if enabled else "")
+
+
+def _resolve_client(sid: str | None = None) -> tuple[object, str, str, bool]:
     """按当前激活模型（含其供应商的 API 格式与视觉标记）构建客户端，
-    返回 (client, model, 指纹, 是否支持视觉)。"""
-    prov, model = _resolve_active()
+    返回 (client, model, 指纹, 是否支持视觉)。sid = 按该会话的模型解析。"""
+    prov, model = _resolve_active(sid)
     if not model:
         raise SystemExit("没有已启用的模型，请在网页「管理模型」里添加并启用")
     client = create_client(prov.get("api_format", "openai"),
@@ -450,10 +475,10 @@ def _resolve_client() -> tuple[object, str, str, bool]:
     return client, model, sig, vision
 
 
-def _active_window() -> int:
+def _active_window(sid: str | None = None) -> int:
     """激活模型的上下文窗口。解析链：模型自填 → 供应商默认列 → .env/全局默认。
     窗口既是前端容量显示的分母，也是自动压缩触发线（估算超 80% 即压缩）的基准。"""
-    prov, model = _resolve_active()
+    prov, model = _resolve_active(sid)
     for m in prov["models"]:
         if m["name"] == model and m["context_window"]:
             return m["context_window"]
@@ -470,13 +495,14 @@ def _model_vision(prov: dict, model: str) -> bool:
     return False
 
 
-def _resolve_vision_model() -> tuple[dict, str]:
+def _resolve_vision_model(sid: str | None = None) -> tuple[dict, str]:
     """找一位"替主模型看图"的视觉模型，选择链：
     1. 当前激活模型自己标注了视觉 → 直接用它；
     2. 否则借用任意已启用且标注了视觉的模型；
     3. 都没有 → RuntimeError（analyze_image 工具会转成可读的错误给主模型）。
+    sid = 按该会话的主模型判断（会话模型与全局默认可能不是同一个）。
     """
-    prov, model = _resolve_active()
+    prov, model = _resolve_active(sid)
     if model and _model_vision(prov, model):
         return prov, model
     for p in db.list_providers():
@@ -488,15 +514,23 @@ def _resolve_vision_model() -> tuple[dict, str]:
     raise RuntimeError("没有任何模型被标注为「视觉」。请在「管理模型」面板给支持看图的模型勾选视觉。")
 
 
-def _vision_backend(image_parts: list, question: str) -> str:
+def _vision_backend(image_parts: list, question: str, sid: str | None = None) -> str:
     """analyze_image 工具的看图后端（tools.py 启动时注入）。
     image_parts 是 OpenAI 格式的 image_url content 部分。"""
-    prov, model = _resolve_vision_model()
+    prov, model = _resolve_vision_model(sid)
     client = create_client(prov.get("api_format", "openai"),
                            api_key=prov["api_key"], base_url=prov["base_url"], model=model)
     message = {"role": "user", "content": [*image_parts, {"type": "text", "text": question}]}
     reply = client.chat([message])
     return (reply.get("content") or "").strip()
+
+
+def _vision_backend_for(sid: str | None):
+    """把看图后端绑定到某个会话后交给 Agent（工具层仍只认两个位置参数）。
+    不同会话可挂着不同主模型，"是否需要借视觉模型"必须各按各的算。"""
+    def backend(image_parts: list, question: str) -> str:
+        return _vision_backend(image_parts, question, sid)
+    return backend
 
 
 MAX_IMAGE_B64 = 6_000_000   # 单张图片 base64 长度上限（约 4.5MB 原图）
@@ -576,16 +610,17 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
     任务归属校验：传入的 session_id 必须存在且属于该用户，否则一律开新任务
     （防止拿着别人的任务 id 读/写别人的对话）。
 
-    注意顺序：先解析客户端、确认模型可用，再创建会话行——否则模型配置有问题时
-    会在数据库里留下"零消息、空标题"的孤儿任务。
+    注意顺序：先确认会话归属与模型可用，再创建会话行——否则模型配置有问题时
+    会在数据库里留下"零消息、空标题"的孤儿任务。模型按会话解析（老会话用它
+    自己选的、新会话用全局默认），所以必须先把 sid 定下来再解析客户端。
     """
-    client, model, sig, vision = _resolve_client()
-
     sid = None
     if isinstance(session_id, str) and session_id:
         # 任务是否存在、是否归当前用户，都以数据库为准
         if db.session_owner(session_id) == user_id:
             sid = session_id
+
+    client, model, sig, vision = _resolve_client(sid)
     if sid is None:
         sid = uuid.uuid4().hex[:8]
         db.create_session(sid, user_id)
@@ -602,8 +637,8 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
     with _lock:
         if sid not in _agents or _sigs.get(sid) != sig:
             agent = Agent(llm=client, verbose=False, vision_supported=vision,
-                          workspace=workspace, vision_backend=_vision_backend,
-                          context_window=_active_window(),  # 压缩触发线的基准（切换模型后重建实例即更新）
+                          workspace=workspace, vision_backend=_vision_backend_for(sid),
+                          context_window=_active_window(sid),  # 压缩触发线的基准（切换模型后重建实例即更新）
                           artifact_reader=db.read_artifact,  # 外置大消息的还原器（模型视图用）
                           permission_gate=_build_permission_gate(workspace),
                           session_id=sid)  # 文档工具据此确定文档归属
@@ -690,15 +725,25 @@ class Handler(SimpleHTTPRequestHandler):
     def _query(self) -> dict:
         return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
 
-    def _config_view(self) -> dict:
-        prov, model = _resolve_active()
+    def _query_sid(self) -> str | None:
+        """查询串里的 session_id：缺失、或不属于当前用户 → None（按全局默认处理）。
+        只用于"读"接口：拿别人的 id 最多看到默认模型，不会泄露或改动任何会话。"""
+        sid = (self._query().get("session_id") or [""])[0]
+        if sid and db.session_owner(sid) != self.user["id"]:
+            return None
+        return sid or None
+
+    def _config_view(self, sid: str | None = None) -> dict:
+        """当前激活模型视图。sid = 按该会话的模型返回（None = 该用户的全局默认）。"""
+        prov, model = _resolve_active(sid)
         return {
             "provider_id": prov["id"],
             "provider_name": prov["name"],
             "model": model,
             "api_key_masked": _mask(prov["api_key"]),
-            "context_window": _active_window(),
+            "context_window": _active_window(sid),
             "vision": _model_vision(prov, model),  # 激活模型是否支持看图（前端附件提示用）
+            "session_id": sid or "",   # 回显：前端据此丢弃切会话途中的过期响应
         }
 
     # ---------- 路由 ----------
@@ -712,9 +757,11 @@ class Handler(SimpleHTTPRequestHandler):
             if user is None:
                 return self._json({"error": "未登录"}, 401)
             self._json({"username": user["username"]})
-        elif self.path == "/api/config":
-            self._json(self._config_view())
-        elif self.path == "/api/models":
+        elif path == "/api/config":
+            # 带 session_id = 该任务用的模型；不带 = 全局默认（新任务将用的）
+            self._json(self._config_view(self._query_sid()))
+        elif path == "/api/models":
+            sid = self._query_sid()
             models = []
             for p in db.list_providers():
                 if not p["enabled"]:
@@ -723,8 +770,9 @@ class Handler(SimpleHTTPRequestHandler):
                     if m["enabled"]:
                         models.append({"provider_id": p["id"], "provider_name": p["name"],
                                        "model": m["name"], "context_window": m["context_window"]})
-            self._json({"models": models, "active": _resolve_active()[1],
-                        "active_provider": _resolve_active()[0]["id"]})
+            prov, active_model = _resolve_active(sid)
+            self._json({"models": models, "active": active_model,
+                        "active_provider": prov["id"]})
         elif self.path == "/api/providers":
             provs = []
             for p in db.list_providers():
@@ -790,7 +838,7 @@ class Handler(SimpleHTTPRequestHandler):
             stat = _ctx.get(sid, {})
             self._json({
                 "tokens": stat.get("prompt_tokens", 0),
-                "window": _active_window(),
+                "window": _active_window(sid),  # 分母按该任务的模型算（各会话窗口可以不同）
                 "breakdown": stat.get("context"),
                 "cache_hit_rate": stat.get("cache_hit_rate"),
             })
@@ -1377,16 +1425,27 @@ class Handler(SimpleHTTPRequestHandler):
     # ---------- 模型供应商 ----------
 
     def _handle_active_model(self):
+        """切换激活模型。带 session_id = 只改该任务用哪个模型；不带 = 改全局默认，
+        即"新任务的初始模型"（新任务还没有会话行，无法按会话存）。
+        校验的是"该供应商下存在这个模型"而非"已启用"：与旧行为一致，已停用的
+        模型仍可被显式选中（解析时会回落，但用户的显式选择不被静默吞掉）。"""
         body = self._body()
         pid, model = body.get("provider_id"), body.get("model")
+        sid = str(body.get("session_id") or "").strip()
+        if sid and db.session_owner(sid) != self.user["id"]:
+            return self._json({"error": "任务不存在或不属于当前用户"}, 404)
         prov = db.get_provider(str(pid)) if pid else None
         if prov is None:
             return self._json({"error": "供应商不存在"}, 400)
         if model not in [m["name"] for m in prov["models"]]:
             return self._json({"error": f"供应商 {prov['name']} 下没有模型 {model}"}, 400)
-        db.set_setting("active_model", {"provider_id": prov["id"], "model": model})
-        log.info("激活模型切换为 %s / %s", prov["name"], model)
-        self._json({"ok": True, **self._config_view()})
+        if sid:
+            db.set_session_model(sid, prov["id"], model)
+            log.info("会话 %s 的模型切换为 %s / %s", sid, prov["name"], model)
+        else:
+            db.set_setting("active_model", {"provider_id": prov["id"], "model": model})
+            log.info("默认模型（新任务初始模型）切换为 %s / %s", prov["name"], model)
+        self._json({"ok": True, **self._config_view(sid or None)})
 
     def _handle_provider_save(self):
         b = self._body()

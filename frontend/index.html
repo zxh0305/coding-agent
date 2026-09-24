@@ -137,8 +137,10 @@
 
   </div>
 
-  <!-- 模型切换气泡：按供应商分组列出已启用模型 -->
+  <!-- 模型切换气泡：按供应商分组列出已启用模型。
+       标题行区分两件事：任务内切换（只改这个任务）与设默认（新任务的初始模型） -->
   <div id="model-pop" class="model-pop hidden">
+    <div id="model-pop-head" class="model-pop-head"></div>
     <div id="model-pop-list"></div>
     <div class="model-pop-foot">
       <button id="manage-models" class="link-btn">⚙️ 管理模型</button>

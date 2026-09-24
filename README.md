@@ -233,7 +233,7 @@ python3 backend/cli.py "37*89+100 等于多少"  # 单次提问
 | `message_usage` | 消息级统计（prompt/completion/cached tokens + 完整 `_stats` JSON），与正文分离存储 |
 | `providers` | 模型供应商：名称 / Base URL / API Key / 启用状态 / 默认上下文窗口 |
 | `provider_models` | 供应商下的模型：模型名 / 上下文窗口 / 启用状态 / 是否视觉 |
-| `settings` | 键值设置（当前激活模型、权限规则等） |
+| `settings` | 键值设置（全局默认模型 `active_model`、权限规则等） |
 
 - **schema 升级**用 `PRAGMA user_version` + 有序迁移列表（`db.MIGRATIONS`），启动时只补执行未到达版本。
 - **会话恢复按窗口加载**：压缩边界之前的消息不进内存，内存占用与当前窗口成正比。
@@ -254,9 +254,9 @@ python3 backend/cli.py "37*89+100 等于多少"  # 单次提问
 | `/api/sessions/<id>/messages` | GET | 历史消息（分页回放，默认最近 100 条；`?before_ord=&limit=` 向上翻页） |
 | `/api/sessions/<id>/artifact` | GET | `?path=` 读取外置归档消息原文（realpath 白名单校验） |
 | `/api/sessions/<id>/docs` | GET | 会话文档列表；带 `?name=` 读单个 md 原文（仅 .md，realpath 白名单校验） |
-| `/api/context` | GET | `?session_id=` 上下文容量（token 数 + 构成占比 + 缓存命中率） |
-| `/api/models` | GET | 可用模型列表（供工具栏切换） |
-| `/api/active-model` | POST | 切换激活模型 |
+| `/api/context` | GET | `?session_id=` 上下文容量（token 数 + 构成占比 + 缓存命中率；窗口分母按该任务的模型） |
+| `/api/models` | GET | 可用模型列表（供工具栏切换；带 `?session_id=` 时 `active` 返回该任务的模型） |
+| `/api/active-model` | POST | 切换模型：带 `session_id` 只改该任务；不带改**全局默认**（新任务的初始模型） |
 | `/api/providers` | GET | 供应商列表（含模型，Key 打码） |
 | `/api/providers/save` `/delete` | POST | 新建/更新供应商；删除（"默认"不可删） |
 | `/api/providers/models/save` `/delete` | POST | 供应商下的模型增改/删除 |

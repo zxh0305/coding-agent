@@ -116,7 +116,9 @@ CREATE TABLE IF NOT EXISTS sessions(
     user_id INTEGER,
     created REAL,
     updated REAL,
-    workspace TEXT
+    workspace TEXT,
+    provider_id TEXT,
+    model TEXT
 );
 CREATE TABLE IF NOT EXISTS messages(
     mid TEXT NOT NULL,
@@ -222,6 +224,13 @@ MIGRATIONS: list[tuple[int, str | None]] = [
          "GENERATED ALWAYS AS (datetime(updated, 'unixepoch', '+8 hours')) VIRTUAL"),
     (14, "ALTER TABLE providers ADD COLUMN created_txt TEXT "
          "GENERATED ALWAYS AS (datetime(created, 'unixepoch', '+8 hours')) VIRTUAL"),
+    # 15~16：会话级模型选择。动机：激活模型原本只存在 settings 的全局单例里，
+    #    切一次模型等于改了所有会话——而工作区、权限模式、附件都是会话私有的，
+    #    模型跟着会话走才符合直觉（同一个会话可以继续用老模型，新会话用新的）。
+    #    两列同 NULL 表示"该会话没单独选过"→ 跟随全局默认（settings.active_model），
+    #    因此老会话行为逐字节不变。拆成两条迁移与 10~14 同理：一条 ALTER 一列。
+    (15, "ALTER TABLE sessions ADD COLUMN provider_id TEXT"),
+    (16, "ALTER TABLE sessions ADD COLUMN model TEXT"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -261,6 +270,10 @@ def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
                  13: "sessions", 14: "providers"}[version]
         col = "updated_txt" if version == 13 else "created_txt"
         return col in _table_columns(conn, table)
+    if version == 15:          # sessions.provider_id
+        return "provider_id" in _table_columns(conn, "sessions")
+    if version == 16:          # sessions.model
+        return "model" in _table_columns(conn, "sessions")
     return False
 
 
@@ -455,6 +468,27 @@ def get_session_workspace(sid: str) -> str | None:
 def set_session_workspace(sid: str, path: str) -> None:
     with _conn() as conn:
         conn.execute("UPDATE sessions SET workspace=? WHERE id=?", (path, sid))
+
+
+def get_session_model(sid: str) -> dict | None:
+    """任务自选的模型 {provider_id, model}；没单独选过返回 None（= 跟随全局默认）。
+
+    注意 None 与"有值但失效"是两回事：前者静默用全局默认，后者由调用方
+    （app._resolve_active）逐级回退，都不在这里写库——用户的显式选择要留着，
+    供应商暂时禁用/改名不代表该丢弃它。
+    """
+    with _conn() as conn:
+        row = conn.execute("SELECT provider_id, model FROM sessions WHERE id=?",
+                           (sid,)).fetchone()
+    if not row or not row["model"]:
+        return None
+    return {"provider_id": row["provider_id"] or "", "model": row["model"]}
+
+
+def set_session_model(sid: str, provider_id: str, model: str) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE sessions SET provider_id=?, model=? WHERE id=?",
+                     (provider_id, model, sid))
 
 
 def touch_session(sid: str) -> None:

@@ -766,6 +766,11 @@ button.primary:hover { background: var(--accent-hover); }
   padding: 6px;
 }
 .mp-head { font-size: 11px; color: var(--text-3); padding: 8px 10px 2px; }
+/* 气泡顶部说明条：本次点击改的是"这个任务"还是"新任务默认" */
+.model-pop-head {
+  font-size: 11px; color: var(--text-2); padding: 6px 10px 7px;
+  border-bottom: 1px solid var(--border); margin-bottom: 4px;
+}
 .mp-row {
   display: flex; align-items: center; gap: 8px;
   padding: 7px 10px; border-radius: 8px; cursor: pointer; font-size: 13px;

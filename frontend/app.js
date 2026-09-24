@@ -702,6 +702,7 @@ async function doDeleteSession(id) {
     refreshCtx();
     closeEvents();
     historyMids = new Set();
+    loadConfig();  // 任务没了：标签回到全局默认（新任务的初始模型）
   }
   loadSessions();  // 与服务端对齐一次（时间戳/排序），不阻塞交互
 }
@@ -712,6 +713,7 @@ async function newTask(presetProject = null) {
   currentSession = null;
   confirmingDelete = null;
   pendingProjectPath = presetProject;
+  loadConfig();  // 回到新建态：标签显示全局默认（新任务将用的初始模型）
   resetStreamState();  // 旧任务的事件流已断，流式状态必须随之复位
   closeEvents();      // 旧任务的事件流断开：新任务未建，第一条消息发出后再连
   chatEl.innerHTML = "";
@@ -981,6 +983,7 @@ async function switchSession(id) {
   openEvents(id);                 // 再接事件流：断线/刷新期间的回合靠 since 补发接上
   await loadSessions();
   await refreshCtx();
+  await loadConfig(id);  // 模型随任务走：切换后工具栏标签跟着换成该任务的模型
   loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换（内部顺带拉权限模式）
   closeGitPop();    // 工作区变了，旧的提交列表不再对应当前项目
   refreshGitChip(); // 按钮上的分支名随任务的工作区更新
@@ -1470,22 +1473,36 @@ let activeModelVision = true;  // 激活模型是否支持看图（/api/config �
 let editingProvId = null;  // 管理面板当前打开的供应商（null = 新供应商未保存）
 let editorModels = [];     // 管理面板里正在编辑的模型行
 
-async function loadConfig() {
+// 模型是【按会话】存的（sessions.provider_id/model）：没单独选过的会话跟随
+// 全局默认（settings.active_model，也就是新任务的初始模型）。sid 为空 = 看全局默认。
+async function loadConfig(sid = null) {
   try {
-    const cfg = await api("/api/config");
+    const q = sid ? `?session_id=${encodeURIComponent(sid)}` : "";
+    const cfg = await api("/api/config" + q);
+    // 竞态闸门：切会话是异步的，慢响应可能在切走之后才回来——回显的
+    // session_id 与请求的不符就丢弃，免得工具栏标签被上一个会话的模型覆盖。
+    if ((cfg.session_id || "") !== (sid || "")) return;
     activeModel = { provider_id: cfg.provider_id, model: cfg.model };
     contextWindow = cfg.context_window || contextWindow;
     activeModelVision = !!cfg.vision;   // 激活模型能否看图（决定附件上传时的提示）
     lastCfg = cfg;                      // 设置面板展示用
-    $("model-label").textContent = `${cfg.provider_name || "模型"} / ${cfg.model || "—"}`;
+    const label = `${cfg.provider_name || "模型"} / ${cfg.model || "—"}`;
+    $("model-label").textContent = label;
+    $("model-chip").title = sid ? `本任务使用的模型：${label}`
+                                : `默认模型（新任务的初始模型）：${label}`;
     updateCtxChip();
   } catch (e) {
     $("model-label").textContent = "模型未配置";
   }
 }
 
+// 气泡里列模型。带当前任务 id 请求：勾选态与"切到哪个"都按该任务的模型算；
+// 新任务（还没有会话）则以全局默认为基准——在气泡里选中它 = 设定新任务的初始模型。
 async function loadModelPop() {
-  const data = await api("/api/models");
+  const sid = currentSession || "";
+  const data = await api("/api/models" + (sid ? `?session_id=${encodeURIComponent(sid)}` : ""));
+  $("model-pop-head").textContent = sid ? "切换此任务使用的模型"
+                                        : "设置默认模型（新任务的初始模型）";
   const list = $("model-pop-list");
   list.innerHTML = "";
   let lastProv = null;
@@ -1511,16 +1528,21 @@ async function loadModelPop() {
     row.append(name, win, check);
     row.addEventListener("click", async () => {
       try {
+        const payload = { provider_id: m.provider_id, model: m.model };
+        if (sid) payload.session_id = sid;   // 带 id = 只改这个任务；不带 = 改全局默认
         const cfg = await api("/api/active-model", {
           method: "POST",
-          body: JSON.stringify({ provider_id: m.provider_id, model: m.model }),
+          body: JSON.stringify(payload),
         });
         activeModel = { provider_id: cfg.provider_id, model: cfg.model };
         contextWindow = cfg.context_window || contextWindow;
+        activeModelVision = !!cfg.vision;   // 视觉标记随模型变（影响发图提示）
+        lastCfg = cfg;
         $("model-label").textContent = `${cfg.provider_name} / ${cfg.model}`;
         $("model-pop").classList.add("hidden");
         updateCtxChip();
-        toast(`已切换到 ${cfg.provider_name} / ${cfg.model}`);
+        toast(sid ? `此任务已切换到 ${cfg.provider_name} / ${cfg.model}`
+                  : `新任务默认模型：${cfg.provider_name} / ${cfg.model}`);
       } catch (e) {
         toast("切换失败：" + e.message);
       }
