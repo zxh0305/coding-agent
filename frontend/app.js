@@ -2359,11 +2359,11 @@ function makeToolResultLine(name, resultStr, dur = "") {
   const hintSuffix = (p) => p.hint ? `\n💡 ${p.hint}` : "";
 
   if (parsed && typeof parsed === "object" && "exit_code" in parsed) {
-    // run_bash：非零退出也带完整输出（统一信封下 ok:false 但输出是第一手材料）
+    // run_bash：非零退出也带完整输出（统一信封下 ok:false 但输出是第一手材料）。
+    // 输出只在 result 字段（stdout 与 [stderr] 段已拼合，历史里只存这一份）
     summary.textContent = `↩ ${dur.replace(" · ", "") || "0s"} · exit ${parsed.exit_code}`;
     if (parsed.exit_code !== 0) summary.classList.add("err");
-    pre.textContent = [parsed.stdout, parsed.stderr].filter(Boolean).join("\n[stderr]\n")
-      || "(无输出)";
+    pre.textContent = parsed.result || "(无输出)";
     pre.textContent += hintSuffix(parsed);
   } else if (parsed && typeof parsed === "object" && "error" in parsed) {
     // 权限拒绝是"人做的决定"而非故障：单独标注，并带上给模型的改道提示

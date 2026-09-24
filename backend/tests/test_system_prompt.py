@@ -311,14 +311,17 @@ class TestUnifiedEnvelope(unittest.TestCase):
                 self.assertIn("error", payload, name)
 
     def test_run_bash_nonzero_exit_is_failure_envelope_with_output(self):
-        """run_bash 非零退出：ok=false + error，但 stdout/stderr 原样保留——
-        命令失败不是工具失败，输出是模型定位问题的第一手材料。"""
+        """run_bash 非零退出：ok=false + error，原始输出保留在 result——
+        命令失败不是工具失败，输出是模型定位问题的第一手材料。输出只存
+        result 一份（stdout/stderr 已拼合在内，历史里不重复携带）。"""
         payload = json.loads(execute_tool("run_bash", {"command": "printf x; exit 7"}, self.ctx))
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["exit_code"], 7)
         self.assertIn("7", payload["error"])
         self.assertIn("hint", payload)
-        self.assertEqual(payload["stdout"], "x")
+        self.assertEqual(payload["result"], "x")
+        self.assertNotIn("stdout", payload)
+        self.assertNotIn("stderr", payload)
 
     def test_permission_rejection_shares_same_envelope(self):
         """权限拒绝（permissions.rejection_result）与工具失败同构：ok/error/hint。"""

@@ -26,6 +26,7 @@ Function Calling、Tool Use、ReAct……底层都是这个循环的不同包装
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -188,6 +189,12 @@ class Agent:
         # 压缩后置回 None——摘要的 token 密度与原始日志完全不同，旧系数必然失真，
         # 等下一轮真实 usage 重新校准（见 context_stats / _maybe_compact）。
         self._token_ratio: float | None = None
+        # 记忆索引的回合快照（_run 开始时刷新）。system 是每轮请求的前缀头，
+        # 供应商的前缀缓存要求它逐字节稳定：索引若每轮从磁盘现读，模型在回合
+        # 中途写一条记忆（MEMORY_CONTRACT 鼓励这么做）就会改掉 system，后面
+        # 每一轮的整段历史缓存全部失效、按全价重算。快照保住前缀；跨回合的
+        # 新鲜度不受影响——下一回合开始时重新快照，刚写的记忆那时自然可见。
+        self._memory_snapshot: str | None = None
         # 工具执行上下文：工作区 + 看图后端随 Agent 实例走；images 每轮提问时更新。
         # 状态挂在实例上而不是模块级全局，两个会话并发执行工具才不会串数据。
         self.ctx = ToolContext(workspace=prepare_workspace(workspace), vision_backend=vision_backend)
@@ -213,9 +220,10 @@ class Agent:
 
         提示词正文与记忆契约都在 SYSTEM_PROMPT（system_prompt.py）：契约以
         import 方式拼在其末尾而非复制副本，memory.py 改契约常量两边自动同步。
-        这里只补【动态】的索引段（memory_index_block）——索引每次组装从磁盘
-        现读，模型/提取线程刚写的记忆下一轮立即可见，读失败由 memory 层降级
-        为空，绝不阻塞主循环；契约由此在 system 里恰好出现一次（既不在块里
+        这里只补【动态】的索引段（memory_index_block）——它用回合开始时的
+        快照（_run 里刷新，见 _memory_snapshot 的缓存论证），不在回合中途
+        现读磁盘；构造后没跑过回合（直接单测 _system_content）时退回现读，
+        行为与旧版一致。契约由此在 system 里恰好出现一次（既不在块里
         重复，也不会漏掉）。
 
         关键不变式：记忆只进 system 消息，绝不进消息历史——上下文压缩只重写
@@ -226,7 +234,9 @@ class Agent:
         （app.py _run_round 收尾处），CLI 不触发——后续要挂时调
         memory.run_extraction_async 即可，是同一个钩子。
         """
-        return self.system_prompt + memory_index_block(memory_dir(self.ctx.workspace))
+        block = (self._memory_snapshot if self._memory_snapshot is not None
+                 else memory_index_block(memory_dir(self.ctx.workspace)))
+        return self.system_prompt + block
 
     def _visible_history(self) -> list[dict]:
         """模型视图的"该看哪些消息"——压缩的唯一生效点（纯函数，测试覆盖）。
@@ -417,6 +427,18 @@ class Agent:
         """run() 的实际循环体（run 只负责停止开关的生命周期）。"""
         self.trace = []  # 每次提问重新记录过程轨迹
         self.history.append(user_message or {"role": "user", "content": user_input})
+        # 回合开始的两个"前缀稳定"动作，各自只在本回合做这一次——之后本回合
+        # 的全部请求前缀逐字节不变，这是供应商自动前缀缓存能命中的前提：
+        # ① 记忆索引快照：回合内模型写记忆 / 提取线程落盘都不再改 system
+        #    （否则缓存全灭，见 _memory_snapshot 的论证）；
+        # ② 清理上一回合的旧工具结果（分级压缩第一档提前到回合开始执行）。
+        #    原本它只在估算超窗口 80% 时才触发——大窗口（如 262k）下正常对话
+        #    很少到 80%，清理形同虚设，而工具输出正是每轮请求里最重的重复携带。
+        #    代价是一次性的前缀缓存失效（旧消息内容变了），换来的是本回合每轮
+        #    都少带几万字符——长任务下稳赚。回合内不再重复清理：边界每轮前移
+        #    会把"上一轮还是原文"的消息改成占位符，前缀逐轮失效，得不偿失。
+        self._memory_snapshot = memory_index_block(memory_dir(self.ctx.workspace))
+        self._clear_old_tool_results()
         # 提取本轮附带的图片（OpenAI content 数组里的 image_url 部分），挂进工具上下文。
         # 主模型看不见像素；analyze_image 工具借"视觉模型"看图时用的就是这份数据。
         content = (user_message or {}).get("content")
@@ -783,8 +805,12 @@ class Agent:
         "没有请求却冒出结果"的悬空消息，服务端直接 400。
 
         返回：实际清理的条数（0 = 没动，交给上层去摘要）。
-        本方法只改内存里的 self.history；DB 原文不受影响（与压缩同一口径：
-        存储永远完整，只有模型视图被瘦身）。
+        本方法只改内存里的 self.history。落库口径要如实说：被清理的消息内容
+        变了 → 内容指纹变了 → 下一次 save_messages 会把占位符重写进对应行
+        （/_tool_result_cleared 标记同样随行进库）。也就是说清理是【全链路】
+        的——DB 与前端时间线回放里，较早的工具结果同样显示占位符。这是有意
+        的取舍：工具输出的价值随轮次衰减，占位符里写了"如何重新获取"；
+        换来的是之后每一轮请求都实打实少带几万字符。
         """
         # 先找出所有"可清理"的工具结果下标：跳过已被摘要吸收的（边界之前）——
         # 那些本来就不在模型视图里，清了也白清，还会误改 DB 待写的行。
@@ -844,7 +870,19 @@ class Agent:
             return None
         stats = self.context_stats()  # 用上一轮真实 usage 校准过的系数估算（无则粗略 0.4）
         est_before = sum(stats.values())
-        if est_before <= self.context_window * COMPACT_THRESHOLD:
+        # 触发线 = 窗口的 80%（能力口径：估算有误差，给输出留余量），再与
+        # COMPACTION_TARGET_TOKENS（成本口径，env 可选）取较小者。窗口是
+        # "模型能吃多少"，成本线是"愿意为单次请求的历史付多少"——大窗口模型
+        # 配小成本线，历史瘦身更勤而不牺牲单轮能力；0/未设置 = 关闭，维持纯
+        # 窗口口径（现网默认）。
+        threshold = self.context_window * COMPACT_THRESHOLD
+        try:
+            target = int(os.environ.get("COMPACTION_TARGET_TOKENS") or 0)
+        except ValueError:
+            target = 0
+        if target > 0:
+            threshold = min(threshold, target)
+        if est_before <= threshold:
             return None
 
         # ── 分级压缩第一档：先清较早的工具结果（无损、不花 LLM 调用）──
@@ -853,7 +891,7 @@ class Agent:
         if self._clear_old_tool_results():
             stats = self.context_stats()
             est_after_clear = sum(stats.values())
-            if est_after_clear <= self.context_window * COMPACT_THRESHOLD:
+            if est_after_clear <= threshold:
                 log.info("分级压缩①后已降至阈值以下（估算 %d → %d tokens），跳过摘要",
                          est_before, est_after_clear)
                 return None
@@ -874,8 +912,8 @@ class Agent:
         head = 2 if has_boundary else first_user + 1
         cut = self._compact_split(view, head)
         if cut is None:
-            log.warning("上下文估算 %d tokens 超过窗口 %d 的 %.0f%%，但没有可安全压缩的段落，跳过",
-                        est_before, self.context_window, COMPACT_THRESHOLD * 100)
+            log.warning("上下文估算 %d tokens 超过阈值 %d，但没有可安全压缩的段落，跳过",
+                        est_before, threshold)
             return None
 
         # 总结输入必须带上旧摘要（视图下标 1，不在 head 起的活区映射里）：再压缩

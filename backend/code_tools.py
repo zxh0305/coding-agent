@@ -431,11 +431,13 @@ def run_bash(command: str, ctx=None) -> str:
     stdout = (proc.stdout or "")[-MAX_OUTPUT_CHARS:]
     stderr = (proc.stderr or "")[-MAX_OUTPUT_CHARS // 2:]
     combined = (stdout + ("\n[stderr]\n" + stderr if stderr else "")).strip() or "（无输出）"
-    payload = {"exit_code": proc.returncode, "stdout": stdout, "stderr": stderr,
-               "result": combined}
+    # 输出只进 result 一个字段（已含 stdout 与 [stderr] 段，各自截断过）。
+    # 之前 payload 同时带 stdout/stderr/result 三份——同一段输出在工具结果里
+    # 存两遍，而工具结果一旦进历史就会随之后每轮请求重复携带，纯浪费。
+    payload = {"exit_code": proc.returncode, "result": combined}
     if proc.returncode != 0:
-        # 非零退出走失败信封：模型看 ok 就能分流；原始输出保留在 result/stderr
-        # 里供定位（命令失败不是工具失败，输出本身就是最重要的错误信息）
+        # 非零退出走失败信封：模型看 ok 就能分流；原始输出保留在 result 里
+        # 供定位（命令失败不是工具失败，输出本身就是最重要的错误信息）
         payload["error"] = f"命令退出码 {proc.returncode}"
         payload["hint"] = "先读 stderr 定位原因再调整命令；不要原样重试同一条命令"
         return json.dumps({"ok": False, **payload}, ensure_ascii=False)
