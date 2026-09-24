@@ -204,6 +204,7 @@ BUILTIN_RULES = [
     Rule("current_time", None, ALLOW, "只读时间查询"),
     Rule("analyze_image", None, ALLOW, "只读图片识别"),
     Rule("get_weather", None, ALLOW, "只读天气查询"),
+    Rule("todo_write", None, ALLOW, "任务清单（仅会话内存）"),
     # run_bash 高危清单 → ask（粗粒度兜底：宁可多问，用户可用「本会话内允许」
     # 放行同类操作；想彻底放行/禁止可写用户规则覆盖）
     Rule("run_bash", "rm -rf", ASK, "递归强制删除（rm -rf / -fr）"),
@@ -236,7 +237,7 @@ _PARSE_FAIL_KEY = ("run_bash", "<unparseable>")
 _READONLY_MODE_KEY_PREFIX = "<readonly_mode>"
 
 READONLY_TOOLS = {"read_file", "list_dir", "grep", "calculator",
-                  "current_time", "analyze_image", "get_weather",
+                  "current_time", "analyze_image", "get_weather", "todo_write",
                   # create_doc 并非真的只读，但文档生成视为【低危】：无论哪种权限
                   # 模式都直接放行、不弹确认卡。放进本集合即达成——只读模式下的
                   # "非本集合工具一律 ask"（见 check）不再对它生效。

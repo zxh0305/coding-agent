@@ -1027,6 +1027,15 @@ class Agent:
                 # else 分支进 SSE 总线），前端据此自动弹出右侧文档面板。
                 # 失败（result 含 error）不推——没生成成功没什么可弹的。
                 name = (call.get("function") or {}).get("name", "")
+                # todo_write 成功：额外产出 todo_update 事件（清单已存 ctx.todos），
+                # 前端据此在过程面板上方渲染任务清单卡（进度一目了然）。
+                if name == "todo_write" and '"error"' not in result:
+                    try:
+                        info = json.loads(result)
+                        if info.get("ok"):
+                            yield "todo_update", {"todos": info.get("todos") or []}
+                    except (json.JSONDecodeError, TypeError):
+                        pass
                 if name == "create_doc" and '"error"' not in result:
                     try:
                         info = json.loads(result)

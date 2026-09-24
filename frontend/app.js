@@ -2660,6 +2660,16 @@ function applyEvent(evt, seq) {
     // 状态下过程静默累积、用户只见秒数跳动。
     if (!liveTracker.state()?.steps) traceEl.open = true;
     queueStreamDelta("answer", evt.mid, evt.delta);
+  } else if (t === "todo_update") {
+    // 任务清单卡：实时路径也画在聊天区（最新一份替换旧的，与 blocks.js 的
+    // 去重规则一致）。回放路径由 blocksFromHistory→renderBlocks 走 todo 块。
+    const todos = Array.isArray(evt.todos) ? evt.todos : [];
+    if (todos.length) {
+      const frag = blocksRenderer.renderBlocks([{ kind: "todo", todos }]);
+      const old = chatEl.querySelector(":scope > .todo-card");
+      if (old) old.replaceWith(frag); else chatEl.appendChild(frag);
+      scrollBottom();
+    }
   } else if (t === "tool_call") {
     flushStreamBuffers();
     // 调工具前输出的正文同样是过程说明（"我先看看这个文件…"），一并降级

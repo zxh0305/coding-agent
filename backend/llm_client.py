@@ -471,7 +471,19 @@ class AnthropicMessagesClient:
 
         body = {"model": self.model, "max_tokens": 16384, "messages": merged}
         if system_parts:
-            body["system"] = "\n\n".join(system_parts)
+            # 提示词缓存（对齐 ZCode ContextBuilder 的 EPHEMERAL_CACHE_CONTROL 思路）：
+            # system 是整段请求里最稳定的部分（守则 + 记忆契约 + 索引，分钟级才变），
+            # 在它末尾打 ephemeral 断点，服务商缓存 system+tools 前缀；工具 schema
+            # 随断点一起进缓存——长会话每轮省下这两块的重复计费与计算。
+            body["system"] = [{"type": "text", "text": "\n\n".join(system_parts),
+                               "cache_control": {"type": "ephemeral"}}]
+        # 第二个断点打在【最后一条消息】末尾：对话历史是纯追加的，上一轮请求的
+        # 全部消息构成下一轮的前缀，断点随消息尾部前移，历史主体逐轮命中缓存。
+        # 只在 Anthropic 格式生效（OpenAI 兼容端自动前缀缓存，无需显式标记）。
+        if merged:
+            last_blocks = merged[-1].get("content")
+            if isinstance(last_blocks, list) and last_blocks:
+                last_blocks[-1]["cache_control"] = {"type": "ephemeral"}
         if tools:
             body["tools"] = [
                 {"name": t["function"]["name"],

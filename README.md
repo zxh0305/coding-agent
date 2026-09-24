@@ -140,6 +140,7 @@ python3 backend/cli.py "37*89+100 等于多少"  # 单次提问
 | `calculator` | 四则运算（ast 白名单，不用 `eval`） |
 | `analyze_image` | 借支持视觉的模型"代为看图"，把描述返回给主模型 |
 | `create_doc` | 生成 / 更新会话 Markdown 文档（右侧面板查看） |
+| `todo_write` | 维护多步任务的待办清单（状态 pending / in_progress / done，前端渲染清单卡） |
 
 **权限闸门**（`permissions.py`）在工具执行前介入，三态判定：
 

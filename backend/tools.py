@@ -96,6 +96,50 @@ def get_weather(city: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# 任务清单工具（todo_write）：长任务的可见进度条
+# 对齐 Claude Code TodoWrite / ZCode todo.ts 的设计：模型把多步任务拆成清单，
+# 随进度更新状态（pending → in_progress → done）。清单内容存在 ToolContext
+# （会话隔离），同时 Agent 依据返回值产出 todo_update 事件推给前端渲染清单卡——
+# 用户不用翻执行过程就能看到"现在做到第几步、还剩什么"。
+# ---------------------------------------------------------------------------
+
+_TODO_STATUS = ("pending", "in_progress", "done")
+
+
+def todo_write(todos: list, ctx: "ToolContext" = None) -> str:
+    """整体替换当前会话的任务清单。todos：[{content, status}]。
+
+    每次都发全量清单（而不是增量改动）——模型端"一次写全"比"记住上次再改"
+    更不易漂移，这也是 CC TodoWrite 的取舍。校验：status 必须合法、content
+    非空；同一时刻至多一条 in_progress（多出的自动降为 pending，不报错——
+    提示即可，别让格式小错打断任务流）。
+    """
+    if not isinstance(todos, list) or not todos:
+        return error_result("todos 必须是非空数组",
+                            "示例：{\"todos\": [{\"content\": \"读代码\", \"status\": \"done\"}]}；"
+                            "任务全部完成或不再需要清单时传 [{\"content\": \"(cleared)\", \"status\": \"done\"}] 或说明已清空")
+    clean, in_progress_seen = [], False
+    for i, t in enumerate(todos):
+        if not isinstance(t, dict) or not str(t.get("content") or "").strip():
+            return error_result(f"第 {i + 1} 项缺少 content",
+                                "每项须为 {\"content\": 任务描述, \"status\": pending|in_progress|done}")
+        status = str(t.get("status") or "pending")
+        if status not in _TODO_STATUS:
+            return error_result(f"第 {i + 1} 项 status 非法: {status}",
+                                "status 只允许 pending / in_progress / done")
+        if status == "in_progress":
+            if in_progress_seen:
+                status = "pending"  # 多个 in_progress 自动降级（首个保留）
+            in_progress_seen = True
+        clean.append({"content": str(t["content"]).strip()[:200], "status": status})
+    if ctx is not None:
+        ctx.todos = clean
+    done = sum(1 for t in clean if t["status"] == "done")
+    return json.dumps({"ok": True, "todos": clean,
+                       "progress": f"{done}/{len(clean)}"}, ensure_ascii=False)
+
+
 def error_result(error: str, hint: str = "") -> str:
     """统一失败信封：{ok:false, error, hint?}。
 
@@ -173,6 +217,7 @@ class ToolContext:
 
     workspace: Path | None = None               # 本会话的工作区（文件/命令工具的边界）
     images: list = field(default_factory=list)  # 本轮用户消息附带的图片（OpenAI content 部分）
+    todos: list = field(default_factory=list)   # 本会话任务清单（todo_write 维护，会话隔离）
     vision_backend: object = None               # fn(image_parts, question) -> str，由 app.py 注入
     browser: object = None                      # BrowserManager（browser_tools），由 agent.py 按
                                                 # 会话注入；工具层不持有实例（与会话生命周期同寿）
@@ -182,6 +227,7 @@ TOOL_REGISTRY = {
     "calculator": calculator,
     "current_time": current_time,
     "get_weather": get_weather,
+    "todo_write": todo_write,
 }
 
 # ---- 合并 Coding 工具（code_tools.py）：读写工作区文件、执行命令 ----
@@ -227,6 +273,37 @@ def analyze_image(image_id: str = "", question: str = "请详细描述这张图�
                             "请在「管理模型」里给某个模型勾选'视觉'并确保其 Key 可用，然后重试")
     return json.dumps({"ok": True, "image_id": str(index + 1), "result": description}, ensure_ascii=False)
 
+
+TOOL_SCHEMAS.append({
+    "type": "function",
+    "function": {
+        "name": "todo_write",
+        "description": "维护当前任务的待办清单（整体替换）。多步任务（≥3 步或需要跨多轮工具调用）"
+                       "开始时先写全清单，每完成一步就更新状态：pending 待做 / in_progress 进行中"
+                       "（同一时刻至多一条）/ done 已完成。简单问答、单步任务不要用。"
+                       "示例：{\"todos\": [{\"content\": \"定位 bug\", \"status\": \"done\"},"
+                       "{\"content\": \"修复并验证\", \"status\": \"in_progress\"}]}。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "description": "全量清单，每次调用都发完整列表",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string", "description": "任务项描述（≤200 字）"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "done"],
+                                       "description": "状态"},
+                        },
+                        "required": ["content", "status"],
+                    },
+                },
+            },
+            "required": ["todos"],
+        },
+    },
+})
 
 TOOL_SCHEMAS.append({
     "type": "function",
@@ -289,6 +366,8 @@ TOOL_READ_ONLY = {
     "current_time": True,
     "get_weather": False,
     "analyze_image": False,
+    # todo_write 只写 ToolContext 内存（不碰工作区/不出网），并行安全
+    "todo_write": True,
 }
 TOOL_READ_ONLY.update(CODE_TOOL_READ_ONLY)  # 并入 coding 工具的标记（同样的合并方式）
 TOOL_READ_ONLY.update(DOC_TOOL_READ_ONLY)   # 并入文档工具（create_doc 为非只读，走串行）
