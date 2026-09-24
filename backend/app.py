@@ -269,10 +269,25 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             # 上次的结局）。回合真结局在下面收尾处按 error 重新置位。
             with _lock:
                 _turn_status.pop(sid, None)
+            # 用户消息【回合开始即落库】，不等回合收尾。否则回合进行中切走再
+            # 切回来时，时间线分页接口查不到它；若 turn_start 恰好被环形缓冲
+            # 挤掉（超长回合），补发也画不回来——用户输入就"消失"了。提前落库
+            # 后，切回的页面靠分页接口必然能看到它。save_messages 增量幂等，
+            # 收尾处的整段落盘按内容指纹跳过它，不产生重复行。
+            # mid 必须这里预分配并写进 user_message：agent.run 的 _run 把同一个
+            # 对象追加进 history，收尾整段落盘、turn_end 提取的 user_mid 都与
+            # 此处一致（原逻辑等收尾时才由 save_messages 分配，那时 turn_start
+            # 早已发完，带不了 mid）。
+            user_mid = uuid.uuid4().hex
+            user_message["_mid"] = user_mid
+            db.save_messages(sid, [user_message], {})
             bus.publish({"type": "turn_start", "nonce": nonce, "input": plain, "atts": atts,
-                         # 回合真起点（秒）。补发/多标签页/刷新回来的客户端没有本地
+                         # 回合真起点（秒）。补发/多标签页/刷新后的页面没有本地
                          # 计时起点，靠它把「已工作 N 秒」接上，而不是从 0 重数。
-                         "started_at": time.time()})
+                         "started_at": time.time(),
+                         # 本回合输入消息的 mid：前端据此对"已在时间线"的输入
+                         # 去重补画（落库提前后，历史接口与补发都会带它）。
+                         "user_mid": user_mid})
             log.info("[会话 %s] 用户提问: %s", sid, plain)
             seg_mid = None  # 当前回答段落的 SSE 气泡 mid（每个 round 事件换一段，仅事件流用）
             error = None

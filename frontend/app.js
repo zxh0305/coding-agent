@@ -2534,8 +2534,12 @@ function applyEvent(evt, seq) {
   if (t === "turn_start") {
     // 回合开始。本 tab 自己发的消息（nonce 相同）不重复画气泡——发起方在
     // send/dispatch 时已带缩略图画过；其他标签页/刷新后的页面靠事件里的
-    // 原文补画（附件只带名字：图片 base64 不该进环形缓冲占容量）
-    if (!evt.nonce || evt.nonce !== myNonce) {
+    // 原文补画（附件只带名字：图片 base64 不该进环形缓冲占容量）。
+    // 另一种不补画的情况：输入消息已随回合开始提前落库、且刚加载的历史里
+    // 已有它（user_mid 在 historyMids）——切会话回来的页面时间线已含这条
+    // 输入，再画一次就重复了。
+    const alreadyShown = evt.user_mid && historyMids.has(evt.user_mid);
+    if ((!evt.nonce || evt.nonce !== myNonce) && !alreadyShown) {
       userBubble(evt.input || "（仅附件）",
         (evt.atts || []).map(a => ({ kind: a.kind, name: a.name, preview: "" })),
         evt.user_mid);
