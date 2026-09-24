@@ -534,15 +534,20 @@ def delete_session(sid: str) -> None:
     shutil.rmtree(_docs_dir() / sid, ignore_errors=True)
     # attachments/<sid>/ 同理：该任务上传的附件随会话一起消失（与 artifacts/docs 一致）
     shutil.rmtree(_attachments_dir() / sid, ignore_errors=True)
-    # 附件现在可能落在工作区 .coding-agent/attachments/（见 _session_attach_root）：
-    # 只清我们自己建的那个子目录，绝不碰用户工作区的其它内容。
+    # 附件现在可能落在工作区 .coding-agent/attachments/<sid>/（见
+    # _session_attach_root）：只清本会话那个子目录，绝不碰用户工作区的
+    # 其它内容、也不动同工作区其它会话的附件。
     if ws:
         try:
-            sub = Path(ws).expanduser() / ATTACH_DIR_NAME
+            sub = Path(ws).expanduser() / ATTACH_DIR_NAME / sid
             if sub.is_dir():
                 shutil.rmtree(sub, ignore_errors=True)
-                # 若 .coding-agent/ 已空则一并清掉，不留空壳
-                parent = sub.parent
+            # attachments/<sid>/ 消失后，attachments/ 空了就连 .coding-agent/
+            # 一起收掉空壳；不空说明还有别的会话的附件，留着。
+            root = Path(ws).expanduser() / ATTACH_DIR_NAME
+            if root.is_dir() and not any(root.iterdir()):
+                root.rmdir()
+                parent = root.parent
                 if parent.is_dir() and not any(parent.iterdir()):
                     parent.rmdir()
         except OSError:
@@ -692,12 +697,17 @@ def _session_attach_root(sid: str) -> Path:
     锁在工作区、read_file 有越界校验），压缩包类附件因此没法用。落进工作区后，
     附件变成"普通文件"，一切文件能力自然可用——这是 ZCode 的做法（附件即
     workspace path）。工作区未绑定时仍回退 data/attachments，保证不丢附件。
+
+    为什么再多一层 <sid> 子目录（2026-09-29）：同一个工作区会被多个会话绑定，
+    早期实现落 <ws>/.coding-agent/attachments/ 本身，导致同工作区切换会话时
+    "附件不变"——物理上是同一目录。加上 <sid> 一层后才真正按会话隔离，且
+    删除会话时 rmtree <sid>/ 不会误伤其它会话的附件。
     """
     ws = get_session_workspace(sid)
     if ws:
         base = Path(ws).expanduser()
         if base.is_dir():
-            return base / ATTACH_DIR_NAME
+            return base / ATTACH_DIR_NAME / sid
     return _attachments_dir() / sid
 
 
@@ -748,6 +758,9 @@ def _session_attach_bytes(sid: str) -> int:
         return 0
     total = 0
     for p in d.iterdir():
+        # _extracted/ 是压缩包解压的派生产物，不计入附件配额
+        if p.name == "_extracted":
+            continue
         try:
             if p.is_file():
                 total += p.stat().st_size
@@ -856,7 +869,7 @@ def read_attachment_text(sid: str, name: str, offset: int = 0,
 
 
 def extract_attachment(sid: str, name: str) -> dict:
-    """把一个归档附件解压到 attachments/<sid>/_extracted/<附件名>/。
+    """把一个归档附件解压到附件区根下的 _extracted/<附件名>/。
 
     返回 {ok, kind, members, file_count, total_bytes, extracted_dir, rel_dir}。
     失败返回 {ok: False, error}。rel_dir 是解压目录相对【附件区根】的路径，
@@ -883,6 +896,10 @@ def migrate_attachments_to_workspace(sid: str) -> int:
     只能落 data/。工作区绑定后调用本函数搬过去，之后 agent 就能用文件工具
     直接访问。同名文件以工作区已有者为准（不覆盖用户后来上传的），迁移后
     清理空的旧目录。返回迁移的文件数。
+
+    顺带兜底一次旧布局迁移：把 <ws>/.coding-agent/attachments/ 里平铺的
+    遗留文件（加 <sid> 层之前的）搬进本会话的 <sid>/ 子目录——同一工作区
+    的旧附件无法精确归属，约定归给第一个触发迁移的会话。
     """
     ws = get_session_workspace(sid)
     if not ws:
@@ -890,29 +907,33 @@ def migrate_attachments_to_workspace(sid: str) -> int:
     base = Path(ws).expanduser()
     if not base.is_dir():
         return 0
-    old_dir = _attachments_dir() / sid
-    if not old_dir.is_dir():
-        return 0
-    new_dir = base / ATTACH_DIR_NAME
+    new_dir = base / ATTACH_DIR_NAME / sid
     new_dir.mkdir(parents=True, exist_ok=True)
     moved = 0
-    for p in list(old_dir.iterdir()):
-        if not p.is_file() or p.name.endswith(".tmp"):
+    # 两个旧布局：a) data/attachments/<sid>/（本会话未绑工作区前落下的）；
+    # b) <ws>/.coding-agent/attachments/ 直接平铺（2026-09-29 加 <sid> 层之前
+    # 的布局）——b 里无法精确归属到某个会话，约定归给【触发迁移的会话】，
+    # 也就是"绑定/切换到该工作区的第一个会话"。
+    for old_dir in (_attachments_dir() / sid, base / ATTACH_DIR_NAME):
+        if old_dir == new_dir or not old_dir.is_dir():
             continue
-        target = new_dir / p.name
-        if target.exists():
-            continue  # 工作区已有同名：保留工作区那份
+        for p in list(old_dir.iterdir()):
+            if not p.is_file() or p.name.endswith(".tmp"):
+                continue
+            target = new_dir / p.name
+            if target.exists():
+                continue  # 目标已有同名：保留已有的那份
+            try:
+                shutil.move(str(p), str(target))
+                moved += 1
+            except OSError as e:
+                log.warning("附件迁移失败 sid=%r name=%r: %s", sid, p.name, e)
+        # 旧目录只剩空壳时清掉
         try:
-            shutil.move(str(p), str(target))
-            moved += 1
-        except OSError as e:
-            log.warning("附件迁移失败 sid=%r name=%r: %s", sid, p.name, e)
-    # 旧目录只剩空壳时清掉
-    try:
-        if old_dir.is_dir() and not any(old_dir.iterdir()):
-            old_dir.rmdir()
-    except OSError:
-        pass
+            if old_dir.is_dir() and not any(old_dir.iterdir()):
+                old_dir.rmdir()
+        except OSError:
+            pass
     if moved:
         log.info("附件迁移到工作区：sid=%r %d 个", sid, moved)
     return moved
