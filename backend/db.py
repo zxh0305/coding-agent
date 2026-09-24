@@ -640,6 +640,17 @@ def read_doc(sid: str, name: str) -> str:
     return p.read_text(encoding="utf-8")
 
 
+def delete_doc(sid: str, name: str) -> None:
+    """删除某会话下的一份文档（用户在文档面板手动删除）。
+
+    路径校验与 read_doc 同一套（_doc_path 防 ../ 逃逸、防跨会话）；文件
+    不存在视为已删除（幂等，重复点删除不报错）。
+    """
+    p = _doc_path(sid, _safe_doc_name(name))
+    if p.is_file():
+        p.unlink()
+
+
 def write_doc(sid: str, name: str, content: str) -> dict:
     """写入/覆盖一份文档，返回 {name, bytes, lines}。
 
@@ -812,6 +823,22 @@ def list_attachments(sid: str) -> list[dict]:
         out.append({"name": p.name, "bytes": st.st_size, "mtime": st.st_mtime})
     out.sort(key=lambda x: x["mtime"], reverse=True)
     return out
+
+
+def delete_attachment(sid: str, name: str) -> None:
+    """删除某会话下的一份附件（用户在附件浮窗手动删除）。
+
+    路径校验与 read_attachment_text 同一套（_attach_path 防 ../ 逃逸、
+    防跨会话）。文件不存在视为已删除（幂等）。若该附件是压缩包且解压过，
+    _extracted/<附件名>/ 的派生产物一并清掉——本体没了，解压结果没有
+    独立存在的价值，留着只会占盘、且会出现在 run_bash 的目录列表里迷惑模型。
+    """
+    p = _attach_path(sid, _safe_attach_name(name))
+    if p.is_file():
+        p.unlink()
+    extracted = _session_attach_root(sid) / "_extracted" / p.name
+    if extracted.is_dir():
+        shutil.rmtree(extracted, ignore_errors=True)
 
 
 def read_attachment_text(sid: str, name: str, offset: int = 0,

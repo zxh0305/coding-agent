@@ -117,6 +117,23 @@ class TestSizeLimit(DocsTestBase):
         self.assertFalse((db._docs_dir() / "s1" / "big.md").exists())
 
 
+class TestDeleteDoc(DocsTestBase):
+
+    def test_delete_doc(self):
+        """删除文档：文件消失、列表为空；再删一次幂等不报错。"""
+        db.write_doc("s1", "d1", "内容")
+        db.delete_doc("s1", "d1")
+        self.assertEqual(db.list_docs("s1"), [])
+        db.delete_doc("s1", "d1")  # 不存在视为已删，不抛
+
+    def test_delete_doc_rejects_escape(self):
+        """删除同样走 _doc_path 校验：../ 逃逸、跨会话都被拒。"""
+        db.write_doc("s2", "secret", "private")
+        with self.assertRaises(ValueError):
+            db.delete_doc("s1", "../s2/secret.md")
+        self.assertEqual([d["name"] for d in db.list_docs("s2")], ["secret.md"])  # 毫发无损
+
+
 class TestSessionDelete(DocsTestBase):
 
     def test_delete_session_clears_docs(self):

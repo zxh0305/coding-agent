@@ -1361,6 +1361,23 @@ button.primary:hover { background: var(--accent-hover); }
 .attach-item:hover .attach-toc-btn { display: block; }
 .attach-toc-btn:hover { color: var(--accent); background: var(--hover-soft); }
 
+/* 删除入口（附件列表与文档列表共用）：hover 露出；一次点击进入确认态
+   （变红 + 显示"确认?"），再点才真删，2.5 秒不点自动退回——防误删。 */
+.attach-del-btn, .docs-del-btn {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  display: none; cursor: pointer; color: var(--text-3);
+  font-size: 12px; padding: 3px 8px; border-radius: 6px;
+  background: var(--panel); white-space: nowrap;
+}
+.attach-del-btn { right: 28px; }   /* md 附件右侧还有 ☰ 目录按钮，错开 */
+.docs-del-btn { right: 10px; }
+.attach-item:hover .attach-del-btn,
+.docs-item:hover .docs-del-btn { display: block; }
+.attach-del-btn:hover, .docs-del-btn:hover { color: #d33; background: var(--hover-soft); }
+.attach-del-btn.confirm, .docs-del-btn.confirm {
+  display: block; color: #fff; background: #d33; font-weight: 600;
+}
+
 /* 目录浮层：贴列表项右侧，点击条目滚动正文 */
 .attach-toc-pop {
   position: fixed; z-index: 40; width: 220px; max-height: 320px;

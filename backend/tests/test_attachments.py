@@ -168,6 +168,31 @@ class TestSizeLimits(AttachTestBase):
 
 class TestList(AttachTestBase):
 
+    def test_delete_attachment(self):
+        """删除附件：文件消失、列表为空；再删一次幂等不报错。"""
+        db.save_attachment("s1", "a.txt", b"x")
+        db.delete_attachment("s1", "a.txt")
+        self.assertEqual(db.list_attachments("s1"), [])
+        db.delete_attachment("s1", "a.txt")  # 不存在视为已删，不抛
+
+    def test_delete_attachment_cleans_extracted(self):
+        """删压缩包附件时，_extracted/ 下的解压残留一并清掉。"""
+        db.save_attachment("s1", "a.tar.gz", b"x")
+        dest = db._session_attach_root("s1") / "_extracted" / "a.tar.gz"
+        dest.mkdir(parents=True)
+        (dest / "inner.txt").write_text("hi")
+        db.delete_attachment("s1", "a.tar.gz")
+        self.assertFalse(dest.exists())
+
+    def test_delete_attachment_rejects_escape(self):
+        """删除同样走 _attach_path 校验：../ 逃逸、跨会话都被拒。"""
+        with self.assertRaises(ValueError):
+            db.delete_attachment("s1", "../s2/a.txt")
+        db.save_attachment("s2", "secret.txt", b"private")
+        with self.assertRaises(ValueError):
+            db.delete_attachment("s1", "../s2/secret.txt")
+        self.assertTrue(db.list_attachments("s2"))  # s2 的附件毫发无损
+
     def test_list_sorted_by_mtime_desc(self):
         db.save_attachment("s1", "a.txt", b"a")
         db.save_attachment("s1", "b.txt", b"b")

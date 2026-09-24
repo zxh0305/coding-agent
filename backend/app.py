@@ -869,6 +869,27 @@ class Handler(SimpleHTTPRequestHandler):
     def do_DELETE(self):
         if not self._require_auth():
             return
+        # /api/sessions/<sid>/attachments?name=xxx / docs?name=xxx：单文件删除
+        # （附件浮窗与文档面板的 🗑 按钮）。归属校验与 GET 同一套。
+        m = re.fullmatch(r"/api/sessions/([^/]+)/(attachments|docs)",
+                         urllib.parse.urlparse(self.path).path)
+        if m:
+            sid, kind = m.group(1), m.group(2)
+            if db.session_owner(sid) != self.user["id"]:
+                return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+            name = (self._query().get("name") or [""])[0]
+            if not name:
+                return self._json({"error": "缺少 name 参数"}, 400)
+            try:
+                if kind == "attachments":
+                    db.delete_attachment(sid, name)
+                else:
+                    db.delete_doc(sid, name)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            except FileNotFoundError:
+                pass  # 幂等：已不存在视为删除成功
+            return self._json({"ok": True})
         if urllib.parse.urlparse(self.path).path == "/api/sessions":  # self.path 带 ?query，须剥掉再比较
             sid = (self._query().get("session_id") or [""])[0]
             if db.session_owner(sid) != self.user["id"]:

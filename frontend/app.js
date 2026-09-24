@@ -3938,9 +3938,62 @@ function renderAttachList() {
       });
       li.appendChild(tocBtn);
     }
+    li.appendChild(makeDeleteBtn("attach-del-btn", it.name, deleteAttachment));
     list.appendChild(li);
   }
   if (attachActive) openAttachment(attachActive);
+}
+
+// 删除按钮（附件浮窗/文档面板共用）：二次确认交互——
+// 第一次点进入确认态（变红显示"确认?"），再点才真删；2.5 秒不点自动退回。
+// 之所以不用 confirm() 对话框：原生弹窗样式突兀，且行内确认让"删的是哪个
+// 文件"看得见，不会弹窗文案与目标对不上号。
+function makeDeleteBtn(cls, name, delFn) {
+  const btn = document.createElement("span");
+  btn.className = cls;
+  btn.textContent = "🗑";
+  btn.title = "删除";
+  let timer = null;
+  const disarm = () => {
+    btn.classList.remove("confirm");
+    btn.textContent = "🗑";
+    if (timer) { clearTimeout(timer); timer = null; }
+  };
+  btn.addEventListener("click", async (e) => {
+    e.stopPropagation();  // 别触发列表项的「打开这份文件」
+    if (!btn.classList.contains("confirm")) {
+      btn.classList.add("confirm");
+      btn.textContent = "确认?";
+      timer = setTimeout(disarm, 2500);  // 犹豫即放弃
+      return;
+    }
+    disarm();
+    try {
+      await delFn(name);
+      toast(`已删除《${name}》`);
+    } catch (err) {
+      toast("删除失败：" + err.message);
+    }
+  });
+  btn.addEventListener("mouseleave", () => {
+    // 鼠标移走后保留确认态一小会儿，期间点回来仍生效；超时自动退回
+    if (btn.classList.contains("confirm") && !timer) timer = setTimeout(disarm, 2500);
+  });
+  return btn;
+}
+
+// 删除一份会话附件：调 DELETE 接口 → 刷新列表与计数 → 若正预览着它就清空右侧。
+async function deleteAttachment(name) {
+  await api(`/api/sessions/${encodeURIComponent(currentSession)}/attachments?name=${encodeURIComponent(name)}`,
+    { method: "DELETE" });
+  attachItems = attachItems.filter((a) => a.name !== name);
+  const countEl = $("attach-count");
+  if (countEl) countEl.textContent = String(attachItems.length);
+  if (attachActive === name) {
+    attachActive = null;
+    $("attach-view").innerHTML = '<div class="attach-empty">附件已删除。</div>';
+  }
+  renderAttachList();
 }
 
 // 打开一份附件：文本按原文渲染（等宽 <pre>，不解析 Markdown——看日志与代码
@@ -4244,11 +4297,23 @@ async function loadDocsList() {
       meta.textContent = `${fmtBytes(d.bytes)} · ${fmtDocTime(d.mtime)}`;
       li.append(name, meta);
       li.addEventListener("click", () => openDoc(d.name));
+      li.appendChild(makeDeleteBtn("docs-del-btn", d.name, deleteDoc));
       list.appendChild(li);
     }
   } catch (e) {
     renderDocsEmpty("文档列表加载失败：" + e.message);
   }
+}
+
+// 删除一份会话文档：调 DELETE 接口 → 刷新列表；删的是右侧正展示的那份就清空视图。
+// openDoc 会给列表项打 .active 且 data-name 即文件名，据此判断"开的是不是它"。
+async function deleteDoc(name) {
+  await api(`/api/sessions/${encodeURIComponent(currentSession)}/docs?name=${encodeURIComponent(name)}`,
+    { method: "DELETE" });
+  // 先判断再刷新：loadDocsList 会重建列表，被删项在新列表里已不存在
+  const wasOpen = document.querySelector(`.docs-item[data-name="${CSS.escape(name)}"].active`);
+  await loadDocsList();
+  if (wasOpen) $("docs-view").innerHTML = '<div class="docs-empty">文档已删除。</div>';
 }
 
 function renderDocsEmpty(msg) {
