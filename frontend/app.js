@@ -378,8 +378,17 @@ function renderIntoBubble(el, text) {
 // 优先流式输出"的体感就来自这里）。规则：只有用户本来就在底部附近（80px）
 // 才跟随滚动；往上滑了就不打扰，滚回底部或用户自己发消息时恢复跟随。
 let stickBottom = true;
+// 触顶自动加载更早的历史：滚到顶部附近（<120px）且还有更多时自动翻页，
+// 不再依赖手动点「加载更早的消息」按钮（按钮保留，作触发的兜底入口）。
+// histLoading 防重入：翻页请求在途时忽略后续 scroll 触发，加载完成或
+// 没有更多时自动解除。
+let histLoading = false;
 chatEl.addEventListener("scroll", () => {
   stickBottom = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 80;
+  if (!histLoading && histHasMore && chatEl.scrollTop < 120 && currentSession) {
+    histLoading = true;
+    loadHistoryPage().finally(() => { histLoading = false; });
+  }
 }, { passive: true });
 
 function scrollBottom(force = false) {
@@ -421,9 +430,11 @@ function fmtTime(ts) {
   const pad = (x) => String(x).padStart(2, "0");
   const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
   if (d.toDateString() === now.toDateString()) return hm;
-  const days = Math.floor((now - d) / 86400000);
-  if (days >= 0 && days < 7) return `${days}天前`;
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
+  // 按自然日差算（去掉时分秒再相减）："1天前"其实可能是昨天 23:59 的任务
+  const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diffDays = Math.round((day(now) - day(d)) / 86400000);
+  if (diffDays === 1) return `昨天 ${hm}`;
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;  // 前天起就显示日期
 }
 
 function toast(text) {
@@ -1390,20 +1401,28 @@ function buildUserBubble(text, atts) {
     } else {
       // 文件名可点：直接打开会话附件浮窗并定位到这份文件——否则附件发出去
       // 之后就只剩这行死文本，用户想再看一眼只能去翻磁盘。
-      const f = document.createElement("div");
-      f.className = "att-file clickable";
-      f.textContent = "📄 " + a.name;
-      f.title = "点击查看这份附件";
-      f.addEventListener("click", (e) => {
-        // stopPropagation 必须加：点击会冒泡到 document 上的「点空白处关闭浮
-        // 窗」监听器——它看到目标既不在 attach-pop 内也不在 attach-chip 上，
-        // 会把刚打开的浮窗在同一瞬间关掉，表现就是"点了没反应"。
-        e.stopPropagation();
-        const pop = $("attach-pop");
-        if (pop.classList.contains("hidden")) toggleAttachPop();
-        openAttachment(a.name);
-      });
-      div.appendChild(f);
+      if (a.kind === "image") {
+        // 图片但 preview 为空（turn_start 补发路径只带 kind/name，不落盘所以
+        // 没有可回放的预览）：直接跳过不渲染。占位芯片既无信息量又误导
+        // （点了没反应），宁缺勿滥——文字正文不受影响。
+      } else {
+        // 文件名可点：直接打开会话附件浮窗并定位到这份文件——否则附件发出去
+        // 之后就只剩这行死文本，用户想再看一眼只能去翻磁盘。
+        const f = document.createElement("div");
+        f.className = "att-file clickable";
+        f.textContent = "📄 " + a.name;
+        f.title = "点击查看这份附件";
+        f.addEventListener("click", (e) => {
+          // stopPropagation 必须加：点击会冒泡到 document 上的「点空白处关闭浮
+          // 窗」监听器——它看到目标既不在 attach-pop 内也不在 attach-chip 上，
+          // 会把刚打开的浮窗在同一瞬间关掉，表现就是"点了没反应"。
+          e.stopPropagation();
+          const pop = $("attach-pop");
+          if (pop.classList.contains("hidden")) toggleAttachPop();
+          openAttachment(a.name);
+        });
+        div.appendChild(f);
+      }
     }
   }
   if (imgs.length > 1) div.classList.add("multi-img");
@@ -2979,7 +2998,11 @@ document.addEventListener("click", (e) => {
   // 点弹窗外空白处关闭浮动层
   for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"]]) {
     const el = $(pop);
-    if (!el.classList.contains("hidden") && !el.contains(e.target) && !e.target.closest?.("#" + btn)) {
+    // git 的分支二级面板挂在外层（不在 git-pop 内）：点它不算点空白，否则
+    // git 浮窗被关掉而分支面板还留着（真实踩过的坑）
+    const inner = pop === "git-pop" ? e.target.closest?.("#git-branch-pop") : null;
+    if (!el.classList.contains("hidden") && !el.contains(e.target) && !inner
+        && !e.target.closest?.("#" + btn)) {
       el.classList.add("hidden");
     }
   }
@@ -3092,6 +3115,7 @@ async function refreshGitChip() {
 function toggleGitPop() {
   const pop = $("git-pop");
   if (!pop.classList.contains("hidden")) { pop.classList.add("hidden"); return; }
+  restoreGitSize();
   positionGitPop();
   pop.classList.remove("hidden");
   gitWho = "all";
@@ -3448,6 +3472,16 @@ document.addEventListener("click", (e) => {
 });
 $("git-branch").addEventListener("click", (e) => { e.stopPropagation(); toggleBranchPop(); });
 
+// 点附件目录浮层外任意处关闭：目录浮层挂在 body 上（不受 attach-pop 裁剪），
+// 与其他浮层同一套「点空白收起」约定；点 ☰ 按钮自身由 stopPropagation 排除。
+document.addEventListener("click", (e) => {
+  const pop = $("attach-toc-pop");
+  if (!pop || pop.classList.contains("hidden")) return;
+  if (!pop.contains(e.target) && !e.target.closest?.(".attach-toc-btn")) {
+    closeAttachToc();
+  }
+});
+
 // ---------- 启动 ----------
 function boot() {  // 登录成功（或刷新后 token 仍有效）后的页面初始化；切用户时先清现场
   currentSession = null;
@@ -3467,6 +3501,11 @@ function boot() {  // 登录成功（或刷新后 token 仍有效）后的页面
   restoreDocsListState();   // 恢复文档列表的折叠态
   bindDocsResizer();        // 文档栏左缘的拖拽把手
   initSidebar();            // 侧栏收起/展开 + 收起后左缘悬浮唤出
+  restoreSidebarWidth();    // 恢复上次的侧栏宽度
+  bindSideResizer();        // 侧栏右缘的拖拽条
+  bindAttachResizer();      // 附件浮窗左下角的拖拽把手
+  bindAttachListControls(); // 附件浮窗：列表宽度拖拽 + 列表收起/展开
+  bindGitResizer();         // Git 浮窗左下角的拖拽把手
 }
 
 (async () => {
@@ -3538,6 +3577,48 @@ function initSidebar() {
   setCollapsed(localStorage.getItem(SIDE_COLLAPSED_KEY) === "1");
 }
 
+// ---------- 侧栏宽度拖拽 ----------
+// 布局是 sidebar + main 并列：在 sidebar 右缘加一条 4px resizer，拖动改
+// :root 上的 --side-w 变量。180~480px 夹紧；窄屏媒体查询里 resizer 被隐藏，
+// 事件不会触发，无需额外判断。
+const SIDE_W_KEY = "sideWidth";
+const SIDE_W_MIN = 180, SIDE_W_MAX = 480;
+
+function clampSideW(w) {
+  return Math.max(SIDE_W_MIN, Math.min(SIDE_W_MAX, w));
+}
+
+function restoreSidebarWidth() {
+  const saved = parseInt(localStorage.getItem(SIDE_W_KEY) || "", 10);
+  if (Number.isFinite(saved)) {
+    document.documentElement.style.setProperty("--side-w", clampSideW(saved) + "px");
+  }
+}
+
+function bindSideResizer() {
+  const handle = $("side-resizer");
+  if (!handle) return;
+  handle.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = document.querySelector(".sidebar").getBoundingClientRect().width;
+    document.body.classList.add("side-resizing");  // CSS 里借此禁用 width 过渡：拖动要 1:1 跟手
+    const onMove = (ev) => {
+      const w = clampSideW(startW + (ev.clientX - startX)); // 向右拖 → 变宽
+      document.documentElement.style.setProperty("--side-w", w + "px");
+    };
+    const onUp = () => {
+      document.body.classList.remove("side-resizing");
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      const cur = clampSideW(document.querySelector(".sidebar").getBoundingClientRect().width);
+      localStorage.setItem(SIDE_W_KEY, String(cur));
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+}
+
 // ---------- 会话附件浮窗 ----------
 // 用户视角的查看器：只看【已经上传并落盘】的文件类附件（data/attachments 或
 // 工作区 .coding-agent/attachments）。与工具栏 📎 的区别是语义，不是位置：
@@ -3559,6 +3640,86 @@ async function loadAttachments() {
     attachItems = data.attachments || [];
     if (countEl) countEl.textContent = String(attachItems.length);
   } catch (e) { /* 计数是次要信息，失败不打扰用户 */ }
+}
+
+// ---------- 附件浮窗：列表宽度拖拽 + 列表收起 ----------
+// 列表 ↔ 正文之间是 4px 分栏条，拖动改 .attach-pop 上的 --attach-list-w
+// 变量；头部 ◧ 按钮整列收起/展开，两者状态都持久化。
+const ATTACH_LIST_W_KEY = "attachListW", ATTACH_COLLAPSED_KEY = "attachListCollapsed";
+const ATTACH_LIST_W_MIN = 140, ATTACH_LIST_W_MAX = 480;
+
+function bindAttachListControls() {
+  const pop = $("attach-pop"), split = $("attach-split");
+  const toggle = $("attach-list-toggle");
+  if (!pop || !split || !toggle) return;
+
+  if (localStorage.getItem(ATTACH_COLLAPSED_KEY) === "1") {
+    pop.classList.add("list-collapsed");
+    toggle.title = "展开文件列表";
+  }
+
+  toggle.addEventListener("click", () => {
+    const collapsed = pop.classList.toggle("list-collapsed");
+    toggle.title = collapsed ? "展开文件列表" : "收起文件列表";
+    localStorage.setItem(ATTACH_COLLAPSED_KEY, collapsed ? "1" : "0");
+  });
+
+  split.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    if (pop.classList.contains("list-collapsed")) return;
+    const startX = e.clientX;
+    const startW = $("attach-list").getBoundingClientRect().width;
+    document.body.classList.add("attach-splitting");
+    const onMove = (ev) => {
+      const w = Math.max(ATTACH_LIST_W_MIN,
+        Math.min(ATTACH_LIST_W_MAX, startW + (ev.clientX - startX)));
+      pop.style.setProperty("--attach-list-w", w + "px");
+    };
+    const onUp = () => {
+      document.body.classList.remove("attach-splitting");
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      const cur = $("attach-list").getBoundingClientRect().width;
+      localStorage.setItem(ATTACH_LIST_W_KEY, String(Math.round(cur)));
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+
+  const savedW = parseInt(localStorage.getItem(ATTACH_LIST_W_KEY) || "", 10);
+  if (Number.isFinite(savedW)) {
+    pop.style.setProperty("--attach-list-w",
+      Math.max(ATTACH_LIST_W_MIN, Math.min(ATTACH_LIST_W_MAX, savedW)) + "px");
+  }
+}
+
+// ---------- Git 浮窗大小拖拽 ----------
+// 与附件浮窗同款左下角把手：宽高持久化，未拖过时用 CSS 默认尺寸。
+const GIT_W_KEY = "gitPopW", GIT_H_KEY = "gitPopH";
+const GIT_W_MIN = 480, GIT_H_MIN = 320;
+
+function clampGitW(w) { return Math.max(GIT_W_MIN, Math.min(innerWidth - 32, w)); }
+function clampGitH(h) { return Math.max(GIT_H_MIN, Math.min(innerHeight - 80, h)); }
+
+// 打开时若保存过尺寸则恢复；positionGitPop 只设 left/top，不覆盖宽度之外的高度
+function restoreGitSize() {
+  const pop = $("git-pop");
+  const w = parseInt(localStorage.getItem(GIT_W_KEY) || "", 10);
+  const h = parseInt(localStorage.getItem(GIT_H_KEY) || "", 10);
+  if (Number.isFinite(w)) pop.style.width = clampGitW(w) + "px";
+  if (Number.isFinite(h)) pop.style.height = clampGitH(h) + "px";
+}
+
+function bindGitResizer() {
+  const pop = $("git-pop");
+  if (!pop) return;
+  bindEdgeResize(pop, {
+    clampW: clampGitW, clampH: clampGitH,
+    onEnd: (w, h) => {
+      localStorage.setItem(GIT_W_KEY, String(w));
+      localStorage.setItem(GIT_H_KEY, String(h));
+    },
+  });
 }
 
 // 切会话/新任务时复位：收起浮窗并清空内容（对齐 resetDocsPanel 的做法）
@@ -3585,15 +3746,87 @@ function toggleAttachPop() {
   renderAttachList();
 }
 
-// 贴在触发按钮下方；右侧留 16px 边距，避免贴边（与 positionGitPop 同套路）
+// 贴在触发按钮下方；右侧留 16px 边距，避免贴边（与 positionGitPop 同套路）。
+// 用户拖过大小后（localStorage 有记录）沿用保存的宽高，且保持水平锚点不跳动。
+const ATTACH_W_KEY = "attachPopW", ATTACH_H_KEY = "attachPopH";
+const ATTACH_W_MIN = 480, ATTACH_H_MIN = 320;
+
+function clampAttachW(w) { return Math.max(ATTACH_W_MIN, Math.min(innerWidth - 32, w)); }
+function clampAttachH(h) { return Math.max(ATTACH_H_MIN, Math.min(innerHeight - 80, h)); }
+
 function positionAttachPop() {
   const pop = $("attach-pop"), btn = $("attach-chip");
   if (!pop || !btn) return;
   const rect = btn.getBoundingClientRect();
-  const w = Math.min(760, innerWidth - 32);
+  const savedW = parseInt(localStorage.getItem(ATTACH_W_KEY) || "", 10);
+  const savedH = parseInt(localStorage.getItem(ATTACH_H_KEY) || "", 10);
+  const w = Number.isFinite(savedW) ? clampAttachW(savedW) : Math.min(760, innerWidth - 32);
+  const h = Number.isFinite(savedH) ? clampAttachH(savedH) : null;
   pop.style.width = w + "px";
+  if (h) pop.style.height = h + "px";
+  // 锚点：优先按触发按钮左缘对齐；拖宽后若右边距不够则往左收
   pop.style.left = Math.max(16, Math.min(rect.left, innerWidth - w - 16)) + "px";
   pop.style.top = (rect.bottom + 8) + "px";
+}
+
+// 隐形边缘拖拽（所有浮窗通用）：浮窗的【左缘】与【下缘】各是一条 6px 的
+// 透明热区（不画任何把手标志），鼠标靠上去变对应方向的 resize 光标。
+// 左缘左右拖 = 变宽（右缘钉住）；下缘上下拖 = 变高（顶缘钉住）；左下角
+// 两方向同时生效。松开时把最终尺寸交给 onEnd 持久化。
+function bindEdgeResize(pop, opts) {
+  const { clampW, clampH, onEnd } = opts;
+  const EDGE = 6;  // 热区厚度
+  // 左下角斜向热区：独立元素盖在两条边热区之上（同为角部，避免被左缘热区
+  // 挡住落点），拖动时宽高同时跟随，光标是斜向箭头。
+  const corner = document.createElement("div");
+  corner.className = "pop-edge pop-edge-corner";
+  pop.appendChild(corner);
+  corner.addEventListener("mousedown", (e) => startDrag(e, "wh"));
+  for (const edge of ["w", "h"]) {
+    const zone = document.createElement("div");
+    zone.className = `pop-edge pop-edge-${edge}`;
+    pop.appendChild(zone);
+    zone.addEventListener("mousedown", (e) => startDrag(e, edge));
+  }
+
+  function startDrag(e, dirs) {  // dirs: "w" | "h" | "wh"（wh = 两方向同时）
+    e.preventDefault();
+    e.stopPropagation();  // 别冒泡进「点空白关浮窗」
+    const startX = e.clientX, startY = e.clientY;
+    const rect = pop.getBoundingClientRect();
+    document.body.classList.add("pop-resizing");
+    const onMove = (ev) => {
+      if (dirs.includes("w")) {
+        const w = clampW(rect.width + (startX - ev.clientX));  // 左拽 = 变宽
+        pop.style.width = w + "px";
+        pop.style.left = Math.max(4, rect.right - w) + "px";   // 右缘钉住
+      }
+      if (dirs.includes("h")) {
+        pop.style.height = clampH(rect.height + (ev.clientY - startY)) + "px";  // 下拽 = 变高
+      }
+    };
+    const onUp = () => {
+      document.body.classList.remove("pop-resizing");
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      const r = pop.getBoundingClientRect();
+      onEnd(Math.round(r.width), Math.round(r.height));
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+}
+
+function bindAttachResizer() {
+  const pop = $("attach-pop");
+  if (!pop) return;
+  bindEdgeResize(pop, {
+    clampW: clampAttachW, clampH: clampAttachH,
+    onEnd: (w, h) => {
+      localStorage.setItem(ATTACH_W_KEY, String(w));
+      localStorage.setItem(ATTACH_H_KEY, String(h));
+    },
+  });
 }
 
 function renderAttachList() {
@@ -3626,6 +3859,19 @@ function renderAttachList() {
     meta.textContent = `${fmtBytes(it.bytes)} · ${fmtDocTime(it.mtime)}`;
     li.append(name, meta);
     li.addEventListener("click", () => openAttachment(it.name));
+    // Markdown 附件才有目录可看：hover 时在文件名右侧露出 ☰ 入口
+    if (/\.md$/i.test(it.name || "")) {
+      const tocBtn = document.createElement("span");
+      tocBtn.className = "attach-toc-btn";
+      tocBtn.textContent = "☰";
+      tocBtn.title = "查看文档目录";
+      tocBtn.addEventListener("click", (e) => {
+        e.stopPropagation();  // 别触发 li 的「打开这份附件」
+        if (attachActive !== it.name) openAttachment(it.name).then(() => toggleAttachToc(it.name));
+        else toggleAttachToc(it.name);
+      });
+      li.appendChild(tocBtn);
+    }
     list.appendChild(li);
   }
   if (attachActive) openAttachment(attachActive);
@@ -3633,6 +3879,73 @@ function renderAttachList() {
 
 // 打开一份附件：文本按原文渲染（等宽 <pre>，不解析 Markdown——看日志与代码
 // 就该是原样）；压缩包列成员清单；二进制明确说"不能在这儿看"。
+// ---------- 附件 Markdown 目录（TOC）----------
+// 列表项 hover 露出 ☰ → 点击弹出目录浮层：从当前预览的渲染结果里收集
+// md-h1~h3 标题，点击条目滚动正文到对应标题。随文件切换重建/关闭。
+let attachToc = [];  // [{id, lvl, text}]
+
+function buildAttachToc(box) {
+  attachToc = [];
+  box.querySelectorAll(".md-h1, .md-h2, .md-h3").forEach((el, idx) => {
+    const id = `att-toc-${idx}`;
+    el.id = id;
+    attachToc.push({ id, lvl: +el.tagName[1], text: el.textContent });
+  });
+  closeAttachToc();  // 换文件后旧目录浮层立即作废
+}
+
+function toggleAttachToc(name) {
+  const pop = $("attach-toc-pop");
+  if (!pop) return;
+  if (!pop.classList.contains("hidden") && pop.dataset.name === name) {
+    closeAttachToc();
+    return;
+  }
+  pop.dataset.name = name;
+  const list = pop.querySelector(".attach-toc-list");
+  list.innerHTML = "";
+  if (!attachToc.length) {
+    list.innerHTML = '<div class="attach-toc-empty">这篇文档没有可导航的标题</div>';
+  } else {
+    for (const t of attachToc) {
+      const row = document.createElement("div");
+      row.className = "attach-toc-row";
+      row.style.paddingLeft = (8 + (t.lvl - 1) * 14) + "px";
+      row.textContent = t.text;
+      row.addEventListener("click", (e) => {
+        // stopPropagation 必须加：目录浮层挂在 body 上，点击会冒泡到 document
+        // 的「点空白关浮窗」监听器——它看到目标不在 attach-pop 内，会把整个
+        // 附件浮窗连带关掉（表现就是"点了目录浮窗没了、正文也没跳"）。
+        e.stopPropagation();
+        const box = $("attach-view").querySelector(".docs-view");
+        const el = box && box.querySelector("#" + CSS.escape(t.id));
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "start" });
+          el.classList.remove("toc-flash");
+          void el.offsetWidth;  // 重启动画
+          el.classList.add("toc-flash");
+        }
+        closeAttachToc();
+      });
+      list.appendChild(row);
+    }
+  }
+  // 贴在列表项右侧：锚点是触发按钮所在 li
+  const li = document.querySelector(`.attach-item[data-name="${CSS.escape(name)}"]`);
+  if (li) {
+    const r = li.getBoundingClientRect();
+    const pr = $("attach-pop").getBoundingClientRect();
+    pop.style.left = Math.min(r.right + 8, pr.right - 220) + "px";
+    pop.style.top = Math.min(r.top, pr.bottom - 60) + "px";
+  }
+  pop.classList.remove("hidden");
+}
+
+function closeAttachToc() {
+  const pop = $("attach-toc-pop");
+  if (pop) pop.classList.add("hidden");
+}
+
 async function openAttachment(name) {
   if (!currentSession) return;
   const view = $("attach-view");
@@ -3654,14 +3967,28 @@ async function openAttachment(name) {
       d.textContent = `《${data.name}》是二进制文件，无法在页面上预览。`
         + "附件已落盘，可用本地编辑器打开。";
       view.appendChild(d);
+    } else if (/\.md$/i.test(data.name || "")) {
+      // Markdown 文件：与文档面板同款渲染（renderMarkdown），不再裸显 # 记号。
+      // 注意 truncated 只在超 2000 行时出现——渲染路径以完整内容为准，超长仍走纯文本。
+      const head = document.createElement("div");
+      head.className = "attach-file-head";
+      head.textContent = `${data.name}　Markdown 渲染`;
+      const box = document.createElement("div");
+      box.className = "docs-view";  // 直接复用文档面板的排版样式（标题/列表/行距）
+      box.style.padding = "4px 0";
+      box.appendChild(renderMarkdown(data.content || "（空文件）"));
+      view.append(head, box);
+      buildAttachToc(box);  // 从渲染结果收集标题，目录入口随文件切换重建
     } else {
+      // 纯文本预览：压缩 3 行及以上的连续空行为 1 个空行（常见于导出文档，
+      // 原文段间 2~3 空行在等宽字体下显得非常松散）。只改显示，不动原文件。
       const head = document.createElement("div");
       head.className = "attach-file-head";
       head.textContent = `${data.name}　第 ${data.offset + 1}~${data.offset + data.lines} 行`
         + `（共 ${data.total_lines} 行）`;
       const pre = document.createElement("pre");
       pre.className = "attach-text mono";
-      pre.textContent = data.content || "（空文件）";
+      pre.textContent = (data.content || "（空文件）").replace(/\n{3,}/g, "\n\n");
       view.append(head, pre);
       if (data.truncated) {
         const more = document.createElement("div");

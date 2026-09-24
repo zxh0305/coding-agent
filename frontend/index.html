@@ -48,6 +48,8 @@
         <span class="user-caret">▴</span>
       </button>
     </aside>
+    <!-- 侧栏右缘拖拽条：拖动改宽度（180~480px），窄屏媒体查询下隐藏 -->
+    <div id="side-resizer" class="side-resizer" title="拖动调整侧栏宽度"></div>
 
     <!-- 主区：对话 + 输入框工具栏 -->
     <main class="main">
@@ -265,12 +267,21 @@
     <div class="attach-head">
       <b>🗂 会话附件</b>
       <span id="attach-scope" class="attach-scope"></span>
+      <button id="attach-list-toggle" class="git-x" title="收起文件列表">◧</button>
       <button id="attach-close" class="git-x" title="关闭">✕</button>
     </div>
     <div class="attach-body">
       <ul id="attach-list" class="attach-list"></ul>
+      <div id="attach-split" class="attach-split" title="拖动调整列表宽度"></div>
       <div id="attach-view" class="attach-view"></div>
     </div>
+  </div>
+
+  <!-- 附件 Markdown 目录浮层：列表项 hover 露出 ☰，点击弹出（挂 body 上，
+       不受 attach-pop overflow 裁剪；定位贴在触发的列表项右侧） -->
+  <div id="attach-toc-pop" class="attach-toc-pop hidden">
+    <div class="attach-toc-head">目录</div>
+    <div class="attach-toc-list"></div>
   </div>
 
   <!-- 分支切换：浮窗内的二级小面板 -->
