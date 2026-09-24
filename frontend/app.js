@@ -2109,6 +2109,7 @@ const TOOL_ICONS = {
   write_file: "✏️", apply_patch: "✏️",
   read_file: "🔍", grep: "🔍", list_dir: "📂",
   run_bash: "▶️", calculator: "🧮", current_time: "🕐", get_weather: "🌤️",
+  browser_open: "🌐", browser_click: "🖱️", browser_type: "⌨️", browser_screenshot: "📷",
 };
 
 function ensureTrace() {
@@ -2196,6 +2197,7 @@ const TOOL_KIND = {
   write_file: "写入", apply_patch: "修改",
   read_file: "读取", grep: "搜索", list_dir: "列目录",
   run_bash: "命令", calculator: "计算", current_time: "时间", get_weather: "天气",
+  browser_open: "打开", browser_click: "点击", browser_type: "输入", browser_screenshot: "截图",
 };
 
 // 构建工具调用行（游离节点）：实时流与历史回放共用
