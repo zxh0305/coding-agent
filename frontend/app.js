@@ -2050,7 +2050,13 @@ function finishBoot(caughtUp) {
   for (const seg of segments) {
     if (!seg.events.length) continue;
     if (seg.closed && seg.userMid && historyMids.has(seg.userMid)) continue;  // 已在时间线
-    for (const { seq: s, evt } of seg.events) applyEvent(evt, s);
+    for (const { seq: s, evt } of seg.events) {
+      // 与实时路径同一条 seq 闸门：补发段会故意从 turn_start 起整段重发
+      // 与本页已渲染部分重叠的事件，不跳过的话 turn_start 被重复应用——
+      // traceEl/thinkEl 被强制清空重建（秒数闪跳回 0、思考流凭空消失）。
+      if (s != null && lastSeq != null && s <= lastSeq) continue;
+      applyEvent(evt, s);
+    }
   }
 }
 
@@ -2073,6 +2079,9 @@ let liveBubble = null, metaEl = null, metaTimer = null, qStart = 0;
 let thinkEl = null;  // 当前轮次的思考流块（思考模型的 reasoning_delta 实时显示用）
 let traceEl = null;
 let traceCurrent = "";  // 当前正在执行的工具（收起状态下摘要行显示的"此刻在干嘛"）
+let tracePhase = "";    // 当前阶段文案（"正在理解问题…/深度思考中…/正在撰写回答…"），
+                        // 随事件切换、由 traceTick 拼进摘要行；工具执行期间被
+                        // traceCurrent 覆盖（"正在读文件…"比笼统的阶段更具体）。
 let pendingCalls = [];  // 已发出但未见结果的工具调用（算持续时长用）
 let permissionCards = new Map();  // permission id -> 卡片元素：补发重放同一请求时复用/整卡重画，不叠卡片
 let liveMsgs = new Map();  // mid -> {el, text}：事件流里同一 mid 的 delta 归并进同一气泡
@@ -2136,10 +2145,12 @@ function traceTick() {
   // traceCurrent 是本 tab 自己发工具时设的即时值；补发/刷新场景下为空，
   // 此时从 tracker 记账里现取「正在跑的工具」——两处同源，不会各说各话。
   const cur = traceCurrent || traceCurrentFromTracker();
-  const doing = cur ? `${cur} · ` : "";
+  // 优先级：具体工具（正在读文件…）> 阶段文案（深度思考中…）> 无
+  const doing = cur || tracePhase;
+  const prefix = doing ? `${doing} · ` : "";
   const label = steps > 0 ? "已工作" : "已思考";
   traceEl.querySelector("summary").textContent =
-    `${doing}${label} ${el} · ${steps} 步`;
+    `${prefix}${label} ${el} · ${steps} 步`;
 }
 
 // 追加一行执行痕迹。步数已由 liveTracker 记账（tool_call 时 +1），这里不再自增。
@@ -2534,8 +2545,12 @@ function applyEvent(evt, seq) {
     // 正在进行的回合也走同一套初始化）
     liveMsgs = new Map();
     liveBubble = null; traceEl = null; traceCurrent = "";
+    tracePhase = "正在理解问题…";  // 回合开场：模型还没吐任何内容时的友好占位
     metaEl = null; thinkEl = null; pendingCalls = [];
     liveTracker.reset();  // 工具记账随回合重置（与 blocksFromEvents 的 turn_start 行为一致）
+    // 服务端回合起点喂给记账器：补发/切会话场景下 qStart 为 0，traceTick 的
+    // traceStart() 退回 tracker.startedAt——没有这条，秒数基准会漂移闪跳。
+    liveTracker.feed({ type: "turn_start", started_at: evt.started_at });
     permissionCards = new Map();  // 新回合的确认卡是新的请求：旧卡引用随时间线一起失效
     pendingDeltas = new Map(); pendingThink = "";
     usageNow = null; curMid = null;
@@ -2555,6 +2570,7 @@ function applyEvent(evt, seq) {
     // 先降级进执行过程面板（顺序在轮次标题之前，读起来才顺），再写标题。
     demoteLiveBubbleToTrace();
     traceLine(`🧠 思考 · 第 ${evt.round} 轮`);
+    tracePhase = "深度思考中…";  // 推理/正文还没来，先给个阶段占位
     thinkEl = null;  // 新一轮的思考流开一个新块
     curMid = evt.mid;  // 本轮回答段落的 mid：后续 delta/done 归并的键
   } else if (t === "reasoning_delta") {
@@ -2575,11 +2591,13 @@ function applyEvent(evt, seq) {
     }
     queueStreamDelta("think", null, evt.delta);
   } else if (t === "answer_delta") {
+    if (tracePhase && tracePhase !== "正在撰写回答…") tracePhase = "正在撰写回答…";
     queueStreamDelta("answer", evt.mid, evt.delta);
   } else if (t === "tool_call") {
     flushStreamBuffers();
     // 调工具前输出的正文同样是过程说明（"我先看看这个文件…"），一并降级
     demoteLiveBubbleToTrace();
+    tracePhase = "";  // 阶段让位：接下来摘要行显示具体的工具名（"正在读取…"）
     // 记账交给共用追踪器（与回放同一套配对逻辑），DOM 侧只负责画这一行
     const act = liveTracker.feed(evt);
     if (act && act.kind === "tool_open") toolCallLine(act.tool.name, act.tool.arguments);
