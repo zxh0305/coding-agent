@@ -1014,7 +1014,14 @@ async function loadHistoryPage() {
       chatEl.scrollTop = prevTop + (chatEl.scrollHeight - prevHeight);
     } else {
       chatEl.appendChild(frag);
-      chatEl.scrollTop = chatEl.scrollHeight;
+      // 初始加载的落点：回合进行中定位到最后一条用户消息——那是这个进行中
+      // 回合的"阅读起点"，直接贴底看到的却是过程面板里最新的思考流，割裂
+      // 且位置随机；回合已结束才贴底（看最终答案）。
+      const running = document.querySelector('#chat details.trace.running');
+      const lastUser = [...chatEl.querySelectorAll('.bubble.user')].pop();
+      const anchor = running && lastUser ? lastUser : null;
+      if (anchor) anchor.scrollIntoView({ block: "start" });
+      else chatEl.scrollTop = chatEl.scrollHeight;
     }
     updateLoadOlder();
     scheduleRail();  // 历史装载完毕：导航条按新消息重建
@@ -2082,6 +2089,12 @@ let traceCurrent = "";  // 当前正在执行的工具（收起状态下摘要�
 let tracePhase = "";    // 当前阶段文案（"正在理解问题…/深度思考中…/正在撰写回答…"），
                         // 随事件切换、由 traceTick 拼进摘要行；工具执行期间被
                         // traceCurrent 覆盖（"正在读文件…"比笼统的阶段更具体）。
+let traceLast = "";     // 摘要行"此刻状态"的实际渲染值 + 变更时刻：极快的事件序列
+                        // （git 等秒回命令）下"思考中→命令→思考中"每秒切换好几次，
+                        // 视觉上就是闪烁；每个状态至少停留 MIN 状态才被下一个取代
+                        // （但正在执行的工具永远优先，保证"正在跑什么"实时可信）。
+let traceLastAt = 0;
+const TRACE_MIN_STATE_MS = 2000;
 let pendingCalls = [];  // 已发出但未见结果的工具调用（算持续时长用）
 let permissionCards = new Map();  // permission id -> 卡片元素：补发重放同一请求时复用/整卡重画，不叠卡片
 let liveMsgs = new Map();  // mid -> {el, text}：事件流里同一 mid 的 delta 归并进同一气泡
@@ -2100,7 +2113,7 @@ const TOOL_ICONS = {
 function ensureTrace() {
   if (traceEl) return;
   traceEl = document.createElement("details");
-  traceEl.className = "trace";
+  traceEl.className = "trace running";  // running：进行中回合标记（切会话定位锚点用）
   // 默认【收起】：执行过程不是回答。之前生成期间强制展开，几十行浅灰小字
   // 在正文下方滚动，把真正的答案挤出视口——"看不到重点"的直接来源。
   // 改成收起后，摘要行持续显示"当前正在做什么"，既有动静又不抢正文。
@@ -2145,8 +2158,18 @@ function traceTick() {
   // traceCurrent 是本 tab 自己发工具时设的即时值；补发/刷新场景下为空，
   // 此时从 tracker 记账里现取「正在跑的工具」——两处同源，不会各说各话。
   const cur = traceCurrent || traceCurrentFromTracker();
-  // 优先级：具体工具（正在读文件…）> 阶段文案（深度思考中…）> 无
-  const doing = cur || tracePhase;
+  // 目标状态优先级：正在执行的工具 > 阶段文案（toolResultLine 设置的"✓ 完成"
+  // 定格态写入 traceLast，由下面节流延续）> 无。
+  // 防闪：刚渲染的状态不满 TRACE_MIN_STATE_MS 不被下一个取代——git 等秒回命令
+  // 下"深度思考中→命令→深度思考中"每秒切好几次，视觉即闪烁。例外：正在执行
+  // 的工具（cur 非空）直接切换，"正在跑什么"必须实时可信。
+  let doing = cur || tracePhase;
+  if (doing && traceLast && doing !== traceLast && !cur &&
+      Date.now() - traceLastAt < TRACE_MIN_STATE_MS) {
+    doing = traceLast;  // 上一状态（含"✓ 完成"定格）停留不满 2s：延续它，不闪
+  } else if (doing !== traceLast) {
+    traceLast = doing; traceLastAt = Date.now();
+  }
   const prefix = doing ? `${doing} · ` : "";
   const label = steps > 0 ? "已工作" : "已思考";
   traceEl.querySelector("summary").textContent =
@@ -2337,7 +2360,12 @@ function toolResultLine(name, resultStr, tool) {
     if (sum) sum.classList.add("err");
   }
   appendTrace(line);
-  traceCurrent = "";  // 工具已返回：摘要行不再显示"正在…"
+  // 工具已返回：摘要行从"▶️ 正在命令 xxx"切换为"✓ 命令 xxx · 完成(0.4s)"并
+  // 定格到下一次事件——而不是清空退回阶段文案。否则秒回的命令会让"正在→思考
+  // 中→正在"来回横跳（闪烁来源）；"call+result 合并为一个连续状态"也符合直觉。
+  traceLast = `✓ ${TOOL_KIND[name] || name}${dur ? " " + dur.replace(" · ", "") : ""}`;
+  traceLastAt = Date.now();
+  traceCurrent = "";
   traceTick();
 }
 
@@ -2595,7 +2623,11 @@ function applyEvent(evt, seq) {
     }
     queueStreamDelta("think", null, evt.delta);
   } else if (t === "answer_delta") {
-    if (tracePhase && tracePhase !== "正在撰写回答…") tracePhase = "正在撰写回答…";
+    tracePhase = "正在撰写回答…";
+    // 非思考模型没有 reasoning_delta，正文流就是它"思考过程"的唯一可见形态
+    // （多轮工具回合尤其如此）——与 reasoning_delta 同样展开面板，避免收起
+    // 状态下过程静默累积、用户只见秒数跳动。
+    if (!liveTracker.state()?.steps) traceEl.open = true;
     queueStreamDelta("answer", evt.mid, evt.delta);
   } else if (t === "tool_call") {
     flushStreamBuffers();

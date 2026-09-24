@@ -110,7 +110,7 @@
 
       if (block.kind === "process") {
         const d = doc.createElement("details");
-        d.className = "trace";
+        d.className = "trace" + (block.running ? " running" : "");
         d.open = false;
         d.appendChild(doc.createElement("summary"));
         for (const it of block.items) d.appendChild(renderProcessItem(it));
