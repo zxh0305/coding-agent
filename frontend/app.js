@@ -1796,6 +1796,7 @@ async function chooseWorkspace() {
     wsCustom = true;
     setWsLabel(path);
     renderWsChip();
+    refreshGitChip();  // 预选项目后徽章立即显示该项目的分支（不必等首条消息）
     $("modal").classList.add("hidden");
     toast(`已选择项目 ${path.split("/").pop()}，发送消息时绑定`);
     return;
