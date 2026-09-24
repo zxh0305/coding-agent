@@ -214,6 +214,23 @@ def _spawn_memory_extraction(sid: str, agent: Agent) -> None:
         log.exception("[会话 %s] 记忆提取线程启动失败（忽略，不影响回合）", sid)
 
 
+def _push_browser_screenshot(sid: str, png: bytes, url: str, note: str) -> None:
+    """浏览器工具的截图推送（browser_tools.screenshot_pusher 注入点）：
+    PNG 落盘到会话浏览器目录 + 发 SSE 事件（前端右侧「浏览器」弹窗实时显示）。
+    调用发生在工具线程里，publish 有锁，安全；落盘失败不影响工具调用。"""
+    try:
+        out = Path("data/browser-shots") / sid
+        out.mkdir(parents=True, exist_ok=True)
+        n = len(list(out.glob("shot-*.png"))) + 1
+        rel = out / f"shot-{n:04d}.png"
+        rel.write_bytes(png)
+        _event_bus(sid).publish({"type": "browser_shot",
+                                 "url": url, "note": note,
+                                 "shot": f"/api/sessions/{sid}/browser/shot?n={n}"})
+    except Exception:
+        log.exception("[会话 %s] 浏览器截图推送失败（忽略）", sid)
+
+
 def _persist_trace(sid: str, mid: str, trace: list) -> None:
     """把一轮提问的轨迹裁剪后落库。轨迹里的工具结果原样来自执行器（可能几 MB），
     回放场景用不到全文（那在归档/历史消息里），逐条截断控制体积；
@@ -281,6 +298,9 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             user_mid = uuid.uuid4().hex
             user_message["_mid"] = user_mid
             db.save_messages(sid, [user_message], {})
+            # 截图推送注入（browser_tools → SSE）：回合线程里安全，publish 自带锁
+            import browser_tools
+            browser_tools.screenshot_pusher = _push_browser_screenshot
             bus.publish({"type": "turn_start", "nonce": nonce, "input": plain, "atts": atts,
                          # 回合真起点（秒）。补发/多标签页/刷新后的页面没有本地
                          # 计时起点，靠它把「已工作 N 秒」接上，而不是从 0 重数。
@@ -366,6 +386,13 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             user_mid = next((m.get("_mid") for m in reversed(agent.history)
                              if m.get("role") == "user" and not m.get("_synthetic")), None)
             bus.publish({"type": "turn_end", "user_mid": user_mid})
+            # 回合结束关掉本会话的浏览器：Chromium 进程不常驻；profile 目录
+            # 保留在磁盘，下次 browser_* 工具再用时登录态还在。
+            try:
+                import browser_tools
+                browser_tools.close_session(sid)
+            except Exception:
+                pass
             # 轮末自动提取（memory.py）：daemon 线程异步跑，绝不阻塞 worker
             # 返回与下一个回合。全程静默——不发 SSE 事件、不写数据库：记忆是
             # 后台维护动作，用户无需感知，推送事件反而会进环形缓冲、打扰所有
@@ -752,6 +779,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._handle_session_docs(sid)
             if sub == "attachments":
                 return self._handle_session_attachments(sid)
+            if sub == "browser" and len(parts) > 4 and parts[4] == "shot":
+                return self._handle_browser_shot(sid)
             return self._handle_session_messages(sid)
         elif self.path.startswith("/api/context"):
             sid = (self._query().get("session_id") or [""])[0]
@@ -1260,6 +1289,30 @@ class Handler(SimpleHTTPRequestHandler):
         except (OSError, FileNotFoundError):
             return self._json({"error": "文档不存在"}, 404)
         self._json({"name": name, "content": content})
+
+    def _handle_browser_shot(self, sid: str):
+        """浏览器工具推送的截图（PNG 字节流）。?n=<序号> 指定第几张，
+        缺省取最新一张。归属已在上层校验；n 只允许数字，杜绝路径逃逸。"""
+        qs = self._query()
+        n = (qs.get("n") or [""])[0]
+        root = Path("data/browser-shots") / sid
+        if n.isdigit():
+            target = root / f"shot-{int(n):04d}.png"
+        else:
+            shots = sorted(root.glob("shot-*.png")) if root.is_dir() else []
+            target = shots[-1] if shots else None
+        if not target or not target.is_file():
+            return self._json({"error": "截图不存在"}, 404)
+        try:
+            data = target.read_bytes()
+        except OSError:
+            return self._json({"error": "截图读取失败"}, 500)
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_session_attachments(self, sid: str):
         """本会话的附件（用户上传、已落盘的文件类附件）：列表 / 读单个。

@@ -242,6 +242,16 @@ READONLY_TOOLS = {"read_file", "list_dir", "grep", "calculator",
                   # "非本集合工具一律 ask"（见 check）不再对它生效。
                   "create_doc"}
 
+# 浏览器工具整工具 ask（confirm 模式）：真实浏览器带本地登录态出网、可点击/
+# 填表，操作面大于工作区工具——每个动作先弹确认卡，用户可用「本会话内允许」
+# 一次性放行。readonly 模式下它们同样不在 READONLY_TOOLS，逐次 ask，天然覆盖。
+BROWSER_ASK_RULES = [
+    Rule("browser_open", None, ASK, "打开网页（内置浏览器，复用本地登录态）"),
+    Rule("browser_click", None, ASK, "点击页面元素（内置浏览器）"),
+    Rule("browser_type", None, ASK, "向网页输入内容（内置浏览器）"),
+    Rule("browser_screenshot", None, ASK, "页面截图（内置浏览器）"),
+]
+
 
 def _builtin_verdict(tool: str, arguments: dict, workspace: Path) -> Verdict:
     if tool in _WRITE_TOOLS:
@@ -361,7 +371,7 @@ class PermissionGate:
         的稳定次序：deny/ask 取"第一个命中者"，次序确定结果才可复现）。"""
         table: dict[tuple, Rule] = {}
         order: list[tuple] = []
-        for r in BUILTIN_RULES:
+        for r in [*BUILTIN_RULES, *BROWSER_ASK_RULES]:
             if r.key not in table:
                 order.append(r.key)
             table[r.key] = r

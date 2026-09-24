@@ -78,6 +78,7 @@
           <button id="ctx-chip" class="chip" title="上下文容量">⛁ —</button>
           <button id="ws-pick" class="chip" title="选择工作区文件夹">📁 <span id="ws-short">工作区</span></button>
           <button id="docs-chip" class="chip" title="查看本会话生成的文档">📄 文档 <span id="docs-count">0</span></button>
+          <button id="browser-chip" class="chip hidden" title="查看 agent 的内置浏览器画面">🌐 浏览器</button>
           <button id="model-chip" class="chip" title="切换模型 / 管理模型">⚙️ <span id="model-label">模型</span></button>
           <span class="grow"></span>
           <button id="send" class="primary send-btn">发送</button>
@@ -103,6 +104,20 @@
         </div>
         <div id="docs-view" class="docs-view"></div>
       </div>
+    </aside>
+
+    <!-- 右侧浏览器栏：agent 用内置浏览器（browser_* 工具）时出现的实时画面。
+         与文档栏同一套「并列面板 + --docs-w 宽度」机制，同一时刻只开一个。 -->
+    <aside id="browser-panel" class="docs-panel browser-panel hidden">
+      <div class="docs-head">
+        <b>🌐 浏览器</b>
+        <button id="browser-close" class="docs-x" title="关闭">✕</button>
+      </div>
+      <div class="browser-meta">
+        <span id="browser-url" class="browser-url">—</span>
+        <span id="browser-note" class="browser-note"></span>
+      </div>
+      <div id="browser-view" class="browser-view"></div>
     </aside>
 
   </div>

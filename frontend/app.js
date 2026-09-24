@@ -965,6 +965,7 @@ async function switchSession(id) {
   refreshGitChip(); // 按钮上的分支名随任务的工作区更新
   dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
   resetDocsPanel();      // 上一个会话的文档栏不留给新会话：收起并清空
+  resetBrowserPanel();   // 浏览器栏同理：会话的浏览器画面是会话私有
   loadDocsList();        // 刷新文档计数（切会话后 chip 上的数字跟着变）
   resetAttachPop();      // 同理：上一个会话的附件浮窗收起并清空
   loadAttachments();     // 刷新附件计数
@@ -2724,6 +2725,9 @@ function applyEvent(evt, seq) {
   } else if (t === "doc_created") {
     // agent 生成了一份文档：刷新列表、展开右侧面板并打开新文档
     onDocCreated(evt.name);
+  } else if (t === "browser_shot") {
+    // agent 的内置浏览器推来了新截图：展开右侧浏览器栏、追加最新画面
+    onBrowserShot(evt.url, evt.note, evt.shot);
   } else if (t === "session_deleted") {
     // 其他标签页删掉了这个任务：收摊回到新建态
     closeEvents();
@@ -2986,6 +2990,14 @@ bind("attach-chip", "click", toggleAttachPop);
 bind("attach-close", "click", () => $("attach-pop").classList.add("hidden"));
 bind("docs-close", "click", closeDocsPanel);
 bind("docs-toggle", "click", toggleDocsList);
+// 浏览器栏：chip 点开/收起，✕ 关闭。与文档栏共用 --docs-w，二者互斥。
+bind("browser-chip", "click", () => {
+  const p = browserPanelEl();
+  if (!p) return;
+  if (p.classList.contains("hidden")) { p.classList.remove("hidden"); closeDocsPanel(); }
+  else closeBrowserPanel();
+});
+bind("browser-close", "click", closeBrowserPanel);
 bind("m-cancel", "click", closePicker);
 bind("m-close", "click", closePicker);
 // 点遮罩空白处关闭（只在点到遮罩本身时，点弹窗内部不关）
@@ -4174,6 +4186,7 @@ function toggleDocsPanel() {
   if (!p) return;
   if (p.classList.contains("hidden")) {
     p.classList.remove("hidden");
+    closeBrowserPanel();  // 与浏览器栏互斥（共用 --docs-w）
     loadDocsList();
   } else {
     p.classList.add("hidden");
@@ -4283,4 +4296,53 @@ function onDocCreated(name) {
   if (p) p.classList.remove("hidden");
   loadDocsList().then(() => { if (name) openDoc(name); });
   if (name) toast(`已生成文档《${name}》`);
+}
+
+// ---------- 🌐 浏览器栏：agent 内置浏览器的实时截图流 ----------
+// 与文档栏同一时刻只开一个：browser_shot 到达时收起文档栏（反之亦然）。
+// 截图本体走 /api/sessions/<sid>/browser/shot 接口按需拉取，事件里只带 URL。
+
+function browserPanelEl() { return $("browser-panel"); }
+
+// browser_shot 事件：展开浏览器栏、显示最新截图。
+function onBrowserShot(url, note, shot) {
+  const chip = $("browser-chip");
+  if (chip) chip.classList.remove("hidden");
+  const p = browserPanelEl();
+  if (!p) return;
+  if (!p.classList.contains("hidden")) syncBrowser(url, note, shot);
+  else {
+    p.classList.remove("hidden");
+    closeDocsPanel();  // 两个面板共用 --docs-w：只保留一个，避免互相挤压
+    syncBrowser(url, note, shot);
+  }
+}
+
+// 把一条截图信息渲染进浏览器栏（追加，保留历史画面可回看）
+function syncBrowser(url, note, shot) {
+  const urlEl = $("browser-url"), noteEl = $("browser-note"), view = $("browser-view");
+  if (!view) return;
+  if (urlEl) { urlEl.textContent = url || "—"; urlEl.title = url || ""; }
+  if (noteEl) noteEl.textContent = note || "";
+  const img = document.createElement("img");
+  img.src = shot + (shot.includes("?") ? "&" : "?") + "t=" + Date.now();  // 破缓存
+  img.alt = note || url || "浏览器截图";
+  view.appendChild(img);
+  view.scrollTop = view.scrollHeight;
+}
+
+function closeBrowserPanel() {
+  const p = browserPanelEl();
+  if (p) p.classList.add("hidden");
+}
+
+// 切会话/新建任务时复位浏览器栏：收起 + 清空画面，chip 藏回（新会话还没有浏览器活动）
+function resetBrowserPanel() {
+  closeBrowserPanel();
+  const view = $("browser-view");
+  if (view) view.innerHTML = "";
+  const urlEl = $("browser-url"), noteEl = $("browser-note"), chip = $("browser-chip");
+  if (urlEl) urlEl.textContent = "—";
+  if (noteEl) noteEl.textContent = "";
+  if (chip) chip.classList.add("hidden");
 }

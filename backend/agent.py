@@ -184,6 +184,12 @@ class Agent:
         # 状态挂在实例上而不是模块级全局，两个会话并发执行工具才不会串数据。
         self.ctx = ToolContext(workspace=prepare_workspace(workspace), vision_backend=vision_backend)
         self.ctx.session_id = session_id  # 文档工具据此确定文档归属（会话隔离）
+        # 浏览器管理器（browser_tools）：按会话惰性创建，第一次 browser_* 工具
+        # 调用才拉起 Chromium；回合/会话收尾由 app.py 调 close_session 销毁。
+        # session_id 为空（CLI/单测）时也创建一个独立实例，工具统一可用。
+        if session_id:
+            from browser_tools import manager_for
+            self.ctx.browser = manager_for(session_id)
         self.cancel_event: threading.Event | None = None  # 本轮生成的停止开关（stop() 置位）
         # 权限闸门（permissions.py）：挂实例而非模块级——规则里的工作区边界、
         # 会话内记住的 ask 决定都按会话隔离，两个会话并发各判各的。

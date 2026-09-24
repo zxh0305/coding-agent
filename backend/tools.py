@@ -174,6 +174,8 @@ class ToolContext:
     workspace: Path | None = None               # 本会话的工作区（文件/命令工具的边界）
     images: list = field(default_factory=list)  # 本轮用户消息附带的图片（OpenAI content 部分）
     vision_backend: object = None               # fn(image_parts, question) -> str，由 app.py 注入
+    browser: object = None                      # BrowserManager（browser_tools），由 agent.py 按
+                                                # 会话注入；工具层不持有实例（与会话生命周期同寿）
     session_id: str | None = None               # 本会话 id（文档工具据此确定文档归属）
 
 TOOL_REGISTRY = {
@@ -200,12 +202,20 @@ TOOL_REGISTRY.update(CODE_TOOL_REGISTRY)
 def analyze_image(image_id: str = "", question: str = "请详细描述这张图片的内容", ctx: ToolContext = None) -> str:
     images = ctx.images if ctx is not None else []
     if not images:
-        return error_result("当前这条消息没有附带图片", "请让用户重新上传图片后再试，不要凭空描述图片内容")
-    # image_id：'1'/'2'/... 按用户消息中图片出现顺序；空值默认第一张
-    digits = "".join(ch for ch in str(image_id) if ch.isdigit())
-    index = (int(digits) - 1) if digits else 0
-    if index < 0 or index >= len(images):
+        # 没有用户上传图片时回退浏览器截图：browser_screenshot 之后 agent 调
+        # 本工具即可"看见"页面（browser_tools 截图后把 base64 挂在 ctx.browser 上）
+        shot = getattr(getattr(ctx, "browser", None), "last_shot_b64", None) if ctx is not None else None
+        if not shot:
+            return error_result("当前这条消息没有附带图片，浏览器也没有最新截图",
+                                "若想看网页内容：先调 browser_screenshot 再调本工具；用户图片则让用户重新上传")
+        images = [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{shot}"}}]
         index = 0
+    else:
+        # image_id：'1'/'2'/... 按用户消息中图片出现顺序；空值默认第一张
+        digits = "".join(ch for ch in str(image_id) if ch.isdigit())
+        index = (int(digits) - 1) if digits else 0
+        if index < 0 or index >= len(images):
+            index = 0
     backend = ctx.vision_backend if ctx is not None else None
     if backend is None:
         return error_result("图片识别后端未配置（系统内部问题，请联系服务部署者）")
@@ -255,6 +265,14 @@ from attachment_tools import (ATTACH_TOOL_REGISTRY, ATTACH_TOOL_READ_ONLY,
 TOOL_SCHEMAS += ATTACH_TOOL_SCHEMAS
 TOOL_REGISTRY.update(ATTACH_TOOL_REGISTRY)
 
+# ---- 浏览器工具（browser_tools.py）：内置 Chromium 验证/登录/调研 ----
+# 可选依赖：playwright 未安装时工具返回可读安装指引，不影响其它功能
+from browser_tools import (BROWSER_TOOL_REGISTRY, BROWSER_TOOL_READ_ONLY,
+                           BROWSER_TOOL_SCHEMAS)
+
+TOOL_SCHEMAS += BROWSER_TOOL_SCHEMAS
+TOOL_REGISTRY.update(BROWSER_TOOL_REGISTRY)
+
 # ---------------------------------------------------------------------------
 # 工具元数据：read_only（是否只读、能否并行）
 #
@@ -275,6 +293,7 @@ TOOL_READ_ONLY = {
 TOOL_READ_ONLY.update(CODE_TOOL_READ_ONLY)  # 并入 coding 工具的标记（同样的合并方式）
 TOOL_READ_ONLY.update(DOC_TOOL_READ_ONLY)   # 并入文档工具（create_doc 为非只读，走串行）
 TOOL_READ_ONLY.update(ATTACH_TOOL_READ_ONLY)  # 并入附件工具（list/read_attachment 均只读）
+TOOL_READ_ONLY.update(BROWSER_TOOL_READ_ONLY)  # 并入浏览器工具（全部非只读：出网/改页面状态）
 
 def is_read_only(name: str) -> bool:
     """name 是否只读工具。未知工具返回 False——没有元数据就当写操作走串行，永远站在安全侧。"""

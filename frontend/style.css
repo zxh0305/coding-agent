@@ -1555,6 +1555,23 @@ body.docs-resizing .docs-panel { transition: none; }
 .docs-item.active { background: var(--link-weak); color: var(--link); font-weight: 600; }
 .docs-item .docs-meta { display: block; margin-top: 2px; font-size: 11px; color: var(--text-3); font-weight: 400; }
 .docs-empty { padding: 16px 10px; font-size: 12.5px; color: var(--text-3); line-height: 1.7; }
+/* ===== 浏览器栏：与文档栏同布局，内容是截图流 ===== */
+.browser-view {
+  flex: 1 1 auto; overflow: auto; padding: 8px;
+  display: flex; flex-direction: column; gap: 8px; align-items: stretch;
+}
+.browser-view img {
+  max-width: 100%; border: 1px solid var(--border); border-radius: 6px;
+  background: #fff;  /* 截图多为浅色页面，深色主题下给个白底避免融进背景 */
+}
+.browser-meta {
+  display: flex; gap: 8px; align-items: baseline; padding: 6px 12px;
+  border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-3);
+  min-width: 0;
+}
+.browser-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.browser-note { flex-shrink: 0; }
+
 .docs-view {
   flex: 1 1 auto; overflow-y: auto; padding: 10px 20px 24px;
   font-size: 14px; line-height: 1.75; color: var(--text);
