@@ -161,6 +161,7 @@ let stickBottom = true;
 let histLoading = false;
 chatEl.addEventListener("scroll", () => {
   stickBottom = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 80;
+  updateBackBottom();
   if (!histLoading && histHasMore && chatEl.scrollTop < 120 && currentSession) {
     histLoading = true;
     loadHistoryPage().finally(() => { histLoading = false; });
@@ -170,6 +171,16 @@ chatEl.addEventListener("scroll", () => {
 function scrollBottom(force = false) {
   if (!force && !stickBottom) return;  // 用户在看历史：不拽
   chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+// 「↓ 最新」悬浮按钮：贴底时隐藏，上滚超过一屏的 1/4 才出现（阈值太低会
+// 在正常流动中闪烁）。点击平滑回底并恢复跟随。新内容到达时 scrollBottom
+// 依旧只服务贴底用户——召回靠这个按钮，不靠强拽。
+function updateBackBottom() {
+  const btn = $("back-bottom");
+  if (!btn) return;
+  const away = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight;
+  btn.classList.toggle("hidden", stickBottom || away < chatEl.clientHeight * 0.25);
 }
 
 function bubble(className, text) {
@@ -1710,6 +1721,12 @@ function toggleCtxPop() {
   pop.classList.remove("hidden");
 }
 
+// 分段条配色：与 ctx-breakdown 行前的色点一一对应（常量表，不涉不可信内容）
+const CTX_SEG_COLORS = {
+  system: "#8b949e", tools: "#d29922", user: "#3fb950",
+  assistant: "#58a6ff", tool_results: "#bc8cff",
+};
+
 function renderCtxPop() {
   const nums = $("ctx-nums"), fill = $("ctx-fill"), bd = $("ctx-breakdown");
   const tokens = usageNow ? usageNow.prompt_tokens : 0;
@@ -1718,21 +1735,38 @@ function renderCtxPop() {
   fill.style.width = pct + "%";
   fill.classList.toggle("warn", pct > 80);
 
+  // 分段条：进度条内部按五类构成切分（ZCode contextUsage 的 breakdown
+  // 可视化）——一眼看到 token 花在哪儿，而不是只有一个总数。
+  fill.innerHTML = "";  // 只拼固定 key 的 span 常量，无不可信内容
+  const b = (usageNow && usageNow.context) || {};
+  const bTotal = Math.max(1, Object.values(b).reduce((x, y) => x + (y || 0), 0));
+  for (const [key, color] of Object.entries(CTX_SEG_COLORS)) {
+    const seg = document.createElement("div");
+    seg.className = "ctx-seg";
+    seg.style.background = color;
+    seg.style.flexGrow = String(b[key] || 0);
+    fill.appendChild(seg);
+  }
+
   const labels = { system: "系统提示词", tools: "工具定义", user: "用户消息", assistant: "助手回复", tool_results: "工具结果" };
   bd.innerHTML = "";
-  const b = (usageNow && usageNow.context) || {};
-  const total = Math.max(1, Object.values(b).reduce((x, y) => x + (y || 0), 0));
   for (const [key, label] of Object.entries(labels)) {
     const row = document.createElement("div");
     row.className = "ctx-row";
+    const dot = document.createElement("i");
+    dot.className = "ctx-dot";
+    dot.style.background = CTX_SEG_COLORS[key];
     const name = document.createElement("span");
     name.textContent = label;
     const val = document.createElement("b");
-    val.textContent = ((b[key] || 0) / total * 100).toFixed(1) + "%";
-    row.append(name, val);
+    val.textContent = ((b[key] || 0) / bTotal * 100).toFixed(1) + "%";
+    row.append(dot, name, val);
     bd.appendChild(row);
   }
-  $("ctx-cache").textContent = usageNow && usageNow.cache_hit_rate != null ? usageNow.cache_hit_rate + "%" : "—";
+  // 缓存命中率只在 >78% 时显示（ZCode 同规则）：低命中率展示出来只会
+  // 分散注意力——它要么还没稳定（前几轮），要么说明这个供应商不缓存。
+  const hit = usageNow && usageNow.cache_hit_rate;
+  $("ctx-cache").textContent = hit != null && hit > 78 ? hit + "%" : "—";
 }
 
 // ---------- 常驻事件流（SSE 断线重连） ----------
@@ -2223,6 +2257,7 @@ function showPermissionCard(evt) {
   if (card) card.remove();  // 同一请求重放：整卡重画，绝不允许出现两张活卡
   card = document.createElement("div");
   card.className = "perm-card";
+  notifyDesktop("需要确认权限", `${evt.tool}：${summarize(evt.reason || "", 60)}`);
   const title = document.createElement("div");
   title.className = "perm-title";
   title.textContent = `🔐 权限确认 · ${evt.tool}`;
@@ -2530,6 +2565,11 @@ function applyEvent(evt, seq) {
     // 本会话就在前台跑完：用户亲眼看到了结果，立即标记已读——否则服务端刚置的
     // 未读标记会让它在任务列表上亮起绿/红点（"你不在时才提醒"的语义下不该亮）。
     markSessionSeen(currentSession);
+    if (roundErrored) {
+      roundErrored = false;  // 出错通知已随 error 事件发过，不重复
+    } else {
+      notifyDesktop("回合完成", "本任务的回答已结束");
+    }
     dispatchNextQueued();
   } else if (t === "history_renumbered") {
     // 服务端 ord 间隔耗尽兜底：整会话重编号过，before_ord 游标指向的旧序号
@@ -2557,6 +2597,13 @@ function applyEvent(evt, seq) {
     closeDocsPanel();  // 会话没了，文档抽屉一并收起
     loadSessions();
     toast("该任务已在其他窗口被删除");
+  } else if (t === "api_retry") {
+    // API 请求瞬态失败正在退避重试：收起状态下摘要行直接可见（对标 ZCode
+    // 的 apiRetry 徽标）——"正在重试(2/3)"，等待不再像卡死。重试结束后的
+    // 下一轮 round/tool_call 会改写 tracePhase，无需专门复位。
+    ensureTrace();
+    tracePhase = `API 请求重试中（第 ${evt.attempt}/${evt.max_attempts} 次，${evt.wait}s 后）`;
+    traceTick();
   } else if (t === "error") {
     flushStreamBuffers();  // 已生成的部分内容留在气泡里，再显示错误
     retireLiveBubble();
@@ -2565,9 +2612,34 @@ function applyEvent(evt, seq) {
       traceEl.querySelector("summary").textContent =
         `已工作 ${fmtElapsed((Date.now() - traceStart()) / 1000)} · 出错`;
     }
-    bubble("assistant error", "❌ " + evt.message);
+    const eb = bubble("assistant error", "❌ " + evt.message);
+    // 结构化错误（errorAttribution.retryable 语义）：余额/限流/网络类错误
+    // 渲染"重试"按钮——充值后一键重发，不再要用户翻出上一条消息重打一遍。
+    if (evt.retryable && lastSent && lastSent.text) {
+      const btn = document.createElement("button");
+      btn.className = "retry-btn";
+      btn.textContent = "↻ 重试上一条";
+      btn.addEventListener("click", () => {
+        btn.disabled = true;
+        btn.textContent = "已重发";
+        retryLast();
+      });
+      eb.appendChild(document.createElement("div"));
+      eb.lastChild.appendChild(btn);
+    }
+    roundErrored = true;
+    notifyDesktop("回合出错", summarize(evt.message, 80));
     // 生成中状态不在这里复位：turn_end 紧随 error 事件到达，由它统一收尾
   }
+}
+
+// 重试上一条：与 send() 同一条路径（重画用户气泡 + performSend）。排队中
+// 则进队列；不手动清输入框——输入框在出错时早已是空的。
+function retryLast() {
+  if (!lastSent) return;
+  if (streaming) { queueMessage(lastSent.text, lastSent.payloadAtts); return; }
+  userBubble(lastSent.text, lastSent.outAtts);
+  performSend({ text: lastSent.text, payloadAtts: lastSent.payloadAtts });
 }
 
 // 生成期间「发送」变身「停止」：点它请求服务端掐断当前生成。
@@ -2601,6 +2673,38 @@ function resetStreamState() {
   qStart = 0;  // 计时起点随会话一起作废：否则切回来的新回合会接着上一个会话的时间数
 }
 
+// ---------- 桌面通知（边沿触发） ----------
+// 语义沿用 ZCode useTaskNotifications：事实以事件流为准，只在【状态变化边沿】
+// 且页面不在前台时发系统通知——切去干别的，长任务跑完/出错/等确认不用回来刷。
+// 默认关（🔔 手动开，一次性授权）；Notification 不可用（老浏览器/拒绝授权）
+// 时静默退化为无通知，绝不打扰。
+const NOTIFY_KEY = "notify_desktop";
+let notifyOn = localStorage.getItem(NOTIFY_KEY) === "1";
+
+function renderBell() {
+  const chip = $("bell-chip");
+  chip.textContent = notifyOn ? "🔔" : "🔕";
+  chip.title = notifyOn ? "桌面通知：开（仅页面在后台时提醒）" : "桌面通知：关";
+}
+
+function toggleNotify() {
+  notifyOn = !notifyOn;
+  localStorage.setItem(NOTIFY_KEY, notifyOn ? "1" : "0");
+  if (notifyOn && "Notification" in window && Notification.permission === "default") {
+    Notification.requestPermission();
+  }
+  renderBell();
+  toast(notifyOn ? "桌面通知已开启（仅页面在后台时提醒）" : "桌面通知已关闭");
+}
+
+function notifyDesktop(title, body) {
+  if (!notifyOn || document.visibilityState === "visible") return;
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  try {
+    new Notification(title, { body: body || "", tag: "turn-" + (currentSession || "new") });
+  } catch { /* 构造失败不致命 */ }
+}
+
 async function stopGeneration() {
   $("send").textContent = "停止中…";
   try {
@@ -2614,6 +2718,8 @@ async function stopGeneration() {
 // 生成期间再发消息：默认【排队】（当前回答完成后自动接着发），
 // 队列卡片上可「⬆ 立即」（停止当前生成、马上执行这一条）/「✏ 编辑」/「🗑 删除」。
 let pendingQueue = [];  // {text, payloadAtts, sessionId, el, immediate}
+let lastSent = null;    // 本 tab 最近一次成功发出的 {text, payloadAtts, outAtts}：出错重试用
+let roundErrored = false;  // 本回合是否发过 error 事件：turn_end 的通知去重
 
 let pendingProjectPath = null;  // 项目组头「＋」/chip 预选的项目：首条消息建会话时绑定
 
@@ -2637,6 +2743,7 @@ function send() {
     queueMessage(text, payloadAtts);
     return;
   }
+  lastSent = { text, payloadAtts, outAtts };  // 出错重试的素材
   userBubble(text, outAtts);
   performSend({ text, payloadAtts, sessionId: currentSession,
                 chosenPath: pendingProjectPath || undefined });
@@ -2808,6 +2915,13 @@ bind("attach-close", "click", () => $("attach-pop").classList.add("hidden"));
 bind("docs-close", "click", closeDocsPanel);
 bind("docs-toggle", "click", toggleDocsList);
 // 浏览器栏：chip 点开/收起，✕ 关闭。与文档栏共用 --docs-w，二者互斥。
+bind("bell-chip", "click", toggleNotify);
+renderBell();
+bind("back-bottom", "click", () => {
+  stickBottom = true;
+  updateBackBottom();
+  chatEl.scrollTo({ top: chatEl.scrollHeight, behavior: "smooth" });
+});
 bind("browser-chip", "click", () => {
   const p = browserPanelEl();
   if (!p) return;

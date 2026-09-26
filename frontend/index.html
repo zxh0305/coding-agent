@@ -85,6 +85,9 @@
       <div id="chat" class="chat"></div>
       <!-- 会话缩略导航条（minimap）：只画用户提问与助手回答两类主消息，点击定位 -->
       <div id="msg-rail" class="msg-rail hidden"></div>
+      <!-- 回到底部：用户上滚看历史时出现（ZCode timelineScrollAnchor 的
+           shouldShowBackToBottom）；贴底跟随本来就有，这里补的是"召回"入口 -->
+      <button id="back-bottom" class="back-bottom hidden" title="回到底部">↓ 最新</button>
 
       <div class="composer">
         <div id="attach-tray" class="attach-tray hidden"></div>
@@ -98,6 +101,7 @@
           <button id="ws-pick" class="chip" title="选择工作区文件夹">📁 <span id="ws-short">工作区</span></button>
           <button id="docs-chip" class="chip" title="查看本会话生成的文档">📄 文档 <span id="docs-count">0</span></button>
           <button id="browser-chip" class="chip hidden" title="查看 agent 的内置浏览器画面">🌐 浏览器</button>
+          <button id="bell-chip" class="chip" title="桌面通知：关">🔕</button>
           <button id="model-chip" class="chip" title="切换模型 / 管理模型">⚙️ <span id="model-label">模型</span></button>
           <span class="grow"></span>
           <button id="send" class="primary send-btn">发送</button>
