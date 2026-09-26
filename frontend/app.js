@@ -2746,10 +2746,11 @@ function send() {
   const payloadAtts = attachments.map(a => ({ kind: a.kind, name: a.name, mime: a.mime, data: a.data }));
   const outAtts = attachments.map(a => ({ kind: a.kind, name: a.name, preview: a.preview }));
   inputEl.value = "";
+  attachments = [];              // 附件必须先清再存草稿：saveDraft 会把托盘快照
+  renderAttachTray();            // 写回会话槽，若带着刚发出的附件存，它们会留在
+                                 // __new__ 槽里，之后开任何新会话都会被恢复出来
   clearTimeout(draftTimer);      // 已发出：取消待写的防抖存盘
-  saveDraft(currentSession);     // 并立即清掉该会话草稿（此刻输入框已空 → 删除）
-  attachments = [];
-  renderAttachTray();
+  saveDraft(currentSession);     // 并立即清掉该会话草稿（此刻输入框/托盘已空 → 删除）
 
   if (streaming) {
     // 排队：只显示队列卡片，正式气泡等派发执行时再渲染（否则会出现两条重复消息）
