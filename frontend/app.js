@@ -565,6 +565,13 @@ function railFindNode(mid) {
   return null;
 }
 
+// 导航锚点的滚动/高亮目标：display:contents 的 holder 自身没有盒子
+// （offsetTop 恒为 0、类动画不可见），定位与高亮要落到里面真正的气泡上。
+function railAnchorOf(node) {
+  return (node && node.style && node.style.display === "contents" && node.firstElementChild)
+    ? node.firstElementChild : node;
+}
+
 // 重建导航条：条目 = 全量用户提问索引；为空（新会话/无提问）时整条隐藏。
 function rebuildRail() {
   if (!railEl) return;
@@ -605,7 +612,8 @@ function syncRailActive() {
   railTicks.forEach((t, i) => {
     const node = railFindNode(t.item.mid);
     if (!node) return;
-    if (node.offsetTop <= mid && node.offsetTop > best) { best = node.offsetTop; active = i; }
+    const top = railAnchorOf(node).offsetTop;
+    if (top <= mid && top > best) { best = top; active = i; }
   });
   if (best === -Infinity) {
     // 没有任何已加载提问在视口上方：按滚动比例粗定位，避免高亮停在第 0 条
@@ -624,12 +632,13 @@ async function jumpToItem(item) {
     node = railFindNode(item.mid);
   }
   if (!node) { toast("这条消息还没加载出来，请稍后重试"); return; }
-  const top = Math.max(0, node.offsetTop - chatEl.clientHeight / 3);
+  const anchor = railAnchorOf(node);
+  const top = Math.max(0, anchor.offsetTop - chatEl.clientHeight / 3);
   chatEl.scrollTo({ top, behavior: "smooth" });
-  node.classList.remove("rail-hit");
-  void node.offsetWidth;          // 强制重排，让动画能重复触发
-  node.classList.add("rail-hit");
-  setTimeout(() => node.classList.remove("rail-hit"), 3000);
+  anchor.classList.remove("rail-hit");
+  void anchor.offsetWidth;        // 强制重排，让动画能重复触发
+  anchor.classList.add("rail-hit");
+  setTimeout(() => anchor.classList.remove("rail-hit"), 3000);
 }
 
 // 加载目标 ord 所在的一页（around_ord）：把该窗口的历史插进时间线。
@@ -884,7 +893,20 @@ const blocksRenderer = window.CodingAgentRenderBlocks.createRenderer({
 function historyNode(m) {
   // 外置归档消息：库行内只有 head 预览（超大正文存 artifacts 文件），
   // 展示"内容过大已归档"标记，点开按需拉取全文
-  if (m.artifact) return railTag(artifactCard(m), m.mid, "user");
+  if (m.artifact) {
+    const node = artifactCard(m);
+    railTag(node, m.mid, "user");
+    if (m.role === "user" && node.dataset.mid !== String(m.mid)) {
+      // 用户消息的载体是 display:contents 的 holder——没有 bubble/artifact
+      // 类，railTag 的类名守卫会跳过它，锚点永远缺失。后果：带大附件的提问
+      // 在导航条上点定位必报"消息还没加载出来"（loadWindowAround 重拉回来
+      // 的还是同样未打锚的 holder，死循环）。锚直接打在 holder 上——它在
+      // 异步取回全文原位替换时保持不动，锚点稳定。
+      node.dataset.mid = m.mid;
+      node.dataset.role = "user";
+    }
+    return node;
+  }
   return blocksRenderer.renderBlocks(blocksFromHistory([m]));
 }
 
