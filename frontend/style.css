@@ -572,6 +572,31 @@ body.side-resizing .sidebar { transition: none; }
 }
 .back-bottom:hover { background: var(--hover); }
 
+/* 用户气泡上的 ✏️ 回退编辑：悬停浮现（触屏常显低透明度），点击退回输入框 */
+.bubble.user { position: relative; }
+.ub-edit {
+  position: absolute; top: 6px; right: 8px;
+  border: none; background: transparent; cursor: pointer;
+  font-size: 12px; opacity: 0; transition: opacity .15s;
+  color: inherit; padding: 2px 4px;
+}
+.bubble.user:hover .ub-edit { opacity: .75; }
+.ub-edit:hover { opacity: 1 !important; }
+
+/* 回退编辑横幅：composer 顶部的模式提示条 */
+.edit-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 6px 10px; margin-bottom: 6px;
+  border: 1px solid var(--accent-weak-border); border-radius: 8px;
+  background: var(--accent-weak); color: var(--text); font-size: 12px;
+}
+.edit-banner button {
+  flex: 0 0 auto; border: 1px solid var(--border); border-radius: 6px;
+  background: transparent; color: var(--text-2); font-size: 12px;
+  padding: 2px 8px; cursor: pointer;
+}
+.edit-banner button:hover { background: var(--hover); }
+
 /* 出错气泡里的重试按钮（error.retryable 时渲染） */
 .retry-btn {
   margin-top: 6px; padding: 5px 12px;
@@ -1680,6 +1705,9 @@ body.docs-resizing .docs-panel { transition: none; }
   border: 1px solid var(--border); padding: 6px 10px; text-align: left;
 }
 .docs-view .md-table th { background: var(--bg); font-weight: 600; }
+
+/* 触屏没有 hover：回退按钮常显低透明度（mode.js 判定，非媒体查询） */
+[data-mode="mobile"] .ub-edit { opacity: .5; }
 
 /* ================= 手机端（html[data-mode="mobile"]） ================= */
 /* 判定源是 mode.js（视口 ≤720px，或触摸设备），不是媒体查询，所以本节统一用

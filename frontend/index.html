@@ -90,6 +90,11 @@
       <button id="back-bottom" class="back-bottom hidden" title="回到底部">↓ 最新</button>
 
       <div class="composer">
+        <!-- 回退编辑横幅：✏️ 点击用户气泡后出现，发送即截断该轮及其后 -->
+        <div id="edit-banner" class="edit-banner hidden">
+          <span>✏️ 正在回退编辑这一轮——发送后将删除该轮及其后的消息（附件需重新添加）</span>
+          <button id="edit-cancel" type="button">取消</button>
+        </div>
         <div id="attach-tray" class="attach-tray hidden"></div>
         <textarea id="input" rows="2" placeholder="输入问题或任务，Enter 发送（Shift+Enter 换行）"></textarea>
         <div class="toolbar">

@@ -1201,9 +1201,18 @@ function buildUserBubble(text, atts) {
   div.className = "bubble user";
   if (text) {
     const t = document.createElement("div");
+    t.className = "ub-text";  // 回退编辑时按类名取原文（不碰附件节点）
     t.textContent = text;
     div.appendChild(t);
   }
+  // ✏️ 回退编辑入口（ZCode editUserQuery）：悬停浮现，点击把这一轮退回输入框。
+  // mid 在点击时从最近的 [data-role="user"] 上读——自己刚发的气泡要等 turn_end
+  // 才回填 mid，构造时不知道，所以不能在渲染期绑定。
+  const edit = document.createElement("button");
+  edit.className = "ub-edit";
+  edit.textContent = "✏️";
+  edit.title = "退回到这一轮重新编辑";
+  div.appendChild(edit);
   const imgs = (atts || []).filter(a => a.kind === "image" && a.preview);
   const sources = imgs.map(a => a.preview);  // 同组：灯箱左右切换的序列
   for (const a of atts || []) {
@@ -1244,6 +1253,37 @@ function userBubble(text, atts, mid) {
   chatEl.appendChild(railTag(buildUserBubble(text, atts), mid, "user"));
   scrollBottom(true);  // 用户自己的消息永远贴底（同时恢复跟随）
 }
+
+// ---------- 回退编辑（ZCode editUserQuery rewind 语义） ----------
+// 点用户气泡上的 ✏️：该轮原文回到输入框；再次发送时先调 truncate 端点删掉
+// 这一轮及其后的消息，再作为新的一轮发出。已被压缩进摘要的旧消息后端会拒绝
+// （摘要引用会悬空），前端原样展示报错。
+let editTarget = null;      // {mid}：正在回退编辑的用户消息
+let lastTruncateAt = 0;     // 本 tab 刚执行过回退的时间戳：history_truncated 回放去重
+
+function startEdit(bubbleEl) {
+  if (streaming) { toast("生成中：请先停止或等回合结束再回退"); return; }
+  const mid = bubbleEl && bubbleEl.dataset.mid;
+  if (!mid) { toast("这条消息还没有落库，稍等片刻再试"); return; }
+  const textEl = bubbleEl.querySelector(".ub-text");
+  editTarget = { mid };
+  inputEl.value = textEl ? textEl.textContent : "";
+  $("edit-banner").classList.remove("hidden");
+  inputEl.focus();
+}
+
+function cancelEdit() {
+  editTarget = null;
+  $("edit-banner").classList.add("hidden");
+}
+
+// 事件委托：✏️ 按钮在所有用户气泡上动态存在，一个监听器统一接管
+chatEl.addEventListener("click", (e) => {
+  const btn = e.target.closest(".ub-edit");
+  if (!btn) return;
+  e.stopPropagation();
+  startEdit(btn.closest('[data-role="user"]'));
+});
 
 // ---------- 模型：激活切换（工具栏气泡）+ 供应商管理（弹窗） ----------
 let providers = [];        // 供应商列表缓存（含各自模型）
@@ -2584,6 +2624,14 @@ function applyEvent(evt, seq) {
       notifyDesktop("回合完成", "本任务的回答已结束");
     }
     dispatchNextQueued();
+  } else if (t === "history_truncated") {
+    // 某个标签页回退编辑删掉了一段历史：重拉时间线。本 tab 自己的回退在
+    // send() 流程里已重拉过，事件重放到达时 3 秒内跳过，避免二次重拉竞态。
+    if (Date.now() - lastTruncateAt > 3000 && !streaming && currentSession) {
+      const keep = currentSession;
+      currentSession = null;
+      switchSession(keep);
+    }
   } else if (t === "history_renumbered") {
     // 服务端 ord 间隔耗尽兜底：整会话重编号过，before_ord 游标指向的旧序号
     // 在新序号空间里落在哪完全随机——继续翻页会漏条目或重复。重拉整个时间线
@@ -2684,6 +2732,10 @@ function resetStreamState() {
   pendingDeltas = new Map(); pendingThink = "";
   curMid = null; usageNow = null;
   qStart = 0;  // 计时起点随会话一起作废：否则切回来的新回合会接着上一个会话的时间数
+  // 回退编辑态随会话一起作废：换任务后 banner 还挂着会把新消息发进错误的语境
+  editTarget = null;
+  const eb = $("edit-banner");
+  if (eb) eb.classList.add("hidden");
 }
 
 // ---------- 桌面通知（边沿触发） ----------
@@ -2752,6 +2804,30 @@ function send() {
   clearTimeout(draftTimer);      // 已发出：取消待写的防抖存盘
   saveDraft(currentSession);     // 并立即清掉该会话草稿（此刻输入框/托盘已空 → 删除）
 
+  if (editTarget) {
+    // 回退编辑的发送：先截断（服务端删该轮及其后），重拉时间线，再走常规发送。
+    // 队列里有积压时拒绝——那些消息的语境随回退一起失效，自动清掉太越权。
+    const target = editTarget;
+    if (pendingQueue.length) { toast("有排队消息待处理，请先清理再发送回退编辑"); return; }
+    editTarget = null;
+    $("edit-banner").classList.add("hidden");
+    const sid0 = currentSession;
+    (async () => {
+      try {
+        await api(`/api/sessions/${sid0}/truncate`,
+                  { method: "POST", body: JSON.stringify({ mid: target.mid }) });
+        lastTruncateAt = Date.now();
+        currentSession = null;        // 绕过 switchSession 的同 id 早退：全量重拉
+        await switchSession(sid0);    // 被回退的段从时间线消失 + 重开事件流
+        userBubble(text, outAtts);    // 新的一轮：自己画气泡（turn_start 是自己的 nonce，不重复画）
+        performSend({ text, payloadAtts, sessionId: sid0 });
+      } catch (err) {
+        toast("回退失败：" + err.message);
+        inputEl.value = text;         // 字还给用户，别丢
+      }
+    })();
+    return;
+  }
   if (streaming) {
     // 排队：只显示队列卡片，正式气泡等派发执行时再渲染（否则会出现两条重复消息）
     queueMessage(text, payloadAtts);
@@ -2930,6 +3006,7 @@ bind("docs-close", "click", closeDocsPanel);
 bind("docs-toggle", "click", toggleDocsList);
 // 浏览器栏：chip 点开/收起，✕ 关闭。与文档栏共用 --docs-w，二者互斥。
 bind("bell-chip", "click", toggleNotify);
+bind("edit-cancel", "click", cancelEdit);
 renderBell();
 bind("back-bottom", "click", () => {
   stickBottom = true;
