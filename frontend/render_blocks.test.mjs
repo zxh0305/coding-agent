@@ -215,6 +215,25 @@ test("渲染：错误块用 error 气泡", () => {
   assert.equal(frag.children[0].className, "bubble error");
 });
 
+test("渲染：retryable 错误块带重试按钮，非 retryable 不带", () => {
+  const deps = makeDeps();
+  deps.makeRetryButton = () => {
+    const b = new FakeEl("button");
+    b.className = "retry-btn";
+    b.textContent = "↻ 重试上一条";
+    return b;
+  };
+  const r = createRenderer(deps);
+  const withBtn = r.renderBlocks([{ kind: "error", text: "限流", retryable: true }]);
+  // retryable 时错误块被包在一层 div holder 里：[div[气泡, 重试按钮]]
+  assert.equal(withBtn.children[0].tagName, "DIV");
+  assert.equal(withBtn.children[0].children[0].className, "bubble error");
+  assert.equal(withBtn.children[0].children[1].className, "retry-btn");
+  const noBtn = r.renderBlocks([{ kind: "error", text: "参数错误" }]);
+  assert.equal(noBtn.children[0].className, "bubble error");
+  assert.equal(noBtn.children.length, 1);
+});
+
 test("渲染：空数组与空输入不崩", () => {
   const deps = makeDeps();
   const r = createRenderer(deps);

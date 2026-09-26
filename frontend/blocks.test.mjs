@@ -162,6 +162,23 @@ test("回放：正文为空的 assistant 消息不画气泡", () => {
   assert.ok(blocks.some((b) => b.kind === "process")); // 过程仍在
 });
 
+test("回放：错误消息（error 标记）渲染成错误块，retryable 透传", () => {
+  const blocks = blocksFromHistory([
+    { role: "user", content: "你好", mid: "u1" },
+    { role: "assistant", content: "❌ 连接中断", error: true, retryable: true, mid: "e1" },
+  ]);
+  // user 消息也会产出自己的块，错误块是最后一块
+  assert.equal(blocks.length, 2);
+  const errBlock = blocks[blocks.length - 1];
+  assert.equal(errBlock.kind, "error");
+  assert.equal(errBlock.text, "❌ 连接中断");
+  assert.equal(errBlock.retryable, true);
+
+  // 不带 error 标记的普通 assistant 消息不能被误判成错误
+  const normal = blocksFromHistory([{ role: "assistant", content: "正常回答", mid: "a1" }]);
+  assert.ok(normal.every((b) => b.kind !== "error"));
+});
+
 test("压缩卡：两条路径都产出 compact 块", () => {
   const live = blocksFromEvents([{ type: "compacted", summary: "早期对话摘要" }]);
   assert.equal(live[0].kind, "compact");

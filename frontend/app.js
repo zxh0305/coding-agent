@@ -860,6 +860,19 @@ const blocksRenderer = window.CodingAgentRenderBlocks.createRenderer({
   metaText: metaText,
   compactCard: compactCard,
   fmtElapsed: fmtElapsed,
+  // 历史回放错误卡的"重试上一条"按钮：复用与实时 error 事件相同的
+  // retryLast() 路径（与 send() 同一条发送链路）。
+  makeRetryButton: () => {
+    const btn = document.createElement("button");
+    btn.className = "retry-btn";
+    btn.textContent = "↻ 重试上一条";
+    btn.addEventListener("click", () => {
+      btn.disabled = true;
+      btn.textContent = "已重发";
+      retryLast();
+    });
+    return btn;
+  },
 });
 
 // 历史回放：单条存储消息 → DOM 节点。
@@ -2993,7 +3006,7 @@ async function logoutNow() {
 }
 document.addEventListener("click", (e) => {
   // 点弹窗外空白处关闭浮动层
-  for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"]]) {
+  for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"], ["perm-pop", "perm-chip"]]) {
     const el = $(pop);
     // git 的分支二级面板挂在外层（不在 git-pop 内）：点它不算点空白，否则
     // git 浮窗被关掉而分支面板还留着（真实踩过的坑）

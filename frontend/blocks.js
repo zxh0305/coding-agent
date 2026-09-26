@@ -380,6 +380,13 @@
       }
 
       if (m.role === "assistant") {
+        // 错误消息（后端错误路径落库，见 app.py 收尾处）：回放时渲染成与实时
+        // 一致的错误卡，否则刷新/切会话后错误"凭空消失"，时间线上助手那边
+        // 无声无息。retryable 标记透传给渲染层画"重试上一条"按钮。
+        if (m.error) {
+          blocks.push({ kind: "error", text: m.content || "出错了", retryable: !!m.retryable });
+          continue;
+        }
         // 中间轮（带 tool_calls 且正文是过程说明）：不占位——那段文字已随
         // 最终回答的 trace 以 process_text 落库，单独画会与实时视图割裂。
         if (Array.isArray(m.tool_calls) && m.tool_calls.length) continue;

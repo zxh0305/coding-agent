@@ -163,7 +163,16 @@
       }
 
       if (block.kind === "error") {
-        return deps.buildBubble("error", block.text);
+        const eb = deps.buildBubble("error", block.text);
+        // retryable（余额/限流/网络类错误）在回放路径同样给"重试上一条"：
+        // 与实时 error 事件的语义一致（app.js），刷新后仍可一键重发。
+        if (block.retryable && deps.makeRetryButton) {
+          const holder = doc.createElement("div");
+          holder.appendChild(eb);
+          holder.appendChild(deps.makeRetryButton());
+          return holder;
+        }
+        return eb;
       }
 
       return doc.createDocumentFragment();

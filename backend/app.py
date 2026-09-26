@@ -350,6 +350,17 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 log.exception("回合执行出现未预期异常")
                 error = "服务器内部错误，详情见 backend 日志"
 
+            # 出错时把错误本身作为一条 assistant 消息追加进历史（方案 A）：
+            # 不落库的话，错误卡只活在当前页面的 DOM 里，切会话/刷新后即消失，
+            # 时间线上只剩用户气泡、助手那边"无声无息"。带 error 标记落库后：
+            # 1) 历史回放能渲染出同样的错误卡（前端 blocks.js 识别 m.error）；
+            # 2) 下一轮发给模型的上下文里能看到"上轮失败了、败在哪"——这本身
+            #    就是有价值的对话历史（模型可据此道歉/换思路），无需特意剔除。
+            if error is not None:
+                # 前缀只拼一次：实时路径（前端 error 事件）与回放路径（这条落库
+                # 消息）都由各自渲染层加 "❌ "，此处 content 存纯文本。
+                agent.history.append({"role": "assistant", "content": str(error),
+                                      "error": True, "retryable": bool(retryable)})
             # 收尾（正常/停止/出错共用）：增量落盘 → 重编号信号 → turn_end。
             # 落盘在前、turn_end 在后——turn_end 里的 user_mid 是"这回合已可
             # 从时间线读到"的承诺，顺序反了前端去重会误判。
