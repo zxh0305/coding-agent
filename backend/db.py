@@ -491,6 +491,55 @@ def set_session_model(sid: str, provider_id: str, model: str) -> None:
                      (provider_id, model, sid))
 
 
+def truncate_from(sid: str, mid: str) -> dict:
+    """回退编辑（ZCode editUserQuery 的 rewind 语义，V1 不带文件回卷）：
+    删除某条用户消息【及其后】的全部消息，返回 {"removed": 行数, "ord": 切点}。
+
+    约束与附带清理：
+    * mid 必须是本会话存在的 role=user 消息——回退点是"某一轮的开始"；
+    * 目标若在最后一条压缩边界【之前】→ ValueError：那段已被摘要吸收，
+      删掉原文会让摘要引用凭空消失的内容（ZCode 对此走 fork，V1 直接拒绝）；
+    * message_usage / session_traces 的同 mid 行一并删除；被删消息里外置到
+      artifacts 的归档文件同样清掉（校验规则与 read_artifact 一致，best-effort）。
+
+    调用方（app 层）负责：会话锁内调用、确认无运行中回合、同步内存里的
+    agent.history/saved、向事件流广播 history_truncated。
+    """
+    with _conn() as conn:
+        row = conn.execute("SELECT ord, role FROM messages WHERE session_id=? AND mid=?",
+                           (sid, mid)).fetchone()
+        if row is None:
+            raise ValueError("消息不存在或已不在任务中")
+        if row["role"] != "user":
+            raise ValueError("只能回退到自己发出的消息")
+        target_ord = row["ord"]
+        boundary = conn.execute(
+            "SELECT MAX(ord) FROM messages WHERE session_id=? AND role='compact'",
+            (sid,)).fetchone()[0]
+        if boundary is not None and boundary >= target_ord:
+            raise ValueError("该消息已被压缩进摘要，无法回退；请从最新的一轮开始")
+        doomed = conn.execute(
+            "SELECT mid, content FROM messages WHERE session_id=? AND ord>=?",
+            (sid, target_ord)).fetchall()
+        mids = [r["mid"] for r in doomed]
+        base = _artifacts_dir().resolve()
+        for r in doomed:  # 外置归档文件随行清理（路径校验与 read_artifact 同规则）
+            try:
+                blob = json.loads(r["content"])
+                rel = blob.get("path") if isinstance(blob, dict) and blob.get("_artifact") else None
+                if rel:
+                    p = (base / rel).resolve()
+                    if base in p.parents and p.suffix == ".json":
+                        p.unlink(missing_ok=True)
+            except (json.JSONDecodeError, OSError):
+                continue
+        q = ",".join("?" * len(mids))
+        conn.execute(f"DELETE FROM messages WHERE session_id=? AND mid IN ({q})", (sid, *mids))
+        conn.execute(f"DELETE FROM message_usage WHERE session_id=? AND mid IN ({q})", (sid, *mids))
+        conn.execute(f"DELETE FROM session_traces WHERE session_id=? AND mid IN ({q})", (sid, *mids))
+    return {"removed": len(mids), "ord": target_ord}
+
+
 def touch_session(sid: str) -> None:
     with _conn() as conn:
         conn.execute("UPDATE sessions SET updated=? WHERE id=?", (time.time(), sid))

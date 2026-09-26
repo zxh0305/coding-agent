@@ -44,6 +44,8 @@ Web 服务
   DELETE /api/sessions?session_id=  删除任务（须是自己的任务）
   GET  /api/context?session_id=   该任务当前上下文容量
   POST /api/chat/stop             停止指定任务的生成 {"session_id"}
+  POST /api/sessions/<sid>/truncate  回退编辑：删除某条用户消息及其后的全部
+                                  消息 {"mid"}（被压缩进摘要的旧消息拒绝）
 
 命令与事件解耦：POST 只入队（HTTP/1.0 时代的"每轮一个流"被替换掉），回合
 由后台线程按会话锁串行执行，全部过程事件经统一发布口（events.SessionEvents
@@ -115,6 +117,10 @@ ENV_FILE = PROJECT_DIR / ".env"
 # 指纹变了（用户切换模型/改配置）就重建实例，但历史从数据库恢复，不丢对话。
 _agents: dict[str, Agent] = {}
 _sigs: dict[str, str] = {}
+# 正在跑回合的 Agent 实例（sid → agent）。与 _agents 分开记：切模型/切工作区
+# 会重建 _agents[sid]，但旧回合仍持【旧】实例在跑——停止请求若只查 _agents，
+# 会把开关置到没人听的新实例上（实测：停止后干等 60s 直到旧请求超时才收场）。
+_running_agents: dict[str, Agent] = {}
 _ctx: dict[str, dict] = {}  # sid -> 最近一次上下文统计（非关键数据，只存内存）
 # 最近一轮的结局：sid -> {"outcome": "done"|"error", "seen": bool}（只存内存）。
 # 语义是"未读标记"：回合跑完时若用户不在这个会话里，就置 seen=False，列表亮
@@ -284,6 +290,10 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
         # 排队期间任务可能已被删除：直接放弃（会话行没了，落盘也会跳过）
         if db.session_owner(sid) is None:
             return
+        # 登记"正在跑回合的实例"：停止请求的真正目标（见 _running_agents 注释）。
+        # finally 里只有仍是本实例时才摘除——若回合中途实例被重建，新实例的
+        # 登记不能被旧回合的收尾误删。
+        _running_agents[sid] = agent
         try:
             # 新回合开跑：清掉上一轮的绿/红点（此刻列表应显示"运行中"，不是
             # 上次的结局）。回合真结局在下面收尾处按 error 重新置位。
@@ -431,6 +441,9 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 bus.publish({"type": "turn_end", "user_mid": None})
             except Exception:
                 pass
+        finally:
+            if _running_agents.get(sid) is agent:
+                _running_agents.pop(sid, None)
 
 
 def _context_window_fallback() -> int:
@@ -688,6 +701,16 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
         return sid, _agents[sid]
 
 
+def _stop_target(sid: str) -> Agent | None:
+    """停止请求的真正目标：正在跑回合的实例，其次才是当前缓存的实例。
+
+    切模型/切工作区会重建 _agents[sid]，而旧回合仍持【旧】实例在跑——只查
+    _agents 会把停止开关置到没人听的新实例上（实测：00:23:53 发起请求，
+    00:24:15 切模型，00:24:16 点停止，旧请求直到 00:24:53 超时才收场，
+    用户眼里的"停止"慢了近 40 秒）。"""
+    return _running_agents.get(sid) or _agents.get(sid)
+
+
 class Handler(SimpleHTTPRequestHandler):
     """API 路由 + 静态文件托管（frontend/ 目录）。"""
 
@@ -902,6 +925,12 @@ class Handler(SimpleHTTPRequestHandler):
                 if db.session_owner(sid) != self.user["id"]:
                     return self._json({"error": "任务不存在或不属于当前用户"}, 404)
                 self._handle_permission(sid, pid)
+            elif re.fullmatch(r"/api/sessions/[^/]+/truncate", path):
+                # 回退编辑：删除某条用户消息及其后的全部消息
+                sid = path.split("/")[3]
+                if db.session_owner(sid) != self.user["id"]:
+                    return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+                self._handle_truncate(sid)
             elif path == "/api/active-model":
                 self._handle_active_model()
             elif self.path == "/api/providers/save":
@@ -1174,12 +1203,44 @@ class Handler(SimpleHTTPRequestHandler):
         sid = str(self._body().get("session_id") or "")
         if not sid or db.session_owner(sid) != self.user["id"]:
             return self._json({"error": "任务不存在或不属于当前用户"}, 404)
-        agent = _agents.get(sid)
+        agent = _stop_target(sid)
         if agent is None or agent.cancel_event is None or agent.cancel_event.is_set():
             return self._json({"ok": True, "running": False})
         agent.stop()
         log.info("[会话 %s] 用户请求停止生成", sid)
         self._json({"ok": True, "running": True})
+
+    def _handle_truncate(self, sid: str):
+        """回退编辑（ZCode editUserQuery 的 rewind 语义，V1 不带文件回卷）：
+        删除某条用户消息【及其后】的全部消息，前端随后重拉时间线并把编辑后的
+        内容作为新的一轮发出。被压缩进摘要的旧消息拒绝回退（摘要引用会悬空）。
+
+        会话锁内执行（与回合 worker 串行）；锁内确认无运行中回合——防御
+        前端的 streaming 判断失灵（别的标签页正在跑时这里会拦住）。
+        """
+        mid = str(self._body().get("mid") or "")
+        if not mid:
+            return self._json({"error": "缺少 mid"}, 400)
+        with _session_lock(sid):
+            if _running_agents.get(sid) is not None:
+                return self._json({"error": "任务正在运行，请先停止再回退"}, 409)
+            try:
+                out = db.truncate_from(sid, mid)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            agent = _agents.get(sid)
+            if agent is not None:
+                # 内存与库同一口径：丢弃切点及之后的消息（含 compact 标记——
+                # db 层已保证切点在边界之后，这里只可能筛掉活区消息）与指纹
+                # 账本条目。没有 _ord 的消息（理论不存在）保守保留。
+                agent.history = [m for m in agent.history
+                                 if m.get("_ord") is None or m.get("_ord") < out["ord"]]
+                alive = {m.get("_mid") for m in agent.history}
+                agent.saved = {k: v for k, v in agent.saved.items() if k in alive}
+            _event_bus(sid).publish({"type": "history_truncated"})
+            log.info("[会话 %s] 回退编辑：删除 %d 条消息（切点 ord=%d）",
+                     sid, out["removed"], out["ord"])
+            self._json({"ok": True, "removed": out["removed"]})
 
     def _handle_permission(self, sid: str, pid: str):
         """权限确认的决定回令：{"decision": "allow"|"allow_session"|"deny"}。
