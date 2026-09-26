@@ -162,13 +162,16 @@ def _sleep_cancellable(seconds: float, cancel) -> bool:
 
 
 def post_json_with_retry(url: str, headers: dict, payload: dict, timeout: int,
-                         cancel=None, attempts: int = 3):
+                         cancel=None, attempts: int = 3, on_retry=None):
     """带退避重试的 JSON POST（两个 client 的 _post 共用）。
 
     可重试 = HTTP 429/500/502/503/504、连接失败、读超时——都发生在【请求发出
     之前或未完成】；流已经开始后的中断不在这里处理（维持现状，不扩大范围）。
     400/401/403/404 等立即抛出：重试一个注定失败的请求只会白等。
     节奏：优先服务商的 Retry-After（封顶 30s），否则 2s、4s。
+    on_retry：可选回调 fn(info: dict)，每次【确定要重试】时调用一次，info =
+    {error, attempt, max_attempts, wait}——Web 层用它把"正在重试(2/3)"推给
+    前端，等待不再像卡死。同步调用（在 worker 线程里），回调必须快、不许抛。
     等待期间按 0.2s 分片检查 cancel：置位则重抛最后一个错误、不再重试——已知
     取舍：此刻请求没发出去，回合由 worker 的错误路径收尾（error + turn_end），
     与"请求没发出去就取消"的既有行为一致。
@@ -190,6 +193,12 @@ def post_json_with_retry(url: str, headers: dict, payload: dict, timeout: int,
             wait = _RETRY_BACKOFFS[min(attempt, len(_RETRY_BACKOFFS)) - 1]
         log.warning("API 请求失败（%s），%.0f 秒后重试（第 %d/%d 次）",
                     error, wait, attempt, attempts - 1)
+        if on_retry is not None:
+            try:
+                on_retry({"error": str(error), "attempt": attempt,
+                          "max_attempts": attempts, "wait": round(wait, 1)})
+            except Exception:  # 观测回调绝不干扰重试主流程
+                log.exception("on_retry 回调失败（忽略）")
         if not _sleep_cancellable(wait, cancel):
             raise error  # 等待期间被停止：交回 worker 错误路径收尾（取舍见 docstring）
 
@@ -218,11 +227,13 @@ def _arm_cancel_watchdog(resp, cancel) -> None:
 class OpenAIChatClient:
     """任意 OpenAI 兼容接口的客户端（纯标准库实现，零依赖）。"""
 
-    def __init__(self, api_key: str, base_url: str, model: str, timeout: int = 60):
+    def __init__(self, api_key: str, base_url: str, model: str, timeout: int = 60,
+                 on_retry=None):
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
         self._stream_usage = True  # 服务商不支持 stream_options 时自动降级为 False
+        self.on_retry = on_retry   # 重试观测回调（见 post_json_with_retry），可后置赋值
         # GLM 的 base_url 以 / 结尾（…/v4/），OpenAI 的不带（…/v1），统一兜一下
         self.api_url = base_url.rstrip("/") + "/chat/completions"
 
@@ -238,6 +249,7 @@ class OpenAIChatClient:
             payload,
             self.timeout,
             cancel=cancel,
+            on_retry=self.on_retry,
         )
 
     def chat(self, messages: list, tools: list | None = None,
@@ -404,10 +416,12 @@ class AnthropicMessagesClient:
       * 流式事件是 message_start / content_block_delta / message_delta / message_stop。
     """
 
-    def __init__(self, api_key: str, base_url: str, model: str, timeout: int = 60):
+    def __init__(self, api_key: str, base_url: str, model: str, timeout: int = 60,
+                 on_retry=None):
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        self.on_retry = on_retry   # 重试观测回调（见 post_json_with_retry），可后置赋值
         base = base_url.rstrip("/")
         # base 以 /v1 结尾（如 …/code/v1）就直接拼 /messages，否则补全 /v1/messages
         self.api_url = base + ("/messages" if base.endswith("/v1") else "/v1/messages")
@@ -510,6 +524,7 @@ class AnthropicMessagesClient:
             payload,
             self.timeout,
             cancel=cancel,
+            on_retry=self.on_retry,
         )
 
     @staticmethod
@@ -627,11 +642,15 @@ class AnthropicMessagesClient:
         yield "message", message
 
 
-def create_client(api_format: str, api_key: str, base_url: str, model: str, timeout: int = 60):
-    """按供应商的 API 格式选择协议适配器。新协议在这里加一个分支即可。"""
+def create_client(api_format: str, api_key: str, base_url: str, model: str,
+                  timeout: int = 60, on_retry=None):
+    """按供应商的 API 格式选择协议适配器。新协议在这里加一个分支即可。
+    on_retry：重试观测回调（见 post_json_with_retry），Web 层推 api_retry 事件用。"""
     if api_format == "anthropic":
-        return AnthropicMessagesClient(api_key=api_key, base_url=base_url, model=model, timeout=timeout)
-    return OpenAIChatClient(api_key=api_key, base_url=base_url, model=model, timeout=timeout)
+        return AnthropicMessagesClient(api_key=api_key, base_url=base_url, model=model,
+                                       timeout=timeout, on_retry=on_retry)
+    return OpenAIChatClient(api_key=api_key, base_url=base_url, model=model,
+                            timeout=timeout, on_retry=on_retry)
 
 
 def create_llm_client(env_path: str = ".env") -> OpenAIChatClient:

@@ -90,7 +90,8 @@ from git_tools import checkout as git_checkout
 from git_tools import identity as git_identity
 from git_tools import log as git_log
 from git_tools import show as git_show
-from llm_client import create_client, load_env_file, save_env_values
+from llm_client import (create_client, load_env_file, save_env_values,
+                        ApiHTTPError, ApiConnectionError, _RETRYABLE_STATUS)
 from logger import setup_logging
 from memory import memory_dir, recent_user_texts, run_extraction_async
 import permissions
@@ -313,6 +314,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             log.info("[会话 %s] 用户提问: %s", sid, plain)
             seg_mid = None  # 当前回答段落的 SSE 气泡 mid（每个 round 事件换一段，仅事件流用）
             error = None
+            retryable = False  # 出错时是否值得引导用户重试（见下面的归因逻辑）
             try:
                 for kind, payload in agent.run(plain, user_message):
                     if kind == "round":
@@ -334,6 +336,14 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             except RuntimeError as e:
                 log.exception("LLM 请求失败")
                 error = str(e)
+                # 结构化错误归因（参照 ZCode errorAttribution.retryable）：
+                # 前端据此渲染"重试"按钮而不是一坨报错。值得点重试的 = 连接层
+                # 失败（重试窗口耗尽后仍失败）与 402 余额不足 / 429 限流 / 5xx
+                # ——充了值、过了限流窗口就有机会成功；400/401/证书错误等
+                # 注定失败的请求不引导用户重试。
+                retryable = (isinstance(e, ApiConnectionError)
+                             or (isinstance(e, ApiHTTPError)
+                                 and (e.status in _RETRYABLE_STATUS or e.status == 402)))
             except Exception:
                 # 未预期异常也必须转成 error 事件：前端把 turn_end 当回合结束的
                 # 唯一信号，线程无声死掉会让所有订阅页永远挂在"生成中"
@@ -375,7 +385,8 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                                      "seen": False}
             if error is not None:
                 db.renumbered_sessions.discard(sid)  # 错误路径不带重编号信号（与旧行为一致）
-                bus.publish({"type": "error", "message": error})
+                bus.publish({"type": "error", "message": error,
+                             "retryable": bool(retryable)})
             elif sid in db.renumbered_sessions:
                 # 间隔耗尽兜底触发过整会话重编号：分页游标（before_ord 指向旧
                 # 序号空间）全部失效，推事件让前端重拉时间线
@@ -619,10 +630,19 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
         # 任务是否存在、是否归当前用户，都以数据库为准
         if db.session_owner(session_id) == user_id:
             sid = session_id
+    if sid is None:
+        # 新任务的 id 提前定下来（会话行仍在解析客户端成功后才建，保持
+        # "模型配置有问题时不留孤儿会话行"的顺序）：api_retry 事件回闭包
+        # 需要 sid 才能把重试进度推给这个会话的事件流。
+        sid = uuid.uuid4().hex[:8]
 
     client, model, sig, vision = _resolve_client(sid)
-    if sid is None:
-        sid = uuid.uuid4().hex[:8]
+    # 重试观测接线：LLM 请求瞬态失败退避重试时，把进度推给会话事件流
+    # （前端显示"正在重试(2/3)"，等待不再像卡死）。闭包捕获 sid——客户端
+    # 实例随 Agent 缓存复用，但同一会话的 sid 恒定，无需重建闭包。
+    client.on_retry = (lambda info, _sid=sid:
+                       _event_bus(_sid).publish({"type": "api_retry", **info}))
+    if not db.session_owner(sid):
         db.create_session(sid, user_id)
     workspace = _resolve_workspace(user_id, sid)
     if workspace is None:

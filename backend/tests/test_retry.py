@@ -215,7 +215,7 @@ class CaptureRetry:
         self.response = response
         self.records = []
 
-    def __call__(self, url, headers, payload, timeout, cancel=None, attempts=3):
+    def __call__(self, url, headers, payload, timeout, cancel=None, attempts=3, on_retry=None):
         self.records.append({"payload": payload, "cancel": cancel})
         return self.response
 

@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -62,6 +63,34 @@ COMPACT_MIN_SEGMENT = 4   # 可压缩段最少几条消息：太短说明刚压�
 
 COMPACT_SUMMARY_NOTE = "【早期对话已压缩】以下是更早历史的摘要，替代原始消息（原文仍存于数据库）："
 
+# 压缩摘要连续失败的熔断阈值：连续这么多次失败（网络/余额/服务商故障）后
+# 停止自动压缩尝试——每次失败都要等一次超时/报错，回合收尾被无谓拖慢；
+# 阈值状态随下一次成功自然清零，进程重启也清零。
+MAX_COMPACT_FAILURES = 3
+
+# compact 后文件重注入的预算（参照 ZCode compact-post-reminders 的量级）：
+# 最多带最近读过的 5 个文件，单文件正文截 12000 字符（约 5K token），全部
+# 注入合计 48000 字符封顶；超预算的文件降级为一行"需要时重新 read_file"。
+RECENT_READS_KEEP = 12       # 内存里保留最近 N 次 read_file 记录
+REINJECT_MAX_FILES = 5
+REINJECT_FILE_CHARS = 12_000
+REINJECT_TOTAL_CHARS = 48_000
+
+# CJK 感知 token 估算：无真实 usage 校准时的默认口径。
+# 中文（含日文假名/韩文）在 GLM 等分词器里约 1 字 ≈ 0.6-1 token，拉丁/数字
+# 约 4 字符 1 token。公式 ceil((CJK×2 + 其他)/3)：纯中文 ≈ 0.67 token/字，
+# 纯英文 ≈ 0.25 token/字符，混合文本按占比插值。比旧的统一 0.4 系数准——
+# 旧口径对中文系统性低估约一半，压缩与清理因此迟到。
+_CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\uff01-\uffe5]")
+
+
+def estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    cjk = len(_CJK_CHAR_RE.findall(text))
+    other = len(text) - cjk
+    return (cjk * 2 + other + 2) // 3
+
 # ── 分级压缩：先"清旧工具结果"（无损），仍超再摘要（有损）────────────────
 # 背景：工具结果（read_file 的全文、run_bash 的输出、grep 的命中列表）往往
 # 是上下文里最占地方的部分，但它们的价值随轮次迅速衰减——模型看完就用了，
@@ -78,13 +107,17 @@ CLEARED_TOOL_RESULT_PLACEHOLDER = "[较早的工具结果已清理以节省上�
 
 SUMMARIZE_PROMPT = """\
 你是对话压缩器。下面是本任务较早的对话记录（含工具调用与结果）。请把它压缩成一份 \
-给"之后继续这个任务的助手"看的中文备忘，它会替代原始历史发给模型。必须保留：
+给"之后继续这个任务的助手"看的中文备忘，它会替代原始历史发给模型。必须包含以下小节：
 1. 任务目标：用户最初要求做什么，后续追加或修改过哪些要求；
 2. 已完成的改动清单：创建/修改过哪些文件、执行过哪些关键命令及其结论；
 3. 关键文件路径、函数/变量名、重要事实（报错原因、验证是否通过等）；
-4. 未完成事项与下一步计划；
-5. 用户的重要偏好（沟通语言、代码风格、明确禁止的做法等）。
-用简洁的条目式中文输出，不要复述本提示，不要寒暄。细节可以有损，但上述五类信息一条都不能漏。\
+4. 用户的全部发言：按时间顺序【逐字】列出用户说过的每一句话（简短的"继续/好的" \
+可以合并注明，其余不得改写——用户的原话是后续判断意图的唯一依据）；
+5. 安全与偏好红线：用户明确禁止过的做法、要求的代码风格与沟通偏好，逐字保留；
+6. 未完成事项与下一步计划。
+最后一节必须是「下一步」，且只能基于记录末尾（最近几条消息）的实际进展给出， \
+不得凭空编造新计划。用简洁的条目式中文输出，不要复述本提示，不要寒暄。 \
+细节可以有损，但"用户原话"与"安全红线"两个小节一字都不能改写。\
 """
 
 # ---------------------------------------------------------------------------
@@ -195,6 +228,12 @@ class Agent:
         # 每一轮的整段历史缓存全部失效、按全价重算。快照保住前缀；跨回合的
         # 新鲜度不受影响——下一回合开始时重新快照，刚写的记忆那时自然可见。
         self._memory_snapshot: str | None = None
+        # 压缩摘要连续失败计数（熔断，见 MAX_COMPACT_FAILURES）：成功清零。
+        self._compact_fail_streak = 0
+        # 最近读取的文件（read_file 的实际返回片段，最旧在前，容量见
+        # RECENT_READS_KEEP）：压缩后据此重注入"读过但已被摘要吸收"的文件，
+        # 模型不必盲目重读就能继续任务（参照 ZCode compact-post-reminders）。
+        self.recent_reads: list[tuple[str, str]] = []
         # 工具执行上下文：工作区 + 看图后端随 Agent 实例走；images 每轮提问时更新。
         # 状态挂在实例上而不是模块级全局，两个会话并发执行工具才不会串数据。
         self.ctx = ToolContext(workspace=prepare_workspace(workspace), vision_backend=vision_backend)
@@ -320,10 +359,15 @@ class Agent:
         return sanitized
 
     def context_stats(self, prompt_tokens: int | None = None) -> dict:
-        """估算当前上下文的构成（没有本地分词器，用字符占比反推各部分的 token 份额）。
+        """估算当前上下文的构成（各部分的 token 份额）。
 
-        有服务商返回的真实 prompt_tokens 时，先用 它/总字符数 校准出每字符 token 系数，
-        再按各部分字符数分摊 —— 估算值，但量级和占比是可信的。
+        两级口径：
+        1. 有服务商返回的真实 prompt_tokens 时，先用 它/总字符数 校准出每字符
+           token 系数，再按各部分字符数分摊——这是最准的（随模型/语言自适应）；
+        2. 无校准值时（会话第一轮、压缩后系数作废期）用 CJK 感知估算
+           （estimate_tokens）：中文约 0.67 token/字、拉丁约 0.25 token/字符。
+           旧版此处统一按 0.4 token/字符粗估，对中文系统性低估约一半——
+           压缩与清理因此迟到，用户先看到的是账单暴涨。
 
         两处与压缩相关的口径：
         1. 字数统计基于【模型视图】而非原始 history——压缩后模型看到的已是摘要，
@@ -333,28 +377,33 @@ class Agent:
         view = self._messages_for_model()
         # system 口径必须与实际请求一致：含记忆段（契约 + 索引），否则记忆
         # 越攒越多时压缩触发线会被系统性低估
-        sys_chars = len(self._system_content())
-        tool_chars = len(json.dumps(TOOL_SCHEMAS, ensure_ascii=False))
-        buckets = {"user": 0, "assistant": 0, "tool": 0}
+        sys_text = self._system_content()
+        tool_text = json.dumps(TOOL_SCHEMAS, ensure_ascii=False)
+        chars = {"user": 0, "assistant": 0, "tool": 0}
+        toks = {"user": 0, "assistant": 0, "tool": 0}
         for m in view:
-            size = len(str(m.get("content") or ""))
-            size += len(json.dumps(m.get("tool_calls") or "", ensure_ascii=False))
-            if m["role"] in buckets:
-                buckets[m["role"]] += size
-        total_chars = max(1, sys_chars + tool_chars + sum(buckets.values()))
+            text = str(m.get("content") or "")
+            calls = json.dumps(m.get("tool_calls") or "", ensure_ascii=False)
+            if m["role"] in chars:
+                chars[m["role"]] += len(text) + len(calls)
+                toks[m["role"]] += estimate_tokens(text) + estimate_tokens(calls)
+        total_chars = max(1, len(sys_text) + len(tool_text) + sum(chars.values()))
         if prompt_tokens:
             ratio = prompt_tokens / total_chars
             self._token_ratio = ratio  # 缓存：本轮之后的压缩判断用它估算
         else:
-            ratio = self._token_ratio if self._token_ratio else 0.4  # 无实测值时的粗略系数
-        est = lambda chars: round(chars * ratio)
-        return {
-            "system": est(sys_chars),
-            "tools": est(tool_chars),
-            "user": est(buckets["user"]),
-            "assistant": est(buckets["assistant"]),
-            "tool_results": est(buckets["tool"]),
-        }
+            ratio = self._token_ratio  # 可能为 None（首轮/压缩后作废期）
+        if ratio:
+            # 校准态：按字符分摊（随模型/语言自适应，最准）
+            out = {k: round(v * ratio) for k, v in chars.items()}
+            out["system"] = round(len(sys_text) * ratio)
+            out["tools"] = round(len(tool_text) * ratio)
+        else:
+            # 未校准：CJK 感知逐段估算（对中文远比统一字符系数准）
+            out = dict(toks)
+            out["system"] = estimate_tokens(sys_text)
+            out["tools"] = estimate_tokens(tool_text)
+        return out
 
     # ------------------------------------------------------------------
 
@@ -834,6 +883,11 @@ class Agent:
                 continue  # 已经是占位符/空：跳过（幂等，可反复调用）
             if content == CLEARED_TOOL_RESULT_PLACEHOLDER:
                 continue
+            if '"error"' in content or '"ok": false' in content:
+                # 豁免白名单：失败结果不清。错误信息（含权限拒绝）是模型判断
+                # "此路不通、换道"的依据，清掉它，模型再遇同类场景会原样重踩；
+                # 且错误结果通常很短，清了也省不了多少。
+                continue
             saved += len(content)
             plan.append((i, content))
 
@@ -862,13 +916,21 @@ class Agent:
         清完重新估算；仍超阈值才做**有损**的摘要。这样能省下不少"本可不必
         摘要"的场景——工具输出往往是上下文大头，清掉它经常就够了。
 
+        熔断：摘要调用连续失败 MAX_COMPACT_FAILURES 次（网络/余额/服务商
+        故障）后停止自动压缩——每次失败都让回合收尾白等一次超时；成功一次
+        即清零。被用户停止掐断的总结不算失败（不是服务商的错）。
+
         返回给前端的事件载荷（未触发/失败返回 None）。任何异常都不往外抛——
         压缩是"锦上添花"，绝不能让它打断会话；失败就跳过，下一轮回答结束后
         阈值依然超着，自然会重试。
         """
         if not self.context_window:
             return None
-        stats = self.context_stats()  # 用上一轮真实 usage 校准过的系数估算（无则粗略 0.4）
+        if self._compact_fail_streak >= MAX_COMPACT_FAILURES:
+            log.warning("上下文压缩已连续失败 %d 次，熔断暂停自动压缩（本会话内）",
+                        self._compact_fail_streak)
+            return None
+        stats = self.context_stats()  # 校准系数可用则校准，否则 CJK 感知估算
         est_before = sum(stats.values())
         # 触发线 = 窗口的 80%（能力口径：估算有误差，给输出留余量），再与
         # COMPACTION_TARGET_TOKENS（成本口径，env 可选）取较小者。窗口是
@@ -933,12 +995,14 @@ class Agent:
             for kind, payload in self.llm.chat_stream(messages=request, cancel=self.cancel_event):
                 if kind == "message":
                     reply = payload
-        except Exception as e:  # 网络/服务商错误：跳过本轮，下轮重试，绝不打断会话
-            log.warning("上下文压缩失败（%s），将在下一轮回答结束后重试", e)
+        except Exception as e:  # 网络/服务商错误：计一次失败（熔断用），本轮跳过
+            self._compact_fail_streak += 1
+            log.warning("上下文压缩失败（%s），连续第 %d 次；将在下一轮回答结束后重试（达 %d 次熔断）",
+                        e, self._compact_fail_streak, MAX_COMPACT_FAILURES)
             return None
         summary = ((reply or {}).get("content") or "").strip()
         if not summary or self.cancel_event.is_set():
-            return None  # 被停止掐断的半截总结不可信，作废重来
+            return None  # 被停止掐断的半截总结不可信，作废重来（不算服务商失败）
 
         marker = {
             # 特殊 role：DB/前端按普通消息存取和回放；模型视图里被 _visible_history
@@ -953,15 +1017,65 @@ class Agent:
         live_start = (last_boundary + 1) if has_boundary else (first_user + 1)
         insert_at = live_start + (cut - head)
         self.history.insert(insert_at, marker)
+        self._compact_fail_streak = 0  # 成功即清零熔断计数
+        # 压缩后文件重注入：被摘要吸收的"最近读过的文件"以合成消息重放——
+        # 模型不必盲目重读就能继续改代码。预算内装不下的降级为一行引用。
+        # _synthetic 生命周期同收尾指令：发给模型、不落库、不进提取输入。
+        reminder = self._build_post_compact_reminder(
+            tail_text="".join(str(m.get("content") or "") for m in self.history[insert_at + 1:]),
+            reads=self.recent_reads)
+        if reminder:
+            self.history.append({"role": "user", "_synthetic": True, "content": reminder})
         # 校准系数作废：它是在"原始历史"的字符总量上校准的，压缩后请求里换成
         # 了摘要（token 密度完全不同），旧系数会把估算带偏；置回 None 让
-        # context_stats 退回粗略系数，等下一轮真实 usage 到达再重新校准。
+        # context_stats 退回 CJK 感知估算，等下一轮真实 usage 到达再重新校准。
         self._token_ratio = None
 
         stats_after = self.context_stats()
         log.info("上下文压缩完成：估算 %d → %d tokens（保留最近 %d 条，摘要 %d 字）",
                  est_before, sum(stats_after.values()), len(view) - cut, len(summary))
         return {"summary": summary, "prompt_tokens": sum(stats_after.values()), "context": stats_after}
+
+    @staticmethod
+    def _build_post_compact_reminder(tail_text: str,
+                                     reads: list[tuple[str, str]] | None = None) -> str:
+        """构造压缩后的文件重注入消息（纯函数）。
+
+        输入 reads 是 [(路径, read_file 当时返回的带行号片段)]，最旧在前。
+        规则：只取最近 REINJECT_MAX_FILES 个、内容仍【不在】保留段里的文件
+        （还在原文里的不需要重注入）；单文件超 REINJECT_FILE_CHARS 已在记录
+        时截过，此处再控总量 REINJECT_TOTAL_CHARS——装不下的降级为一行引用，
+        提示模型需要时重新 read_file。全部装不下/没有记录时返回空串。
+        """
+        items = list(reversed(reads if reads is not None else []))  # 最新在前
+        seen_paths: set[str] = set()
+        parts: list[str] = []
+        used = 0
+        overflow: list[str] = []
+        for path, snippet in items:
+            if path in seen_paths:  # 同一文件多次读：只看最近一次
+                continue
+            seen_paths.add(path)
+            if len(parts) >= REINJECT_MAX_FILES:
+                overflow.append(path)
+                continue
+            if snippet[:200] and snippet[:200] in tail_text:
+                continue  # 内容还在保留段原文里：跳过
+            header = f"### {path}\n"
+            budget = REINJECT_TOTAL_CHARS - used - len(header)
+            if budget <= 200:  # 剩余空间装不下有意义的内容：降级为引用
+                overflow.append(path)
+                continue
+            body = snippet[:budget]
+            used += len(header) + len(body)
+            parts.append(header + body)
+        for path in overflow:
+            parts.append(f"### {path}（内容过长未注入，需要时重新 read_file）")
+        if not parts:
+            return ""
+        return ("【上下文恢复】更早的对话已压缩为摘要。以下是压缩前最近读取的文件内容"
+                "（可能是旧版本，动手修改前请先重新 read_file 核对）：\n\n"
+                + "\n\n".join(parts))
 
     # ------------------------------------------------------------------
 
@@ -1159,6 +1273,17 @@ class Agent:
             result = execute_tool(name, arguments, self.ctx)
         except Exception as e:  # execute_tool 已兜底一次；这里再兜一层，守住"绝不抛"的承诺
             result = error_result(f"{type(e).__name__}: {e}", "工具内部异常，可换用其它工具或稍后重试")
+        if name == "read_file":
+            # 记录最近读过的文件（供压缩后重注入，见 recent_reads）：失败读取
+            # 不记；列表只留最近 RECENT_READS_KEEP 条，内存占用有界。
+            try:
+                info = json.loads(result)
+                if isinstance(info, dict) and info.get("ok") and info.get("path"):
+                    self.recent_reads.append(
+                        (str(info["path"]), str(info.get("result") or "")[:REINJECT_FILE_CHARS]))
+                    del self.recent_reads[:-RECENT_READS_KEEP]
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
         if '"error"' in result:
             log.warning("工具 %s 执行出错: %s", name, result)
         return result

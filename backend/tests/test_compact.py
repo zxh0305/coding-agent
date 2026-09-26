@@ -436,7 +436,9 @@ class TieredCompactionTest(CompactTestBase):
         hist = [user("任务")]
         for i in range(n):
             hist.append(tool_call_asst(call_id=f"c{i}"))
-            hist.append(tool_result("x" * 3000, call_id=f"c{i}"))
+            # "x"*3600：CJK 估算口径下 ≈1200 token（与旧 0.4 系数口径的
+            # 3000 字符等值），fixture 尺寸不随估算器漂移
+            hist.append(tool_result("x" * 3600, call_id=f"c{i}"))
         llm = FakeLLM()
         agent = self.make_agent(history=hist, llm=llm, context_window=27000)
         agent.cancel_event = threading.Event()  # _maybe_compact 收尾会读它
