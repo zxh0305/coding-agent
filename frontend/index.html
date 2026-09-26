@@ -9,6 +9,10 @@
   <!-- 设备模式判定：同步加载且排在样式表之前，首帧就带上 html[data-mode] -->
   <script src="mode.js"></script>
   <link rel="stylesheet" href="style.css">
+  <!-- highlight.js 主题（代码块高亮配色，配合 .md-pre 的深色底）。
+       marked / DOMPurify / hljs 三个库 vendor 在 vendor/，任一缺失时
+       app.js 自动降级为纯文本渲染（MD_READY 探测），页面不白屏。 -->
+  <link rel="stylesheet" href="vendor/github-dark.min.css">
 </head>
 <body>
 
@@ -325,6 +329,12 @@
   <div id="toast" class="toast hidden"></div>
   <!-- 消息语义块：先把「实时事件 / 历史回放」归一化成同构 Block，再统一渲染。
        放在 app.js 之前，app.js 里直接用全局 CodingAgentBlocks / CodingAgentRenderBlocks。 -->
+  <!-- Markdown 渲染三件套（marked 解析 / DOMPurify 消毒 / hljs 高亮），vendor 本地化，
+       必须排在 app.js 之前——app.js 首帧渲染就可能用到 -->
+  <script src="vendor/marked.min.js"></script>
+  <script src="vendor/purify.min.js"></script>
+  <script src="vendor/highlight.min.js"></script>
+  <script src="md.js"></script>
   <script src="blocks.js"></script>
   <script src="render_blocks.js"></script>
   <script src="app.js"></script>

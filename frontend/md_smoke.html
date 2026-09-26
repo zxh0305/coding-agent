@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>md.js smoke</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="vendor/github-dark.min.css">
+<style>body{padding:20px;background:#fff}.bubble.assistant{display:block}</style>
+</head>
+<body>
+<div id="out" class="bubble assistant md"></div>
+<pre id="result" style="background:#eee;padding:8px;white-space:pre-wrap"></pre>
+<script src="vendor/marked.min.js"></script>
+<script src="vendor/purify.min.js"></script>
+<script src="vendor/highlight.min.js"></script>
+<script src="md.js"></script>
+<script>
+const SRC = [
+  "# 标题一",
+  "",
+  "段落 **加粗** *斜体* `inline` 与 [链接](https://example.com)。",
+  "",
+  "- 项目甲",
+  "  - 嵌套子项",
+  "- 项目乙",
+  "",
+  "1. 第一",
+  "2. 第二",
+  "",
+  "> 引用行",
+  "",
+  "| 列A | 列B |",
+  "|---|---|",
+  "| 1 | 2 |",
+  "",
+  "```python",
+  "def add(a, b):",
+  '    return a + b  # 注释',
+  "```",
+  "",
+  '<script>alert(1)<\/script><img src=x onerror="window.__pwned=1">[坏链接](javascript:alert(2))',
+].join("\n");
+
+const out = document.getElementById("out");
+out.appendChild(renderMarkdown(SRC));
+
+const checks = {
+  h1: !!out.querySelector("h1.md-h.md-h1"),
+  strong: !!out.querySelector("strong"),
+  inline_code: !!out.querySelector("p code"),
+  link_noopener: (() => { const a = out.querySelector("a"); return a && a.target === "_blank" && a.rel.includes("noopener"); })(),
+  nested_list: !!out.querySelector("ul ul"),
+  ordered: !!out.querySelector("ol li"),
+  blockquote: !!out.querySelector("blockquote.md-quote"),
+  table_wrapped: !!out.querySelector(".md-table-wrap .md-table"),
+  code_lang_tag: !!out.querySelector(".md-pre .md-lang"),
+  hljs_applied: !!out.querySelector("pre code .hljs-keyword, pre code .hljs-built_in"),
+  script_stripped: !out.querySelector("script"),
+  onerror_stripped: !out.querySelector("img[onerror]") && !window.__pwned,
+  jslink_stripped: (() => { const bad = [...out.querySelectorAll("a")].some(a => (a.getAttribute("href")||"").startsWith("javascript:")); return !bad; })(),
+  no_style_attr: !out.querySelector("[style]"),
+};
+const pass = Object.values(checks).every(Boolean);
+document.getElementById("result").textContent =
+  (pass ? "SMOKE PASS" : "SMOKE FAIL") + "\n" + JSON.stringify(checks, null, 2);
+document.title = pass ? "PASS" : "FAIL";
+</script>
+</body>
+</html>
