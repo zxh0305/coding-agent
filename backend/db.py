@@ -1368,6 +1368,29 @@ def get_messages(sid: str, since_ord: int | None = None,
     return msgs
 
 
+def latest_context_tokens(sid: str) -> int | None:
+    """该会话最近一次真实请求的 prompt_tokens（/api/context 的持久化兜底）。
+
+    服务重启后内存 _ctx 为空，从 message_usage 回查：取 ord 最大、且 stats_json
+    带 usage 的 assistant 消息。压缩边界之后的才可信——压缩前的旧值代表的是
+    压缩前的上下文，比现在大，会误导分母占比。
+    """
+    with _conn() as conn:
+        boundary = conn.execute(
+            "SELECT MAX(ord) FROM messages WHERE session_id=? AND role='compact'",
+            (sid,)).fetchone()[0]
+        sql = ("SELECT u.prompt_tokens FROM message_usage u "
+               "JOIN messages m ON m.session_id=u.session_id AND m.mid=u.mid "
+               "WHERE u.session_id=? AND u.prompt_tokens IS NOT NULL")
+        params: list = [sid]
+        if boundary is not None:
+            sql += " AND m.ord>?"
+            params.append(boundary)
+        sql += " ORDER BY m.ord DESC, u.rowid DESC LIMIT 1"
+        row = conn.execute(sql, params).fetchone()
+        return row["prompt_tokens"] if row else None
+
+
 def compact_boundary_ord(sid: str) -> int | None:
     """最后一条 role=compact 压缩边界的 ord（从未压缩过返回 None）。"""
     with _conn() as conn:

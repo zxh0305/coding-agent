@@ -890,8 +890,16 @@ class Handler(SimpleHTTPRequestHandler):
             if sid and db.session_owner(sid) != self.user["id"]:
                 return self._json({"error": "任务不存在或不属于当前用户"}, 404)
             stat = _ctx.get(sid, {})
+            # tokens = 最近一次真实请求的 prompt_tokens（=模型当前上下文大小）。
+            # 旧字段 prompt_tokens 是本回合多轮请求的累加值，会把重发的历史
+            # 重复计数，只留给兼容；徽章口径用新的 context_tokens。
+            # 内存无值（服务重启后）时回查 message_usage 最新记录兜底——
+            # 落库的是每条 assistant 消息当时的 stats_json。
+            tokens = stat.get("context_tokens")
+            if tokens is None:
+                tokens = db.latest_context_tokens(sid)
             self._json({
-                "tokens": stat.get("prompt_tokens", 0),
+                "tokens": tokens or 0,
                 "window": _active_window(sid),  # 分母按该任务的模型算（各会话窗口可以不同）
                 "breakdown": stat.get("context"),
                 "cache_hit_rate": stat.get("cache_hit_rate"),

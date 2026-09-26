@@ -505,7 +505,11 @@ class Agent:
         usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         # 跨轮回调状态（主循环与收尾轮共用一套）：缓存命中率、上下文估算、计时起点。
         # 由 _consume_stream / 两个收尾方法就地更新。
+        # context_tokens：本回合【最后一次】请求的真实 prompt_tokens——那才是模型
+        # 当前看到的上下文大小。usage_total.prompt_tokens 是多轮请求的累加值（每轮
+        # 都重发全部历史，会被重复计数），拿它当"上下文容量"会系统性偏大。
         metrics = {"start": start, "cache_hit_rate": None,
+                   "context_tokens": None,
                    "context": self.context_stats()}  # 还没发过请求时给个纯估算
 
         for round_no in range(1, self.max_rounds + 1):
@@ -581,7 +585,8 @@ class Agent:
             yield "done", {"answer": "（已手动停止）",
                            "elapsed_s": round(time.time() - metrics["start"], 1),
                            "usage": usage_total, "cache_hit_rate": metrics["cache_hit_rate"],
-                           "context": metrics["context"], "stopped": True}
+                           "context": metrics["context"],
+                           "context_tokens": metrics["context_tokens"], "stopped": True}
             return
         # 跑满 max_rounds：轮数上限的新语义是「触发收尾」而非「强制杀死」——
         # 注入合成指令，以 tools=None 请求一轮真实总结，回合以模型自己的总结
@@ -623,10 +628,13 @@ class Agent:
                 miss = payload.get("prompt_cache_miss_tokens")
                 if hit is not None and (hit + (miss or 0)) > 0:
                     metrics["cache_hit_rate"] = round(hit / (hit + miss) * 100, 1)
-                metrics["context"] = self.context_stats(prompt_tokens=payload.get("prompt_tokens"))
+                last_prompt = payload.get("prompt_tokens") or 0
+                metrics["context_tokens"] = max(metrics["context_tokens"] or 0, last_prompt)
+                metrics["context"] = self.context_stats(prompt_tokens=last_prompt)
                 yield "usage", {**usage_total, "elapsed_s": round(time.time() - metrics["start"], 1),
                                 "cache_hit_rate": metrics["cache_hit_rate"],
-                                "context": metrics["context"]}
+                                "context": metrics["context"],
+                                "context_tokens": metrics["context_tokens"]}
             else:
                 assistant_msg = payload
         # 本轮推理文本收尾后整段入 trace（放流结束而非每个 delta 追加：一条条目
@@ -651,7 +659,8 @@ class Agent:
         log.info("耗时 %.1fs · 用户中途停止", elapsed)
         yield "done", {"answer": answer, "elapsed_s": elapsed, "usage": usage_total,
                        "cache_hit_rate": metrics["cache_hit_rate"],
-                       "context": metrics["context"], "stopped": True}
+                       "context": metrics["context"],
+                       "context_tokens": metrics["context_tokens"], "stopped": True}
 
     def _tail_answer(self, assistant_msg, usage_total: dict, metrics: dict,
                      stopped_reason: str | None = None):
@@ -675,7 +684,8 @@ class Agent:
         log.info("耗时 %.1fs · tokens 输入 %d / 输出 %d",
                  elapsed, usage_total["prompt_tokens"], usage_total["completion_tokens"])
         payload = {"answer": answer, "elapsed_s": elapsed, "usage": usage_total,
-                   "cache_hit_rate": metrics["cache_hit_rate"], "context": metrics["context"]}
+                   "cache_hit_rate": metrics["cache_hit_rate"], "context": metrics["context"],
+                   "context_tokens": metrics["context_tokens"]}
         if stopped_reason:
             payload["stopped_reason"] = stopped_reason
         yield "done", payload

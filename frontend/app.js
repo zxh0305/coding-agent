@@ -1751,7 +1751,9 @@ function togglePermPop() {
 function updateCtxChip() {
   const chip = $("ctx-chip");
   if (!usageNow) { chip.textContent = "⛁ —"; return; }
-  chip.textContent = `⛁ ${fmtWan(usageNow.prompt_tokens)} / ${fmtWan(contextWindow)}`;
+  // context_tokens = 最近一次真实请求的 prompt_tokens（模型当前上下文大小）；
+  // prompt_tokens 是回合内多轮请求的累加值（历史被重复计数），只作兼容回退。
+  chip.textContent = `⛁ ${fmtWan(usageNow.context_tokens ?? usageNow.prompt_tokens)} / ${fmtWan(contextWindow)}`;
 }
 
 async function refreshCtx() {
@@ -1759,7 +1761,8 @@ async function refreshCtx() {
   try {
     const c = await api(`/api/context?session_id=${encodeURIComponent(currentSession)}`);
     contextWindow = c.window || contextWindow;
-    usageNow = { prompt_tokens: c.tokens, context: c.breakdown, cache_hit_rate: c.cache_hit_rate };
+    usageNow = { prompt_tokens: c.tokens, context_tokens: c.tokens,
+                 context: c.breakdown, cache_hit_rate: c.cache_hit_rate };
     updateCtxChip();
   } catch (e) { /* 忽略 */ }
 }
@@ -1782,7 +1785,7 @@ const CTX_SEG_COLORS = {
 
 function renderCtxPop() {
   const nums = $("ctx-nums"), fill = $("ctx-fill"), bd = $("ctx-breakdown");
-  const tokens = usageNow ? usageNow.prompt_tokens : 0;
+  const tokens = usageNow ? (usageNow.context_tokens ?? usageNow.prompt_tokens) : 0;
   const pct = Math.min(100, (tokens / contextWindow) * 100);
   nums.textContent = `${fmtWan(tokens)} / ${fmtWan(contextWindow)}（${pct.toFixed(1)}%）`;
   fill.style.width = pct + "%";
@@ -2601,7 +2604,8 @@ function applyEvent(evt, seq) {
     // 到达顺序在 done 之后——回答气泡已定稿，卡片插在对话流末尾即正确位置。
     chatEl.appendChild(compactCard(evt.summary));
     scrollBottom();
-    usageNow = { prompt_tokens: evt.prompt_tokens, context: evt.context, cache_hit_rate: null };
+    usageNow = { prompt_tokens: evt.prompt_tokens, context_tokens: evt.prompt_tokens,
+                 context: evt.context, cache_hit_rate: null };
     updateCtxChip();
     toast("早期对话已压缩为摘要，上下文占用已下降");
   } else if (t === "turn_end") {
