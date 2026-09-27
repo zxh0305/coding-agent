@@ -1,0 +1,24 @@
+# CI：push/PR 时跑全量单元测试。
+# 套件纯标准库、不依赖网络与 .env（llm_client.load_env_file 对缺失文件直接
+# 返回，测试用例自带临时库与假 LLM），所以没有任何安装步骤——检出即跑。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 单元测试
+        working-directory: backend
+        run: python -m unittest discover -s tests -t .

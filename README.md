@@ -1,5 +1,7 @@
 # 豆沙包coding — 本地 Coding Agent
 
+[![CI](https://github.com/zxh0305/coding-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/zxh0305/coding-agent/actions/workflows/ci.yml)
+
 一个跑在本机的 AI 编程助手：你在网页里用自然语言提任务，它在指定的本地文件夹里读代码、改文件、跑命令，并把执行过程实时展示给你看。
 
 后端纯 Python 标准库（不用任何 Web 框架），前端原生 HTML/CSS/JS（无构建步骤），零第三方依赖。前后端分离，数据全部落在本机。
@@ -167,7 +169,7 @@ python3 backend/cli.py "37*89+100 等于多少"  # 单次提问
 ### 5.3 工作区隔离与边界保护
 
 - **越界保护**：路径 `resolve()` 消解 `../` 后校验必须仍在工作区内，`/etc/passwd`、`../../.env` 一律被拒。
-- **按任务隔离**：每个任务可单独切换工作区（工具栏切换，或设为"新任务默认"）。解析链为「任务自选 → 用户默认 → `.env` 的 `WORKSPACE_DIR` / 项目 `workspace/`」。
+- **按任务隔离**：每个任务可单独切换工作区（工具栏切换，或设为"新任务默认"）。解析链为「任务自选 → 用户默认 → 项目 `workspace/`」。
 - **ToolContext 注入**：工作区路径不进全局环境变量，而是随 `ToolContext` 注入到每次工具调用——切换某任务的工作区不影响其他正在跑的任务，并发会话也不会串图片数据。
 
 ### 5.4 防死循环：提醒而非砍停

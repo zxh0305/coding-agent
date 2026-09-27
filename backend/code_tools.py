@@ -95,7 +95,9 @@ _WORKSPACE_SEED = {
 def prepare_workspace(ws: str | Path | None = None) -> Path:
     """解析工作区根目录并确保存在，返回绝对路径。
 
-    优先级：显式传入（会话自己的工作区）> .env 的 WORKSPACE_DIR > 项目 workspace/。
+    优先级：显式传入（会话自己的工作区）> 项目 workspace/ 默认。工作区只来自
+    会话绑定，环境变量不再参与兜底——遗留的 .env 值曾指向项目根本身，
+    兜底兜进源码目录的事故面不保留。
     工作区曾经是全局唯一的环境变量——任何一个用户切换，所有会话立即跟着变，
     并发生成的两个 Agent 会互相踩对方目录；现在每个任务解析出自己的路径，
     通过 ToolContext 注入到每次工具调用（见 tools.py），互不可见。
@@ -103,7 +105,7 @@ def prepare_workspace(ws: str | Path | None = None) -> Path:
     if ws:
         target = Path(ws).expanduser().resolve()
     else:
-        target = Path(os.environ.get("WORKSPACE_DIR") or DEFAULT_WORKSPACE).expanduser().resolve()
+        target = Path(DEFAULT_WORKSPACE).expanduser().resolve()
     if not target.exists():
         target.mkdir(parents=True, exist_ok=True)
         # 只给内置默认工作区放练习文件；用户自选的目录保持原样，别往里塞东西

@@ -177,7 +177,7 @@ class Agent:
                         收场（防反复空转另有重复指纹提醒，见 REPEAT_STREAK_REMIND）
         verbose:        是否在终端打印每一轮的思考/工具调用过程（学习时强烈建议开着）
         workspace:      本会话的工作区目录（文件/命令工具的边界）。不传 = 默认工作区
-                        （.env 的 WORKSPACE_DIR 或项目 workspace/）。每个任务各自解析，
+                        （项目 workspace/）。每个任务各自解析，
                         互不共享——这是多会话隔离的关键。
         vision_backend: fn(image_parts, question) -> str，analyze_image 工具的"看图"
                         后端，由 app.py 按当前模型配置提供；命令行版不传（无图可看）。
