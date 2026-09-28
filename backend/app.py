@@ -1579,7 +1579,7 @@ class Handler(SimpleHTTPRequestHandler):
         # 进行中回合的快照：切走再切回的页面靠它补画执行过程（含已累积的思考
         # 内容）。回合结束后快照行已删、正式轨迹已按 answer_mid 落库，这里自然
         # 取不到——running=false 时这笔查询直接跳过，正常路径零额外开销。
-        if session_state(sid) == "running":
+        if _session_state(sid) == "running":
             user_mid = next((it["mid"] for it in reversed(items)
                              if it["role"] == "user"), None)
             snap = db.get_trace(sid, user_mid) if user_mid else None
