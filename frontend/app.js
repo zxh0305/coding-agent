@@ -1514,6 +1514,7 @@ async function openProvModal() {
   $("model-pop").classList.add("hidden");
   $("prov-modal").classList.remove("hidden");
   providers = await api("/api/providers").catch(() => []);
+  if (usageMode) { showUsageView(); return; }  // 上次开着用量页：保持住
   const valid = providers.some(p => p.id === editingProvId);
   openProvEditor(valid ? editingProvId : (providers[0]?.id ?? null));
 }
@@ -1536,6 +1537,9 @@ function renderProvList() {
 
 function openProvEditor(pid) {
   editingProvId = pid;
+  usageMode = false;  // 从用量页点回某个供应商：恢复编辑器视图
+  $("usage-view").classList.add("hidden");
+  $("prov-editor").classList.remove("hidden");
   renderProvList();
   const p = providers.find(x => x.id === pid);
   $("p-name").value = p?.name || "";
@@ -1711,6 +1715,77 @@ async function testProv() {
     }
   } catch (e) {
     result.textContent = "❌ " + e.message;
+  }
+}
+
+// ---------- 模型用量页（管理模型弹窗内，与供应商编辑器互斥） ----------
+// 状态：usageMode = 弹窗当前显示的是编辑器还是用量页（切回供应商时恢复编辑器）
+let usageMode = false;
+
+function showProvEditor() {
+  usageMode = false;
+  $("usage-view").classList.add("hidden");
+  $("prov-editor").classList.remove("hidden");
+}
+
+function showUsageView() {
+  usageMode = true;
+  $("prov-editor").classList.add("hidden");
+  $("usage-view").classList.remove("hidden");
+  renderProvList();  // 左侧取消高亮：用量页不属于任何供应商
+  loadUsage().catch((e) => toast("加载用量失败：" + e.message));
+}
+
+function fmtTokens(n) {
+  if (n == null) return "—";
+  if (n >= 1e8) return (n / 1e8).toFixed(2) + " 亿";
+  if (n >= 1e4) return (n / 1e4).toFixed(1) + " 万";
+  return String(n);
+}
+
+async function loadUsage() {
+  const days = $("usage-range").value;
+  const q = days === "0" ? "?days=0" : `?days=${days}`;
+  const rows = await api("/api/usage/summary" + q);
+  const total = rows.reduce((a, r) => ({
+    turns: a.turns + r.turns,
+    prompt: a.prompt + r.prompt_tokens,
+    completion: a.completion + r.completion_tokens,
+  }), { turns: 0, prompt: 0, completion: 0 });
+  $("usage-total").innerHTML =
+    `<span>回合 <b>${total.turns}</b></span>` +
+    `<span>输入 <b>${fmtTokens(total.prompt)}</b></span>` +
+    `<span>输出 <b>${fmtTokens(total.completion)}</b></span>`;
+  const body = $("usage-body");
+  body.innerHTML = "";
+  if (!rows.length) {
+    body.innerHTML = `<div class="usage-empty">该范围内还没有用量记录${days !== "0" ? "，试试切到「全部」" : ""}</div>`;
+    return;
+  }
+  // 按供应商分组：同一家厂商的模型画进一张表
+  const groups = new Map();
+  for (const r of rows) {
+    if (!groups.has(r.provider_name)) groups.set(r.provider_name, []);
+    groups.get(r.provider_name).push(r);
+  }
+  for (const [pname, models] of groups) {
+    const card = document.createElement("div");
+    card.className = "usage-card";
+    const sum = models.reduce((a, r) => a + r.prompt_tokens + r.completion_tokens, 0);
+    card.innerHTML =
+      `<div class="usage-card-head"><b>${pname}</b>` +
+      `<span>共 ${fmtTokens(sum)} tokens</span></div>` +
+      `<table class="usage-table"><thead><tr>` +
+      `<th>模型</th><th>回合</th><th>输入 ↑</th><th>输出 ↓</th><th>缓存命中</th>` +
+      `</tr></thead><tbody>` +
+      models.map(r => {
+        const rate = r.prompt_tokens ? Math.round(r.cached_tokens / r.prompt_tokens * 100) : 0;
+        return `<tr><td class="mono">${r.model}</td><td>${r.turns}</td>` +
+               `<td>${fmtTokens(r.prompt_tokens)}</td><td>${fmtTokens(r.completion_tokens)}</td>` +
+               `<td>${r.cached_tokens ? `${fmtTokens(r.cached_tokens)}（${rate}%）` : "—"}</td></tr>`;
+      }).join("") +
+      `</tbody></table>`;
+    body.appendChild(card);
   }
 }
 
@@ -3200,6 +3275,8 @@ bind("new-task", "click", () => newTask());  // 顶栏"新任务"：不预绑项
 bind("model-chip", "click", toggleModelPop);
 bind("manage-models", "click", openProvModal);
 bind("prov-add", "click", addProv);
+bind("prov-usage", "click", showUsageView);
+bind("usage-range", "change", loadUsage);
 bind("prov-close", "click", () => $("prov-modal").classList.add("hidden"));
 bind("p-save", "click", saveProv);
 bind("p-test", "click", testProv);

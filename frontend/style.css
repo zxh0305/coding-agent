@@ -1044,6 +1044,39 @@ button.primary:hover { background: var(--accent-hover); }
 .add-row:hover { background: var(--accent-weak); border-color: var(--accent); }
 .prov-left .add-row { display: block; }
 
+/* 模型用量页（管理模型弹窗内，与供应商编辑器共用右侧区域） */
+.usage-head { display: flex; align-items: center; gap: 10px; }
+.usage-head b { font-size: 15px; }
+.usage-head .hint { flex: 1; margin: 0; }
+.usage-head select {
+  padding: 6px 8px; border: 1px solid var(--border-input); border-radius: 7px;
+  font-size: 12px; background: var(--panel);
+}
+.usage-total {
+  display: flex; gap: 18px; font-size: 13px; color: var(--text-2);
+  padding: 10px 14px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel);
+}
+.usage-total b { color: var(--text); font-size: 15px; margin-left: 4px; }
+.usage-card {
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 14px; background: var(--panel);
+}
+.usage-card-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  margin-bottom: 8px; font-size: 13px;
+}
+.usage-card-head span { font-size: 12px; color: var(--text-3); }
+.usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.usage-table th {
+  text-align: left; font-weight: 500; color: var(--text-3);
+  padding: 4px 8px; border-bottom: 1px solid var(--border);
+}
+.usage-table td { padding: 6px 8px; border-bottom: 1px solid var(--border-weak, var(--border)); }
+.usage-table tbody tr:last-child td { border-bottom: none; }
+.usage-empty { font-size: 13px; color: var(--text-3); padding: 24px 0; text-align: center; }
+
 /* 模型行的带标签勾选框（可用 / 👁视觉） */
 .pm-check {
   display: inline-flex; align-items: center; gap: 3px;

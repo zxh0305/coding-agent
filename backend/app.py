@@ -767,7 +767,8 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
                           context_window=_active_window(sid),  # 压缩触发线的基准（切换模型后重建实例即更新）
                           artifact_reader=db.read_artifact,  # 外置大消息的还原器（模型视图用）
                           permission_gate=_build_permission_gate(workspace),
-                          session_id=sid)  # 文档工具据此确定文档归属
+                          session_id=sid,  # 文档工具据此确定文档归属
+                          model_tag=(prov["id"], model))  # 随 _stats 落库，用量页按它聚合
             # 窗口恢复：从未压缩 = 全量；压缩过 = 锚点 + 最后一条边界及其之后
             # （边界摘要是后续再压缩的输入）。内存占用与当前窗口成正比，而非
             # 全会话长度；模型视图与全量恢复逐字节一致。
@@ -909,6 +910,11 @@ class Handler(SimpleHTTPRequestHandler):
             prov, active_model = _resolve_active(sid)
             self._json({"models": models, "active": active_model,
                         "active_provider": prov["id"]})
+        elif path == "/api/usage/summary":
+            # 模型用量汇总（管理模型弹窗的"用量"页）。days 缺省 7。
+            days = self._query().get("days", ["7"])[0]
+            days = int(days) if str(days).isdigit() and int(days) > 0 else None
+            self._json(db.usage_summary(days))
         elif self.path == "/api/providers":
             provs = []
             for p in db.list_providers():

@@ -196,12 +196,16 @@ class Agent:
     def __init__(self, llm, system_prompt: str = SYSTEM_PROMPT,
                  max_rounds: int = 40, verbose: bool = True, vision_supported: bool = True,
                  workspace=None, vision_backend=None, context_window: int = 0,
-                 artifact_reader=None, permission_gate=None, session_id=None):
+                 artifact_reader=None, permission_gate=None, session_id=None,
+                 model_tag: tuple[str, str] | None = None):
         # max_rounds=40：上限只是兜底（真失控另有指纹提醒拦截），合法的长任务
         # （读代码→改→跑验证→再修）经常要几十轮，40 是给它们的余量；到限走
         # 收尾轮（_wrap_up_round）而不是"强制停止"。
         self.llm = llm
         self.system_prompt = system_prompt
+        # 当前模型标识（app.py 构建时传入）。只做一件事：随 _stats 落库，让
+        # message_usage 能按供应商/模型聚合出用量页（会话中途切模型也能正确归组）。
+        self.model_tag = model_tag or ("", "")
         self.max_rounds = max_rounds
         self.verbose = verbose
         self.vision_supported = vision_supported  # 激活模型能否直接看图（决定是否剥离图片输入）
@@ -656,6 +660,7 @@ class Agent:
                              "_stats": {"elapsed_s": elapsed, "usage": dict(usage_total),
                                         "cache_hit_rate": metrics["cache_hit_rate"],
                                         "context_tokens": metrics["context_tokens"],
+                                        "provider_id": self.model_tag[0], "model": self.model_tag[1],
                                         "stopped": True}})
         log.info("耗时 %.1fs · 用户中途停止", elapsed)
         yield "done", {"answer": answer, "elapsed_s": elapsed, "usage": usage_total,
@@ -682,7 +687,8 @@ class Agent:
         self.history.append({"role": "assistant", "content": answer,
                              "_stats": {"elapsed_s": elapsed, "usage": dict(usage_total),
                                         "cache_hit_rate": metrics["cache_hit_rate"],
-                                        "context_tokens": metrics["context_tokens"]}})
+                                        "context_tokens": metrics["context_tokens"],
+                                        "provider_id": self.model_tag[0], "model": self.model_tag[1]}})
         log.info("耗时 %.1fs · tokens 输入 %d / 输出 %d",
                  elapsed, usage_total["prompt_tokens"], usage_total["completion_tokens"])
         payload = {"answer": answer, "elapsed_s": elapsed, "usage": usage_total,

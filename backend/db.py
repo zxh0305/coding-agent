@@ -244,6 +244,13 @@ MIGRATIONS: list[tuple[int, str | None]] = [
     #     重命名接口（用户亲手动过）、以及将来的其它人工改名路径；AI 总结前
     #     先查此标记，为 1 就彻底不动标题。默认 0 = 自动生成的标题可被覆盖。
     (20, "ALTER TABLE sessions ADD COLUMN title_manual INTEGER DEFAULT 0"),
+    # 21~23：模型用量页面的数据基础。message_usage 原本只认 (session_id, mid)，
+    #    没记"这条回答是谁花的"——会话中途切过模型就无从归组。三列分工：
+    #    provider_id/model 由 agent 落 _stats 时带上（同一条消息归属固定）；
+    #    created 是落库时刻（老数据为 NULL，只出现在"全部"口径里）。
+    (21, "ALTER TABLE message_usage ADD COLUMN provider_id TEXT"),
+    (22, "ALTER TABLE message_usage ADD COLUMN model TEXT"),
+    (23, "ALTER TABLE message_usage ADD COLUMN created REAL"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -295,6 +302,9 @@ def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
         return "todos" in _table_columns(conn, "sessions")
     if version == 20:          # sessions.title_manual（标题是否被用户手动改过）
         return "title_manual" in _table_columns(conn, "sessions")
+    if version in (21, 22, 23):   # message_usage.provider_id / model / created
+        col = {21: "provider_id", 22: "model", 23: "created"}[version]
+        return col in _table_columns(conn, "message_usage")
     return False
 
 
@@ -1326,10 +1336,36 @@ def _upsert_usage(conn: sqlite3.Connection, sid: str, mid: str, stats: dict) -> 
     usage = stats.get("usage") or {}
     conn.execute(
         "INSERT OR REPLACE INTO message_usage(session_id, mid, prompt_tokens, completion_tokens, "
-        "cached_tokens, stats_json) VALUES(?,?,?,?,?,?)",
+        "cached_tokens, stats_json, provider_id, model, created) VALUES(?,?,?,?,?,?,?,?,?)",
         (sid, mid, usage.get("prompt_tokens"), usage.get("completion_tokens"),
-         usage.get("prompt_cache_hit_tokens"), json.dumps(stats, ensure_ascii=False)),
+         usage.get("prompt_cache_hit_tokens"), json.dumps(stats, ensure_ascii=False),
+         stats.get("provider_id"), stats.get("model"), time.time()),
     )
+
+
+def usage_summary(days: int | None = None) -> list[dict]:
+    """模型用量汇总：按 (provider_id, model) 聚合 message_usage。
+
+    days：只统计最近 N 天（按 message_usage.created）；None = 全部。
+    老数据（迁移 23 之前落库的）created 为 NULL，只出现在"全部"口径里。
+    供应商被删除的用量归进 provider_name="（已删除）"——数据不能凭空消失。
+    """
+    where, args = "", []
+    if days:
+        where = "WHERE u.created >= ?"
+        args = [time.time() - days * 86400]
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT u.provider_id, u.model, COUNT(*) AS turns, "
+            "SUM(u.prompt_tokens) AS prompt_tokens, "
+            "SUM(u.completion_tokens) AS completion_tokens, "
+            "SUM(u.cached_tokens) AS cached_tokens, p.name AS provider_name "
+            "FROM message_usage u LEFT JOIN providers p ON p.id = u.provider_id "
+            f"{where} GROUP BY u.provider_id, u.model ORDER BY prompt_tokens DESC", args).fetchall()
+    return [{"provider_id": r["provider_id"] or "", "model": r["model"] or "—",
+             "provider_name": r["provider_name"] or "（已删除）", "turns": r["turns"],
+             "prompt_tokens": r["prompt_tokens"] or 0, "completion_tokens": r["completion_tokens"] or 0,
+             "cached_tokens": r["cached_tokens"] or 0} for r in rows]
 
 
 def save_messages(sid: str, history: list[dict], saved: dict) -> int:

@@ -199,8 +199,24 @@
         <div class="prov-left">
           <ul id="prov-list" class="prov-list"></ul>
           <button id="prov-add" class="add-row">＋ 添加供应商</button>
+          <button id="prov-usage" class="add-row">📊 模型用量</button>
         </div>
-        <div class="prov-right">
+        <!-- 用量视图：与供应商编辑器互斥显示（同一块右侧区域） -->
+        <div id="usage-view" class="prov-right usage-view hidden">
+          <div class="usage-head">
+            <b>模型用量</b>
+            <span class="hint">按回答消息统计（一条回答 = 一个回合，工具循环的多次请求已计入）</span>
+            <select id="usage-range" title="统计范围">
+              <option value="1">近 24 小时</option>
+              <option value="7" selected>近 7 天</option>
+              <option value="30">近 30 天</option>
+              <option value="0">全部</option>
+            </select>
+          </div>
+          <div id="usage-total" class="usage-total"></div>
+          <div id="usage-body"></div>
+        </div>
+        <div class="prov-right" id="prov-editor">
           <div class="prov-title">
             <label class="field prov-name-field">名称
               <input id="p-name" class="p-name" placeholder="例如：智谱GLM">
