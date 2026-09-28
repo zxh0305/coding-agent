@@ -614,7 +614,13 @@ class AnthropicMessagesClient:
                             blk["type"] = "tool_use"
                             blk["json"] += d.get("partial_json", "")
                     elif t == "message_delta":
-                        usage["completion_tokens"] = (data.get("usage") or {}).get("output_tokens", 0)
+                        du = data.get("usage") or {}
+                        usage["completion_tokens"] = du.get("output_tokens", 0)
+                        # 部分兼容网关 message_start 时不带 input_tokens（恒 0），
+                        # 真实输入用量到 message_delta 才给——非 0 时合并，否则
+                        # prompt_tokens 恒 0，上下文徽章永远没数字（真实踩过）
+                        if du.get("input_tokens"):
+                            usage["prompt_tokens"] = du["input_tokens"]
                     elif t == "error":
                         raise RuntimeError(f"Anthropic API 错误：{(data.get('error') or {}).get('message', data)}")
                     elif t == "message_stop":
