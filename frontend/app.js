@@ -159,18 +159,45 @@ function renderIntoBubble(el, text) {
 // 优先流式输出"的体感就来自这里）。规则：只有用户本来就在底部附近（80px）
 // 才跟随滚动；往上滑了就不打扰，滚回底部或用户自己发消息时恢复跟随。
 let stickBottom = true;
-// 触顶自动加载更早的历史：滚到顶部附近（<120px）且还有更多时自动翻页，
-// 不再依赖手动点「加载更早的消息」按钮（按钮保留，作触发的兜底入口）。
-// histLoading 防重入：翻页请求在途时忽略后续 scroll 触发，加载完成或
-// 没有更多时自动解除。
+// 上滑瞬间立刻解除跟随：光靠 scroll 事件里的「距底<80px」判定，流式期间用户
+// 往上滑的头几帧仍满足阈值，每帧 flush 都会把 scrollTop 拽回底部——拉扯感
+// 就是上滑卡顿的主源。因此改判方向：任何向上滚动意图（wheel deltaY<0 或
+// touchmove 上划）直接 stickBottom=false，scroll 只负责「滚回底才恢复跟随」。
 let histLoading = false;
-chatEl.addEventListener("scroll", () => {
-  stickBottom = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 80;
-  updateBackBottom();
-  if (!histLoading && histHasMore && chatEl.scrollTop < 120 && currentSession) {
-    histLoading = true;
-    loadHistoryPage().finally(() => { histLoading = false; });
+function onWheelUp(e) {
+  if (e.deltaY < 0 && stickBottom) { stickBottom = false; updateBackBottom(); }
+}
+chatEl.addEventListener("wheel", onWheelUp, { passive: true });
+let lastTouchY = null;
+chatEl.addEventListener("touchstart", e => { lastTouchY = e.touches[0].clientY; }, { passive: true });
+chatEl.addEventListener("touchmove", e => {
+  if (lastTouchY != null && e.touches[0].clientY > lastTouchY && stickBottom) {
+    stickBottom = false; updateBackBottom();  // 手指下移 = 内容上划看历史
   }
+  lastTouchY = e.touches[0].clientY;
+}, { passive: true });
+
+// scroll 高频触发，且流式期间每帧都有 DOM 写入——回调里读 scrollHeight 会
+// 强制同步布局。用 rAF 合并：一帧最多算一次「距底距离」，sticky 判定与
+// back-bottom 按钮共用同一结果，不再各读各的。
+let scrollRafQueued = false;
+let snapping = false;  // 「↓ 最新」平滑回底途中不参与 sticky 判定，否则中途
+                       // away>4 会把刚恢复的跟随又掐掉，永远滚不回跟随态
+chatEl.addEventListener("scroll", () => {
+  if (scrollRafQueued) return;
+  scrollRafQueued = true;
+  requestAnimationFrame(() => {
+    scrollRafQueued = false;
+    const away = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight;
+    if (snapping) {
+      if (away < 4) snapping = false;  // 平滑滚动到位，交还判定
+    } else if (away < 4) stickBottom = true;  // 真正回到底部才恢复跟随
+    updateBackBottom();
+    if (!histLoading && histHasMore && chatEl.scrollTop < 120 && currentSession) {
+      histLoading = true;
+      loadHistoryPage().finally(() => { histLoading = false; });
+    }
+  });
 }, { passive: true });
 
 function scrollBottom(force = false) {
@@ -3357,6 +3384,7 @@ bind("edit-cancel", "click", cancelEdit);
 renderBell();
 bind("back-bottom", "click", () => {
   stickBottom = true;
+  snapping = true;
   updateBackBottom();
   chatEl.scrollTo({ top: chatEl.scrollHeight, behavior: "smooth" });
 });
