@@ -1469,18 +1469,56 @@ button.primary:hover { background: var(--accent-hover); }
   box-shadow: var(--shadow-md);
   animation: attach-pop-in .16s ease-out;
 }
-.todo-pop-body { flex: 1; overflow-y: auto; padding: 10px 14px; }
-/* 清单条目：状态图标 + 内容；done 划线弱化（沿用原对话流清单卡的视觉语义） */
-.todo-row { display: flex; gap: 8px; padding: 5px 2px; font-size: 13px; line-height: 1.5; }
-.todo-row .todo-ico { flex: none; }
-.todo-row.done { color: var(--text-3); text-decoration: line-through; }
-.todo-row.in_progress { color: var(--text); font-weight: 500; }
-.todo-row.pending { color: var(--text-2); }
-.todo-pop-foot {
-  padding: 8px 14px; border-top: 1px solid var(--border);
-  font-size: 12px; color: var(--text-3);
-  display: flex; justify-content: space-between; align-items: center;
+.todo-pop-body { flex: 1; overflow-y: auto; padding: 8px; }
+/* 清单条目：状态图标用 CSS 按 status 类绘制（待办空心圈 / 进行中旋转圈 /
+   完成绿勾），不用 emoji——尺寸与基线不可控，且圈圈需要动画 */
+.todo-row {
+  display: flex; gap: 9px; align-items: flex-start;
+  padding: 6px 8px; border-radius: 8px;
+  font-size: 13px; line-height: 1.55;
 }
+.todo-row .todo-ico {
+  flex: none; width: 14px; height: 14px; margin-top: 3px;
+  border-radius: 50%; position: relative;
+}
+.todo-row.pending { color: var(--text-2); }
+.todo-row.pending .todo-ico { border: 1.5px solid var(--border-strong); }
+.todo-row.done { color: var(--text-3); text-decoration: line-through; }
+.todo-row.done .todo-ico { background: var(--success); }
+.todo-row.done .todo-ico::after {
+  content: ""; position: absolute; left: 4px; top: 1px;
+  width: 4px; height: 7px; border: solid #fff; border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+.todo-row.in_progress { color: var(--text); font-weight: 500; background: var(--accent-weak); }
+.todo-row.in_progress .todo-ico {
+  border: 2px solid var(--accent-weak-border); border-top-color: var(--accent);
+}
+/* 圈圈只在回合生成中旋转（根节点 .running 由 JS 按 streaming 加/去）：
+   回合停止后 in_progress 项静止保留高亮——清单停在哪儿一眼可见，但不装作还在跑 */
+.todo-pop.running .todo-row.in_progress .todo-ico { animation: todo-spin .8s linear infinite; }
+@keyframes todo-spin { to { transform: rotate(360deg); } }
+/* 底部状态条：常驻（不随清单滚动），两行——进度条行 + 当前状态行 */
+.todo-pop-foot { padding: 8px 12px 10px; border-top: 1px solid var(--border); }
+.todo-foot-top { display: flex; align-items: center; gap: 8px; }
+.todo-progress { flex: 1; height: 4px; border-radius: 999px; background: var(--hover); overflow: hidden; }
+.todo-progress-fill {
+  display: block; height: 100%; width: 0;
+  border-radius: 999px; background: var(--accent); transition: width .3s;
+}
+.todo-progress-num { flex: none; font-size: 11px; color: var(--text-3); }
+/* 状态行：进行中任务（单行截断）/ 全部完成 / 运行中；停止后转"待继续"弱化 */
+.todo-foot-state { display: flex; align-items: center; gap: 6px; margin-top: 7px; font-size: 12px; min-width: 0; }
+.todo-foot-spin {
+  flex: none; width: 10px; height: 10px; border-radius: 50%;
+  border: 1.5px solid var(--accent-weak-border); border-top-color: var(--accent);
+}
+.todo-pop.running .todo-foot-spin { animation: todo-spin .8s linear infinite; }
+.todo-foot-state.doing { color: var(--text-2); }
+.todo-foot-state.doing.paused { color: var(--text-3); }
+.todo-foot-doing-text { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.todo-foot-state.alldone { color: var(--success-strong); }
+.todo-foot-state.running { color: var(--text-3); }
 /* 入口徽标：未完成数；全部完成时（.all-done）换绿色 ✅ 视觉 */
 #todo-badge {
   font-size: 12px; color: inherit;

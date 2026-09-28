@@ -2826,6 +2826,8 @@ function setStreaming(on) {
       $("todo-pop").classList.remove("hidden");
     }
   }
+  // 浮窗状态条跟随运行状态刷新（"运行中…" ↔ 静止不显示）
+  if (sessionTodos.length) renderTodoPop();
 }
 
 // 离开当前会话视图（切换任务/新建任务/登出）时复位流式渲染状态。
@@ -3919,36 +3921,80 @@ function renderTodoChip() {
 }
 
 function renderTodoPop() {
-  const body = $("todo-pop-body"), title = $("todo-pop-title");
+  const body = $("todo-pop-body"), foot = $("todo-pop-foot"), title = $("todo-pop-title");
   if (!body) return;
-  if (!sessionTodos.length) { body.innerHTML = ""; return; }
+  const pop = $("todo-pop");
+  // 旋转动画的总开关挂在浮窗根节点：只有回合生成中（.running）圈圈才转，
+  // 回合停止后 in_progress 项保留高亮但静止——数据里的标记不清，视觉不撒谎
+  if (pop) pop.classList.toggle("running", !!streaming && sessionTodos.length > 0);
+  if (!sessionTodos.length) {
+    body.innerHTML = "";
+    if (foot) foot.hidden = true;
+    return;
+  }
+  const total = sessionTodos.length;
   const done = sessionTodos.filter((t) => t.status === "done").length;
   if (title) {
-    title.textContent = done === sessionTodos.length
-      ? "📋 任务清单 · 全部完成" : "📋 任务清单";
+    title.textContent = done === total ? "📋 任务清单 · 全部完成" : "📋 任务清单";
   }
   body.innerHTML = "";
+  // 条目图标由 CSS 按 status 类绘制（待办空心圈 / 进行中圈 / 完成绿勾），
+  // 圈是否旋转由根节点 .running 决定
   for (const t of sessionTodos) {
     const row = document.createElement("div");
     row.className = "todo-row " + (t.status || "pending");
     const ico = document.createElement("span");
     ico.className = "todo-ico";
-    ico.textContent = t.status === "done" ? "✅" : (t.status === "in_progress" ? "🔄" : "⬜");
     row.appendChild(ico);
     row.appendChild(document.createTextNode(t.content || ""));
     body.appendChild(row);
   }
-  const foot = document.createElement("div");
-  foot.className = "todo-pop-foot";
+  if (!foot) return;
+  foot.hidden = false;
+  foot.innerHTML = "";
+  // 第一行：进度条 + 计数（单独占行，不再与"进行中"文案互抢宽度）
+  const top = document.createElement("div");
+  top.className = "todo-foot-top";
+  const bar = document.createElement("div");
+  bar.className = "todo-progress";
+  const fill = document.createElement("i");
+  fill.className = "todo-progress-fill";
+  fill.style.width = Math.round((done / total) * 100) + "%";
+  bar.appendChild(fill);
+  const num = document.createElement("span");
+  num.className = "todo-progress-num mono";
+  num.textContent = `${done}/${total}`;
+  top.appendChild(bar);
+  top.appendChild(num);
+  foot.appendChild(top);
+  // 第二行：当前状态——生成中：进行中任务（转圈）/ 尚未标进行中（"运行中…"）；
+  // 停止后：进行中项改"待继续"静止显示；全部完成：🎉；其余不显示
   const doing = sessionTodos.find((t) => t.status === "in_progress");
-  const left = document.createElement("span");
-  left.textContent = `${done}/${sessionTodos.length} 已完成`;
-  const right = document.createElement("span");
-  right.textContent = doing ? `进行中：${doing.content}`
-    : (done === sessionTodos.length ? "🎉 全部完成" : "");
-  foot.appendChild(left);
-  foot.appendChild(right);
-  body.appendChild(foot);
+  let state = document.createElement("div");
+  if (doing) {
+    state.className = "todo-foot-state doing";
+    const ico = document.createElement("span");
+    ico.className = "todo-foot-spin";
+    const txt = document.createElement("span");
+    txt.className = "todo-foot-doing-text";
+    txt.textContent = streaming ? `进行中：${doing.content}` : `待继续：${doing.content}`;
+    txt.title = doing.content;
+    state.appendChild(ico);
+    state.appendChild(txt);
+    if (!streaming) state.className += " paused";
+  } else if (done === total) {
+    state.className = "todo-foot-state alldone";
+    state.textContent = "🎉 全部完成";
+  } else if (streaming) {
+    state.className = "todo-foot-state running";
+    const ico = document.createElement("span");
+    ico.className = "todo-foot-spin";
+    state.appendChild(ico);
+    state.appendChild(document.createTextNode("运行中…"));
+  } else {
+    state = null;
+  }
+  if (state) foot.appendChild(state);
 }
 
 async function loadTodos() {
