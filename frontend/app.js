@@ -2367,9 +2367,19 @@ function showPermissionCard(evt) {
 }
 
 // ⏱ 耗时 + token 统计行（跟随当前回答气泡）
+// 两个口径必须分开标注：↑↓ 是本回合多次请求的【累计账单】（工具循环每轮都
+// 重发全部历史，历史被重复计数）；「上下文」是模型当前真实占用（最后一次
+// 请求的 prompt_tokens，即徽章口径）。单次请求的回合两者相等，不重复标注。
 function metaText(elapsed, u) {
   let t = `⏱ ${elapsed}s`;
-  if (u && u.total_tokens) t += ` · ↑${u.prompt_tokens} ↓${u.completion_tokens} tokens`;
+  if (u && u.total_tokens) {
+    t += ` · 累计 ↑${u.prompt_tokens} ↓${u.completion_tokens}`;
+    // context_tokens 只在流中 usage 事件顶层有；done 的 usage 是纯累计快照，
+    // 借 usageNow 兜底——它同样来自本回合最后一次 usage 事件，口径一致。
+    const ctx = u.context_tokens ?? (usageNow && usageNow.context_tokens);
+    if (ctx && ctx !== u.prompt_tokens) t += ` · 上下文 ${ctx}`;
+    t += " tokens";
+  }
   return t;
 }
 

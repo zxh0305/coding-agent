@@ -102,7 +102,7 @@
           <input type="file" id="file-input" multiple hidden
                  accept="image/png,image/jpeg,image/webp,image/gif,.txt,.md,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.html,.css,.csv,.log,.xml,.sh,.sql,.java,.c,.cpp,.go,.rs">
           <button id="perm-chip" class="chip" title="权限模式：只读 = 写入和命令逐次确认；确认 = 高危操作才确认；完全访问 = 全部放行">🛡 <span id="perm-label">确认</span></button>
-          <button id="ctx-chip" class="chip" title="上下文容量">⛁ —</button>
+          <button id="ctx-chip" class="chip" title="模型当前上下文占用 = 最近一次请求的输入 token（含缓存命中）。回答统计行的 ↑↓ 是本回合累计消耗，工具循环每轮重发历史所以远大于它">⛁ —</button>
           <button id="ws-pick" class="chip" title="选择工作区文件夹">📁 <span id="ws-short">工作区</span></button>
           <button id="docs-chip" class="chip" title="查看本会话生成的文档">📄 文档 <span id="docs-count">0</span></button>
           <button id="browser-chip" class="chip hidden" title="查看 agent 的内置浏览器画面">🌐 浏览器</button>
@@ -166,6 +166,7 @@
     <div class="ctx-bar"><div id="ctx-fill" class="ctx-fill"></div></div>
     <div id="ctx-breakdown"></div>
     <div class="ctx-foot"><span>平均缓存命中率</span><b id="ctx-cache">—</b></div>
+    <div class="ctx-hint">口径：徽章与分段条是模型当前真实占用（最后一次请求的输入，含缓存命中）；回答统计行的 ↑↓ 是本回合累计消耗——工具循环每轮重发全部历史，两者本就不同。</div>
   </div>
 
   <!-- 管理模型弹窗：供应商列表 + 编辑器（Base URL / Key / 模型列表 / 测试链接） -->

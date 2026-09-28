@@ -666,6 +666,12 @@ button.primary:hover { background: var(--accent-hover); }
   margin-top: 8px; padding-top: 8px;
 }
 
+/* 口径说明行：解释徽章（当前占用）与回答统计行（累计消耗）为何对不上 */
+.ctx-hint {
+  font-size: 11px; line-height: 1.5; color: var(--text-3, var(--text-2));
+  margin-top: 6px;
+}
+
 /* 权限模式气泡（复用 ctx-pop 定位）：三行选项 */
 .perm-row {
   display: flex; flex-direction: column; gap: 2px;
