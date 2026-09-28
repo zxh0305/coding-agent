@@ -965,6 +965,21 @@ class Handler(SimpleHTTPRequestHandler):
     # ---------- 路由 ----------
 
     def do_GET(self):
+        # 与 do_POST 同款兜底：GET 链路任何接口异常原先会一路抛到 socketserver
+        # ——socket 被直接关掉、不回任何 HTTP 响应，前端 fetch 只能报"无法连接
+        # 后端服务"，把代码 bug 伪装成服务没启动。这里统一转成 500 JSON。
+        # 95a0572 曾经在此真实翻车：历史接口的 property 误加括号调用，前端只见
+        # "连不上后端"，真实堆栈只在进程日志里。
+        try:
+            self._do_get()
+        except Exception:
+            log.exception("接口处理出错")  # 完整堆栈进 agent.log
+            try:
+                self._json({"error": "服务器内部错误，详情见 backend 日志"}, 500)
+            except Exception:
+                pass  # SSE 等已开始写响应的接口报不了 500，只能断开（与原行为一致）
+
+    def _do_get(self):
         if not self._require_auth():
             return
         path = urllib.parse.urlparse(self.path).path  # 剥掉 ?query 后的纯路径
@@ -1589,7 +1604,7 @@ class Handler(SimpleHTTPRequestHandler):
                                    "user_index": db.user_message_index(sid),
                                    "running_trace": snap,
                                    "running_started_at":
-                                       (_bus.round_started_at() if _bus else None)})
+                                       (_bus.round_started_at if _bus else None)})
         # user_index：本会话【全部】用户提问的轻量索引（mid+ord，不含正文）。
         # 左侧导航条用它一次性画出整个会话的提问分布，不受「只加载最近 N 条」
         # 的窗口限制；点击某条时若尚未加载，再用 before_ord 分页把那一页取回来。
