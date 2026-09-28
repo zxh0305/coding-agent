@@ -234,6 +234,32 @@ body.side-resizing .sidebar { transition: none; }
 /* 归档浮窗里的项目分组头：复用主列表 .group-head 基础样式，间距略收紧 */
 .archive-list .group-head { padding: 8px 6px 2px; }
 
+/* --- 归档区批量模式 --- */
+.arch-manage-btn {
+  border: none; background: none; cursor: pointer; font-size: 12px;
+  color: var(--text-3); padding: 3px 8px; border-radius: 6px; margin-left: auto;
+}
+.arch-manage-btn:hover { background: var(--accent-weak); color: var(--accent); }
+/* 批量选择态的行：勾选框出现，恢复/删除单行按钮隐去（避免和批量动作打架） */
+.archive-item .arch-check {
+  flex-shrink: 0; accent-color: var(--accent); cursor: pointer; margin: 0;
+}
+.archive-item.batch .arch-btn { display: none; }
+.archive-item.batch.selected { background: var(--accent-weak); }
+/* 底部操作条：贴浮窗底部，随选择数联动 */
+.archive-batch-bar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 10px; border-top: 1px solid var(--border);
+}
+.archive-batch-bar.hidden { display: none; }
+.ab-count { font-size: 12px; color: var(--text-2); margin-right: auto; }
+.ab-btn {
+  border: 1px solid var(--border); background: none; cursor: pointer;
+  font-size: 12px; color: var(--text-2); padding: 4px 9px; border-radius: 7px;
+}
+.ab-btn:hover { background: var(--hover); color: var(--text-1); }
+.ab-btn.danger:hover { background: var(--danger-weak, #fde8e8); color: var(--danger, #d33); border-color: var(--danger, #d33); }
+
 /* 归档任务只读态：输入框与发送键置灰 + composer 半透明提示 */
 .composer.archived-locked { opacity: .55; pointer-events: none; }
 .composer.archived-locked #input::placeholder { color: var(--text-3); }

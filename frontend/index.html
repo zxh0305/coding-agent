@@ -358,9 +358,18 @@
     <div class="attach-head">
       <b>🗄 归档区</b>
       <span id="archive-scope" class="attach-scope"></span>
+      <button id="archive-batch" class="arch-manage-btn" title="批量恢复 / 删除">管理</button>
       <button id="archive-close" class="git-x" title="关闭">✕</button>
     </div>
     <ul id="archive-list" class="archive-list"></ul>
+    <!-- 批量操作条：仅"管理"模式下出现；恢复直接执行，删除仍走确认弹窗 -->
+    <div id="archive-batch-bar" class="archive-batch-bar hidden">
+      <span id="archive-batch-count" class="ab-count">已选 0</span>
+      <button id="archive-batch-all" class="ab-btn">全选</button>
+      <button id="archive-batch-restore" class="ab-btn">↩ 恢复</button>
+      <button id="archive-batch-del" class="ab-btn danger">🗑 删除</button>
+      <button id="archive-batch-cancel" class="ab-btn">取消</button>
+    </div>
   </div>
 
   <!-- 删除任务的二次确认弹窗（modal）：删除不可逆，比行内确认更醒目 -->

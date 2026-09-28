@@ -1064,6 +1064,24 @@ class Handler(SimpleHTTPRequestHandler):
                 db.archive_session(sid, 0)
                 log.info("取消归档会话 %s", sid)
                 self._json({"ok": True, "sid": sid, "archived": 0})
+            elif path == "/api/sessions/unarchive":
+                # 批量恢复（归档区勾选多行后一键恢复）。逐个校验归属：不属于
+                # 当前用户的 id 跳过而不是整体 404——批量操作里混进一个坏 id
+                # 不该让其余正常项全部失败。归档区里能被勾选的自然都是归档态，
+                # archive_session(0) 本身幂等，不必再逐个查 archived。
+                ids = self._body().get("ids")
+                if not isinstance(ids, list) or not ids \
+                        or not all(isinstance(i, str) and i for i in ids) or len(ids) > 100:
+                    return self._json({"error": "ids 须为非空字符串数组（≤100）"}, 400)
+                restored, skipped = 0, 0
+                for sid in ids:
+                    if db.session_owner(sid) != self.user["id"]:
+                        skipped += 1
+                        continue
+                    db.archive_session(sid, 0)
+                    restored += 1
+                log.info("批量取消归档 %d 个会话（跳过 %d）", restored, skipped)
+                self._json({"ok": True, "restored": restored, "skipped": skipped})
             elif re.fullmatch(r"/api/sessions/[^/]+/seen", path):
                 # 标记该会话的绿/红点已读（清掉未读徽标）
                 sid = path.split("/")[3]
@@ -1111,6 +1129,24 @@ class Handler(SimpleHTTPRequestHandler):
                 pass  # 幂等：已不存在视为删除成功
             return self._json({"ok": True})
         if urllib.parse.urlparse(self.path).path == "/api/sessions":  # self.path 带 ?query，须剥掉再比较
+            # 两种形态：?session_id=xxx 单删（原有入口，归档区行内 🗑）；
+            # body {"ids": [...]} 批量删（归档区勾选后的批量删除按钮）。
+            # 批量走同一套收摊逻辑，逐个校验归属与归档态——单个坏 id 跳过
+            # 计数，不让其余正常项整体失败。
+            ids = self._body().get("ids") if self.headers.get("Content-Length") else None
+            if isinstance(ids, list):
+                if not ids or not all(isinstance(i, str) and i for i in ids) or len(ids) > 100:
+                    return self._json({"error": "ids 须为非空字符串数组（≤100）"}, 400)
+                deleted, skipped = 0, 0
+                for sid in ids:
+                    if db.session_owner(sid) == self.user["id"] and db.session_archived(sid):
+                        self._delete_session_cleanup(sid)
+                        deleted += 1
+                    else:
+                        skipped += 1
+                log.info("批量删除 %d 个会话（跳过 %d）", deleted, skipped)
+                return self._json({"ok": True, "deleted": deleted, "skipped": skipped})
+
             sid = (self._query().get("session_id") or [""])[0]
             if db.session_owner(sid) != self.user["id"]:
                 return self._json({"error": "任务不存在或不属于当前用户"}, 404)
@@ -1118,21 +1154,26 @@ class Handler(SimpleHTTPRequestHandler):
             # 出现，这里再拦一道，防止直接调接口绕过"会话栏不可删"的设计。
             if not db.session_archived(sid):
                 return self._json({"error": "任务未归档，请先归档再删除"}, 409)
-            db.delete_session(sid)
-            with _lock:
-                _agents.pop(sid, None)
-                _ctx.pop(sid, None)
-                _turn_status.pop(sid, None)
-                bus = _buses.pop(sid, None)
-            if bus is not None:
-                # 先发 session_deleted 再关总线：其他标签页的常驻连接收到后
-                # 自行收摊（切走/清空界面），close 的哨兵再把连接线程送终
-                bus.publish({"type": "session_deleted"})
-                bus.close()
+            self._delete_session_cleanup(sid)
             log.info("删除会话 %s", sid)
             self._json({"ok": True})
         else:
             self._json({"error": "未知接口"}, 404)
+
+    def _delete_session_cleanup(self, sid: str):
+        """删除一个会话的全部收摊动作（原 do_DELETE 内联逻辑提为方法，供单删
+        与批量删共用）：落库删除、清内存态、广播 session_deleted 后关总线。"""
+        db.delete_session(sid)
+        with _lock:
+            _agents.pop(sid, None)
+            _ctx.pop(sid, None)
+            _turn_status.pop(sid, None)
+            bus = _buses.pop(sid, None)
+        if bus is not None:
+            # 先发 session_deleted 再关总线：其他标签页的常驻连接收到后
+            # 自行收摊（切走/清空界面），close 的哨兵再把连接线程送终
+            bus.publish({"type": "session_deleted"})
+            bus.close()
 
     # ---------- 登录/注册 ----------
 

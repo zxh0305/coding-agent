@@ -4876,12 +4876,30 @@ async function loadArchiveCount() {
 // 归档区的组折叠态：与主列表 collapsedGroups 分开存，互不干扰
 const archCollapsedGroups = new Set();
 
+// --- 归档区批量模式：勾选多行后一键恢复 / 删除 ---
+let archBatchMode = false;
+let archBatchSel = new Set();   // 勾选的会话 id；全选/组头全选都写这里
+let archListIds = [];           // 最近一次渲染的归档列表 id 顺序（全选用）
+// 关浮窗/退出管理态时清空，避免下次打开残留上次的勾选
+function exitArchBatch() {
+  archBatchMode = false;
+  archBatchSel.clear();
+  $("archive-batch-bar").classList.add("hidden");
+  $("archive-batch").textContent = "管理";
+}
+
 async function renderArchiveList() {
   const ul = $("archive-list");
   // 先取数据、在内存里把新列表构建完，再一次性替换 DOM：
   // 避免先清空再等接口导致浮窗内容闪空白
   let list = [];
   try { list = await api("/api/sessions?archived=1"); } catch (e) { return; }
+  // 批量态下清掉已不在列表里的 id（恢复/删除成功后勾选残留会导致计数虚高）
+  if (archBatchMode) {
+    const alive = new Set(list.map(s => s.id));
+    for (const id of [...archBatchSel]) if (!alive.has(id)) archBatchSel.delete(id);
+  }
+  archListIds = list.map(s => s.id);  // 「全选」直接用这份数据，不去 DOM 里抠
   const fresh = document.createDocumentFragment();
   if (!Array.isArray(list) || !list.length) {
     const li = document.createElement("li");
@@ -4924,18 +4942,57 @@ async function renderArchiveList() {
         renderArchiveList();
       });
       head.appendChild(text);
+      // 批量态：组头右侧加「全选」——只勾本组（跨组混选时用户容易误删别的项目）
+      if (archBatchMode && !collapsed) {
+        const all = document.createElement("button");
+        const allSel = g.items.every(s => archBatchSel.has(s.id));
+        all.className = "ab-btn";
+        all.textContent = allSel ? "取消全选" : "全选";
+        all.addEventListener("click", (e) => {
+          e.stopPropagation();
+          for (const s of g.items) allSel ? archBatchSel.delete(s.id) : archBatchSel.add(s.id);
+          renderArchiveList();
+        });
+        head.appendChild(all);
+      }
       fresh.appendChild(head);
     }
     if (showHead && archCollapsedGroups.has(key)) continue;
     for (const s of g.items) fresh.appendChild(archiveRow(s));
   }
   ul.replaceChildren(fresh);  // 一次替换，无中间空白帧
+  // 批量态：操作条常驻浮窗底部，计数随勾选联动
+  if (archBatchMode) {
+    $("archive-batch-bar").classList.remove("hidden");
+    $("archive-batch-count").textContent = `已选 ${archBatchSel.size}`;
+    $("archive-batch-all").textContent =
+      archBatchSel.size && archBatchSel.size === list.length ? "取消全选" : "全选";
+  }
 }
 
 function archiveRow(s) {
   const li = document.createElement("li");
   li.className = "archive-item";
   li.title = s.title || "";
+  // 批量态：行首勾选框替换单行的恢复/删除按钮；行点击=切换勾选（不再切会话）
+  if (archBatchMode) {
+    li.classList.add("batch");
+    if (archBatchSel.has(s.id)) li.classList.add("selected");
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.className = "arch-check";
+    check.checked = archBatchSel.has(s.id);
+    check.addEventListener("click", (e) => e.stopPropagation());  // 勾选框自己处理，避免行点击二次触发
+    check.addEventListener("change", () => {
+      check.checked ? archBatchSel.add(s.id) : archBatchSel.delete(s.id);
+      renderArchiveList();
+    });
+    li.appendChild(check);
+    li.addEventListener("click", () => {
+      check.checked ? archBatchSel.delete(s.id) : archBatchSel.add(s.id);
+      renderArchiveList();
+    });
+  }
   const title = document.createElement("div");
   title.className = "t-title";
   title.textContent = s.title || "新任务";
@@ -4964,11 +5021,14 @@ function archiveRow(s) {
     openArchiveDelete(s.id, s.title);
   });
   li.append(title, un, del);
-  // 点击任务行 = 切到该会话查看内容（方案 A）
-  li.addEventListener("click", () => {
-    toggleArchivePop();  // 先收起归档浮窗，再切会话
-    switchSession(s.id);
-  });
+  // 点击任务行 = 切到该会话查看内容（方案 A）。批量态下行点击已被上面的
+  // 勾选逻辑接管（return 前各自注册），这里再挂会叠加触发，必须跳过。
+  if (!archBatchMode) {
+    li.addEventListener("click", () => {
+      toggleArchivePop();  // 先收起归档浮窗，再切会话
+      switchSession(s.id);
+    });
+  }
   return li;
 }
 
@@ -5003,7 +5063,61 @@ function toggleArchivePop() {
   const pop = $("archive-pop");
   const opening = pop.classList.contains("hidden");
   pop.classList.toggle("hidden");
-  if (opening) renderArchiveList();
+  if (opening) {
+    exitArchBatch();      // 每次打开都是干净的非批量态（也清掉上次的勾选）
+    renderArchiveList();
+  }
+}
+
+// --- 批量恢复 / 批量删除 ---
+
+async function archBatchRestore() {
+  const ids = [...archBatchSel];
+  if (!ids.length) return toast("先勾选要恢复的任务");
+  try {
+    const r = await api("/api/sessions/unarchive", {
+      method: "POST", body: JSON.stringify({ ids }),
+      headers: { "Content-Type": "application/json" },
+    });
+    toast(r.skipped ? `已恢复 ${r.restored} 个（${r.skipped} 个无权限跳过）`
+                    : `已恢复 ${r.restored} 个到任务列表`);
+    // 恢复的可能包含当前正打开的归档任务：输入框随之解锁
+    if (ids.includes(currentSession)) setComposerArchived(false);
+    await renderArchiveList();   // 勾选残留会在渲染前被清掉
+    loadSessions();
+    loadArchiveCount();
+  } catch (e) { toast("批量恢复失败：" + e.message); }
+}
+
+// 批量删除走与单删同一个确认弹窗：pendingDeleteSid 存不下多个 id，
+// 用 null 之外的数组形态区分（confirmArchiveDelete 里分流）。
+let pendingDeleteIds = null;
+
+function archBatchDelete() {
+  const ids = [...archBatchSel];
+  if (!ids.length) return toast("先勾选要删除的任务");
+  pendingDeleteIds = ids;
+  $("archive-del-text").textContent =
+    `确定删除选中的 ${ids.length} 个任务吗？它们的全部消息、附件与文档将被永久删除，不可恢复。`;
+  $("archive-del-mask").classList.remove("hidden");
+}
+
+async function archBatchDeleteConfirm() {
+  const ids = pendingDeleteIds || [];
+  pendingDeleteIds = null;
+  $("archive-del-mask").classList.add("hidden");
+  if (!ids.length) return;
+  try {
+    const r = await api("/api/sessions", {
+      method: "DELETE", body: JSON.stringify({ ids }),
+      headers: { "Content-Type": "application/json" },
+    });
+    toast(r.skipped ? `已删除 ${r.deleted} 个（${r.skipped} 个无权限跳过）`
+                    : `已删除 ${r.deleted} 个任务`);
+    if (ids.includes(currentSession)) { newTask(); setComposerArchived(false); }
+    await renderArchiveList();
+    loadArchiveCount();
+  } catch (e) { toast("批量删除失败：" + e.message); }
 }
 
 // --- 行内「确认」后的真正归档：成功只 toast 提示（不再弹成功弹窗），
@@ -5022,9 +5136,29 @@ async function doArchiveSession(sid) {
 }
 
 bind("archive-btn", "click", toggleArchivePop);
-bind("archive-close", "click", toggleArchivePop);
-bind("archive-del-cancel", "click", closeArchiveDelete);
-bind("archive-del-confirm", "click", confirmArchiveDelete);
+bind("archive-close", "click", () => { exitArchBatch(); toggleArchivePop(); });
+bind("archive-del-cancel", "click", () => { pendingDeleteIds = null; closeArchiveDelete(); });
+// 同一个确认弹窗服务单删与批量删：批量发起时 pendingDeleteIds 非空 → 走批量分支
+bind("archive-del-confirm", "click", () => {
+  pendingDeleteIds ? archBatchDeleteConfirm() : confirmArchiveDelete();
+});
+// 「管理」进入/退出批量态：进入时操作条出现由 renderArchiveList 负责
+bind("archive-batch", "click", () => {
+  archBatchMode = !archBatchMode;
+  if (!archBatchMode) archBatchSel.clear();
+  $("archive-batch").textContent = archBatchMode ? "退出管理" : "管理";
+  $("archive-batch-bar").classList.toggle("hidden", !archBatchMode);
+  renderArchiveList();
+});
+bind("archive-batch-all", "click", () => {
+  // 全选 = 当前列表里的所有归档任务；已有勾选时按钮文案是"取消全选"→清空
+  if (archBatchSel.size) archBatchSel.clear();
+  else for (const id of archListIds) archBatchSel.add(id);
+  renderArchiveList();
+});
+bind("archive-batch-restore", "click", archBatchRestore);
+bind("archive-batch-del", "click", archBatchDelete);
+bind("archive-batch-cancel", "click", () => { exitArchBatch(); renderArchiveList(); });
 bind("archive-del-mask", "click", (e) => { if (e.target.id === "archive-del-mask") closeArchiveDelete(); });
 // 点浮窗外区域收起归档浮窗（确认弹窗不受影响，它 z-index 更高且自带遮罩）
 document.addEventListener("click", (e) => {
