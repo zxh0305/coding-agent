@@ -2771,10 +2771,6 @@ function setStreaming(on) {
       positionTodoPop();
       $("todo-pop").classList.remove("hidden");
     }
-  } else if (todoAutoOpened && !$("todo-pop").classList.contains("hidden")) {
-    // 任务结束：不自动收起，挂 stay-open 豁免全局"点空白关浮窗"——
-    // 否则用户一点别处就被收走，永远到不了 ✕ 手动关闭那一步。
-    $("todo-pop").classList.add("stay-open");
   }
 }
 
@@ -3059,6 +3055,8 @@ bind("todo-close", "click", () => {
   // 记录"用户手动关闭"：streaming 期间不再自动弹开（解除常驻）
   $("todo-pop").dataset.userClosed = "1";
 });
+// 注意：todo-pop 的"stay-open 常驻 + 点空白豁免"已按用户要求移除——
+// 现在与 ctx/git/attach 等浮窗同一逻辑：点击浮窗外任意位置即关闭（全局 click 处理）。
 bind("attach-btn", "click", () => $("file-input").click());
 bind("file-input", "change", onFilesChosen);
 bind("input", "paste", onPaste);
@@ -3160,14 +3158,18 @@ document.addEventListener("click", (e) => {
   // 点弹窗外空白处关闭浮动层
   for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"], ["perm-pop", "perm-chip"], ["todo-pop", "todo-chip"]]) {
     const el = $(pop);
-    // todo 浮窗常驻（任务中/结束后保持展开），只有 ✕ 按钮能关——跳过自动收起
-    if (pop === "todo-pop" && el.dataset.userClosed === "1") continue;
     // git 的分支二级面板挂在外层（不在 git-pop 内）：点它不算点空白，否则
     // git 浮窗被关掉而分支面板还留着（真实踩过的坑）
     const inner = pop === "git-pop" ? e.target.closest?.("#git-branch-pop") : null;
     if (!el.classList.contains("hidden") && !el.contains(e.target) && !inner
         && !e.target.closest?.("#" + btn)) {
       el.classList.add("hidden");
+      if (pop === "todo-pop") {
+        // todo 浮窗与其它浮窗同一逻辑：点空白即收起；等同 ✕ 手动关闭——
+        // 本回合不再自动弹开（否则 streaming 中下一个 todo_update 又把它弹回来）
+        el.classList.remove("stay-open");
+        el.dataset.userClosed = "1";
+      }
     }
   }
 });
