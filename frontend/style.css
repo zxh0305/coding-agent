@@ -1133,16 +1133,29 @@ button.primary:hover { background: var(--accent-hover); }
   text-shadow: 0 1px 1px rgba(0, 0, 0, 0.08);
 }
 
-/* 生成期间排队的消息卡片 */
-.bubble.user.queued { opacity: 0.88; border: 1px dashed rgba(255, 255, 255, 0.6); }
-.queue-actions { display: flex; gap: 6px; margin-top: 8px; }
-.q-btn {
-  font-size: 11px; padding: 3px 9px;
-  border: 1px solid rgba(255, 255, 255, 0.55); border-radius: 6px;
-  background: rgba(255, 255, 255, 0.14); color: var(--text-inverse); cursor: pointer;
+/* 生成期间排队的消息条：挂在 composer 内、输入框上方（不进会话流） */
+.queue-bar { display: flex; flex-direction: column; gap: 6px; }
+.queue-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px;
+  border: 1px dashed var(--border-strong); border-radius: 8px;
+  background: var(--panel-soft); font-size: 13px;
 }
-.q-btn:hover { background: rgba(255, 255, 255, 0.28); }
-.q-btn.q-immediate { background: var(--panel); color: var(--accent); border-color: var(--panel); font-weight: 600; }
+.q-drag { flex: 0 0 auto; color: var(--text-3); font-size: 12px; cursor: grab; }
+.q-text {
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: var(--text);
+}
+.q-thumb { flex: 0 0 auto; height: 28px; border-radius: 4px; border: 1px solid var(--border); }
+.queue-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.q-btn {
+  font-size: 12px; padding: 3px 9px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: transparent; color: var(--text-2); cursor: pointer;
+}
+.q-btn:hover { background: var(--hover); }
+.q-btn.q-immediate { color: var(--accent); border-color: var(--accent-weak-border); font-weight: 600; }
 .q-btn.q-immediate:hover { background: var(--accent-weak); }
 
 /* 任务删除的行内二次确认状态 */

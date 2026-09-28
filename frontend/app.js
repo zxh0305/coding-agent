@@ -57,6 +57,7 @@ function showLogin() {
   currentSession = null;      // 下一个登录者不能沿用上一个用户的任务 id
   chatEl.innerHTML = "";
   pendingQueue = [];          // 排队消息也作废（它们属于上一个用户的任务）
+  renderQueueBar();
   closeEvents();              // 事件流属于上一个登录者，立即断开
   resetStreamState();         // 流式状态同样属于上一个用户/任务
   localStorage.removeItem("auth_token");
@@ -470,6 +471,8 @@ async function doDeleteSession(id) {
   if (currentSession === id) {
     // 删的是当前打开的任务：清空对话区，回到待新建状态；事件流随任务一起
     // 消失（其他标签页的连接由 session_deleted 事件收摊）
+    pendingQueue = pendingQueue.filter(it => it.sessionId !== id);  // 任务没了：排队的消息一起作废
+    renderQueueBar();
     currentSession = null;
     resetStreamState();
     chatEl.innerHTML = "";
@@ -497,6 +500,7 @@ async function newTask(presetProject = null) {
   welcome();
   railItems = [];
   rebuildRail();       // 新任务时间线为空：导航条收起
+  renderQueueBar();    // 队列条属于上一个任务：这里隐藏（消息保持排队，切回时接着发）
   restoreDraft(null);  // 新任务自己的草稿位（__new__）
   resetDocsPanel();    // 新任务态：收起文档栏并清空内容
   loadDocsList();      // 新任务态：文档计数清零
@@ -822,6 +826,7 @@ async function doSwitchSession(id) {
   loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换（内部顺带拉权限模式）
   closeGitPop();    // 工作区变了，旧的提交列表不再对应当前项目
   refreshGitChip(); // 按钮上的分支名随任务的工作区更新
+  renderQueueBar(); // 队列条不随会话流清空：按新会话重画（旧卡片的 DOM 属于上一个任务）
   dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
   resetDocsPanel();      // 上一个会话的文档栏不留给新会话：收起并清空
   resetBrowserPanel();   // 浏览器栏同理：会话的浏览器画面是会话私有
@@ -2746,6 +2751,8 @@ function applyEvent(evt, seq) {
   } else if (t === "session_deleted") {
     // 其他标签页删掉了这个任务：收摊回到新建态
     closeEvents();
+    pendingQueue = pendingQueue.filter(it => it.sessionId !== currentSession);  // 任务没了：排队消息作废
+    renderQueueBar();
     currentSession = null;
     resetStreamState();
     chatEl.innerHTML = "";
@@ -2815,7 +2822,7 @@ function setStreaming(on) {
   inputEl.placeholder = currentSessionArchived
     ? "该任务已归档（只读），↩ 恢复后可继续对话"
     : on
-      ? "生成中：现在输入将排队，回答完成后自动发送"
+      ? "继续输入以排队后续修改"
       : "输入问题或任务，Enter 发送（Shift+Enter 换行）";
   // 任务清单跟随任务状态：生成中自动展开常驻（清单随 todo_update 实时刷新）。
   if (on) {
@@ -2902,8 +2909,9 @@ async function stopGeneration() {
 
 // ---------- 发送与排队 ----------
 // 生成期间再发消息：默认【排队】（当前回答完成后自动接着发），
-// 队列卡片上可「⬆ 立即」（停止当前生成、马上执行这一条）/「✏ 编辑」/「🗑 删除」。
-let pendingQueue = [];  // {text, payloadAtts, sessionId, el, immediate}
+// 队列条挂在输入框上方（不进会话流），每条可「⬆ 立即」（停止当前生成、
+// 马上执行这一条）/「✏ 编辑」/「🗑 删除」。
+let pendingQueue = [];  // {text, payloadAtts, sessionId, immediate}
 let lastSent = null;    // 本 tab 最近一次成功发出的 {text, payloadAtts, outAtts}：出错重试用
 let roundErrored = false;  // 本回合是否发过 error 事件：turn_end 的通知去重
 
@@ -2951,7 +2959,7 @@ function send() {
     return;
   }
   if (streaming) {
-    // 排队：只显示队列卡片，正式气泡等派发执行时再渲染（否则会出现两条重复消息）
+    // 排队：只显示输入框上方的队列条，正式气泡等派发执行时再渲染（否则会出现两条重复消息）
     queueMessage(text, payloadAtts);
     return;
   }
@@ -2963,52 +2971,74 @@ function send() {
 }
 
 function queueMessage(text, payloadAtts) {
-  const item = { text, payloadAtts, sessionId: currentSession, immediate: false, el: null };
-  const wrap = document.createElement("div");
-  wrap.className = "bubble user queued";
-  const t = document.createElement("div");
-  t.textContent = text || "（仅附件）";
-  wrap.appendChild(t);
-  const qimgs = payloadAtts.filter(a => a.kind === "image")
-    .map(a => `data:${a.mime};base64,${a.data}`);
-  for (const src of qimgs) wrap.appendChild(msgImage(src, qimgs));
-  if (qimgs.length > 1) wrap.classList.add("multi-img");
-  const actions = document.createElement("div");
-  actions.className = "queue-actions";
-  const mk = (label, fn, cls) => {
-    const b = document.createElement("button");
-    b.textContent = label;
-    b.className = "q-btn" + (cls ? " " + cls : "");
-    b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
-    actions.appendChild(b);
-  };
-  mk("⬆ 立即", () => {
-    item.immediate = true;
-    const i = pendingQueue.indexOf(item);
-    if (i > 0) { pendingQueue.splice(i, 1); pendingQueue.unshift(item); }  // 提到队首
-    item.el?.remove();
-    stopGeneration();  // 停掉当前生成；流结束后队列自动从队首开始发
-  }, "q-immediate");
-  mk("✏ 编辑", () => {
-    pendingQueue.splice(pendingQueue.indexOf(item), 1);
-    item.el?.remove();
-    inputEl.value = item.text;
+  pendingQueue.push({ text, payloadAtts, sessionId: currentSession, immediate: false });
+  renderQueueBar();
+}
+
+// 排队消息条：渲染在输入框上方（composer 内），不进会话消息流——正式气泡
+// 等派发执行时再画。每次全量重画：增删/切会话后状态简单可靠，也免去卡片
+// DOM 跟随会话流被清空后留下悬空引用的问题。只画属于当前会话的条目，
+// 其他会话的排队消息保持静默（派发时同样有 sessionId 守卫）。
+function renderQueueBar() {
+  const bar = $("queue-bar");
+  if (!bar) return;
+  bar.innerHTML = "";
+  const visible = pendingQueue.filter(it => it.sessionId === currentSession);
+  bar.classList.toggle("hidden", !visible.length);
+  for (const item of visible) {
+    const row = document.createElement("div");
+    row.className = "queue-item";
+    row.title = item.text || "（仅附件）";  // 单行省略后的全文提示
+    const handle = document.createElement("span");
+    handle.className = "q-drag";
+    handle.textContent = "⠿";
+    row.appendChild(handle);
+    const t = document.createElement("div");
+    t.className = "q-text";
+    t.textContent = item.text || "（仅附件）";
+    row.appendChild(t);
     for (const a of item.payloadAtts) {
-      attachments.push({ kind: a.kind, name: a.name, mime: a.mime, data: a.data,
-                         preview: a.kind === "image" ? `data:${a.mime};base64,${a.data}` : "" });
+      if (a.kind !== "image") continue;
+      const im = document.createElement("img");
+      im.className = "q-thumb";
+      im.src = `data:${a.mime};base64,${a.data}`;
+      row.appendChild(im);
     }
-    renderAttachTray();
-    inputEl.focus();
-  });
-  mk("🗑 删除", () => {
-    pendingQueue.splice(pendingQueue.indexOf(item), 1);
-    item.el?.remove();
-  });
-  wrap.appendChild(actions);
-  chatEl.appendChild(wrap);
-  scrollBottom(true);  // 队列卡片是用户自己的操作：永远贴底
-  item.el = wrap;
-  pendingQueue.push(item);
+    const actions = document.createElement("div");
+    actions.className = "queue-actions";
+    const mk = (label, title, fn, cls) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      if (title) b.title = title;
+      b.className = "q-btn" + (cls ? " " + cls : "");
+      b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+      actions.appendChild(b);
+    };
+    mk("⬆ 立即", "停止当前生成，马上执行这一条", () => {
+      item.immediate = true;
+      const i = pendingQueue.indexOf(item);
+      if (i > 0) { pendingQueue.splice(i, 1); pendingQueue.unshift(item); }  // 提到队首
+      renderQueueBar();
+      stopGeneration();  // 停掉当前生成；流结束后队列自动从队首开始发
+    }, "q-immediate");
+    mk("✏", "编辑", () => {
+      pendingQueue.splice(pendingQueue.indexOf(item), 1);
+      renderQueueBar();
+      inputEl.value = item.text;
+      for (const a of item.payloadAtts) {
+        attachments.push({ kind: a.kind, name: a.name, mime: a.mime, data: a.data,
+                           preview: a.kind === "image" ? `data:${a.mime};base64,${a.data}` : "" });
+      }
+      renderAttachTray();
+      inputEl.focus();
+    });
+    mk("🗑", "删除", () => {
+      pendingQueue.splice(pendingQueue.indexOf(item), 1);
+      renderQueueBar();
+    });
+    row.appendChild(actions);
+    bar.appendChild(row);
+  }
 }
 
 function dispatchNextQueued() {
@@ -3017,7 +3047,7 @@ function dispatchNextQueued() {
   // 用户已切到其他任务：先不发，切回来时再发（避免渲染混进别的对话视图）
   if (item.sessionId !== currentSession) return;
   pendingQueue.shift();
-  item.el?.remove();  // 队列卡片退场，换成正式的已发送气泡
+  renderQueueBar();   // 队列条上的卡片退场，换成正式的已发送气泡
   const outAtts = item.payloadAtts.map(a => ({
     kind: a.kind, name: a.name,
     preview: a.kind === "image" ? `data:${a.mime};base64,${a.data}` : "",

@@ -110,6 +110,8 @@
           <button id="edit-cancel" type="button">取消</button>
         </div>
         <div id="attach-tray" class="attach-tray hidden"></div>
+        <!-- 排队消息条：生成期间的后续消息挂在这里（不进会话流），回合结束自动派发 -->
+        <div id="queue-bar" class="queue-bar hidden"></div>
         <textarea id="input" rows="2" placeholder="输入问题或任务，Enter 发送（Shift+Enter 换行）"></textarea>
         <div class="toolbar">
           <button id="attach-btn" class="chip" title="添加图片或文本文件">📎</button>
