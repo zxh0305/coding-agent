@@ -915,6 +915,13 @@ class Handler(SimpleHTTPRequestHandler):
             days = self._query().get("days", ["7"])[0]
             days = int(days) if str(days).isdigit() and int(days) > 0 else None
             self._json(db.usage_summary(days))
+        elif path == "/api/usage/sessions":
+            # 用量下钻：某供应商/模型分别花在哪些会话上（用量页模型行展开）。
+            q = self._query()
+            days = q.get("days", ["7"])[0]
+            days = int(days) if str(days).isdigit() and int(days) > 0 else None
+            self._json(db.usage_session_rows(days, q.get("provider_id", [""])[0],
+                                             q.get("model", [""])[0]))
         elif self.path == "/api/providers":
             provs = []
             for p in db.list_providers():

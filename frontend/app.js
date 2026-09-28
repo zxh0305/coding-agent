@@ -1743,6 +1743,48 @@ function fmtTokens(n) {
   return String(n);
 }
 
+// 展开状态：key = "provider_id|model"，值为 true 时该模型行下画会话明细
+const usageExpanded = new Set();
+
+async function toggleUsageRows(providerId, model, tr) {
+  const key = providerId + "|" + model;
+  if (usageExpanded.has(key)) {
+    usageExpanded.delete(key);
+    tr.parentElement.querySelectorAll(`tr[data-detail="${CSS.escape(key)}"]`)
+      .forEach((el) => el.remove());
+    return;
+  }
+  usageExpanded.add(key);
+  const days = $("usage-range").value;
+  const q = `?days=${days}&provider_id=${encodeURIComponent(providerId)}&model=${encodeURIComponent(model)}`;
+  let rows = [];
+  try {
+    rows = await api("/api/usage/sessions" + q);
+  } catch (e) {
+    usageExpanded.delete(key);
+    return toast("加载会话明细失败：" + e.message);
+  }
+  // 明细行插在本模型行之后；切时间范围重载时整表重建，状态自然重置
+  const frag = document.createDocumentFragment();
+  for (const r of rows) {
+    const dtr = document.createElement("tr");
+    dtr.className = "usage-detail";
+    dtr.dataset.detail = key;
+    dtr.innerHTML =
+      `<td class="mono">└ ${r.session_title}</td><td>${r.turns}</td>` +
+      `<td>${fmtTokens(r.prompt_tokens)}</td><td>${fmtTokens(r.completion_tokens)}</td><td></td>`;
+    frag.appendChild(dtr);
+  }
+  if (!rows.length) {
+    const dtr = document.createElement("tr");
+    dtr.className = "usage-detail";
+    dtr.dataset.detail = key;
+    dtr.innerHTML = `<td class="mono">└ （无明细）</td><td colspan="4"></td>`;
+    frag.appendChild(dtr);
+  }
+  tr.after(frag);
+}
+
 async function loadUsage() {
   const days = $("usage-range").value;
   const q = days === "0" ? "?days=0" : `?days=${days}`;
@@ -1758,6 +1800,7 @@ async function loadUsage() {
     `<span>输出 <b>${fmtTokens(total.completion)}</b></span>`;
   const body = $("usage-body");
   body.innerHTML = "";
+  usageExpanded.clear();  // 整表重建（含切时间范围），展开状态一并重置
   if (!rows.length) {
     body.innerHTML = `<div class="usage-empty">该范围内还没有用量记录${days !== "0" ? "，试试切到「全部」" : ""}</div>`;
     return;
@@ -1780,13 +1823,24 @@ async function loadUsage() {
       `</tr></thead><tbody>` +
       models.map(r => {
         const rate = r.prompt_tokens ? Math.round(r.cached_tokens / r.prompt_tokens * 100) : 0;
-        return `<tr><td class="mono">${r.model}</td><td>${r.turns}</td>` +
+        // 模型行可点：展开该模型在各个会话上的用量明细（usageExpanded 记状态）
+        return `<tr class="usage-model-row" data-provider="${r.provider_id}" data-model="${r.model}" ` +
+               `data-key="${r.provider_id}|${r.model}">` +
+               `<td class="mono"><span class="usage-arrow">▸</span> ${r.model}</td><td>${r.turns}</td>` +
                `<td>${fmtTokens(r.prompt_tokens)}</td><td>${fmtTokens(r.completion_tokens)}</td>` +
                `<td>${r.cached_tokens ? `${fmtTokens(r.cached_tokens)}（${rate}%）` : "—"}</td></tr>`;
       }).join("") +
       `</tbody></table>`;
     body.appendChild(card);
   }
+  // 事件委托：点模型行切换会话明细展开（详情行由 toggleUsageRows 动态插入）
+  body.querySelectorAll(".usage-model-row").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      tr.querySelector(".usage-arrow").textContent =
+        usageExpanded.has(tr.dataset.key) ? "▸" : "▾";
+      toggleUsageRows(tr.dataset.provider, tr.dataset.model, tr);
+    });
+  });
 }
 
 // ---------- 工作区（按任务隔离：带 session_id 查/改该任务的；不带 = 用户默认） ----------

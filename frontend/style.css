@@ -1076,6 +1076,10 @@ button.primary:hover { background: var(--accent-hover); }
 .usage-table td { padding: 6px 8px; border-bottom: 1px solid var(--border-weak, var(--border)); }
 .usage-table tbody tr:last-child td { border-bottom: none; }
 .usage-empty { font-size: 13px; color: var(--text-3); padding: 24px 0; text-align: center; }
+.usage-model-row { cursor: pointer; }
+.usage-model-row:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.usage-model-row .usage-arrow { display: inline-block; width: 12px; color: var(--text-3); }
+.usage-detail td { color: var(--text-2); font-size: 11.5px; padding-top: 4px; padding-bottom: 4px; }
 
 /* 模型行的带标签勾选框（可用 / 👁视觉） */
 .pm-check {

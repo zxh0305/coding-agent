@@ -1368,6 +1368,39 @@ def usage_summary(days: int | None = None) -> list[dict]:
              "cached_tokens": r["cached_tokens"] or 0} for r in rows]
 
 
+def usage_session_rows(days: int | None = None, provider_id: str = "",
+                       model: str = "") -> list[dict]:
+    """模型用量的会话级下钻：某供应商/模型（或全部）分别花在哪些会话上。
+
+    与 usage_summary 同口径（days 按 message_usage.created 过滤），按总用量
+    倒序、最多 100 条。会话被删除的显示"（已删除会话）"。
+    """
+    conds, args = [], []
+    if days:
+        conds.append("u.created >= ?")
+        args.append(time.time() - days * 86400)
+    if provider_id:
+        conds.append("u.provider_id = ?")
+        args.append(provider_id)
+    if model:
+        conds.append("u.model = ?")
+        args.append(model)
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT u.session_id, s.title AS session_title, COUNT(*) AS turns, "
+            "SUM(u.prompt_tokens) AS prompt_tokens, "
+            "SUM(u.completion_tokens) AS completion_tokens, "
+            "MAX(u.created) AS last_used "
+            "FROM message_usage u LEFT JOIN sessions s ON s.id = u.session_id "
+            f"{where} GROUP BY u.session_id "
+            "ORDER BY prompt_tokens + completion_tokens DESC LIMIT 100", args).fetchall()
+    return [{"session_id": r["session_id"], "session_title": r["session_title"] or "（已删除会话）",
+             "turns": r["turns"], "prompt_tokens": r["prompt_tokens"] or 0,
+             "completion_tokens": r["completion_tokens"] or 0,
+             "last_used": r["last_used"]} for r in rows]
+
+
 def save_messages(sid: str, history: list[dict], saved: dict) -> int:
     """增量落盘一轮消息，返回实际写入的行数。
 
