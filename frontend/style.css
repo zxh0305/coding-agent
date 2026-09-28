@@ -331,7 +331,10 @@ body.side-resizing .sidebar { transition: none; }
 .hint code { background: var(--hover); padding: 1px 4px; border-radius: 4px; }
 
 /* ---------- 对话区 ---------- */
-.main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative;
+  /* 容器查询锚点：工具栏按钮按主区实际宽度自适应（右侧文档/浏览器面板
+     展开时主区被压窄，媒体查询感知不到这种挤压） */
+  container-type: inline-size; }
 .chat {
   flex: 1; overflow-y: auto; padding: 24px 10%;
   display: flex; flex-direction: column; gap: 12px;
@@ -722,6 +725,28 @@ button.primary {
   border: 1px solid var(--accent); border-radius: 999px; cursor: pointer;
 }
 button.primary:hover { background: var(--accent-hover); }
+
+/* ---------- 工具栏自适应（容器查询：跟随 composer 实际宽度） ----------
+   右侧文档/浏览器面板展开会把主区压窄，媒体查询感知不到这种挤压，
+   这里用容器查询：composer 自身宽度不够时按钮换行 + 收紧样式，
+   而不是全体 chip 被压成"📎..."的省略号挤在一行。 */
+@container (max-width: 860px) {
+  .toolbar {
+    flex-wrap: wrap;                 /* 放不下的按钮折到第二行 */
+    row-gap: 6px;
+    justify-content: flex-start;     /* 折行后靠左排，别散开 */
+  }
+  .toolbar .grow { display: none; }  /* 多行时撑开的空档没意义，发/停靠左即可 */
+  .chip { max-width: 140px; padding: 4px 10px; }
+  /* 模型名往往最长，窄时只留图标（悬停 title 仍可见完整名）；
+     权限/工作区这类短文案保留，靠 max-width + 省略号兜底 */
+  #model-chip #model-label { display: none; }
+  .composer { margin: 0 4% 14px; }   /* 左右留白同步收窄，给按钮腾地方 */
+}
+@container (max-width: 560px) {
+  .composer { margin: 0 2% 12px; }
+  .chip { padding: 4px 8px; max-width: 110px; }
+}
 
 /* ---------- 上下文容量气泡 ---------- */
 .ctx-pop {
