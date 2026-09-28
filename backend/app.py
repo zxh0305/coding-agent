@@ -339,6 +339,13 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                         bus.publish({"type": kind, **payload})
                     else:
                         bus.publish({"type": kind, **payload})
+                        if kind == "todo_update":
+                            # 清单随会话持久化（迁移 19）：右上角清单浮窗在刷新/
+                            # 切会话后仍能回放当前清单与完成状态，不再只存内存
+                            try:
+                                db.save_todos(sid, payload.get("todos") or [])
+                            except Exception:
+                                log.exception("保存任务清单失败")
                     if kind in ("usage", "compacted"):  # 最新上下文容量，供 /api/context
                         _ctx[sid] = payload
                     if kind == "done":
@@ -886,6 +893,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._handle_session_attachments(sid)
             if sub == "browser" and len(parts) > 4 and parts[4] == "shot":
                 return self._handle_browser_shot(sid)
+            if sub == "todos":
+                # 任务清单：todo_write 落库后的最新一份（空数组 = 已清空）
+                return self._json({"todos": db.get_todos(sid)})
             return self._handle_session_messages(sid)
         elif self.path.startswith("/api/context"):
             sid = (self._query().get("session_id") or [""])[0]

@@ -489,6 +489,7 @@ async function newTask(presetProject = null) {
   resetDocsPanel();    // 新任务态：收起文档栏并清空内容
   loadDocsList();      // 新任务态：文档计数清零
   resetAttachPop();    // 新任务态：附件浮窗收起、计数清零
+  setSessionTodos([]); // 新任务态：还没有清单，入口隐藏
   usageNow = null;
   updateCtxChip();
   if (presetProject) {
@@ -768,6 +769,7 @@ async function switchSession(id) {
   histHasMore = false;
   historyMids = new Set();        // 补发去重基准随任务重建
   await loadHistoryPage();        // 时间线先行：补发定性（finishBoot）要拿它比对
+  loadTodos();                    // 本会话的任务清单（若有）：驱动右上角 📋 入口
   openEvents(id);                 // 再接事件流：断线/刷新期间的回合靠 since 补发接上
   await loadSessions();
   // 归档任务可查看不可输入：按服务端最新状态锁/解锁输入框
@@ -3033,6 +3035,8 @@ bind("input", "keydown", (e) => {
   if (e.isComposing || imeComposing || e.keyCode === 229) return;
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
+bind("todo-chip", "click", toggleTodoPop);
+bind("todo-close", "click", () => $("todo-pop").classList.add("hidden"));
 bind("attach-btn", "click", () => $("file-input").click());
 bind("file-input", "change", onFilesChosen);
 bind("input", "paste", onPaste);
@@ -3132,7 +3136,7 @@ async function logoutNow() {
 }
 document.addEventListener("click", (e) => {
   // 点弹窗外空白处关闭浮动层
-  for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"], ["perm-pop", "perm-chip"]]) {
+  for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"], ["perm-pop", "perm-chip"], ["todo-pop", "todo-chip"]]) {
     const el = $(pop);
     // git 的分支二级面板挂在外层（不在 git-pop 内）：点它不算点空白，否则
     // git 浮窗被关掉而分支面板还留着（真实踩过的坑）
@@ -4631,14 +4635,17 @@ const archCollapsedGroups = new Set();
 
 async function renderArchiveList() {
   const ul = $("archive-list");
-  ul.innerHTML = "";
+  // 先取数据、在内存里把新列表构建完，再一次性替换 DOM：
+  // 避免先清空再等接口导致浮窗内容闪空白
   let list = [];
   try { list = await api("/api/sessions?archived=1"); } catch (e) { return; }
+  const fresh = document.createDocumentFragment();
   if (!Array.isArray(list) || !list.length) {
     const li = document.createElement("li");
     li.className = "archive-empty";
     li.textContent = "（暂无归档任务）";
-    ul.appendChild(li);
+    fresh.appendChild(li);
+    ul.replaceChildren(fresh);
     return;
   }
   // 与主列表同款的项目分组：workspace 目录名为组名，空 workspace 进"其他"垫底。
@@ -4653,10 +4660,12 @@ async function renderArchiveList() {
   const keys = [...groups.keys()].filter(k => k !== "__other__").sort(
     (a, b) => groups.get(a).label.localeCompare(groups.get(b).label, "zh"));
   if (groups.has("__other__")) keys.push("__other__");
+  // 唯一的组是"其他"时不显示组头（退化平铺）；组头显示与否决定能否折叠隐藏条目
   const onlyOneGroup = keys.length === 1;
   for (const key of keys) {
     const g = groups.get(key);
-    if (!(onlyOneGroup && key === "__other__")) {
+    const showHead = !(onlyOneGroup && key === "__other__");
+    if (showHead) {
       const head = document.createElement("li");
       head.className = "group-head";
       const collapsed = archCollapsedGroups.has(key);
@@ -4664,16 +4673,20 @@ async function renderArchiveList() {
       const text = document.createElement("span");
       text.className = "gh-label";
       text.textContent = `${collapsed ? "▸" : "▾"} ${icon} ${g.label}（${g.items.length}）`;
-      text.addEventListener("click", () => {
+      text.addEventListener("click", (e) => {
+        // 阻止冒泡到 document 的"点浮窗外关闭"监听：重建后 e.target 已脱离
+        // 浮窗树，会被误判为外部点击而关掉浮窗
+        e.stopPropagation();
         collapsed ? archCollapsedGroups.delete(key) : archCollapsedGroups.add(key);
         renderArchiveList();
       });
       head.appendChild(text);
-      ul.appendChild(head);
+      fresh.appendChild(head);
     }
-    if (archCollapsedGroups.has(key) && !onlyOneGroup) continue;
-    for (const s of g.items) ul.appendChild(archiveRow(s));
+    if (showHead && archCollapsedGroups.has(key)) continue;
+    for (const s of g.items) fresh.appendChild(archiveRow(s));
   }
+  ul.replaceChildren(fresh);  // 一次替换，无中间空白帧
 }
 
 function archiveRow(s) {

@@ -133,25 +133,8 @@
         return d;
       }
 
-      if (block.kind === "todo") {
-        // 任务清单卡：状态图标 + 划线已完成项。纯展示（清单由模型经 todo_write
-        // 维护），不提供交互——用户手动勾选改变不了模型的账本，避免假状态。
-        const d = doc.createElement("div");
-        d.className = "todo-card";
-        const head = doc.createElement("div");
-        head.className = "todo-head";
-        const done = block.todos.filter((t) => t.status === "done").length;
-        head.textContent = `📋 任务清单 ${done}/${block.todos.length}`;
-        d.appendChild(head);
-        for (const t of block.todos) {
-          const row = doc.createElement("div");
-          row.className = "todo-item " + (t.status || "pending");
-          const icon = t.status === "done" ? "✅" : (t.status === "in_progress" ? "🔄" : "⬜");
-          row.textContent = `${icon} ${t.content || ""}`;
-          d.appendChild(row);
-        }
-        return d;
-      }
+      // kind === "todo" 已移除：任务清单改为右上角 📋 浮窗展示（app.js），
+      // 对话流不再渲染清单卡；旧历史里残留的 todo 块直接跳过。
 
       if (block.kind === "compact") return deps.compactCard(block.summary);
 

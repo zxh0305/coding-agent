@@ -216,13 +216,8 @@
         // 要算一步——否则摘要行会把它漏掉，与「已工作 N 步」的口径不符。
         ensureProcess().steps += 1;
       } else if (t === "todo_update") {
-        // 任务清单卡（独立块，位于时间线当前位置）：每次 todo_update 整卡重画
-        // （同一回合多份时以最新为准——旧的存在就把内容替换掉）。
-        const todos = Array.isArray(evt.todos) ? evt.todos : [];
-        if (!todos.length) continue;
-        const existing = blocks.findIndex((b) => b.kind === "todo");
-        if (existing >= 0) blocks[existing] = { kind: "todo", todos: todos };
-        else blocks.push({ kind: "todo", todos: todos });
+        // 清单不再进时间线：右上角 📋 浮窗实时更新（回放走 /todos 接口），
+        // 这里只吞掉事件，避免回放路径在对话流里画出清单卡。
       } else if (t === "done") {
         // 定稿：answer 以 done.answer 为权威正文（非空时覆盖流式累积）
         const authoritative = typeof evt.answer === "string" ? evt.answer : "";

@@ -235,6 +235,10 @@ MIGRATIONS: list[tuple[int, str | None]] = [
     # 归档态的会话才允许删除（删除入口也只出现在归档区），未归档直接删返回 409。
     (17, "ALTER TABLE sessions ADD COLUMN archived INTEGER DEFAULT 0"),
     (18, "ALTER TABLE sessions ADD COLUMN archived_at REAL"),
+    # 19：会话级任务清单（todo_write）。原来只存 ToolContext 内存，重启/切会话
+    #    即丢，前端回放也看不到；现在随会话持久化（JSON 文本），右上角清单
+    #    浮窗据此在任意时刻都能显示当前会话的清单与完成状态。
+    (19, "ALTER TABLE sessions ADD COLUMN todos TEXT"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -278,7 +282,33 @@ def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
         return "provider_id" in _table_columns(conn, "sessions")
     if version == 16:          # sessions.model
         return "model" in _table_columns(conn, "sessions")
+    if version == 19:          # sessions.todos（会话级任务清单 JSON）
+        return "todos" in _table_columns(conn, "sessions")
     return False
+
+
+def save_todos(sid: str, todos: list) -> None:
+    """整体替换会话的任务清单（todo_write 成功后由 agent 事件链路调用）。
+
+    todos 是已校验的 [{content, status}] 数组，原样 JSON 序列化；空数组也照存
+    （表示清单被清空，前端据此隐藏入口）。
+    """
+    with _conn() as conn:
+        conn.execute("UPDATE sessions SET todos=? WHERE id=?",
+                     (json.dumps(todos, ensure_ascii=False), sid))
+
+
+def get_todos(sid: str) -> list:
+    """读会话的任务清单；从未写过（NULL）或 JSON 损坏都返回 []。"""
+    with _conn() as conn:
+        row = conn.execute("SELECT todos FROM sessions WHERE id=?", (sid,)).fetchone()
+    if not row or not row["todos"]:
+        return []
+    try:
+        todos = json.loads(row["todos"])
+        return todos if isinstance(todos, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
 
 
 def _migrate_messages(conn: sqlite3.Connection) -> None:
