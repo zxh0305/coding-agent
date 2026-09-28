@@ -857,8 +857,10 @@ class Handler(SimpleHTTPRequestHandler):
                  "parameters": t["function"]["parameters"]}
                 for t in TOOL_SCHEMAS
             ]})
-        elif self.path == "/api/sessions":
-            rows = db.list_sessions(self.user["id"])
+        elif self.path.split("?")[0] == "/api/sessions":
+            # 注意 self.path 含查询串，必须先剥掉再比较，否则 ?archived=1 会 404
+            archived = (self._query().get("archived") or ["0"])[0]
+            rows = db.list_sessions(self.user["id"], archived=int(archived == "1"))
             for r in rows:  # state 是内存态，db 层不掺和，在这里现算后随列表带回
                 r["state"] = _session_state(r["id"])
             self._json(rows)
@@ -961,6 +963,22 @@ class Handler(SimpleHTTPRequestHandler):
                 if db.session_owner(sid) != self.user["id"]:
                     return self._json({"error": "任务不存在或不属于当前用户"}, 404)
                 self._handle_perm_mode(sid)
+            elif re.fullmatch(r"/api/sessions/[^/]+/archive", path):
+                # 归档：从任务栏消失，进归档区。运行中的任务也允许归档（回合在
+                # 后台继续跑完，事件流照常推送，只是列表里看不见了）。
+                sid = path.split("/")[3]
+                if db.session_owner(sid) != self.user["id"]:
+                    return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+                db.archive_session(sid, 1)
+                log.info("归档会话 %s", sid)
+                self._json({"ok": True, "sid": sid, "archived": 1})
+            elif re.fullmatch(r"/api/sessions/[^/]+/unarchive", path):
+                sid = path.split("/")[3]
+                if db.session_owner(sid) != self.user["id"]:
+                    return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+                db.archive_session(sid, 0)
+                log.info("取消归档会话 %s", sid)
+                self._json({"ok": True, "sid": sid, "archived": 0})
             elif re.fullmatch(r"/api/sessions/[^/]+/seen", path):
                 # 标记该会话的绿/红点已读（清掉未读徽标）
                 sid = path.split("/")[3]
@@ -1011,6 +1029,10 @@ class Handler(SimpleHTTPRequestHandler):
             sid = (self._query().get("session_id") or [""])[0]
             if db.session_owner(sid) != self.user["id"]:
                 return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+            # 硬约束：只有归档区里的任务才允许删除。前端"删除"入口也只在归档区
+            # 出现，这里再拦一道，防止直接调接口绕过"会话栏不可删"的设计。
+            if not db.session_archived(sid):
+                return self._json({"error": "任务未归档，请先归档再删除"}, 409)
             db.delete_session(sid)
             with _lock:
                 _agents.pop(sid, None)

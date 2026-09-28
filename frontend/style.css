@@ -190,7 +190,66 @@ body.side-resizing .sidebar { transition: none; }
 }
 .new-task:hover { background: var(--accent-weak); color: var(--accent); border-color: var(--accent-weak-border); }
 
-.task-label { font-size: 11px; color: var(--text-3); padding: 4px 16px 6px; }
+.task-label {
+  font-size: 11px; color: var(--text-3); padding: 4px 16px 6px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+
+/* 归档区入口：嵌在任务列表栏内部（"任务"标签右侧） */
+.archive-btn {
+  border: none; background: none; cursor: pointer;
+  font-size: 11px; color: var(--text-3); padding: 2px 6px; border-radius: 6px;
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.archive-btn:hover { background: var(--accent-weak); color: var(--accent); }
+.archive-count {
+  background: var(--accent); color: #fff; border-radius: 8px;
+  font-size: 10px; padding: 0 5px; line-height: 15px;
+}
+
+/* 归档区浮窗：贴着侧栏右侧出现（与 attach-pop 同一套动画风格） */
+.archive-pop {
+  position: fixed; z-index: 30;
+  left: calc(var(--sidebar-w, 260px) + 12px); top: 60px;
+  width: 320px; max-height: min(70vh, 600px);
+  display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: var(--shadow-md);
+  animation: attach-pop-in .16s ease-out;
+}
+.archive-list { flex: 1; overflow-y: auto; list-style: none; margin: 0; padding: 6px; }
+.archive-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 10px; border-radius: 8px; font-size: 13px;
+}
+.archive-item:hover { background: var(--hover); }
+.archive-item .t-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-item .arch-btn {
+  border: none; background: none; cursor: pointer; font-size: 12px;
+  color: var(--text-3); padding: 3px 6px; border-radius: 6px; flex-shrink: 0;
+}
+.archive-item .arch-btn:hover { background: var(--accent-weak); color: var(--accent); }
+.archive-item .arch-btn.del:hover { background: var(--danger-weak, #fde8e8); color: var(--danger, #d33); }
+.archive-empty { padding: 24px 12px; text-align: center; color: var(--text-3); font-size: 12px; }
+
+/* 删除二次确认弹窗（modal） */
+.archive-del-mask {
+  position: fixed; inset: 0; z-index: 60; background: var(--mask);
+  display: flex; align-items: center; justify-content: center;
+}
+.archive-del-dialog {
+  width: 320px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 12px; box-shadow: var(--shadow-lg); padding: 16px 18px;
+}
+.archive-del-text { font-size: 13px; color: var(--text-2); margin: 10px 0 16px; line-height: 1.6; }
+.archive-del-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.archive-del-actions button {
+  padding: 6px 14px; font-size: 13px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text-2);
+}
+.archive-del-actions .danger {
+  color: #fff; background: var(--danger, #d33); border-color: var(--danger, #d33);
+}
 .task-list { flex: 1; overflow-y: auto; list-style: none; padding: 0 8px; }
 .task {
   display: flex; align-items: center; gap: 6px;

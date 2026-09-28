@@ -231,6 +231,10 @@ MIGRATIONS: list[tuple[int, str | None]] = [
     #    因此老会话行为逐字节不变。拆成两条迁移与 10~14 同理：一条 ALTER 一列。
     (15, "ALTER TABLE sessions ADD COLUMN provider_id TEXT"),
     (16, "ALTER TABLE sessions ADD COLUMN model TEXT"),
+    # 17~18：会话归档。archived=1 的会话从任务栏列表消失，进"归档区"；只有
+    # 归档态的会话才允许删除（删除入口也只出现在归档区），未归档直接删返回 409。
+    (17, "ALTER TABLE sessions ADD COLUMN archived INTEGER DEFAULT 0"),
+    (18, "ALTER TABLE sessions ADD COLUMN archived_at REAL"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -591,15 +595,32 @@ def get_traces(sid: str, mids: list[str]) -> dict:
     return out
 
 
-def list_sessions(user_id: int) -> list[dict]:
+def list_sessions(user_id: int, archived: int = 0) -> list[dict]:
+    """archived=0 任务栏列表 / archived=1 归档区列表（按归档时间倒序）。"""
+    order = "archived_at DESC" if archived else "updated DESC"
     with _conn() as conn:
-        rows = conn.execute("SELECT id, title, updated, workspace FROM sessions WHERE user_id=? "
-                            "ORDER BY updated DESC", (user_id,)).fetchall()
+        rows = conn.execute(
+            f"SELECT id, title, updated, workspace, archived, archived_at FROM sessions "
+            f"WHERE user_id=? AND archived=? ORDER BY {order}", (user_id, archived)).fetchall()
     # 注意：返回原始 title（可能为空），"新任务"之类的展示兜底交给前端做。
     # 之前在这里兜底，导致"标题为空→设标题"的判断永远不成立，标题永远存不上。
     # workspace 随列表带回：前端按项目（工作区目录名）分组展示任务列表。
     return [{"id": r["id"], "title": r["title"], "updated": r["updated"],
-             "workspace": r["workspace"]} for r in rows]
+             "workspace": r["workspace"], "archived": r["archived"],
+             "archived_at": r["archived_at"]} for r in rows]
+
+
+def archive_session(sid: str, archived: int) -> None:
+    """归档 / 取消归档。取消归档时清掉 archived_at，会话按 updated 回任务栏原位。"""
+    with _conn() as conn:
+        conn.execute("UPDATE sessions SET archived=?, archived_at=? WHERE id=?",
+                     (archived, time.time() if archived else None, sid))
+
+
+def session_archived(sid: str) -> int:
+    with _conn() as conn:
+        row = conn.execute("SELECT archived FROM sessions WHERE id=?", (sid,)).fetchone()
+    return row["archived"] if row else 0
 
 
 def delete_session(sid: str) -> None:

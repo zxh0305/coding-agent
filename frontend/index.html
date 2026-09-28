@@ -46,7 +46,12 @@
         <button id="new-task" class="new-task" title="新建任务">＋ 新任务</button>
         <button id="side-collapse" class="side-collapse" title="收起侧栏">⇤</button>
       </div>
-      <div class="task-label">任务</div>
+      <div class="task-label">
+        任务
+        <button id="archive-btn" class="archive-btn" title="归档区">
+          🗄 归档<span id="archive-count" class="archive-count" hidden>0</span>
+        </button>
+      </div>
       <ul id="task-list" class="task-list"></ul>
 
       <!-- 左下角：头像 + 用户名，点击打开设置面板 -->
@@ -320,6 +325,52 @@
       <ul id="attach-list" class="attach-list"></ul>
       <div id="attach-split" class="attach-split" title="拖动调整列表宽度"></div>
       <div id="attach-view" class="attach-view"></div>
+    </div>
+  </div>
+
+  <!-- 归档区浮窗：已归档任务的清单；只有这里提供"恢复 / 删除（二次确认弹窗）" -->
+  <div id="archive-pop" class="archive-pop hidden">
+    <div class="attach-head">
+      <b>🗄 归档区</b>
+      <span id="archive-scope" class="attach-scope"></span>
+      <button id="archive-close" class="git-x" title="关闭">✕</button>
+    </div>
+    <ul id="archive-list" class="archive-list"></ul>
+  </div>
+
+  <!-- 归档确认弹窗：归档不丢数据，但仍弹一次确认，防手滑 -->
+  <div id="arch-cfm-mask" class="archive-del-mask hidden">
+    <div class="archive-del-dialog">
+      <div class="add-title">归档任务</div>
+      <div id="arch-cfm-text" class="archive-del-text"></div>
+      <div class="archive-del-actions">
+        <button id="arch-cfm-cancel">取消</button>
+        <button id="arch-cfm-confirm" class="danger">归档</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 归档成功弹窗：给出「查看归档区 / 撤销归档」两个后续动作 -->
+  <div id="arch-ok-mask" class="archive-del-mask hidden">
+    <div class="archive-del-dialog">
+      <div class="add-title">✅ 已归档</div>
+      <div id="arch-ok-text" class="archive-del-text"></div>
+      <div class="archive-del-actions">
+        <button id="arch-ok-undo">撤销归档</button>
+        <button id="arch-ok-view" class="danger">查看归档区</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 删除任务的二次确认弹窗（modal）：删除不可逆，比行内确认更醒目 -->
+  <div id="archive-del-mask" class="archive-del-mask hidden">
+    <div class="archive-del-dialog">
+      <div class="add-title">删除任务</div>
+      <div id="archive-del-text" class="archive-del-text"></div>
+      <div class="archive-del-actions">
+        <button id="archive-del-cancel">取消</button>
+        <button id="archive-del-confirm" class="danger">删除</button>
+      </div>
     </div>
   </div>
 

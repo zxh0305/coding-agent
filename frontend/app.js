@@ -368,12 +368,11 @@ function taskRow(s, list) {
   });
   const del = document.createElement("button");
   del.className = "t-del";
-  del.textContent = "🗑";
-  del.title = "删除任务";
+  del.textContent = "🗄";
+  del.title = "归档任务";
   del.addEventListener("click", (e) => {
     e.stopPropagation();
-    confirmingDelete = s.id;   // 第一次点：只进入确认状态，不真删
-    renderSessions(list);
+    openArchiveConfirm(s.id, s.title);
   });
   // 注意 state 可能是 null（idle 无徽标）：appendChild(null) 会插入字面量
   // "null"，必须过滤掉空值再 append。
@@ -4512,3 +4511,171 @@ function resetBrowserPanel() {
   if (noteEl) noteEl.textContent = "";
   if (chip) chip.classList.add("hidden");
 }
+
+// ---------------------------------------------------------------------------
+// 归档区：任务栏"🗄 归档"入口 → 浮窗列出已归档任务，提供 恢复 / 删除（二次确认弹窗）
+// ---------------------------------------------------------------------------
+
+async function loadArchiveCount() {
+  try {
+    const list = await api("/api/sessions?archived=1");
+    const n = Array.isArray(list) ? list.length : 0;
+    const badge = $("archive-count");
+    badge.textContent = n;
+    badge.hidden = n === 0;
+  } catch (e) { /* 后端未就绪不打扰 */ }
+}
+
+async function renderArchiveList() {
+  const ul = $("archive-list");
+  ul.innerHTML = "";
+  let list = [];
+  try { list = await api("/api/sessions?archived=1"); } catch (e) { return; }
+  if (!Array.isArray(list) || !list.length) {
+    const li = document.createElement("li");
+    li.className = "archive-empty";
+    li.textContent = "（暂无归档任务）";
+    ul.appendChild(li);
+    return;
+  }
+  for (const s of list) {
+    const li = document.createElement("li");
+    li.className = "archive-item";
+    li.title = s.title || "";
+    const title = document.createElement("div");
+    title.className = "t-title";
+    title.textContent = s.title || "新任务";
+    const un = document.createElement("button");
+    un.className = "arch-btn";
+    un.textContent = "↩ 恢复";
+    un.title = "恢复到任务列表";
+    un.addEventListener("click", async () => {
+      try {
+        await api(`/api/sessions/${encodeURIComponent(s.id)}/unarchive`, { method: "POST" });
+        toast("已恢复到任务列表");
+        await renderArchiveList();
+        loadSessions();
+        loadArchiveCount();
+      } catch (err) { toast("恢复失败：" + err.message); }
+    });
+    const del = document.createElement("button");
+    del.className = "arch-btn del";
+    del.textContent = "🗑";
+    del.title = "删除任务（不可恢复）";
+    del.addEventListener("click", () => openArchiveDelete(s.id, s.title));
+    li.append(title, un, del);
+    ul.appendChild(li);
+  }
+}
+
+let pendingDeleteSid = null;
+
+function openArchiveDelete(sid, title) {
+  pendingDeleteSid = sid;
+  $("archive-del-text").textContent =
+    `确定删除「${title || "新任务"}」吗？该任务的全部消息、附件与文档将被永久删除，不可恢复。`;
+  $("archive-del-mask").classList.remove("hidden");
+}
+
+function closeArchiveDelete() {
+  pendingDeleteSid = null;
+  $("archive-del-mask").classList.add("hidden");
+}
+
+async function confirmArchiveDelete() {
+  const sid = pendingDeleteSid;
+  if (!sid) return;
+  closeArchiveDelete();
+  try {
+    await api(`/api/sessions?session_id=${encodeURIComponent(sid)}`, { method: "DELETE" });
+    toast("已删除任务");
+    if (currentSession === sid) newTask();
+    await renderArchiveList();
+    loadArchiveCount();
+  } catch (e) { toast("删除失败：" + e.message); }
+}
+
+function toggleArchivePop() {
+  const pop = $("archive-pop");
+  const opening = pop.classList.contains("hidden");
+  pop.classList.toggle("hidden");
+  if (opening) renderArchiveList();
+}
+
+// --- 归档确认弹窗：确认后才真正调 archive 接口 ---
+let pendingArchSid = null;
+
+function openArchiveConfirm(sid, title) {
+  pendingArchSid = sid;
+  $("arch-cfm-text").textContent = `确定归档「${title || "新任务"}」吗？归档后会从任务列表消失，可在归档区找回。`;
+  $("arch-cfm-mask").classList.remove("hidden");
+}
+
+function closeArchiveConfirm() {
+  pendingArchSid = null;
+  $("arch-cfm-mask").classList.add("hidden");
+}
+
+async function confirmArchive() {
+  const sid = pendingArchSid;
+  if (!sid) return;
+  closeArchiveConfirm();
+  try {
+    await api(`/api/sessions/${encodeURIComponent(sid)}/archive`, { method: "POST" });
+    if (currentSession === sid) newTask();  // 归档了当前打开的任务：回到新建态
+    loadSessions();
+    loadArchiveCount();
+    pendingArchSid = sid;  // closeArchiveConfirm 清了它，成功弹窗的「撤销」还要用
+    $("arch-ok-text").textContent = "任务已归档，可在归档区查看或恢复。";
+    $("arch-ok-mask").classList.remove("hidden");
+  } catch (err) { toast("归档失败：" + err.message); }
+}
+
+// 成功弹窗里的「撤销归档」：把刚归档的任务原样拉回任务列表
+async function undoArchive() {
+  const sid = pendingArchSid;
+  $("arch-ok-mask").classList.add("hidden");
+  if (!sid) return;
+  pendingArchSid = null;
+  try {
+    await api(`/api/sessions/${encodeURIComponent(sid)}/unarchive`, { method: "POST" });
+    toast("已撤销归档");
+    loadSessions();
+    loadArchiveCount();
+  } catch (err) { toast("撤销失败：" + err.message); }
+}
+
+// 成功弹窗里的「查看归档区」：收起弹窗并打开归档区浮窗
+function viewArchive() {
+  const sid = pendingArchSid;
+  $("arch-ok-mask").classList.add("hidden");
+  pendingArchSid = null;
+  // 关键：本次 click 还会冒泡到 document 上的"点浮窗外收起"监听器，若同步
+  // 打开浮窗，会被同一事件立即收起（按钮既不在 pop 内也不是 archive-btn）。
+  // 延后到下一轮事件循环，等收起监听跑完再打开。
+  setTimeout(() => {
+    const pop = $("archive-pop");
+    pop.classList.remove("hidden");
+    renderArchiveList();
+  }, 0);
+}
+
+bind("arch-cfm-cancel", "click", closeArchiveConfirm);
+bind("arch-cfm-confirm", "click", confirmArchive);
+bind("arch-cfm-mask", "click", (e) => { if (e.target.id === "arch-cfm-mask") closeArchiveConfirm(); });
+bind("arch-ok-undo", "click", undoArchive);
+bind("arch-ok-view", "click", viewArchive);
+
+bind("archive-btn", "click", toggleArchivePop);
+bind("archive-close", "click", toggleArchivePop);
+bind("archive-del-cancel", "click", closeArchiveDelete);
+bind("archive-del-confirm", "click", confirmArchiveDelete);
+bind("archive-del-mask", "click", (e) => { if (e.target.id === "archive-del-mask") closeArchiveDelete(); });
+// 点浮窗外区域收起归档浮窗（确认弹窗不受影响，它 z-index 更高且自带遮罩）
+document.addEventListener("click", (e) => {
+  const pop = $("archive-pop");
+  if (pop.classList.contains("hidden")) return;
+  if (pop.contains(e.target) || e.target.closest("#archive-btn")) return;
+  pop.classList.add("hidden");
+});
+loadArchiveCount();
