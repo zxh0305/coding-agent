@@ -239,6 +239,11 @@ MIGRATIONS: list[tuple[int, str | None]] = [
     #    即丢，前端回放也看不到；现在随会话持久化（JSON 文本），右上角清单
     #    浮窗据此在任意时刻都能显示当前会话的清单与完成状态。
     (19, "ALTER TABLE sessions ADD COLUMN todos TEXT"),
+    # 20：标题是否由用户手动改过。动机：新增\"首轮结束后 AI 总结标题\"——总结
+    #     结果要写回 title，但绝不能覆盖用户自己起的名字。置 1 的两个入口：
+    #     重命名接口（用户亲手动过）、以及将来的其它人工改名路径；AI 总结前
+    #     先查此标记，为 1 就彻底不动标题。默认 0 = 自动生成的标题可被覆盖。
+    (20, "ALTER TABLE sessions ADD COLUMN title_manual INTEGER DEFAULT 0"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -284,6 +289,8 @@ def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
         return "model" in _table_columns(conn, "sessions")
     if version == 19:          # sessions.todos（会话级任务清单 JSON）
         return "todos" in _table_columns(conn, "sessions")
+    if version == 20:          # sessions.title_manual（标题是否被用户手动改过）
+        return "title_manual" in _table_columns(conn, "sessions")
     return False
 
 
@@ -487,9 +494,39 @@ def session_owner(sid: str) -> int | None:
     return row["user_id"] if row else None
 
 
-def set_session_title(sid: str, title: str) -> None:
+def set_session_title(sid: str, title: str, manual: bool = False) -> None:
+    """写标题。manual=True 表示【用户亲自改名】：同时置 title_manual=1，此后
+    首轮结束的 AI 标题总结不再动它（AI 总结只覆盖自动生成的标题）。
+
+    默认 False —— 首轮提交时的占位标题、以及 AI 总结回写都走这条路，
+    刻意不碰 title_manual：标记一旦被置 1 就再也回不去了。
+    """
     with _conn() as conn:
-        conn.execute("UPDATE sessions SET title=? WHERE id=?", (title, sid))
+        if manual:
+            conn.execute("UPDATE sessions SET title=?, title_manual=1 WHERE id=?",
+                         (title, sid))
+        else:
+            conn.execute("UPDATE sessions SET title=? WHERE id=?", (title, sid))
+
+
+def session_title_manual(sid: str) -> bool:
+    """该会话的标题是否由用户手动改过（AI 总结据此决定要不要跳过）。"""
+    with _conn() as conn:
+        row = conn.execute("SELECT title_manual FROM sessions WHERE id=?",
+                           (sid,)).fetchone()
+    return bool(row and row["title_manual"])
+
+
+def session_title_contains(sid: str, title: str) -> bool:
+    """当前标题是否就是 title（AI 标题总结的幂等闸门）。
+
+    与 session_title_manual 分开两次查询是刻意的：这里读的是"最新已落库的
+    标题"，与写回同一个连接序列，顺序确定——不会出现"查到旧标题→写回→覆盖
+    用户刚改的名"这种竞态窗口里的误判（手动标记的复查紧跟其后）。
+    """
+    with _conn() as conn:
+        row = conn.execute("SELECT title FROM sessions WHERE id=?", (sid,)).fetchone()
+    return bool(row and (row["title"] or "") == title)
 
 
 def get_session_workspace(sid: str) -> str | None:

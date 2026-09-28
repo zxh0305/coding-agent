@@ -223,6 +223,67 @@ def _spawn_memory_extraction(sid: str, agent: Agent) -> None:
         log.exception("[会话 %s] 记忆提取线程启动失败（忽略，不影响回合）", sid)
 
 
+TITLE_PROMPT = (
+    "你在为一个 AI 编程助手生成会话标题。根据下面这段对话，用中文给这个任务起一个"
+    "标题：4~14 个字，动宾或名词短语，概括【用户到底想做什么】，不要复述原句、"
+    "不要引号、不要标点结尾、不要任何解释，只输出标题本身。\n\n"
+    "用户：{user}\n\n"
+    "助手：{answer}\n"
+)
+
+
+def _clean_title(raw: str) -> str:
+    """把模型输出洗成一行可用标题；不合格返回 \"\"（调用方保留占位标题）。"""
+    line = (raw or "").strip().splitlines()
+    text = next((ln.strip() for ln in line if ln.strip()), "")
+    # 去掉模型常见的包装：引号、书名号、Markdown 记号、"标题："前缀
+    text = text.strip("「」『』\"'“”《》\\*# ")
+    text = re.sub(r"^(标题|任务名|会话名)[:：]\s*", "", text).strip()
+    if not text or len(text) > 24:
+        return ""
+    return text
+
+
+def _generate_session_title(sid: str, chat, plain: str, answer: str) -> None:
+    """在后台线程里按首轮问答生成标题；任何失败都静默保留占位标题。
+
+    三道闸门都必须在【真正写库前】现查一次（而不是启动线程时查完就算）：
+    * title_manual=1 —— 用户在等待总结期间亲手改了名，绝不能覆盖；
+    * title 已是总结结果 —— 同一会话只总结一次（重放/重试不重复烧请求）；
+    * 线程优先级之外的失败（模型报错、输出非法）→ 直接放弃，保留 placeholder。
+    """
+    try:
+        prompt = TITLE_PROMPT.format(user=plain[:1500], answer=(answer or "（无回答）")[:1500])
+        msg = chat([{"role": "user", "content": prompt}], temperature=0)
+        title = _clean_title(msg.get("content") if isinstance(msg, dict) else "")
+        if not title:
+            return
+        if db.session_title_manual(sid):
+            return  # 用户手动命名过：这个名字归用户，AI 不碰
+        if db.session_title_contains(sid, title):
+            return  # 已是这个名字（重复触发/重放）：不重复写、不重复广播
+        db.set_session_title(sid, title)
+        # 广播让所有开着这个会话的页面就地更新左侧列表那一行；前端失败与否
+        # 都不影响库里的标题（下次拉列表自然一致）。
+        _event_bus(sid).publish({"type": "session_title", "session_id": sid, "title": title})
+    except Exception:
+        log.exception("[会话 %s] 标题总结失败（忽略，保留原占位标题）", sid)
+
+
+def _spawn_title_generation(sid: str, chat, plain: str, answer: str) -> None:
+    """首轮结束后的标题总结启动点（与 _spawn_memory_extraction 同址同纪律）。
+
+    传的是 chat 方法而非 agent 实例：线程绝不共享 agent.history（下一回合马上
+    会改它）。启动失败只进日志，绝不影响回合收尾。
+    """
+    try:
+        threading.Thread(target=_generate_session_title, daemon=True,
+                         args=(sid, chat, plain, answer),
+                         name=f"title-gen-{sid}").start()
+    except Exception:
+        log.exception("[会话 %s] 标题总结线程启动失败（忽略）", sid)
+
+
 def _push_browser_screenshot(sid: str, png: bytes, url: str, note: str) -> None:
     """浏览器工具的截图推送（browser_tools.screenshot_pusher 注入点）：
     PNG 落盘到会话浏览器目录 + 发 SSE 事件（前端右侧「浏览器」弹窗实时显示）。
@@ -440,6 +501,20 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             # 订阅页的时间线；失败只进日志，下轮自然重试。出错的回合不走这里
             # （内容不完整，避免把半截对话提炼成错误记忆），最终兜底路径同理。
             _spawn_memory_extraction(sid, agent)
+            # 首轮结束的标题总结：只在【本会话第一次提问】跑一次，用回答文本
+            # 把首轮提交时的占位标题（输入前 24 字）换成真正概括任务的短标题。
+            # 判据是历史里只有一条真实用户消息（收尾指令/循环提醒是 _synthetic
+            # 合成消息，必须排除）；出错的回合不走这里（内容不完整，总结出来的
+            # 名字容易跑偏）。线程内自行复查手动改名标记，用户中途改名不会被
+            # AI 覆盖。
+            try:
+                if sum(1 for m in agent.history
+                       if m.get("role") == "user" and not m.get("_synthetic")) <= 1:
+                    answer = next((m.get("content") for m in reversed(agent.history)
+                                   if m.get("role") == "assistant" and m.get("content")), "")
+                    _spawn_title_generation(sid, agent.llm.chat, plain, answer)
+            except Exception:
+                log.exception("[会话 %s] 标题总结启动失败（忽略）", sid)
         except Exception:
             # 最后一道兜底：连收尾都炸了也要把回合关掉，绝不挂起订阅页
             log.exception("[会话 %s] 回合线程收尾异常", sid)
@@ -1669,11 +1744,13 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _handle_session_rename(self, sid: str):
         """重命名任务标题。自动标题（首轮提交时取输入前 24 字）之外，用户
-        可以在左侧任务列表里改任意名字——存 title 字段，与其他展示共用。"""
+        可以在左侧任务列表里改任意名字——存 title 字段，与其他展示共用。
+        这里同时置 title_manual=1：用户亲手动过的名字，首轮结束的 AI 标题
+        总结绝不能再覆盖（见 db.set_session_title 的 manual 参数）。"""
         title = str(self._body().get("title") or "").strip()
         if not title or len(title) > 80:
             return self._json({"error": "标题须为 1-80 字符"}, 400)
-        db.set_session_title(sid, title)
+        db.set_session_title(sid, title, manual=True)
         self._json({"ok": True, "title": title})
 
     def _handle_perm_mode(self, sid: str):

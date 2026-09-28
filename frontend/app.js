@@ -446,6 +446,18 @@ function renderSessions(list) {
   }
 }
 
+// 服务端首轮结束后 AI 总结出的新任务名（SSE session_title）：就地改缓存并
+// 重画列表。正在重命名的那一行不碰——用户手已经放在输入框里了，此刻换掉
+// 标题只会让人以为输入丢了（服务端侧也已标记手动，不会覆盖）。
+function onSessionTitle(id, title) {
+  const s = sessionsCache.find(x => x.id === id);
+  if (!s) return;                 // 归档区/别的会话：列表里没有它，等下次拉取
+  if (renamingSession === id) return;
+  if (!title || s.title === title) return;
+  s.title = title;
+  renderSessions(sessionsCache);
+}
+
 async function doDeleteSession(id) {
   removeSessionLocal(id);  // 先让行消失（即时反馈），请求在后台进行
   try {
@@ -2726,6 +2738,11 @@ function applyEvent(evt, seq) {
   } else if (t === "browser_shot") {
     // agent 的内置浏览器推来了新截图：展开右侧浏览器栏、追加最新画面
     onBrowserShot(evt.url, evt.note, evt.shot);
+  } else if (t === "session_title") {
+    // 首轮结束后服务端用 AI 总结出了更好的任务名（后台线程，可能在本回合
+    // turn_end 之后几十秒才到）。就地更新列表那一行，不必等 8 秒轮询——
+    // 但只在本页还没手动改过这个名字时更新，避免覆盖用户刚起的名字。
+    if (evt.session_id) onSessionTitle(evt.session_id, evt.title);
   } else if (t === "session_deleted") {
     // 其他标签页删掉了这个任务：收摊回到新建态
     closeEvents();

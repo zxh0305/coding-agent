@@ -550,5 +550,51 @@ class TestOrdExhaustion(StorageTestBase):
                          + [4 * db.ORD_GAP + db.ORD_GAP // 2, 5 * db.ORD_GAP])
 
 
+# ---------------------------------------------------------------------------
+# 六、标题：自动生成 vs 用户手动命名
+# ---------------------------------------------------------------------------
+
+class TestSessionTitle(StorageTestBase):
+    """首轮结束的 AI 标题总结要能写回自动标题，但绝不能覆盖用户手动改过的名字。
+
+    title_manual 就是这个分界：set_session_title 默认（占位标题、AI 总结写回）
+    不碰它；只有用户亲自改名（manual=True）才置 1，此后为真、不可逆。
+    """
+
+    def test_default_title_is_not_manual(self):
+        """新建会话的默认标题属于自动类型：标记须为 0，否则 AI 总结永远不会跑。"""
+        db.set_session_title("s1", "显示这个")
+        self.assertFalse(db.session_title_manual("s1"))
+
+    def test_ai_summary_can_overwrite_auto_title(self):
+        """自动标题可被 AI 总结覆盖，且这次写回不会把会话误标成"手动命名"。"""
+        db.set_session_title("s1", "显示这个")
+        db.set_session_title("s1", "修复附件点击无响应")
+        row = self.row("SELECT title, title_manual FROM sessions WHERE id=?", "s1")
+        self.assertEqual(row[0], "修复附件点击无响应")
+        self.assertEqual(row[1], 0)
+
+    def test_manual_rename_sets_flag_and_survives_ai(self):
+        """用户改名后置标记；紧接着 AI 总结尝试写回时，读到的标记为真——
+        调用方据此跳过（此处直接断言标记，写回前的判断在 app._generate_session_title）。"""
+        db.set_session_title("s1", "显示这个")
+        db.set_session_title("s1", "我的名字", manual=True)
+        self.assertTrue(db.session_title_manual("s1"))
+        self.assertEqual(self.row("SELECT title FROM sessions WHERE id=?", "s1")[0],
+                         "我的名字")
+
+    def test_session_title_contains_idempotency_gate(self):
+        """同名判断是"只总结一次"的闸门：已是该标题 → True，防止重复写与重复广播。"""
+        db.set_session_title("s1", "显示这个")
+        self.assertFalse(db.session_title_contains("s1", "修复附件点击无响应"))
+        db.set_session_title("s1", "修复附件点击无响应")
+        self.assertTrue(db.session_title_contains("s1", "修复附件点击无响应"))
+
+    def test_missing_session_does_not_raise(self):
+        """会话已被删除（后台线程醒来时常见）：两个查询都返回 False，不抛异常。"""
+        self.assertFalse(db.session_title_manual("ghost"))
+        self.assertFalse(db.session_title_contains("ghost", "任意"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
