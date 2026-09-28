@@ -229,9 +229,14 @@ function fmtTime(ts) {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;  // 前天起就显示日期
 }
 
-function toast(text) {
+// toast(text, type)：type="success" | "error"，默认 success。
+// 顶部居中弹出，2.5s 自动收起；点击可提前关闭。
+function toast(text, type = "success") {
   const t = $("toast");
-  t.textContent = text;
+  t.className = "toast " + type;
+  t.innerHTML = `<span class="toast-icon">${type === "error" ? "✕" : "✓"}</span>`;
+  t.appendChild(document.createTextNode(text));  // 文本走 textNode，避免消息内容被当 HTML 解析
+  t.onclick = () => t.classList.add("hidden");   // 点击可提前关闭
   t.classList.remove("hidden");
   clearTimeout(toast._timer);
   toast._timer = setTimeout(() => t.classList.add("hidden"), 2500);
@@ -281,7 +286,7 @@ async function submitRename(id, title) {
       { method: "POST", body: JSON.stringify({ title }) });
     const s = sessionsCache.find(x => x.id === id);
     if (s) s.title = title;
-  } catch (e) { toast("重命名失败：" + e.message); }
+  } catch (e) { toast("重命名失败：" + e.message, "error"); }
   renamingSession = null;
   renderSessions(sessionsCache);
 }
@@ -499,7 +504,7 @@ async function doDeleteSession(id) {
   try {
     await api(`/api/sessions?session_id=${encodeURIComponent(id)}`, { method: "DELETE" });
   } catch (e) {
-    toast("删除失败：" + e.message);
+    toast("删除失败：" + e.message, "error");
     loadSessions();  // 回滚：以服务端列表为准
     return;
   }
@@ -682,7 +687,7 @@ async function jumpToItem(item) {
     await loadWindowAround(item.ord);
     node = railFindNode(item.mid);
   }
-  if (!node) { toast("这条消息还没加载出来，请稍后重试"); return; }
+  if (!node) { toast("这条消息还没加载出来，请稍后重试", "error"); return; }
   const anchor = railAnchorOf(node);
   const top = Math.max(0, anchor.offsetTop - chatEl.clientHeight / 3);
   chatEl.scrollTo({ top, behavior: "smooth" });
@@ -1158,10 +1163,10 @@ function renderAttachTray() {
 
 function addFileToAttachments(file) {
   if (!file) return;
-  if (attachments.length >= MAX_ATTACH) { toast(`一次最多 ${MAX_ATTACH} 个附件`); return; }
+  if (attachments.length >= MAX_ATTACH) { toast(`一次最多 ${MAX_ATTACH} 个附件`, "error"); return; }
   const isImage = file.type.startsWith("image/");
-  if (isImage && file.size > 4 * 1024 * 1024) { toast(`图片超过 4MB`); return; }
-  if (!isImage && file.size > 5 * 1024 * 1024) { toast(`文件超过 5MB（附件限制）`); return; }
+  if (isImage && file.size > 4 * 1024 * 1024) { toast(`图片超过 4MB`, "error"); return; }
+  if (!isImage && file.size > 5 * 1024 * 1024) { toast(`文件超过 5MB（附件限制）`, "error"); return; }
   if (isImage && !activeModelVision) {
     toast("当前模型未标注视觉能力，发送后将由 analyze_image 工具代为识别");
   }
@@ -1384,9 +1389,9 @@ let editTarget = null;      // {mid}：正在回退编辑的用户消息
 let lastTruncateAt = 0;     // 本 tab 刚执行过回退的时间戳：history_truncated 回放去重
 
 function startEdit(bubbleEl) {
-  if (streaming) { toast("生成中：请先停止或等回合结束再回退"); return; }
+  if (streaming) { toast("生成中：请先停止或等回合结束再回退", "error"); return; }
   const mid = bubbleEl && bubbleEl.dataset.mid;
-  if (!mid) { toast("这条消息还没有落库，稍等片刻再试"); return; }
+  if (!mid) { toast("这条消息还没有落库，稍等片刻再试", "error"); return; }
   const textEl = bubbleEl.querySelector(".ub-text");
   editTarget = { mid };
   inputEl.value = textEl ? textEl.textContent : "";
@@ -1489,7 +1494,7 @@ async function loadModelPop() {
         toast(sid ? `此任务已切换到 ${cfg.provider_name} / ${cfg.model}`
                   : `新任务默认模型：${cfg.provider_name} / ${cfg.model}`);
       } catch (e) {
-        toast("切换失败：" + e.message);
+        toast("切换失败：" + e.message, "error");
       }
     });
     list.appendChild(row);
@@ -1592,7 +1597,7 @@ function renderModelRows() {
     test.textContent = "⚡";
     test.title = "测试该模型是否连通";
     test.addEventListener("click", async () => {
-      if (!editorModels[i].name.trim()) return toast("先填写模型名再测试");
+      if (!editorModels[i].name.trim()) return toast("先填写模型名再测试", "error");
       test.textContent = "…";
       test.className = "pm-test";
       try {
@@ -1655,8 +1660,8 @@ function renderModelRows() {
 async function saveProv() {
   const name = $("p-name").value.trim();
   const base = $("p-url").value.trim();
-  if (!name) { $("p-name").focus(); return toast("请填写供应商名称"); }
-  if (!base) { $("p-url").focus(); return toast("请填写 Base URL"); }
+  if (!name) { $("p-name").focus(); return toast("请填写供应商名称", "error"); }
+  if (!base) { $("p-url").focus(); return toast("请填写 Base URL", "error"); }
   try {
     const r = await api("/api/providers/save", {
       method: "POST",
@@ -1677,7 +1682,7 @@ async function saveProv() {
     openProvEditor(editingProvId);
     loadConfig();  // 若改的是激活模型，刷新工具栏显示
   } catch (e) {
-    toast("保存失败：" + e.message);
+    toast("保存失败：" + e.message, "error");
   }
 }
 
@@ -1738,7 +1743,7 @@ function showUsageView() {
   $("prov-editor").classList.add("hidden");
   $("usage-view").classList.remove("hidden");
   renderProvList();
-  loadUsage().catch((e) => toast("加载用量失败：" + e.message));
+  loadUsage().catch((e) => toast("加载用量失败：" + e.message, "error"));
 }
 
 function fmtTokens(n) {
@@ -1767,7 +1772,7 @@ async function toggleUsageRows(providerId, model, tr) {
     rows = await api("/api/usage/sessions" + q);
   } catch (e) {
     usageExpanded.delete(key);
-    return toast("加载会话明细失败：" + e.message);
+    return toast("加载会话明细失败：" + e.message, "error");
   }
   // 明细行插在本模型行之后；切时间范围重载时整表重建，状态自然重置
   const frag = document.createDocumentFragment();
@@ -1995,7 +2000,7 @@ function togglePermPop() {
           { method: "POST", body: JSON.stringify({ mode }) });
         permMode = r.mode; renderPermChip();
         toast(`权限模式：${PERM_LABELS[permMode]}`);
-      } catch (e) { toast("切换失败：" + e.message); }
+      } catch (e) { toast("切换失败：" + e.message, "error"); }
     };
   }
   const rect = $("perm-chip").getBoundingClientRect();
@@ -2930,7 +2935,7 @@ function applyEvent(evt, seq) {
     rebuildRail();  // 会话已清空：导航条收起
     closeDocsPanel();  // 会话没了，文档抽屉一并收起
     loadSessions();
-    toast("该任务已在其他窗口被删除");
+    toast("该任务已在其他窗口被删除", "error");
   } else if (t === "api_retry") {
     // API 请求瞬态失败正在退避重试：收起状态下摘要行直接可见（对标 ZCode
     // 的 apiRetry 徽标）——"正在重试(2/3)"，等待不再像卡死。重试结束后的
@@ -3889,7 +3894,7 @@ async function doCheckout(branch, el) {
     });
     if (!r.ok) {
       // git 拒绝（未提交改动冲突等）：把原话给用户看
-      toast("切换失败：" + (r.error || "未知原因"));
+      toast("切换失败：" + (r.error || "未知原因"), "error");
       el.classList.remove("busy");
       return;
     }
@@ -3899,7 +3904,7 @@ async function doCheckout(branch, el) {
     gitOffset = 0;
     loadGitList(true);
   } catch (e) {
-    toast("切换失败：" + e.message);
+    toast("切换失败：" + e.message, "error");
     el.classList.remove("busy");
   }
 }
@@ -4552,7 +4557,7 @@ function makeDeleteBtn(cls, name, delFn) {
       await delFn(name);
       toast(`已删除《${name}》`);
     } catch (err) {
-      toast("删除失败：" + err.message);
+      toast("删除失败：" + err.message, "error");
     }
   });
   btn.addEventListener("mouseleave", () => {
@@ -5192,7 +5197,7 @@ async function confirmArchiveDelete() {
     if (currentSession === sid) { newTask(); setComposerArchived(false); }
     await renderArchiveList();
     loadArchiveCount();
-  } catch (e) { toast("删除失败：" + e.message); }
+  } catch (e) { toast("删除失败：" + e.message, "error"); }
 }
 
 function toggleArchivePop() {
