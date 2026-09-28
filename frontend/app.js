@@ -739,6 +739,20 @@ function markSessionSeen(id) {
   api(`/api/sessions/${encodeURIComponent(id)}/seen`, { method: "POST" }).catch(() => {});
 }
 
+// 当前会话是否处于归档态（切会话/归档/恢复后更新）：归档任务只读——输入框置灰
+let currentSessionArchived = false;
+
+function setComposerArchived(archived) {
+  currentSessionArchived = archived;
+  const input = $("input"), send = $("send");
+  input.disabled = archived;
+  send.disabled = archived;
+  $(".composer").classList.toggle("archived-locked", archived);
+  input.placeholder = archived
+    ? "该任务已归档（只读），↩ 恢复后可继续对话"
+    : "输入问题或任务，Enter 发送（Shift+Enter 换行）";
+}
+
 async function switchSession(id) {
   if (id === currentSession) return;
   saveDraft(currentSession);     // 离开前：把输入框内容存进旧会话的草稿
@@ -756,6 +770,9 @@ async function switchSession(id) {
   await loadHistoryPage();        // 时间线先行：补发定性（finishBoot）要拿它比对
   openEvents(id);                 // 再接事件流：断线/刷新期间的回合靠 since 补发接上
   await loadSessions();
+  // 归档任务可查看不可输入：按服务端最新状态锁/解锁输入框
+  const meta = sessionsCache.find(s => s.id === id);
+  setComposerArchived(!!(meta && meta.archived));
   await refreshCtx();
   await loadConfig(id);  // 模型随任务走：切换后工具栏标签跟着换成该任务的模型
   loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换（内部顺带拉权限模式）
@@ -2560,15 +2577,10 @@ function applyEvent(evt, seq) {
     if (!liveTracker.state()?.steps) traceEl.open = true;
     queueStreamDelta("answer", evt.mid, evt.delta);
   } else if (t === "todo_update") {
-    // 任务清单卡：实时路径也画在聊天区（最新一份替换旧的，与 blocks.js 的
-    // 去重规则一致）。回放路径由 blocksFromHistory→renderBlocks 走 todo 块。
+    // 任务清单不再画进对话流：改为驱动右上角 📋 浮窗实时更新（后端同时已落库，
+    // 重进会话走 loadTodos() 仍能看到）。
     const todos = Array.isArray(evt.todos) ? evt.todos : [];
-    if (todos.length) {
-      const frag = blocksRenderer.renderBlocks([{ kind: "todo", todos }]);
-      const old = chatEl.querySelector(":scope > .todo-card");
-      if (old) old.replaceWith(frag); else chatEl.appendChild(frag);
-      scrollBottom();
-    }
+    setSessionTodos(todos);
   } else if (t === "tool_call") {
     flushStreamBuffers();
     // 调工具前输出的正文同样是过程说明（"我先看看这个文件…"），一并降级
@@ -2824,6 +2836,7 @@ let roundErrored = false;  // 本回合是否发过 error 事件：turn_end 的�
 let pendingProjectPath = null;  // 项目组头「＋」/chip 预选的项目：首条消息建会话时绑定
 
 function send() {
+  if (currentSessionArchived) return;  // 归档任务只读：兜底拦截（正常情况下输入框已禁用）
   const text = inputEl.value.trim();
   if (!text && !attachments.length) return;
   if (attachments.some(a => !a.data)) {  // 占位附件还在读文件：等下一拍
@@ -3782,6 +3795,93 @@ function bindSideResizer() {
   });
 }
 
+// ---------- 会话任务清单（右上角 📋 入口 + 浮窗） ----------
+// 数据源两路：实时 = todo_update 事件；回放 = GET /api/sessions/<id>/todos。
+// 全部完成不自动消失：徽标变 ✅，用户点开仍能看到完成状态；手动关闭只收起浮窗。
+let sessionTodos = [];   // [{content, status}]，空数组 = 当前会话没有清单
+
+function setSessionTodos(todos) {
+  sessionTodos = Array.isArray(todos) ? todos : [];
+  renderTodoChip();
+  renderTodoPop();
+}
+
+function renderTodoChip() {
+  const chip = $("todo-chip"), badge = $("todo-badge");
+  if (!chip || !badge) return;
+  if (!sessionTodos.length) {          // 无清单：入口隐藏
+    chip.classList.add("hidden");
+    return;
+  }
+  const left = sessionTodos.filter((t) => t.status !== "done").length;
+  chip.classList.remove("hidden");
+  chip.classList.toggle("all-done", left === 0);
+  badge.textContent = left === 0 ? "✅" : String(left);
+  chip.title = left === 0 ? "任务清单：全部完成" : `任务清单：还剩 ${left} 项未完成`;
+}
+
+function renderTodoPop() {
+  const body = $("todo-pop-body"), title = $("todo-pop-title");
+  if (!body) return;
+  if (!sessionTodos.length) { body.innerHTML = ""; return; }
+  const done = sessionTodos.filter((t) => t.status === "done").length;
+  if (title) {
+    title.textContent = done === sessionTodos.length
+      ? "📋 任务清单 · 全部完成" : "📋 任务清单";
+  }
+  body.innerHTML = "";
+  for (const t of sessionTodos) {
+    const row = document.createElement("div");
+    row.className = "todo-row " + (t.status || "pending");
+    const ico = document.createElement("span");
+    ico.className = "todo-ico";
+    ico.textContent = t.status === "done" ? "✅" : (t.status === "in_progress" ? "🔄" : "⬜");
+    row.appendChild(ico);
+    row.appendChild(document.createTextNode(t.content || ""));
+    body.appendChild(row);
+  }
+  const foot = document.createElement("div");
+  foot.className = "todo-pop-foot";
+  const doing = sessionTodos.find((t) => t.status === "in_progress");
+  const left = document.createElement("span");
+  left.textContent = `${done}/${sessionTodos.length} 已完成`;
+  const right = document.createElement("span");
+  right.textContent = doing ? `进行中：${doing.content}`
+    : (done === sessionTodos.length ? "🎉 全部完成" : "");
+  foot.appendChild(left);
+  foot.appendChild(right);
+  body.appendChild(foot);
+}
+
+async function loadTodos() {
+  if (!currentSession) { setSessionTodos([]); return; }
+  try {
+    const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}/todos`);
+    setSessionTodos(data.todos || []);
+  } catch (e) { /* 清单是次要信息，拉取失败不打扰用户 */ }
+}
+
+function positionTodoPop() {
+  const pop = $("todo-pop"), btn = $("todo-chip");
+  if (!pop || !btn) return;
+  const rect = btn.getBoundingClientRect();
+  const w = Math.min(380, innerWidth - 32);
+  pop.style.width = w + "px";
+  pop.style.left = Math.max(16, Math.min(rect.left, innerWidth - w - 16)) + "px";
+  pop.style.top = (rect.bottom + 8) + "px";
+}
+
+function toggleTodoPop() {
+  const pop = $("todo-pop");
+  if (!pop) return;
+  if (!pop.classList.contains("hidden")) { pop.classList.add("hidden"); return; }
+  $("git-pop").classList.add("hidden");   // 与 git 浮窗互斥，不叠层
+  $("attach-pop").classList.add("hidden");
+  positionTodoPop();
+  pop.classList.remove("hidden");
+  renderTodoPop();
+}
+
 // ---------- 会话附件浮窗 ----------
 // 用户视角的查看器：只看【已经上传并落盘】的文件类附件（data/attachments 或
 // 工作区 .coding-agent/attachments）。与工具栏 📎 的区别是语义，不是位置：
@@ -4526,6 +4626,9 @@ async function loadArchiveCount() {
   } catch (e) { /* 后端未就绪不打扰 */ }
 }
 
+// 归档区的组折叠态：与主列表 collapsedGroups 分开存，互不干扰
+const archCollapsedGroups = new Set();
+
 async function renderArchiveList() {
   const ul = $("archive-list");
   ul.innerHTML = "";
@@ -4538,34 +4641,79 @@ async function renderArchiveList() {
     ul.appendChild(li);
     return;
   }
+  // 与主列表同款的项目分组：workspace 目录名为组名，空 workspace 进"其他"垫底。
+  // 归档组头不放「＋」（归档区里新建任务语义不通），其余（折叠/排序/退化平铺）照搬。
+  const groups = new Map();
   for (const s of list) {
-    const li = document.createElement("li");
-    li.className = "archive-item";
-    li.title = s.title || "";
-    const title = document.createElement("div");
-    title.className = "t-title";
-    title.textContent = s.title || "新任务";
-    const un = document.createElement("button");
-    un.className = "arch-btn";
-    un.textContent = "↩ 恢复";
-    un.title = "恢复到任务列表";
-    un.addEventListener("click", async () => {
-      try {
-        await api(`/api/sessions/${encodeURIComponent(s.id)}/unarchive`, { method: "POST" });
-        toast("已恢复到任务列表");
-        await renderArchiveList();
-        loadSessions();
-        loadArchiveCount();
-      } catch (err) { toast("恢复失败：" + err.message); }
-    });
-    const del = document.createElement("button");
-    del.className = "arch-btn del";
-    del.textContent = "🗑";
-    del.title = "删除任务（不可恢复）";
-    del.addEventListener("click", () => openArchiveDelete(s.id, s.title));
-    li.append(title, un, del);
-    ul.appendChild(li);
+    const name = s.workspace ? (s.workspace.replace(/\/+$/, "").split("/").pop() || "项目") : null;
+    const key = name || "__other__";
+    if (!groups.has(key)) groups.set(key, { label: name || "其他", items: [] });
+    groups.get(key).items.push(s);
   }
+  const keys = [...groups.keys()].filter(k => k !== "__other__").sort(
+    (a, b) => groups.get(a).label.localeCompare(groups.get(b).label, "zh"));
+  if (groups.has("__other__")) keys.push("__other__");
+  const onlyOneGroup = keys.length === 1;
+  for (const key of keys) {
+    const g = groups.get(key);
+    if (!(onlyOneGroup && key === "__other__")) {
+      const head = document.createElement("li");
+      head.className = "group-head";
+      const collapsed = archCollapsedGroups.has(key);
+      const icon = key === "__other__" ? "💬" : "📁";
+      const text = document.createElement("span");
+      text.className = "gh-label";
+      text.textContent = `${collapsed ? "▸" : "▾"} ${icon} ${g.label}（${g.items.length}）`;
+      text.addEventListener("click", () => {
+        collapsed ? archCollapsedGroups.delete(key) : archCollapsedGroups.add(key);
+        renderArchiveList();
+      });
+      head.appendChild(text);
+      ul.appendChild(head);
+    }
+    if (archCollapsedGroups.has(key) && !onlyOneGroup) continue;
+    for (const s of g.items) ul.appendChild(archiveRow(s));
+  }
+}
+
+function archiveRow(s) {
+  const li = document.createElement("li");
+  li.className = "archive-item";
+  li.title = s.title || "";
+  const title = document.createElement("div");
+  title.className = "t-title";
+  title.textContent = s.title || "新任务";
+  const un = document.createElement("button");
+  un.className = "arch-btn";
+  un.textContent = "↩ 恢复";
+  un.title = "恢复到任务列表";
+  un.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    try {
+      await api(`/api/sessions/${encodeURIComponent(s.id)}/unarchive`, { method: "POST" });
+      toast("已恢复到任务列表");
+      // 恢复的是当前正打开的归档任务：输入框随之解锁
+      if (currentSession === s.id) setComposerArchived(false);
+      await renderArchiveList();
+      loadSessions();
+      loadArchiveCount();
+    } catch (err) { toast("恢复失败：" + err.message); }
+  });
+  const del = document.createElement("button");
+  del.className = "arch-btn del";
+  del.textContent = "🗑";
+  del.title = "删除任务（不可恢复）";
+  del.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openArchiveDelete(s.id, s.title);
+  });
+  li.append(title, un, del);
+  // 点击任务行 = 切到该会话查看内容（方案 A）
+  li.addEventListener("click", () => {
+    toggleArchivePop();  // 先收起归档浮窗，再切会话
+    switchSession(s.id);
+  });
+  return li;
 }
 
 let pendingDeleteSid = null;
@@ -4589,7 +4737,7 @@ async function confirmArchiveDelete() {
   try {
     await api(`/api/sessions?session_id=${encodeURIComponent(sid)}`, { method: "DELETE" });
     toast("已删除任务");
-    if (currentSession === sid) newTask();
+    if (currentSession === sid) { newTask(); setComposerArchived(false); }
     await renderArchiveList();
     loadArchiveCount();
   } catch (e) { toast("删除失败：" + e.message); }
@@ -4622,7 +4770,10 @@ async function confirmArchive() {
   closeArchiveConfirm();
   try {
     await api(`/api/sessions/${encodeURIComponent(sid)}/archive`, { method: "POST" });
-    if (currentSession === sid) newTask();  // 归档了当前打开的任务：回到新建态
+    if (currentSession === sid) {
+      newTask();  // 归档了当前打开的任务：回到新建态
+      setComposerArchived(false);  // 新建态输入框恢复可用
+    }
     loadSessions();
     loadArchiveCount();
     pendingArchSid = sid;  // closeArchiveConfirm 清了它，成功弹窗的「撤销」还要用
