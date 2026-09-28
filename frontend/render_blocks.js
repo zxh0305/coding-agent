@@ -50,7 +50,7 @@
 
     // ---- 单个子块（process 内部）----
 
-    function renderProcessItem(item) {
+    function renderProcessItem(item, running) {
       if (item.kind === "note") {
         const div = doc.createElement("div");
         if (item.roundHead) {
@@ -83,6 +83,11 @@
         const callEl = deps.makeToolCallLine(item.name, item.arguments || "{}");
         const frag = doc.createDocumentFragment();
         frag.appendChild(callEl);
+        // 进行中快照的末位工具仍可能是 running：摘要行带🔵徽章提示"还在跑"
+        if (running && item.status === "running" && callEl.querySelector) {
+          const s = callEl.querySelector("summary");
+          if (s) s.textContent = "🔵 " + s.textContent;
+        }
         if (item.status !== "running" && item.status !== "waiting" && item.result != null) {
           if (callEl.classList && callEl.classList.contains("card")) {
             deps.decorateWriteCard(callEl, item.result);
@@ -113,7 +118,7 @@
         d.className = "trace" + (block.running ? " running" : "");
         d.open = false;
         d.appendChild(doc.createElement("summary"));
-        for (const it of block.items) d.appendChild(renderProcessItem(it));
+        for (const it of block.items) d.appendChild(renderProcessItem(it, block.running));
         const label = block.steps > 0 ? "已工作" : "已思考";
         // 秒数：已定稿的回合用固定值；进行中的回合（block.running）现算——
         // 它的起点来自服务端（补发/切会话路径），不现算就会显示成 0 秒。

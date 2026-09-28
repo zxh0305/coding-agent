@@ -323,6 +323,53 @@ def _persist_trace(sid: str, mid: str, trace: list) -> None:
     db.set_trace(sid, mid, json.dumps(entries, ensure_ascii=False))
 
 
+# 进行中回合快照的节流间隔（秒）：太密会高频写库，太疏切回来缺一大段。
+SNAPSHOT_INTERVAL = 2.0
+
+# 快照条目上限：直接复用落库轨迹同款裁剪（_persist_trace 的裁剪规则），保证
+# 「进行中快照」与「最终轨迹」的数据形状/体量一致，回放渲染零特判。
+SNAPSHOT_MAX_ENTRIES = 150
+
+# 单条目文本上限（与 _persist_trace 内的 4000 截断同源）。
+SNAPSHOT_MAX_TEXT = 4000
+
+
+def _snapshot_trace(agent: Agent) -> list:
+    """从 agent 现场拼「进行中」轨迹快照：已固化条目 + 当前轮的思考累积。
+
+    agent.trace 里的 reasoning 条目要等每轮流结束才 append；进行中的思考文本
+    存在 agent.reasoning_live（round_no → 已吐出的文本）。快照按 round_no 顺序
+    把 live 部分接在对应轮次标题之后——与收尾后的最终 trace 同构。
+    """
+    entries = list(agent.trace)
+    if agent.reasoning_live:
+        merged = []
+        seen_rounds = set()
+        for e in entries:
+            merged.append(e)
+            if e.get("type") == "round":
+                r = e.get("round")
+                seen_rounds.add(r)
+                live = agent.reasoning_live.get(r)
+                if live:
+                    merged.append({"type": "reasoning", "round": r,
+                                   "text": live, "live": True})
+        # live 缓冲里有而 trace 里还没有对应轮次标题的（极小的窗口期）：补在末尾
+        for r, live in agent.reasoning_live.items():
+            if r not in seen_rounds and live:
+                merged.append({"type": "reasoning", "round": r, "text": live, "live": True})
+        entries = merged
+    # 裁剪规则与 _persist_trace 一致：条目数 150、单条文本 4000
+    out = []
+    for e in entries[:SNAPSHOT_MAX_ENTRIES]:
+        e = dict(e)
+        t = e.get("text")
+        if isinstance(t, str) and len(t) > SNAPSHOT_MAX_TEXT:
+            e["text"] = t[:SNAPSHOT_MAX_TEXT] + f"…[思考截断，共 {len(t)} 字符]"
+        out.append(e)
+    return out
+
+
 def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                nonce: str, atts: list) -> None:
     """回合执行体（POST 只入队，真正的生成在这里跑）。
@@ -386,6 +433,28 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             seg_mid = None  # 当前回答段落的 SSE 气泡 mid（每个 round 事件换一段，仅事件流用）
             error = None
             retryable = False  # 出错时是否值得引导用户重试（见下面的归因逻辑）
+            # 进行中快照（方案A核心）：回合事件实时推给在线订阅者，但切走再切回
+            # 的页面靠的是「历史分页 + 环形缓冲补发」。环形缓冲只有 500 条，长回合
+            # 的事件量轻松把它挤穿，补发退化成"尽力补尾巴"——切回来的页面就只剩
+            # "已工作 N 秒"的空壳，思考内容全部丢失，看起来像卡死。这里把 agent
+            # 现场的 trace 快照按 user_mid 键节流落库（session_traces 同表），历史
+            # 接口发现回合仍在跑时带回 running_trace，前端据此把执行过程折叠条
+            # 连同已累积的思考内容一次性补画。收尾时正式轨迹按 answer_mid 落库、
+            # 临时快照行删除，同表共存互不干扰。
+            snap_mid = user_mid
+            last_snap = 0.0
+
+            def _maybe_snapshot(force=False):
+                nonlocal last_snap
+                now = time.time()
+                if not force and now - last_snap < SNAPSHOT_INTERVAL:
+                    return
+                try:
+                    db.set_trace(sid, snap_mid, json.dumps(_snapshot_trace(agent), ensure_ascii=False))
+                    last_snap = now
+                except Exception:
+                    log.exception("[会话 %s] 进行中快照落库失败（忽略）", sid)
+
             try:
                 for kind, payload in agent.run(plain, user_message):
                     if kind == "round":
@@ -398,8 +467,11 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                         # 归并进回答气泡（同一 mid = 同一气泡），推理文字就冒充了
                         # 正文——思考流在「执行过程」面板里有自己的块，不需要 mid。
                         bus.publish({"type": kind, **payload})
+                        _maybe_snapshot()  # 思考流是"切回来像没反应"的重灾区：跟着 delta 节流落快照
                     else:
                         bus.publish({"type": kind, **payload})
+                        if kind in ("tool_call", "tool_result"):
+                            _maybe_snapshot()  # 工具步骤同样进快照（非思考模型的回合只有工具流）
                         if kind == "todo_update":
                             # 清单随会话持久化（迁移 19）：右上角清单浮窗在刷新/
                             # 切会话后仍能回放当前清单与完成状态，不再只存内存
@@ -463,6 +535,13 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                         _persist_trace(sid, answer_mid, agent.trace)
                     except Exception:
                         log.exception("[会话 %s] 轨迹落库失败（忽略）", sid)
+            # 正式轨迹已按 answer_mid 落库（answer_mid 为 None 也会走到这）：删掉
+            # 进行中临时快照行，session_traces 里不留孤儿——否则 get_traces 按
+            # 消息 mid 批查虽不会命中它，但行会随时间积累。失败不阻塞收尾。
+            try:
+                db.delete_trace(sid, user_mid)
+            except Exception:
+                log.exception("[会话 %s] 临时快照清理失败（忽略）", sid)
             # 记下本轮结局，供任务列表徽标用（"跑过且正常结束"= done 绿点、
             # 出错 = error 红点）。seen=False = 未读：徽标只在"用户不在这个会话
             # 里跑完"时亮，用户切进去看过即置 seen=True 清掉（前端在切会话 /
@@ -1497,6 +1576,20 @@ class Handler(SimpleHTTPRequestHandler):
                 it["trace"] = traces[it["mid"]]
         # has_more：本页最小 ord 之前还有更早的消息（向上翻页入口的显隐依据）
         has_more = bool(items) and db.has_messages_before(sid, items[0]["ord"])
+        # 进行中回合的快照：切走再切回的页面靠它补画执行过程（含已累积的思考
+        # 内容）。回合结束后快照行已删、正式轨迹已按 answer_mid 落库，这里自然
+        # 取不到——running=false 时这笔查询直接跳过，正常路径零额外开销。
+        if session_state(sid) == "running":
+            user_mid = next((it["mid"] for it in reversed(items)
+                             if it["role"] == "user"), None)
+            snap = db.get_trace(sid, user_mid) if user_mid else None
+            if snap:
+                _bus = _buses.get(sid)
+                return self._json({"messages": items, "has_more": has_more,
+                                   "user_index": db.user_message_index(sid),
+                                   "running_trace": snap,
+                                   "running_started_at":
+                                       (_bus.round_started_at() if _bus else None)})
         # user_index：本会话【全部】用户提问的轻量索引（mid+ord，不含正文）。
         # 左侧导航条用它一次性画出整个会话的提问分布，不受「只加载最近 N 条」
         # 的窗口限制；点击某条时若尚未加载，再用 before_ord 分页把那一页取回来。

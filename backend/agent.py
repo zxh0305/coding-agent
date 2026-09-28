@@ -212,6 +212,11 @@ class Agent:
         self.context_window = int(context_window or 0)  # 压缩触发线的基准（providers 表解析链提供）
         self.history: list[dict] = []  # 不含 system 的完整对话历史，跨提问持续累积
         self.trace: list[dict] = []    # 最近一次提问的过程轨迹（轮次/工具调用），供前端展示
+        # 进行中回合的推理累积缓冲（按轮次分段，字符串）——trace 里的 reasoning
+        # 条目要等整轮流结束才写入，进行中快照（app.py 的节流落库）靠它取到
+        # 「已吐出的思考文本」。round_no → str；流结束时被 _consume_stream 聚合
+        # 进 trace 后清零对应键。
+        self.reasoning_live: dict[int, str] = {}
         # 增量落盘的指纹账本 {mid: sha1}：save_messages 靠它识别"这条已写过、
         # 内容没变"，每轮只落新增。跨轮随实例存活；进程重启后由恢复的历史重建
         # （db.fingerprints，见 app.py 的会话恢复）。值由 db.save_messages 维护。
@@ -479,6 +484,7 @@ class Agent:
     def _run(self, user_input: str, user_message: dict | None = None):
         """run() 的实际循环体（run 只负责停止开关的生命周期）。"""
         self.trace = []  # 每次提问重新记录过程轨迹
+        self.reasoning_live = {}  # 进行中快照的推理缓冲同步重置（见 __init__ 注释）
         self.history.append(user_message or {"role": "user", "content": user_input})
         # 回合开始的两个"前缀稳定"动作，各自只在本回合做这一次——之后本回合
         # 的全部请求前缀逐字节不变，这是供应商自动前缀缓存能命中的前提：
@@ -627,6 +633,9 @@ class Agent:
                 yield "answer_delta", {"delta": payload}
             elif kind == "reasoning_delta":
                 reasoning_parts.append(payload)
+                # 同步累积进 live 缓冲：进行中快照（app.py 节流落库）在流尚未
+                # 结束时也能取到已吐出的思考文本，切会话回放才不缺当前轮的推理
+                self.reasoning_live[round_no] = self.reasoning_live.get(round_no, "") + payload
                 yield "reasoning_delta", {"delta": payload}
             elif kind == "usage":  # 本轮 token 用量 → 累计后实时推给前端
                 # 缓存命中/未命中一并累计（工具循环的多次请求求和），否则落库
@@ -652,6 +661,8 @@ class Agent:
         text = "".join(reasoning_parts)
         if text:
             self.trace.append({"type": "reasoning", "round": round_no, "text": text})
+        # 本轮推理已固化进 trace：从 live 缓冲摘除，避免快照双份携带
+        self.reasoning_live.pop(round_no, None)
         return assistant_msg
 
     def _tail_stopped(self, assistant_msg, usage_total: dict, metrics: dict):

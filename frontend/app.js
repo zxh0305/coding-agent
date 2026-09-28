@@ -933,6 +933,18 @@ async function loadHistoryPage() {
     if (!data.messages.length) { updateLoadOlder(); return; }
     histOldestOrd = data.messages[0].ord;
     const frag = document.createDocumentFragment();
+    // 进行中回合快照（后端 running_trace）：挂在最后一条用户消息上随历史一起
+    // 渲染成 running 折叠条——环形缓冲补发把回合开头挤掉时，切回页面也能
+    // 立刻看到已累积的执行过程与思考内容，而不是"已工作 N 秒"的空壳。
+    if (data.running_trace) {
+      for (let i = data.messages.length - 1; i >= 0; i--) {
+        if (data.messages[i].role === "user") {
+          data.messages[i]._runningTrace = data.running_trace;
+          data.messages[i]._runningStartedAt = data.running_started_at;
+          break;
+        }
+      }
+    }
     for (const m of data.messages) {
       if (m.mid) historyMids.add(m.mid);  // 事件流补发去重的比对基准
       frag.appendChild(historyNode(m));

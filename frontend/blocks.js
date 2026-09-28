@@ -279,7 +279,7 @@
   function blocksFromHistory(msgs) {
     const blocks = [];
 
-    function traceToProcess(trace, elapsed) {
+    function traceToProcess(trace, elapsed, running, startedAt) {
       const items = [];
       let steps = 0;
       let lastTool = null;
@@ -288,7 +288,7 @@
         if (e.type === "round") {
           items.push({ kind: "note", text: `🧠 思考 · 第 ${e.round} 轮`, roundHead: true, wrapUp: !!e.wrap_up });
         } else if (e.type === "reasoning") {
-          if (e.text) items.push({ kind: "reasoning", text: e.text });
+          if (e.text) items.push({ kind: "reasoning", text: e.text, live: !!e.live });
         } else if (e.type === "process_text") {
           items.push({ kind: "note", text: e.text || "", demoted: true });
         } else if (e.type === "tool_call") {
@@ -322,7 +322,11 @@
         }
       }
       if (!items.length) return null;
-      return { kind: "process", steps: steps, elapsed: elapsed != null ? elapsed : null, items: items };
+      // running=true：进行中回合的快照块（app.py 历史接口的 running_trace）。
+      // 带上 startedAt 后渲染层让秒数现算自跳、末位工具保持 running 徽章，
+      // 与实时折叠条观感一致；切回页面不再只剩空壳。
+      return { kind: "process", steps: steps, elapsed: elapsed != null ? elapsed : null,
+               items: items, running: !!running, startedAt: startedAt };
     }
 
     for (const m of Array.isArray(msgs) ? msgs : []) {
@@ -385,6 +389,13 @@
         // 中间轮（带 tool_calls 且正文是过程说明）：不占位——那段文字已随
         // 最终回答的 trace 以 process_text 落库，单独画会与实时视图割裂。
         if (Array.isArray(m.tool_calls) && m.tool_calls.length) continue;
+
+        // 回放时若该消息携带 _runningTrace（app.js 注入的进行中回合快照），
+        // 优先用它画 running 过程块——正式 trace 此时还不存在（回合未结束）
+        if (m._runningTrace) {
+          const live = traceToProcess(m._runningTrace, null, true, m._runningStartedAt);
+          if (live) blocks.push(live);
+        }
 
         const proc = traceToProcess(m.trace, m.stats && m.stats.elapsed_s);
         if (proc) blocks.push(proc);

@@ -676,6 +676,25 @@ def get_traces(sid: str, mids: list[str]) -> dict:
     return out
 
 
+def get_trace(sid: str, mid: str) -> list | None:
+    """取单条轨迹（进行中回合的快照用）；不存在返回 None。"""
+    with _conn() as conn:
+        row = conn.execute("SELECT trace_json FROM session_traces "
+                           "WHERE session_id=? AND mid=?", (sid, mid)).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row["trace_json"])
+    except (ValueError, TypeError):
+        return None
+
+
+def delete_trace(sid: str, mid: str) -> None:
+    """删除一条轨迹（进行中回合的临时快照在转正后清掉，避免残留孤儿行）。"""
+    with _conn() as conn:
+        conn.execute("DELETE FROM session_traces WHERE session_id=? AND mid=?", (sid, mid))
+
+
 def list_sessions(user_id: int, archived: int = 0) -> list[dict]:
     """archived=0 任务栏列表 / archived=1 归档区列表（按归档时间倒序）。"""
     order = "archived_at DESC" if archived else "updated DESC"
