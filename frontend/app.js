@@ -748,18 +748,38 @@ function setComposerArchived(archived) {
   const input = $("input"), send = $("send");
   input.disabled = archived;
   send.disabled = archived;
-  $(".composer").classList.toggle("archived-locked", archived);
+  // 注意 $() 只按 id 查（getElementById），不能传 ".composer" 这类选择器：
+  // 那样必然得到 null，紧接着的 .classList 会抛异常并中断 switchSession 的后续初始化。
+  document.querySelector(".composer").classList.toggle("archived-locked", archived);
   input.placeholder = archived
     ? "该任务已归档（只读），↩ 恢复后可继续对话"
     : "输入问题或任务，Enter 发送（Shift+Enter 换行）";
 }
 
+// 切会话的对外入口：只负责兜住异常，实现在 doSwitchSession。
+// 之前切换逻辑里一处 .classList 拿到 null 就抛出，整个切换被中断（后续草稿恢复、
+// 历史加载、事件流全没执行），而调用方既没 await 也没 catch，错误淹死在
+// unhandledrejection 里很难发现——这里显式打日志，保证失败可见、可定位。
 async function switchSession(id) {
+  try {
+    await doSwitchSession(id);
+  } catch (err) {
+    console.error("[switchSession] 切换会话失败:", id, err);
+  }
+}
+
+async function doSwitchSession(id) {
   if (id === currentSession) return;
   saveDraft(currentSession);     // 离开前：把输入框内容存进旧会话的草稿
   currentSession = id;
   markSessionSeen(id);            // 进入即视为已读：清掉该任务的未读徽标
   resetStreamState();  // 旧会话的事件流已断，流式状态必须随之复位
+  // 归档态先同步定一次（用现有 cache）：resetStreamState 里 setStreaming(false)
+  // 会用【上一个会话】的归档标志刷 placeholder，不立刻纠正的话，整个历史加载
+  // 期间输入框一直显示错误文案（从非归档切进归档任务时尤为明显）。
+  // loadSessions 之后再精调一次（服务端最新状态），见下方。
+  const metaEarly = sessionsCache.find(s => s.id === id);
+  setComposerArchived(!(metaEarly && !metaEarly.archived));
   chatEl.innerHTML = "";
   welcome();
   railItems = [];                 // 上一个会话的提问索引作废
@@ -772,9 +792,19 @@ async function switchSession(id) {
   loadTodos();                    // 本会话的任务清单（若有）：驱动右上角 📋 入口
   openEvents(id);                 // 再接事件流：断线/刷新期间的回合靠 since 补发接上
   await loadSessions();
-  // 归档任务可查看不可输入：按服务端最新状态锁/解锁输入框
+  // 归档任务可查看不可输入：按服务端最新状态精调（上面已用旧 cache 预设过）。
+  // sessionsCache 只装未归档列表：从归档区点进来的会话在这里查不到（meta=undefined），
+  // 保持"归档"兜底加锁（宁可误锁不可误放），再异步向归档列表确认真实状态。
   const meta = sessionsCache.find(s => s.id === id);
-  setComposerArchived(!!(meta && meta.archived));
+  setComposerArchived(!(meta && !meta.archived));
+  if (!meta) {
+    api("/api/sessions?archived=1").then(list => {
+      if (currentSession !== id) return;  // 期间用户已切走：不覆盖新会话的状态
+      const archived = list.some(s => s.id === id);
+      // 后端确认不在归档区（竞态：刚被恢复但主列表还没刷新）才解锁
+      if (!archived) setComposerArchived(false);
+    }).catch(() => {});  // 确认失败维持加锁态：只读比可写安全
+  }
   await refreshCtx();
   await loadConfig(id);  // 模型随任务走：切换后工具栏标签跟着换成该任务的模型
   loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换（内部顺带拉权限模式）
@@ -1486,16 +1516,17 @@ function renderModelRows() {
     win.title = "上下文窗口（token），用于容量显示";
     win.value = m.context_window;
     win.addEventListener("input", () => (editorModels[i].context_window = parseInt(win.value) || 262144));
-    const en = document.createElement("input");
-    en.type = "checkbox";
-    en.checked = m.enabled;
+    // 两个勾都带短文字标签：纯图标靠 hover title 看不出语义（用户反馈）
+    const en = document.createElement("label");
+    en.className = "pm-check";
     en.title = "启用（出现在聊天工具栏）";
-    en.addEventListener("change", () => (editorModels[i].enabled = en.checked));
-    const vision = document.createElement("input");
-    vision.type = "checkbox";
-    vision.checked = !!m.vision;
+    en.innerHTML = `<input type="checkbox" ${m.enabled ? "checked" : ""}><span>可用</span>`;
+    en.querySelector("input").addEventListener("change", (ev) => (editorModels[i].enabled = ev.target.checked));
+    const vision = document.createElement("label");
+    vision.className = "pm-check";
     vision.title = "视觉：该模型支持看图（非视觉模型发图时，由它代为识别）";
-    vision.addEventListener("change", () => (editorModels[i].vision = vision.checked));
+    vision.innerHTML = `<input type="checkbox" ${m.vision ? "checked" : ""}><span>👁</span>`;
+    vision.querySelector("input").addEventListener("change", (ev) => (editorModels[i].vision = ev.target.checked));
     const test = document.createElement("button");
     test.className = "pm-test";
     test.textContent = "⚡";
@@ -2757,12 +2788,18 @@ function retryLast() {
 function setStreaming(on) {
   streaming = on;
   const btn = $("send");
-  btn.disabled = false;  // 生成中也要保持可点（此时点 = 停止）
+  // 生成中保持可点（此时点 = 停止）；但归档会话例外——只读态不允许被流式
+  // 状态变化解锁（真实 bug：归档任务里点停止/回合结束，发送按钮被这里重新点亮）
+  btn.disabled = !on && currentSessionArchived;
   btn.textContent = on ? "■ 停止" : "发送";
   btn.classList.toggle("stop", on);
-  inputEl.placeholder = on
-    ? "生成中：现在输入将排队，回答完成后自动发送"
-    : "输入问题或任务，Enter 发送（Shift+Enter 换行）";
+  // placeholder 不能无条件重置：归档会话锁定时显示"已归档（只读）"提示，
+  // 之前回合结束/手动停止走这里会把提示覆盖回普通文案，用户误以为还能发
+  inputEl.placeholder = currentSessionArchived
+    ? "该任务已归档（只读），↩ 恢复后可继续对话"
+    : on
+      ? "生成中：现在输入将排队，回答完成后自动发送"
+      : "输入问题或任务，Enter 发送（Shift+Enter 换行）";
   // 任务清单跟随任务状态：生成中自动展开常驻（清单随 todo_update 实时刷新）。
   if (on) {
     todoAutoOpened = true;
@@ -2783,7 +2820,10 @@ function resetStreamState() {
   clearInterval(metaTimer);
   todoAutoOpened = false;              // 新会话/新视图重新允许"任务中自动展开"
   $("todo-pop").classList.remove("stay-open");
-  delete $("todo-pop").dataset.userClosed;
+  // 注意：不能 delete userClosed！这是用户"手动关掉、别再自动弹"的意愿，
+  // 切会话清掉它的话，SSE 补发 todo_update（此时 caught_up 置 streaming=true）
+  // 会重新满足自动展开条件 → 每次切进有清单的会话浮窗都自己弹开（真实 bug）。
+  // 意愿周期 = 一个回合：新回合发送时在 send() 里重置。
   $("todo-pop").classList.add("hidden");
   setStreaming(false);
   myNonce = null;
@@ -2971,6 +3011,8 @@ async function performSend(item) {
   // 命令接口：POST 立即返回，过程事件走常驻事件流。「生成中」状态在这里
   // 乐观置位（防连点双发——turn_start 事件到达前有一小段窗口），回合的真
   // 正结束由事件流的 turn_end 驱动（那里统一复位并推进队列）。
+  // 新回合 = 新的意愿周期：用户上一回合的手动关闭意愿到此为止，重新允许自动弹。
+  delete $("todo-pop").dataset.userClosed;
   setStreaming(true);
   // 回令：服务端会在 turn_start 里原样带回，本 tab 据此不重复画自己的气泡。
   // crypto.randomUUID 只在安全上下文可用（本机 http OK，局域网 http 不一定），

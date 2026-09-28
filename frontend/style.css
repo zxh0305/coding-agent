@@ -1014,6 +1014,15 @@ button.primary:hover { background: var(--accent-hover); }
 .add-row:hover { background: var(--accent-weak); border-color: var(--accent); }
 .prov-left .add-row { display: block; }
 
+/* 模型行的带标签勾选框（可用 / 👁视觉） */
+.pm-check {
+  display: inline-flex; align-items: center; gap: 3px;
+  flex-shrink: 0; cursor: pointer;
+  font-size: 12px; color: var(--text-dim); white-space: nowrap;
+}
+.pm-check input { margin: 0; cursor: pointer; }
+.pm-check:hover { color: var(--text); }
+
 /* 单模型测试按钮（⚡） */
 .pm-test {
   width: 26px; height: 26px; flex-shrink: 0;
