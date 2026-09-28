@@ -340,12 +340,20 @@ class OpenAIChatClient:
                     except json.JSONDecodeError:
                         continue
                     if chunk.get("usage"):  # 用量统计 chunk（choices 为空，必须先于 choices 判断）
-                        usage = {k: chunk["usage"].get(k, 0) for k in
+                        u = chunk["usage"]
+                        usage = {k: u.get(k, 0) for k in
                                  ("prompt_tokens", "completion_tokens", "total_tokens")}
-                        for extra in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
-                            # DeepSeek 等会返回缓存命中统计 → 前端可显示"缓存命中率"
-                            if extra in chunk["usage"]:
-                                usage[extra] = chunk["usage"][extra]
+                        # 缓存命中两种风格：DeepSeek 顶层 prompt_cache_hit/miss_tokens；
+                        # OpenAI 风格嵌在 prompt_tokens_details.cached_tokens（GLM 等
+                        # 兼容接口常见）。后者缺 miss 时用 prompt - hit 推导。
+                        hit = u.get("prompt_cache_hit_tokens")
+                        if hit is None:
+                            hit = (u.get("prompt_tokens_details") or {}).get("cached_tokens")
+                        if hit is not None:
+                            usage["prompt_cache_hit_tokens"] = hit
+                            usage["prompt_cache_miss_tokens"] = u.get(
+                                "prompt_cache_miss_tokens",
+                                max((u.get("prompt_tokens") or 0) - hit, 0))
                         yield "usage", usage
                     choices = chunk.get("choices") or []
                     if not choices:

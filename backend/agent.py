@@ -506,7 +506,10 @@ class Agent:
         self._reminders_used = 0
         self._budget_remind_rounds = {self.max_rounds - 10, self.max_rounds - 4}
         start = time.time()
-        usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                       # 缓存命中/未命中随 _stats 落库（message_usage.cached_tokens），
+                       # 用量页「缓存命中」列的数据来源
+                       "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
         # 跨轮回调状态（主循环与收尾轮共用一套）：缓存命中率、上下文估算、计时起点。
         # 由 _consume_stream / 两个收尾方法就地更新。
         # context_tokens：本回合【最后一次】请求的真实 prompt_tokens——那才是模型
@@ -626,8 +629,11 @@ class Agent:
                 reasoning_parts.append(payload)
                 yield "reasoning_delta", {"delta": payload}
             elif kind == "usage":  # 本轮 token 用量 → 累计后实时推给前端
-                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                    usage_total[key] += payload.get(key) or 0
+                # 缓存命中/未命中一并累计（工具循环的多次请求求和），否则落库
+                # 的 _stats 里永远没有这两个键 → 用量页「缓存命中」列恒为空
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens",
+                            "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+                    usage_total[key] = usage_total.get(key, 0) + (payload.get(key) or 0)
                 hit = payload.get("prompt_cache_hit_tokens")
                 miss = payload.get("prompt_cache_miss_tokens")
                 if hit is not None and (hit + (miss or 0)) > 0:

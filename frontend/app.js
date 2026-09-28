@@ -1730,9 +1730,10 @@ function showProvEditor() {
 
 function showUsageView() {
   usageMode = true;
+  editingProvId = null;  // 用量页不属于任何供应商 → 清掉选中态，左侧取消高亮
   $("prov-editor").classList.add("hidden");
   $("usage-view").classList.remove("hidden");
-  renderProvList();  // 左侧取消高亮：用量页不属于任何供应商
+  renderProvList();
   loadUsage().catch((e) => toast("加载用量失败：" + e.message));
 }
 
