@@ -1052,7 +1052,7 @@ function historyNode(m) {
       frag.append(node, liveEl);
       node.dataset.mid = m.mid;   // 锚点打在 holder 上，导航条定位稳定
       node.dataset.role = "user";
-      return frag;
+      return tagLiveTrace(frag, m);
     }
     railTag(node, m.mid, "user");
     if (m.role === "user" && node.dataset.mid !== String(m.mid)) {
@@ -1066,7 +1066,21 @@ function historyNode(m) {
     }
     return node;
   }
-  return blocksRenderer.renderBlocks(blocksFromHistory([m]));
+  return tagLiveTrace(blocksRenderer.renderBlocks(blocksFromHistory([m])), m);
+}
+
+// 给"进行中回合快照"画出的过程卡打接管标记（user_mid → DOM）。SSE 补发到达
+// 时 ensureTrace 优先按标记找到这张卡继续实时更新，而不是在时间线尾部再
+// 造一张——否则切回会话会出现快照卡 + 实时卡两张叠着（快照冻结在切走
+// 时刻，实时卡从 turn_start 重建，内容重叠、秒数不一致）。
+// renderBlocks 返回 fragment 时（user 气泡 + 过程块两个子节点），子节点
+// 散入 #chat 后标记仍各自生效，querySelector 按 data-livetrace 找得到。
+function tagLiveTrace(node, m) {
+  const card = node.querySelector?.(".trace.running");
+  if (card && m && m.mid) {
+    card.dataset.livetrace = m.mid;
+  }
+  return node;
 }
 
 // 外置归档消息：超大正文不随时间线整页带回，用户要看时才走 artifact 接口取。
@@ -2325,6 +2339,17 @@ const TOOL_ICONS = {
 
 function ensureTrace() {
   if (traceEl) return;
+  // 接管已有快照卡：切会话/刷新回来时，历史接口的 running_trace 已在时间线里
+  // 画了一张 running 过程卡（带 data-livetrace 标记，见 tagLiveTrace）。SSE 补发
+  // 从 turn_start 重放时若在这里再新建一张，就会快照卡+实时卡叠着。优先找到
+  // 标记卡原地接管（traceEl 指向它，后续 traceTick/tool 事件继续实时更新），
+  // 摘掉标记防重复接管；找不到才从空白新建（正常实时路径）。
+  const existing = chatEl.querySelector("[data-livetrace]");
+  if (existing) {
+    existing.removeAttribute("data-livetrace");
+    traceEl = existing;
+    return;
+  }
   traceEl = document.createElement("details");
   traceEl.className = "trace running";  // running：进行中回合标记（切会话定位锚点用）
   // 默认【收起】：执行过程不是回答。之前生成期间强制展开，几十行浅灰小字
