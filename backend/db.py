@@ -719,6 +719,8 @@ def delete_session(sid: str) -> None:
     shutil.rmtree(_docs_dir() / sid, ignore_errors=True)
     # attachments/<sid>/ 同理：该任务上传的附件随会话一起消失（与 artifacts/docs 一致）
     shutil.rmtree(_attachments_dir() / sid, ignore_errors=True)
+    # browser-profiles/<sid>/ 同理：该会话的浏览器 profile 副本（~90MB）随会话回收
+    shutil.rmtree(DB_PATH.parent / "browser-profiles" / sid, ignore_errors=True)
     # 附件现在可能落在工作区 .coding-agent/attachments/<sid>/（见
     # _session_attach_root）：只清本会话那个子目录，绝不碰用户工作区的
     # 其它内容、也不动同工作区其它会话的附件。

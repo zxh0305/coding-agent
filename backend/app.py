@@ -1901,6 +1901,10 @@ def main():
     load_env_file(str(ENV_FILE))   # 读 .env（首库播种 / 默认供应商 / 默认工作区用）
     db.init_db()                   # 建表 + 播种（已初始化则跳过）
     db.cleanup_orphan_attachments()  # 兜底：清理无主会话的附件目录（防 kill -9 残留）
+    from browser_tools import cleanup_stale_profiles  # noqa: E402
+    n = cleanup_stale_profiles(int(os.environ.get("BROWSER_PROFILE_KEEP_DAYS", "7")))
+    if n:
+        print(f"🧹 已清理 {n} 个陈旧浏览器 profile 目录", flush=True)
     log_file = setup_logging(console=True)
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)

@@ -28,6 +28,7 @@ data/browser-profiles/<sid>/，之后的 cookies/localStorage 一直留在这份
 import json
 import shutil
 import threading
+import time
 from pathlib import Path
 
 # playwright 是可选依赖
@@ -62,6 +63,34 @@ def manager_for(sid: str) -> "BrowserManager":
         if sid not in _MANAGERS:
             _MANAGERS[sid] = BrowserManager(sid)
         return _MANAGERS[sid]
+
+
+PROFILES_BASE = Path("data/browser-profiles")
+
+
+def cleanup_stale_profiles(keep_days: int) -> int:
+    """启动时清理陈旧的浏览器 profile 副本：目录 mtime 超过 keep_days 天的整棵删除。
+
+    背景：每个用过浏览器工具的会话都会复制一份系统 Chrome profile（~90MB），
+    回合结束只关进程、目录永不清理，长期使用会无限线性增长。登录态价值
+    （cookies/localStorage）只对近期活跃会话有意义，陈旧副本直接回收。
+    keep_days<=0 表示关闭清理。返回删除的目录数。
+    """
+    if keep_days <= 0 or not PROFILES_BASE.is_dir():
+        return 0
+    deadline = time.time() - keep_days * 86400
+    removed = 0
+    for d in PROFILES_BASE.iterdir():
+        if not d.is_dir():
+            continue
+        try:
+            if d.stat().st_mtime >= deadline:
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+        except OSError:
+            continue  # 单个目录失败不阻断其余清理
+    return removed
 
 
 def close_session(sid: str) -> None:
