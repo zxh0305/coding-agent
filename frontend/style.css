@@ -235,9 +235,10 @@ body.side-resizing .sidebar { transition: none; }
 .archive-list .group-head { padding: 8px 6px 2px; }
 
 /* --- 归档区批量模式 --- */
+/* 紧挨右侧 ✕（auto 属于 ✕，这里不能抢，否则两个 auto 平分空间、按钮悬在中间） */
 .arch-manage-btn {
-  border: none; background: none; cursor: pointer; font-size: 12px;
-  color: var(--text-3); padding: 3px 8px; border-radius: 6px; margin-left: auto;
+  border: 1px solid var(--border); background: none; cursor: pointer; font-size: 12px;
+  color: var(--text-3); padding: 2px 10px; border-radius: 999px;
 }
 .arch-manage-btn:hover { background: var(--accent-weak); color: var(--accent); }
 /* 批量选择态的行：勾选框出现，恢复/删除单行按钮隐去（避免和批量动作打架） */
