@@ -655,6 +655,7 @@ class Agent:
         self.history.append({"role": "assistant", "content": answer,
                              "_stats": {"elapsed_s": elapsed, "usage": dict(usage_total),
                                         "cache_hit_rate": metrics["cache_hit_rate"],
+                                        "context_tokens": metrics["context_tokens"],
                                         "stopped": True}})
         log.info("耗时 %.1fs · 用户中途停止", elapsed)
         yield "done", {"answer": answer, "elapsed_s": elapsed, "usage": usage_total,
@@ -680,7 +681,8 @@ class Agent:
         elapsed = round(time.time() - metrics["start"], 1)
         self.history.append({"role": "assistant", "content": answer,
                              "_stats": {"elapsed_s": elapsed, "usage": dict(usage_total),
-                                        "cache_hit_rate": metrics["cache_hit_rate"]}})
+                                        "cache_hit_rate": metrics["cache_hit_rate"],
+                                        "context_tokens": metrics["context_tokens"]}})
         log.info("耗时 %.1fs · tokens 输入 %d / 输出 %d",
                  elapsed, usage_total["prompt_tokens"], usage_total["completion_tokens"])
         payload = {"answer": answer, "elapsed_s": elapsed, "usage": usage_total,

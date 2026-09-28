@@ -1371,24 +1371,40 @@ def get_messages(sid: str, since_ord: int | None = None,
 def latest_context_tokens(sid: str) -> int | None:
     """该会话最近一次真实请求的 prompt_tokens（/api/context 的持久化兜底）。
 
-    服务重启后内存 _ctx 为空，从 message_usage 回查：取 ord 最大、且 stats_json
-    带 usage 的 assistant 消息。压缩边界之后的才可信——压缩前的旧值代表的是
-    压缩前的上下文，比现在大，会误导分母占比。
+    服务重启后内存 _ctx 为空，从 message_usage 回查：取 ord 最大的 assistant
+    消息起往回扫。压缩边界之后的才可信——压缩前的旧值代表的是压缩前的上下文，
+    比现在大，会误导分母占比。
+
+    口径：优先 stats_json.context_tokens（最后一次请求的真实 prompt，agent
+    落库 _stats 时带上）——usage.prompt_tokens 列是本回合多轮请求的累计值，
+    历史被重复计数，不能当"当前上下文"用，只对没有 context_tokens 的老消息
+    作降级兼容。停止得早的空回合（usage 全 0）必须跳过：0 不是"上下文为空"，
+    是"还没收到过用量"，返回它会让徽章显示 0/100万（真实踩过）。
     """
     with _conn() as conn:
         boundary = conn.execute(
             "SELECT MAX(ord) FROM messages WHERE session_id=? AND role='compact'",
             (sid,)).fetchone()[0]
-        sql = ("SELECT u.prompt_tokens FROM message_usage u "
+        sql = ("SELECT u.prompt_tokens, u.stats_json FROM message_usage u "
                "JOIN messages m ON m.session_id=u.session_id AND m.mid=u.mid "
-               "WHERE u.session_id=? AND u.prompt_tokens IS NOT NULL")
+               "WHERE u.session_id=? AND u.stats_json IS NOT NULL")
         params: list = [sid]
         if boundary is not None:
             sql += " AND m.ord>?"
             params.append(boundary)
-        sql += " ORDER BY m.ord DESC, u.rowid DESC LIMIT 1"
-        row = conn.execute(sql, params).fetchone()
-        return row["prompt_tokens"] if row else None
+        sql += " ORDER BY m.ord DESC, u.rowid DESC"
+        rows = conn.execute(sql, params).fetchall()
+        for r in rows:  # 新数据：最后一次请求的真实值
+            try:
+                ct = (json.loads(r["stats_json"]) or {}).get("context_tokens")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if ct:
+                return int(ct)
+        for r in rows:  # 老数据降级：非零累计值（至少不会把 0 当上下文）
+            if r["prompt_tokens"]:
+                return int(r["prompt_tokens"])
+        return None
 
 
 def compact_boundary_ord(sid: str) -> int | None:
