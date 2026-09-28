@@ -2763,6 +2763,19 @@ function setStreaming(on) {
   inputEl.placeholder = on
     ? "生成中：现在输入将排队，回答完成后自动发送"
     : "输入问题或任务，Enter 发送（Shift+Enter 换行）";
+  // 任务清单跟随任务状态：生成中自动展开常驻（清单随 todo_update 实时刷新）。
+  if (on) {
+    todoAutoOpened = true;
+    if (sessionTodos.length && $("todo-pop").classList.contains("hidden")
+        && !$("todo-pop").dataset.userClosed) {
+      positionTodoPop();
+      $("todo-pop").classList.remove("hidden");
+    }
+  } else if (todoAutoOpened && !$("todo-pop").classList.contains("hidden")) {
+    // 任务结束：不自动收起，挂 stay-open 豁免全局"点空白关浮窗"——
+    // 否则用户一点别处就被收走，永远到不了 ✕ 手动关闭那一步。
+    $("todo-pop").classList.add("stay-open");
+  }
 }
 
 // 离开当前会话视图（切换任务/新建任务/登出）时复位流式渲染状态。
@@ -2772,6 +2785,10 @@ function setStreaming(on) {
 // 回合真身不丢：切回旧会话时由历史分页 + 补发定性（finishBoot）重建。
 function resetStreamState() {
   clearInterval(metaTimer);
+  todoAutoOpened = false;              // 新会话/新视图重新允许"任务中自动展开"
+  $("todo-pop").classList.remove("stay-open");
+  delete $("todo-pop").dataset.userClosed;
+  $("todo-pop").classList.add("hidden");
   setStreaming(false);
   myNonce = null;
   liveBubble = null; metaEl = null; thinkEl = null;
@@ -3036,7 +3053,12 @@ bind("input", "keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
 bind("todo-chip", "click", toggleTodoPop);
-bind("todo-close", "click", () => $("todo-pop").classList.add("hidden"));
+bind("todo-close", "click", () => {
+  $("todo-pop").classList.add("hidden");
+  $("todo-pop").classList.remove("stay-open");
+  // 记录"用户手动关闭"：streaming 期间不再自动弹开（解除常驻）
+  $("todo-pop").dataset.userClosed = "1";
+});
 bind("attach-btn", "click", () => $("file-input").click());
 bind("file-input", "change", onFilesChosen);
 bind("input", "paste", onPaste);
@@ -3138,6 +3160,8 @@ document.addEventListener("click", (e) => {
   // 点弹窗外空白处关闭浮动层
   for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"], ["perm-pop", "perm-chip"], ["todo-pop", "todo-chip"]]) {
     const el = $(pop);
+    // todo 浮窗常驻（任务中/结束后保持展开），只有 ✕ 按钮能关——跳过自动收起
+    if (pop === "todo-pop" && el.dataset.userClosed === "1") continue;
     // git 的分支二级面板挂在外层（不在 git-pop 内）：点它不算点空白，否则
     // git 浮窗被关掉而分支面板还留着（真实踩过的坑）
     const inner = pop === "git-pop" ? e.target.closest?.("#git-branch-pop") : null;
@@ -3803,11 +3827,20 @@ function bindSideResizer() {
 // 数据源两路：实时 = todo_update 事件；回放 = GET /api/sessions/<id>/todos。
 // 全部完成不自动消失：徽标变 ✅，用户点开仍能看到完成状态；手动关闭只收起浮窗。
 let sessionTodos = [];   // [{content, status}]，空数组 = 当前会话没有清单
+let todoAutoOpened = false;  // 本回合是否由 streaming 自动展开过（防重复触发）
 
 function setSessionTodos(todos) {
   sessionTodos = Array.isArray(todos) ? todos : [];
   renderTodoChip();
   renderTodoPop();
+  // streaming 期间清单数据到达（todo_update 常晚于 turn_start）：若浮窗还没
+  // 弹开且不是用户手动关掉的，主动展开——满足"任务过程中展开常驻"。
+  const pop = $("todo-pop");
+  if (pop && streaming && sessionTodos.length && pop.classList.contains("hidden")
+      && !pop.dataset.userClosed) {
+    positionTodoPop();
+    pop.classList.remove("hidden");
+  }
 }
 
 function renderTodoChip() {
@@ -3878,7 +3911,12 @@ function positionTodoPop() {
 function toggleTodoPop() {
   const pop = $("todo-pop");
   if (!pop) return;
-  if (!pop.classList.contains("hidden")) { pop.classList.add("hidden"); return; }
+  if (!pop.classList.contains("hidden")) {
+    pop.classList.add("hidden");
+    pop.classList.remove("stay-open");
+    pop.dataset.userClosed = "1";        // 手动收起 = 本回合不再自动弹开
+    return;
+  }
   $("git-pop").classList.add("hidden");   // 与 git 浮窗互斥，不叠层
   $("attach-pop").classList.add("hidden");
   positionTodoPop();

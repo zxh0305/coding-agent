@@ -1286,6 +1286,8 @@ button.primary:hover { background: var(--accent-hover); }
 .git-chip-icon { font-size: 15px; line-height: 1; }
 /* 附件入口：与 git-chip 同一区域（右上角），排在它下方，视觉同构 */
 #attach-chip { top: 56px; }
+/* 任务清单入口：排在附件下方再一行，避免与 git 徽章重叠 */
+#todo-chip { top: 100px; }
 /* 分支名：等宽字体、限宽省略——长分支名不能把按钮撑到盖住工具栏 */
 .git-chip-branch {
   max-width: 180px; overflow: hidden; text-overflow: ellipsis;
