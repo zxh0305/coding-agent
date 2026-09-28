@@ -1039,6 +1039,21 @@ function historyNode(m) {
   // 展示"内容过大已归档"标记，点开按需拉取全文
   if (m.artifact) {
     const node = artifactCard(m);
+    // 进行中回合的快照（后端 running_trace）挂在 user 消息上；artifact 路径
+    // 在此提前 return，快照必须在这里补画，否则带图/大附件的提问切回会话
+    // 看不到思考过程（blocks.js 的 user 分支覆盖不到这条路径）。
+    const liveBlock = window.CodingAgentBlocks.runningTraceBlock(m);
+    if (m.role === "user" && liveBlock) {
+      // runningTraceBlock 返回的是 block 数据对象，需经 renderBlock 画成
+      // DOM。过程块画在归档气泡之后：renderBlocks 落地后两者都直接成为
+      // #chat 的子节点，与正常路径（气泡后紧跟折叠条）观感一致。
+      const liveEl = blocksRenderer.renderBlock(liveBlock);
+      const frag = document.createDocumentFragment();
+      frag.append(node, liveEl);
+      node.dataset.mid = m.mid;   // 锚点打在 holder 上，导航条定位稳定
+      node.dataset.role = "user";
+      return frag;
+    }
     railTag(node, m.mid, "user");
     if (m.role === "user" && node.dataset.mid !== String(m.mid)) {
       // 用户消息的载体是 display:contents 的 holder——没有 bubble/artifact

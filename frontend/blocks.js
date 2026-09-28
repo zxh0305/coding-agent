@@ -276,10 +276,9 @@
    *   {type:"process_text", text} / {type:"tool_call", name, arguments} /
    *   {type:"tool_result", name, result} / {type:"system_reminder", kind}
    */
-  function blocksFromHistory(msgs) {
-    const blocks = [];
-
-    function traceToProcess(trace, elapsed, running, startedAt) {
+  // trace 条目 → process 块（回放与进行中快照共用；从 blocksFromHistory
+  // 提升到模块级，app.js 的 artifact 路径也要用——见 runningTraceBlock）。
+  function traceToProcess(trace, elapsed, running, startedAt) {
       const items = [];
       let steps = 0;
       let lastTool = null;
@@ -327,7 +326,17 @@
       // 与实时折叠条观感一致；切回页面不再只剩空壳。
       return { kind: "process", steps: steps, elapsed: elapsed != null ? elapsed : null,
                items: items, running: !!running, startedAt: startedAt };
-    }
+  }
+
+  // 进行中回合的快照块：挂点在 user 消息（回放时还没有 assistant 落库行），
+  // blocksFromHistory 的 user 分支与 app.js 的 artifact 分支共用。
+  function runningTraceBlock(m) {
+    if (!m || !m._runningTrace) return null;
+    return traceToProcess(m._runningTrace, null, true, m._runningStartedAt);
+  }
+
+  function blocksFromHistory(msgs) {
+    const blocks = [];
 
     for (const m of Array.isArray(msgs) ? msgs : []) {
       if (!isObj(m)) continue;
@@ -369,6 +378,10 @@
           text = typeof m.content === "string" ? m.content : "";
         }
         blocks.push({ kind: "user", text: text, atts: atts, mid: m.mid || null });
+        // 进行中回合的快照（app.js 注入的 _runningTrace）挂在这条 user 消息上：
+        // 回合尚未结束，assistant 行还不存在，紧跟用户气泡画 running 过程块
+        const live = runningTraceBlock(m);
+        if (live) blocks.push(live);
         continue;
       }
 
@@ -540,6 +553,9 @@
     blocksFromEvents: blocksFromEvents,
     blocksFromHistory: blocksFromHistory,
     createLiveTracker: createLiveTracker,
+    // 进行中回合快照 → process 块：user 分支（blocksFromHistory）与 app.js
+    // 的 artifact 路径共用
+    runningTraceBlock: runningTraceBlock,
     // 导出给测试与渲染层复用
     _toolStatus: toolStatus,
     _parseResult: parseResult,
