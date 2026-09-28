@@ -105,11 +105,15 @@ async function api(path, options = {}) {
   let resp;
   try {
     resp = await fetch(path, {
+      // headers 必须合并而不是被 ...options 整体覆盖：批量删除/恢复等调用
+      // 会传自己的 headers（Content-Type），若覆盖则丢掉 Authorization，
+      // 请求 401 → 前端误判"登录失效"直接弹登录层（表现为批量操作就掉线）。
+      ...options,
       headers: {
         "Content-Type": "application/json",
         ...authHeaders(),
+        ...options.headers,
       },
-      ...options,
     });
   } catch (e) {
     // fetch 抛错基本只有一种情况：后端没启动或地址不通
