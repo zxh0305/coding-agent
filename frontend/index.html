@@ -361,30 +361,6 @@
     <ul id="archive-list" class="archive-list"></ul>
   </div>
 
-  <!-- 归档确认弹窗：归档不丢数据，但仍弹一次确认，防手滑 -->
-  <div id="arch-cfm-mask" class="archive-del-mask hidden">
-    <div class="archive-del-dialog">
-      <div class="add-title">归档任务</div>
-      <div id="arch-cfm-text" class="archive-del-text"></div>
-      <div class="archive-del-actions">
-        <button id="arch-cfm-cancel">取消</button>
-        <button id="arch-cfm-confirm" class="danger">归档</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- 归档成功弹窗：给出「查看归档区 / 撤销归档」两个后续动作 -->
-  <div id="arch-ok-mask" class="archive-del-mask hidden">
-    <div class="archive-del-dialog">
-      <div class="add-title">✅ 已归档</div>
-      <div id="arch-ok-text" class="archive-del-text"></div>
-      <div class="archive-del-actions">
-        <button id="arch-ok-undo">撤销归档</button>
-        <button id="arch-ok-view" class="danger">查看归档区</button>
-      </div>
-    </div>
-  </div>
-
   <!-- 删除任务的二次确认弹窗（modal）：删除不可逆，比行内确认更醒目 -->
   <div id="archive-del-mask" class="archive-del-mask hidden">
     <div class="archive-del-dialog">

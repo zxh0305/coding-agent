@@ -235,6 +235,7 @@ function toast(text) {
 
 // ---------- 任务列表：按项目（工作区）分组 + 折叠 + 重命名 ----------
 let confirmingDelete = null;  // 正处于"确认删除"状态的任务 id（二次确认，防误触）
+let confirmingArchive = null; // 正处于"确认归档"状态的任务 id（行内「确认」按钮，点其他地方即消失）
 let sessionsCache = [];       // 最近一次拉取的任务列表，删除的乐观更新直接改它
 let renamingSession = null;   // 正在重命名的任务 id（行内出现输入框）
 const collapsedGroups = new Set();  // 已折叠的项目组（存组名）
@@ -347,6 +348,32 @@ function taskRow(s, list) {
     return li;
   }
 
+  // 归档二次确认状态：这一行变成「标题 + 红色确认按钮」，不做弹窗。
+  // 点「确认」才真正归档；点其他任何地方由 document 的全局 click 收起。
+  if (s.id === confirmingArchive) {
+    const title = document.createElement("div");
+    title.className = "t-title";
+    title.textContent = s.title || "新任务";
+    const yes = document.createElement("button");
+    yes.className = "t-yes";
+    yes.textContent = "确认";
+    yes.title = "确认归档";
+    yes.addEventListener("click", (e) => {
+      e.stopPropagation();
+      confirmingArchive = null;
+      doArchiveSession(s.id);
+    });
+    // 行内其余区域的点击也算"其他地方"：取消确认，不切会话
+    li.addEventListener("click", (e) => {
+      e.stopPropagation();
+      confirmingArchive = null;
+      renderSessions(sessionsCache);
+    });
+    li.append(title, yes);
+    li.title = s.title || "";
+    return li;
+  }
+
   const title = document.createElement("div");
   title.className = "t-title";
   title.textContent = s.title || "新任务";
@@ -362,6 +389,7 @@ function taskRow(s, list) {
   rename.title = "重命名";
   rename.addEventListener("click", (e) => {
     e.stopPropagation();
+    confirmingArchive = null;  // 进重命名态：别的行上挂着的确认按钮一并收起
     renamingSession = s.id;
     renderSessions(sessionsCache);
     const inp = document.querySelector(".t-rename");
@@ -373,7 +401,9 @@ function taskRow(s, list) {
   del.title = "归档任务";
   del.addEventListener("click", (e) => {
     e.stopPropagation();
-    openArchiveConfirm(s.id, s.title);
+    confirmingDelete = null;
+    confirmingArchive = s.id;  // 行内二次确认：浮出「确认」按钮，点其他地方即消失
+    renderSessions(sessionsCache);
   });
   // 注意 state 可能是 null（idle 无徽标）：appendChild(null) 会插入字面量
   // "null"，必须过滤掉空值再 append。
@@ -381,6 +411,7 @@ function taskRow(s, list) {
   li.title = s.title || "";
   li.addEventListener("click", () => {
     confirmingDelete = null;
+    confirmingArchive = null;
     switchSession(s.id);
   });
   return li;
@@ -3246,6 +3277,12 @@ async function logoutNow() {
   showLogin();
 }
 document.addEventListener("click", (e) => {
+  // 归档的行内「确认」按钮：点其他任何地方即取消（按钮消失）。
+  // 确认按钮与所在行的点击各自 stopPropagation，不会走到这里。
+  if (confirmingArchive !== null) {
+    confirmingArchive = null;
+    renderSessions(sessionsCache);
+  }
   // 点弹窗外空白处关闭浮动层
   for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"], ["perm-pop", "perm-chip"], ["todo-pop", "todo-chip"]]) {
     const el = $(pop);
@@ -4938,72 +4975,20 @@ function toggleArchivePop() {
   if (opening) renderArchiveList();
 }
 
-// --- 归档确认弹窗：确认后才真正调 archive 接口 ---
-let pendingArchSid = null;
-
-function openArchiveConfirm(sid, title) {
-  pendingArchSid = sid;
-  $("arch-cfm-text").textContent = `确定归档「${title || "新任务"}」吗？归档后会从任务列表消失，可在归档区找回。`;
-  $("arch-cfm-mask").classList.remove("hidden");
-}
-
-function closeArchiveConfirm() {
-  pendingArchSid = null;
-  $("arch-cfm-mask").classList.add("hidden");
-}
-
-async function confirmArchive() {
-  const sid = pendingArchSid;
-  if (!sid) return;
-  closeArchiveConfirm();
+// --- 行内「确认」后的真正归档：成功只 toast 提示（不再弹成功弹窗），
+// 恢复走归档区的「↩ 恢复」，删除走归档区的确认弹窗 ---
+async function doArchiveSession(sid) {
   try {
     await api(`/api/sessions/${encodeURIComponent(sid)}/archive`, { method: "POST" });
     if (currentSession === sid) {
       newTask();  // 归档了当前打开的任务：回到新建态
       setComposerArchived(false);  // 新建态输入框恢复可用
     }
+    toast("已归档，可在归档区查看或恢复");
     loadSessions();
     loadArchiveCount();
-    pendingArchSid = sid;  // closeArchiveConfirm 清了它，成功弹窗的「撤销」还要用
-    $("arch-ok-text").textContent = "任务已归档，可在归档区查看或恢复。";
-    $("arch-ok-mask").classList.remove("hidden");
   } catch (err) { toast("归档失败：" + err.message); }
 }
-
-// 成功弹窗里的「撤销归档」：把刚归档的任务原样拉回任务列表
-async function undoArchive() {
-  const sid = pendingArchSid;
-  $("arch-ok-mask").classList.add("hidden");
-  if (!sid) return;
-  pendingArchSid = null;
-  try {
-    await api(`/api/sessions/${encodeURIComponent(sid)}/unarchive`, { method: "POST" });
-    toast("已撤销归档");
-    loadSessions();
-    loadArchiveCount();
-  } catch (err) { toast("撤销失败：" + err.message); }
-}
-
-// 成功弹窗里的「查看归档区」：收起弹窗并打开归档区浮窗
-function viewArchive() {
-  const sid = pendingArchSid;
-  $("arch-ok-mask").classList.add("hidden");
-  pendingArchSid = null;
-  // 关键：本次 click 还会冒泡到 document 上的"点浮窗外收起"监听器，若同步
-  // 打开浮窗，会被同一事件立即收起（按钮既不在 pop 内也不是 archive-btn）。
-  // 延后到下一轮事件循环，等收起监听跑完再打开。
-  setTimeout(() => {
-    const pop = $("archive-pop");
-    pop.classList.remove("hidden");
-    renderArchiveList();
-  }, 0);
-}
-
-bind("arch-cfm-cancel", "click", closeArchiveConfirm);
-bind("arch-cfm-confirm", "click", confirmArchive);
-bind("arch-cfm-mask", "click", (e) => { if (e.target.id === "arch-cfm-mask") closeArchiveConfirm(); });
-bind("arch-ok-undo", "click", undoArchive);
-bind("arch-ok-view", "click", viewArchive);
 
 bind("archive-btn", "click", toggleArchivePop);
 bind("archive-close", "click", toggleArchivePop);
