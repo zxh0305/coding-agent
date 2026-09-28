@@ -1440,6 +1440,10 @@ async function loadModelPop() {
   const data = await api("/api/models" + (sid ? `?session_id=${encodeURIComponent(sid)}` : ""));
   $("model-pop-head").textContent = sid ? "切换此任务使用的模型"
                                         : "设置默认模型（新任务的初始模型）";
+  // 提示切换后果：任务内 = 只影响本任务、历史不丢；新建视图 = 已有任务不受影响
+  $("model-pop-hint").textContent = sid
+    ? "切换仅本任务生效：对话历史保留，下一轮起使用新模型"
+    : "仅影响之后新建的任务；已有任务继续使用各自绑定的模型";
   const list = $("model-pop-list");
   list.innerHTML = "";
   let lastProv = null;
