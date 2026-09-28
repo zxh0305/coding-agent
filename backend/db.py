@@ -287,6 +287,10 @@ def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
         return "provider_id" in _table_columns(conn, "sessions")
     if version == 16:          # sessions.model
         return "model" in _table_columns(conn, "sessions")
+    if version == 17:          # sessions.archived（归档标记）
+        return "archived" in _table_columns(conn, "sessions")
+    if version == 18:          # sessions.archived_at（归档时间）
+        return "archived_at" in _table_columns(conn, "sessions")
     if version == 19:          # sessions.todos（会话级任务清单 JSON）
         return "todos" in _table_columns(conn, "sessions")
     if version == 20:          # sessions.title_manual（标题是否被用户手动改过）
