@@ -578,9 +578,9 @@ def _resolve_active(sid: str | None = None) -> tuple[dict, str]:
     return prov, (enabled[0] if enabled else "")
 
 
-def _resolve_client(sid: str | None = None) -> tuple[object, str, str, bool]:
+def _resolve_client(sid: str | None = None) -> tuple[dict, object, str, str, bool]:
     """按当前激活模型（含其供应商的 API 格式与视觉标记）构建客户端，
-    返回 (client, model, 指纹, 是否支持视觉)。sid = 按该会话的模型解析。"""
+    返回 (prov, client, model, 指纹, 是否支持视觉)。sid = 按该会话的模型解析。"""
     prov, model = _resolve_active(sid)
     if not model:
         raise SystemExit("没有已启用的模型，请在网页「管理模型」里添加并启用")
@@ -589,7 +589,7 @@ def _resolve_client(sid: str | None = None) -> tuple[object, str, str, bool]:
     vision = _model_vision(prov, model)
     sig = json.dumps([prov["id"], model, prov["base_url"], prov["api_key"], prov.get("api_format"), vision],
                      ensure_ascii=False)
-    return client, model, sig, vision
+    return prov, client, model, sig, vision
 
 
 def _active_window(sid: str | None = None) -> int:
@@ -742,7 +742,7 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
         # 需要 sid 才能把重试进度推给这个会话的事件流。
         sid = uuid.uuid4().hex[:8]
 
-    client, model, sig, vision = _resolve_client(sid)
+    prov, client, model, sig, vision = _resolve_client(sid)
     # 重试观测接线：LLM 请求瞬态失败退避重试时，把进度推给会话事件流
     # （前端显示"正在重试(2/3)"，等待不再像卡死）。闭包捕获 sid——客户端
     # 实例随 Agent 缓存复用，但同一会话的 sid 恒定，无需重建闭包。
