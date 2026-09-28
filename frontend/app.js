@@ -2862,7 +2862,10 @@ function setStreaming(on) {
   // 任务清单跟随任务状态：生成中自动展开常驻（清单随 todo_update 实时刷新）。
   if (on) {
     todoAutoOpened = true;
-    if (sessionTodos.length && $("todo-pop").classList.contains("hidden")
+    const left = sessionTodos.filter((t) => t.status !== "done").length;
+    // 只在「还有未完成项」时自动展开：清单已全部完成的，后续回合不再打扰
+    // （用户反馈：完成后每发一条消息都重新弹出是骚扰；想看就点 chip 手动打开）
+    if (left > 0 && sessionTodos.length && $("todo-pop").classList.contains("hidden")
         && !$("todo-pop").dataset.userClosed) {
       positionTodoPop();
       $("todo-pop").classList.remove("hidden");
@@ -2880,6 +2883,8 @@ function setStreaming(on) {
 function resetStreamState() {
   clearInterval(metaTimer);
   todoAutoOpened = false;              // 新会话/新视图重新允许"任务中自动展开"
+  todoDoneAnnounced = false;           // 完成展示边沿随会话一起作废
+  clearTimeout(todoDoneTimer);
   $("todo-pop").classList.remove("stay-open");
   // 注意：不能 delete userClosed！这是用户"手动关掉、别再自动弹"的意愿，
   // 切会话清掉它的话，SSE 补发 todo_update（此时 caught_up 置 streaming=true）
@@ -3097,6 +3102,9 @@ async function performSend(item) {
   // 正结束由事件流的 turn_end 驱动（那里统一复位并推进队列）。
   // 新回合 = 新的意愿周期：用户上一回合的手动关闭意愿到此为止，重新允许自动弹。
   delete $("todo-pop").dataset.userClosed;
+  // 新回合重置"全部完成已展示"边沿：本回合若又跑出新清单并做完，允许再展示一次
+  todoDoneAnnounced = false;
+  clearTimeout(todoDoneTimer);
   setStreaming(true);
   // 回令：服务端会在 turn_start 里原样带回，本 tab 据此不重复画自己的气泡。
   // crypto.randomUUID 只在安全上下文可用（本机 http OK，局域网 http 不一定），
@@ -3962,6 +3970,8 @@ function bindSideResizer() {
 // 全部完成不自动消失：徽标变 ✅，用户点开仍能看到完成状态；手动关闭只收起浮窗。
 let sessionTodos = [];   // [{content, status}]，空数组 = 当前会话没有清单
 let todoAutoOpened = false;  // 本回合是否由 streaming 自动展开过（防重复触发）
+let todoDoneAnnounced = false;  // "全部完成"是否已展示过（边沿触发，一回合只弹一次）
+let todoDoneTimer = null;       // 完成展示的自动收起定时器
 
 function setSessionTodos(todos) {
   sessionTodos = Array.isArray(todos) ? todos : [];
@@ -3972,8 +3982,25 @@ function setSessionTodos(todos) {
   const pop = $("todo-pop");
   if (pop && streaming && sessionTodos.length && pop.classList.contains("hidden")
       && !pop.dataset.userClosed) {
+    // 全部完成 → 不自动弹（只亮 ✅ 徽标，想看用户自己点开）
+    const left = sessionTodos.filter((t) => t.status !== "done").length;
+    if (left > 0) {
+      positionTodoPop();
+      pop.classList.remove("hidden");
+    }
+  }
+  // 「最后一项完成」的边沿：生成过程中恰好全部做完 → 弹出展示一次"全部完成"，
+  // 4 秒后自动收起。之后本回合的任何事件都不再触发（todoDoneAnnounced 挡住）。
+  const allDone = streaming && sessionTodos.length > 0 && !pop.dataset.userClosed
+    && sessionTodos.every((t) => t.status === "done");
+  if (allDone && !todoDoneAnnounced) {
+    todoDoneAnnounced = true;
     positionTodoPop();
     pop.classList.remove("hidden");
+    clearTimeout(todoDoneTimer);
+    todoDoneTimer = setTimeout(() => {
+      $("todo-pop").classList.add("hidden");
+    }, 4000);
   }
 }
 
