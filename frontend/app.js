@@ -3457,6 +3457,7 @@ document.addEventListener("click", (e) => {
 
 function addProv() {
   editingProvId = null;  // null = 新供应商，保存时后端生成 id
+  showProvEditor();  // 若当前在用量页：先切回编辑器视图，否则表单填了也看不见
   renderProvList();
   $("p-name").value = "";
   $("p-url").value = "";
