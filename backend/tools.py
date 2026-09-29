@@ -264,6 +264,21 @@ def is_read_only(name: str) -> bool:
     return bool(TOOL_READ_ONLY.get(name))
 
 
+def tool_schema(name: str) -> dict | None:
+    """按名字查工具的 parameters 定义。
+
+    仅在参数解析失败路径调用（失败是例外不是常态，线性扫一遍无所谓）：
+    把期望参数形状随失败信封回传，模型在同一轮就能自行修正参数重试，
+    不必"猜字段名 → 再错一轮 → 再猜"。未知工具返回 None（错误信封不带
+    schema 字段）。
+    """
+    for s in TOOL_SCHEMAS:
+        fn = s.get("function") or {}
+        if fn.get("name") == name:
+            return fn.get("parameters")
+    return None
+
+
 def execute_tool(name: str, arguments: dict, ctx: ToolContext | None = None) -> str:
     """按名字执行工具。
 
@@ -282,8 +297,15 @@ def execute_tool(name: str, arguments: dict, ctx: ToolContext | None = None) -> 
         if "ctx" in inspect.signature(func).parameters:
             return func(**arguments, ctx=ctx)
         return func(**arguments)
-    except TypeError as e:  # 参数缺失/多传/类型不对：execute_tool 统一转成信封
-        return error_result(f"参数不匹配: {e}", "对照本工具 schema 核对参数名与类型后重试")
+    except TypeError as e:  # 参数缺失/多传/类型不对：统一转信封，并附上期望 schema
+        # 让模型在同一轮对照修正、原样重试（DeepSeek harness 的"错误带 schema
+        # 回传"模式）。schema 可选：未知工具没有定义可附。
+        payload = {"ok": False, "error": f"参数不匹配: {e}",
+                   "hint": "对照 schema 核对参数名与类型后重试"}
+        schema = tool_schema(name)
+        if schema:
+            payload["schema"] = schema
+        return json.dumps(payload, ensure_ascii=False)
     except Exception as e:
         return error_result(f"{type(e).__name__}: {e}", "执行失败，可调整参数重试或换用其它工具")
 

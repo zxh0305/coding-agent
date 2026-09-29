@@ -37,7 +37,7 @@ from code_tools import prepare_workspace
 from memory import memory_dir, memory_index_block
 from permissions import ALLOW, ASK, DENY, PermissionGate, Verdict, rejection_result
 from system_prompt import SYSTEM_PROMPT
-from tools import TOOL_SCHEMAS, ToolContext, error_result, execute_tool, is_read_only
+from tools import TOOL_SCHEMAS, ToolContext, error_result, execute_tool, is_read_only, tool_schema
 from ui import colored
 
 log = logging.getLogger("agent")  # 输出目的地由 logger.py 统一配置（写入 agent.log）
@@ -1308,20 +1308,37 @@ class Agent:
         跑在 ThreadPoolExecutor 的工作线程上，一旦抛出，future.result() 会在
         收集处重新抛出、殃及同组其它工具的回填（要求：单个工具出错不能
         影响同组其它工具）。
+
+        参数解析失败（非法 JSON / 不是 JSON 对象）时不执行工具、直接回错误
+        信封并附上该工具的期望参数定义（schema）——模型看到的不再是笼统的
+        "参数不匹配"，同一轮就能对照修正重试；此前静默换成 {} 继续执行，
+        模型会把"JSON 写坏"误诊为"字段名记错"，白白多烧一轮。
         """
         name = (call.get("function") or {}).get("name", "")
         raw_args = (call.get("function") or {}).get("arguments") or "{}"
+
+        def args_error(reason: str) -> str:
+            payload = {"ok": False, "error": reason,
+                       "hint": "arguments 是【JSON 字符串】，修正后原样重试本工具"}
+            schema = tool_schema(name)
+            if schema:
+                payload["schema"] = schema
+            return json.dumps(payload, ensure_ascii=False)
+
+        result: str | None = None
         try:
             # 注意坑点：arguments 是【JSON 字符串】不是 dict（模型输出的是文本）
             arguments = json.loads(raw_args)
             if not isinstance(arguments, dict):
-                arguments = {}
-        except json.JSONDecodeError:
-            arguments = {}
-        try:
-            result = execute_tool(name, arguments, self.ctx)
-        except Exception as e:  # execute_tool 已兜底一次；这里再兜一层，守住"绝不抛"的承诺
-            result = error_result(f"{type(e).__name__}: {e}", "工具内部异常，可换用其它工具或稍后重试")
+                result = args_error(f"arguments 必须是 JSON 对象（{{\"参数\": 值}})，实际是 "
+                                    f"{type(arguments).__name__}；原文开头: {raw_args[:200]}")
+        except json.JSONDecodeError as e:
+            result = args_error(f"arguments 不是合法 JSON: {e}；原文开头: {raw_args[:200]}")
+        if result is None:
+            try:
+                result = execute_tool(name, arguments, self.ctx)
+            except Exception as e:  # execute_tool 已兜底一次；这里再兜一层，守住"绝不抛"的承诺
+                result = error_result(f"{type(e).__name__}: {e}", "工具内部异常，可换用其它工具或稍后重试")
         if name == "read_file":
             # 记录最近读过的文件（供压缩后重注入，见 recent_reads）：失败读取
             # 不记；列表只留最近 RECENT_READS_KEEP 条，内存占用有界。

@@ -351,5 +351,63 @@ class TestUnifiedEnvelope(unittest.TestCase):
         self.assertIn("hint", payload)
 
 
+class TestArgErrorSchemaHint(unittest.TestCase):
+    """参数解析失败回传期望 schema：模型同一轮就能对照修正（借鉴 DeepSeek harness）。
+
+    此前两条失败路径都让模型盲猜：JSON 写坏时静默换成 {} 执行、得到的
+    "参数不匹配"把"格式错误"误诊成"字段名记错"；executor 的 TypeError 也
+    只给一句 hint 不给定义。锁死三条失败路径都带 schema（未知工具除外）。"""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp(prefix="schema_ws_"))
+        self.addCleanup(shutil.rmtree, self.ws, ignore_errors=True)
+        self.agent = Agent(llm=_StaticLLM(), verbose=False, workspace=str(self.ws))
+
+    def run_tool(self, arguments, name="read_file"):
+        return json.loads(self.agent._run_tool({"function": {"name": name, "arguments": arguments}}))
+
+    def test_malformed_json_carries_schema_and_raw_head(self):
+        """JSON 缺右括号：报"不合法 JSON"、附 schema、带原文开头（定位错在哪）。"""
+        r = self.run_tool('{"path": "a.txt"')
+        self.assertFalse(r["ok"])
+        self.assertIn("合法 JSON", r["error"])
+        self.assertIn('{"path": "a.txt"', r["error"])
+        self.assertEqual(r["schema"]["type"], "object")
+        self.assertIn("path", r["schema"]["properties"])
+        self.assertNotIn("result", r)  # 绝不能执行工具
+
+    def test_non_object_arguments_carries_schema(self):
+        """arguments 是合法 JSON 但不是对象（数组）：同样拒绝执行并附 schema。"""
+        r = self.run_tool('["a.txt"]')
+        self.assertFalse(r["ok"])
+        self.assertIn("JSON 对象", r["error"])
+        self.assertIn("list", r["error"])
+        self.assertIn("path", r["schema"]["properties"])
+
+    def test_typeerror_from_executor_carries_schema(self):
+        """参数名写错 → executor TypeError 信封附 schema（此前只有一句 hint）。"""
+        r = self.run_tool('{"pathx": "a.txt"}')
+        self.assertFalse(r["ok"])
+        self.assertIn("参数不匹配", r["error"])
+        self.assertIn("path", r["schema"]["properties"])
+
+    def test_unknown_tool_error_without_schema(self):
+        """未知工具没有定义可附：错误信封保持无 schema 字段。"""
+        r = self.run_tool("{}", name="no_such_tool")
+        self.assertFalse(r["ok"])
+        self.assertIn("未知工具", r["error"])
+        self.assertNotIn("schema", r)
+
+    def test_valid_args_unaffected(self):
+        """正常调用不受影响：成功信封不带 schema 字段。"""
+        (self.ws / "ok.txt").write_text("hi", encoding="utf-8")
+        r = self.run_tool('{"path": "ok.txt"}')
+        self.assertTrue(r["ok"])
+        self.assertNotIn("schema", r)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+
