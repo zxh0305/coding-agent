@@ -115,10 +115,20 @@ class ToolContext:
     executor: object = None                     # 命令执行提供者（executor.py seam）：None =
                                                 # 本机子进程；换 Docker 沙箱即注入新提供者
     session_id: str | None = None               # 本会话 id（文档工具据此确定文档归属）
+    subagent_runner: object = None              # fn(task) -> str：只读子代理运行器（spawn_subagent
+                                                # 用）。Agent 构造时自装配为 _spawn_subagent，
+                                                # 工具层不 import agent——依赖保持单向
 
 TOOL_REGISTRY = {
     "todo_write": todo_write,
 }
+
+# ---- 子代理工具（subagent_tools.py）：读侧扇出的独立上下文侦察 ----
+from subagent_tools import (SUBAGENT_TOOL_REGISTRY, SUBAGENT_TOOL_READ_ONLY,
+                            SUBAGENT_TOOL_SCHEMAS)
+
+TOOL_SCHEMAS += SUBAGENT_TOOL_SCHEMAS
+TOOL_REGISTRY.update(SUBAGENT_TOOL_REGISTRY)
 
 # ---- 合并 Coding 工具（code_tools.py）：读写工作区文件、执行命令 ----
 from code_tools import CODE_TOOL_REGISTRY, CODE_TOOL_READ_ONLY, CODE_TOOL_SCHEMAS
@@ -260,6 +270,7 @@ TOOL_READ_ONLY.update(CODE_TOOL_READ_ONLY)  # 并入 coding 工具的标记（�
 TOOL_READ_ONLY.update(DOC_TOOL_READ_ONLY)   # 并入文档工具（create_doc 为非只读，走串行）
 TOOL_READ_ONLY.update(ATTACH_TOOL_READ_ONLY)  # 并入附件工具（list/read_attachment 均只读）
 TOOL_READ_ONLY.update(BROWSER_TOOL_READ_ONLY)  # 并入浏览器工具（全部非只读：出网/改页面状态）
+TOOL_READ_ONLY.update(SUBAGENT_TOOL_READ_ONLY)  # 并入子代理工具（spawn_subagent 串行，见其注释）
 
 def is_read_only(name: str) -> bool:
     """name 是否只读工具。未知工具返回 False——没有元数据就当写操作走串行，永远站在安全侧。"""

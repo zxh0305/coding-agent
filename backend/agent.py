@@ -36,7 +36,8 @@ from concurrent.futures import ThreadPoolExecutor
 from code_tools import prepare_workspace
 from memory import memory_dir, memory_index_block
 from permissions import ALLOW, ASK, DENY, PermissionGate, Verdict, rejection_result
-from system_prompt import SYSTEM_PROMPT
+from subagent_tools import SUBAGENT_REPORT_MAX_CHARS, SUBAGENT_TOOLSET
+from system_prompt import SUBAGENT_SYSTEM_PROMPT, SYSTEM_PROMPT
 from tools import TOOL_SCHEMAS, ToolContext, error_result, execute_tool, is_read_only, tool_schema
 from ui import colored
 
@@ -129,6 +130,11 @@ SUMMARIZE_PROMPT = """\
 
 PARALLEL_TOOL_WORKERS = 4  # 只读组的最大并发数：读文件/搜索以 IO 等待为主，4 个线程已足够重叠
 
+# ── 子代理（读侧扇出，工具面与定位见 subagent_tools.py 模块注释）──────────
+# 侦察任务的轮数兜底：读文件/搜索为主，通常几轮就够，15 已是宽裕上限；
+# 跑满走同一套禁工具收尾轮，结论仍以模型自己的总结收场。
+SUBAGENT_MAX_ROUNDS = 15
+
 # 单条工具结果进入历史的长度上限（字符）。这是最后的安全闸：各工具内部虽有
 # 各自的输出上限（MAX_READ_LINES / MAX_OUTPUT_CHARS 等），但工具众多、口径
 # 不一，且 run_bash `cat 100MB文件` 这类组合仍可能漏出巨型结果。巨型结果一旦
@@ -198,7 +204,8 @@ class Agent:
                  max_rounds: int = 40, verbose: bool = True, vision_supported: bool = True,
                  workspace=None, vision_backend=None, context_window: int = 0,
                  artifact_reader=None, permission_gate=None, session_id=None,
-                 model_tag: tuple[str, str] | None = None):
+                 model_tag: tuple[str, str] | None = None,
+                 allowed_tools: tuple[str, ...] | None = None):
         # max_rounds=40：上限只是兜底（真失控另有指纹提醒拦截），合法的长任务
         # （读代码→改→跑验证→再修）经常要几十轮，40 是给它们的余量；到限走
         # 收尾轮（_wrap_up_round）而不是"强制停止"。
@@ -232,6 +239,11 @@ class Agent:
         # 压缩后置回 None——摘要的 token 密度与原始日志完全不同，旧系数必然失真，
         # 等下一轮真实 usage 重新校准（见 context_stats / _maybe_compact）。
         self._token_ratio: float | None = None
+        # 工具白名单（子代理专用）：None = 全量工具面（主代理）；给了名字集合
+        # 则 schema 与执行两侧都只暴露这个子集（见 _tool_schemas / _run_tool）。
+        # 子代理传 SUBAGENT_TOOLSET（只读侦察面）——schema 是"模型能看见什么"
+        # 的唯一来源，看不见的工具模型调不到；执行侧再把关一道是防幻觉调用。
+        self.allowed_tools = set(allowed_tools) if allowed_tools is not None else None
         # 记忆索引的回合快照（_run 开始时刷新）。system 是每轮请求的前缀头，
         # 供应商的前缀缓存要求它逐字节稳定：索引若每轮从磁盘现读，模型在回合
         # 中途写一条记忆（MEMORY_CONTRACT 鼓励这么做）就会改掉 system，后面
@@ -274,11 +286,27 @@ class Agent:
         # 权限闸门（permissions.py）：挂实例而非模块级——规则里的工作区边界、
         # 会话内记住的 ask 决定都按会话隔离，两个会话并发各判各的。
         self.permissions = permission_gate or PermissionGate(self.ctx.workspace, ask_timeout=0.0)
+        # 子代理运行器自装配（spawn_subagent 工具经 ctx 调到这里）：主代理、
+        # CLI、单测构造的实例都天然带能力，app.py 无需额外接线。子代理再构造
+        # 子代理会被 allowed_tools 名单在 schema 与执行两处挡住（递归上限 1 层）。
+        self.ctx.subagent_runner = self._spawn_subagent
 
     @staticmethod
     def _clean_outgoing(m: dict) -> dict:
         """发给模型前剥离内部字段（_stats 等下划线前缀），部分服务商会拒绝未知字段。"""
         return {k: v for k, v in m.items() if not k.startswith("_")}
+
+    def _tool_schemas(self) -> list[dict]:
+        """本实例可用的工具清单。allowed_tools 为 None（主代理）时返回全量
+        TOOL_SCHEMAS 原对象；子代理（白名单非 None）只返回白名单内的 schema。
+
+        schema 是"模型能看见什么"的唯一来源——看不见的工具模型调不到，这比
+        执行层拦截更根本；_run_tool 的名单把关只是防幻觉调用的第二道闸。
+        context_stats 也走这里：子代理的容量估算按它实际携带的工具面算。"""
+        if self.allowed_tools is None:
+            return TOOL_SCHEMAS
+        return [s for s in TOOL_SCHEMAS
+                if s.get("function", {}).get("name") in self.allowed_tools]
 
     def _system_content(self) -> str:
         """实际发给模型的 system 内容 = 系统提示词 + 持久记忆索引段。
@@ -414,7 +442,7 @@ class Agent:
         # system 口径必须与实际请求一致：含记忆段（契约 + 索引），否则记忆
         # 越攒越多时压缩触发线会被系统性低估
         sys_text = self._system_content()
-        tool_text = json.dumps(TOOL_SCHEMAS, ensure_ascii=False)
+        tool_text = json.dumps(self._tool_schemas(), ensure_ascii=False)
         chars = {"user": 0, "assistant": 0, "tool": 0}
         toks = {"user": 0, "assistant": 0, "tool": 0}
         for m in view:
@@ -574,7 +602,8 @@ class Agent:
 
             # 流式拿模型回复：文字片段实时往外 yield，最后拿到完整 message。
             # 消费逻辑提取成 _consume_stream——收尾轮复用同一份，防止两处漂移。
-            assistant_msg = yield from self._consume_stream(messages, TOOL_SCHEMAS,
+            # 工具清单按实例白名单过滤（主代理=全量；子代理=只读侦察面）。
+            assistant_msg = yield from self._consume_stream(messages, self._tool_schemas(),
                                                             usage_total, metrics,
                                                             round_no)
             log.debug("LLM 原始返回: %s", json.dumps(assistant_msg, ensure_ascii=False))
@@ -849,6 +878,91 @@ class Agent:
     def reset(self) -> None:
         """清空对话历史，开始新会话。"""
         self.history.clear()
+
+    # ------------------------------------------------------------------
+    # 子代理（读侧扇出）：独立上下文的只读侦察员
+    #
+    # 调用链：模型请求 spawn_subagent → _run_tool → execute_tool →
+    # ctx.subagent_runner（__init__ 自装配到这里）→ 本节的 _spawn_subagent。
+    # 工具层只认 runner 签名，不 import 本模块——依赖保持单向（agent → tools
+    # → subagent_tools）。
+    # ------------------------------------------------------------------
+
+    def run_attached(self, user_input: str, cancel_event: threading.Event):
+        """附属模式跑一个回合：不创建、也不置位停止开关，直接复用调用方给的
+        Event（生成器，事件与 run() 同名同形）。
+
+        与 run() 的唯一差别是停止开关的生命周期：run() 每回合造新 Event 并在
+        finally 里 set——那是父回合自有的开关，子代理照抄会把父回合一起杀掉；
+        附属模式共享父开关，用户点「停止」时父子同时收场，且谁都不替谁置位。"""
+        self.cancel_event = cancel_event
+        yield from self._run(user_input)
+
+    def _spawn_subagent(self, task: str) -> str:
+        """构造并同步驱动一个只读侦察子代理，返回结论信封 JSON（spawn_subagent
+        的运行器，装配在 ctx.subagent_runner）。
+
+        与主代理的四个刻意差异：
+          * 工具面：SUBAGENT_TOOLSET（只读侦察），spawn_subagent 不在其中——
+            递归派生在 schema（模型看不见）与 _run_tool 名单闸两处被挡；
+          * 轮数：SUBAGENT_MAX_ROUNDS 兜底，跑满走同一套禁工具收尾轮；
+          * 权限：全新闸门 ask_timeout=0——只读工具走内置放行规则；万一命中
+            ask（如幻觉出的 run_bash）无卡可弹，按拒绝立即收场（安全侧），
+            绝不允许子代理在无人应答的等待里挂死父回合；
+          * 事件：过程事件就地消费不外发（v0 契约，docs/protocol.md §4.3），
+            父回合时间线只见一次 tool_call/tool_result；子代理的 history/
+            trace 随实例销毁，不落库、不进父历史。
+
+        同步跑完是刻意的：spawn_subagent 标记 read_only=False，天然独占一个
+        串行组，父循环在工具结果回填前不会有其它动作——本方法内直接迭代生成
+        器没有并发问题。"""
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            return error_result("父回合已停止，子代理未派出")
+        child = Agent(llm=self.llm,
+                      system_prompt=SUBAGENT_SYSTEM_PROMPT,
+                      max_rounds=SUBAGENT_MAX_ROUNDS,
+                      verbose=False,            # 子代理过程只进 agent.log，不刷父终端
+                      vision_supported=False,   # 工具面里没有 analyze_image
+                      workspace=self.ctx.workspace,
+                      context_window=self.context_window,
+                      permission_gate=PermissionGate(self.ctx.workspace, ask_timeout=0.0),
+                      session_id=self.ctx.session_id,  # read_attachment 据此定位上传附件
+                      model_tag=self.model_tag,
+                      allowed_tools=SUBAGENT_TOOLSET)
+        rounds, answer, stopped, usage = 0, "", False, {}
+        try:
+            for kind, payload in child.run_attached(
+                    task, self.cancel_event or threading.Event()):
+                if kind == "round":
+                    rounds = payload.get("round") or rounds
+                elif kind == "done":
+                    answer = str(payload.get("answer") or "")
+                    stopped = bool(payload.get("stopped"))
+                    usage = payload.get("usage") or {}
+        except Exception as e:  # LLM 层的 RuntimeError 等：转失败信封交主模型改道
+            log.warning("子代理执行失败：%s", e)
+            return error_result(f"子代理执行失败: {e}",
+                                "可缩小任务范围重试，或主代理自行侦察")
+        # 停止判定必须在结论判定之前：被掐断的子代理走「手动停止」收尾，done
+        # 里仍带着半截回答——那是残缺的中间产物，不是结论，回收它并继续跑
+        # 父回合等于无视用户刚刚表达的「停下」。
+        if stopped or (self.cancel_event and self.cancel_event.is_set()):
+            return error_result("子代理被用户停止，未回收结论",
+                                "停止是全局的；需要继续侦察请在下一轮重新派出")
+        if not answer.strip():
+            return error_result("子代理未产出结论（轮数耗尽且收尾轮为空）",
+                                "缩小任务范围后重试，或主代理自行侦察")
+        report = answer[:SUBAGENT_REPORT_MAX_CHARS]
+        if len(answer) > SUBAGENT_REPORT_MAX_CHARS:
+            report += (f"\n…[报告超长已截断，共 {len(answer)} 字符；"
+                       "需要细节请派边界更窄的子任务分次侦察]")
+        return json.dumps({"ok": True, "report": report, "rounds": rounds,
+                           # 子代理用量随信封透出（可观测），但不进父回合的
+                           # usage_total/_stats——用量页按主回合消息归账（见
+                           # 可优化清单：子代理用量归账留后续）
+                           "usage": {"prompt_tokens": usage.get("prompt_tokens") or 0,
+                                     "completion_tokens": usage.get("completion_tokens") or 0}},
+                          ensure_ascii=False)
 
     # ------------------------------------------------------------------
     # 上下文压缩
@@ -1367,6 +1481,14 @@ class Agent:
         """
         name = (call.get("function") or {}).get("name", "")
         raw_args = (call.get("function") or {}).get("arguments") or "{}"
+
+        # 白名单前置闸（子代理防幻觉调用）：schema 已过滤，模型正常情况下看
+        # 不到名单外的工具；这里仍拦一道，把"幻觉出的调用"变成可读的错误信封
+        # 而不是执行到注册表里（execute_tool 按全量表查找，白名单限制会失守）。
+        if self.allowed_tools is not None and name not in self.allowed_tools:
+            return error_result(f"本代理无权使用工具 {name}",
+                                "只能使用任务说明给出的只读侦察工具；需要写操作请写进结论，"
+                                "由主代理决定执行")
 
         # ── pre 钩子：返回拒绝原因字符串即否决 ─────────────────────────
         for hook in self.pre_tool_hooks:

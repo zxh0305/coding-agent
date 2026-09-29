@@ -202,6 +202,8 @@ BUILTIN_RULES = [
     Rule("grep", None, ALLOW, "只读工具"),
     Rule("analyze_image", None, ALLOW, "只读图片识别"),
     Rule("todo_write", None, ALLOW, "任务清单（仅会话内存）"),
+    Rule("spawn_subagent", None, ALLOW, "只读子代理（子代理工具面无写权限，"
+                       "结论回传主代理）"),
     # run_bash 高危清单 → ask（粗粒度兜底：宁可多问，用户可用「本会话内允许」
     # 放行同类操作；想彻底放行/禁止可写用户规则覆盖）
     Rule("run_bash", "rm -rf", ASK, "递归强制删除（rm -rf / -fr）"),
