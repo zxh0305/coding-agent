@@ -241,6 +241,16 @@ class Agent:
         # 当前时间块（_system_content 首次调用时生成并缓存，见其 docstring）。
         # 会话开始时刻的一次性快照：逐轮现取会改坏 system 前缀的 KV 缓存。
         self._time_block: str | None = None
+        # 工具执行钩子（借鉴 dsh 的 pre/execute/post 三段事件，简化为两段）：
+        # pre 返回拒绝原因字符串 = 否决本次调用（不执行、结果为拦截信封），
+        # 返回 None = 放行；post 接 (name, arguments, result)，返回新结果串 =
+        # 改写，返回 None = 保持原样（链式折叠）。改写 JSON 信封时须保持其
+        # 合法——前端/trace/recent_reads 等消费方都按 JSON 解析。钩子抛异常
+        # 一律忽略——钩子是扩展面（审计/沙箱策略/子代理权限继承），绝不能
+        # 拖垮主循环。权限闸门【不】在这里：ask 的等待语义必须活在回合线程
+        # （见 _execute_tool_calls 阶段〇），钩子只做无需等待的同步判定。
+        self.pre_tool_hooks: list = []
+        self.post_tool_hooks: list = [self._record_recent_read]
         # 压缩摘要连续失败计数（熔断，见 MAX_COMPACT_FAILURES）：成功清零。
         self._compact_fail_streak = 0
         # 最近一次压缩放弃的原因（_maybe_compact 各早退分支写入；/compact
@@ -1350,9 +1360,24 @@ class Agent:
         信封并附上该工具的期望参数定义（schema）——模型看到的不再是笼统的
         "参数不匹配"，同一轮就能对照修正重试；此前静默换成 {} 继续执行，
         模型会把"JSON 写坏"误诊为"字段名记错"，白白多烧一轮。
+
+        钩子时序：pre 在解析之前（否决连解析都不必发生）；post 只对【真实
+        执行过】的调用运行（解析失败/否决/执行抛异常都不跑 post）——post
+        的输入必须是工具的真实产物，改写才有意义。
         """
         name = (call.get("function") or {}).get("name", "")
         raw_args = (call.get("function") or {}).get("arguments") or "{}"
+
+        # ── pre 钩子：返回拒绝原因字符串即否决 ─────────────────────────
+        for hook in self.pre_tool_hooks:
+            try:
+                reason = hook(name, raw_args, self.ctx)
+            except Exception:
+                log.exception("pre_tool_hook 执行失败（忽略）")
+                continue
+            if isinstance(reason, str) and reason:
+                return error_result(f"工具调用被拦截: {reason}",
+                                    "本次调用未执行。调整方式后重试，或改用其它工具。")
 
         def args_error(reason: str) -> str:
             payload = {"ok": False, "error": reason,
@@ -1363,6 +1388,7 @@ class Agent:
             return json.dumps(payload, ensure_ascii=False)
 
         result: str | None = None
+        executed_args: dict | None = None
         try:
             # 注意坑点：arguments 是【JSON 字符串】不是 dict（模型输出的是文本）
             arguments = json.loads(raw_args)
@@ -1374,22 +1400,41 @@ class Agent:
         if result is None:
             try:
                 result = execute_tool(name, arguments, self.ctx)
+                executed_args = arguments
             except Exception as e:  # execute_tool 已兜底一次；这里再兜一层，守住"绝不抛"的承诺
                 result = error_result(f"{type(e).__name__}: {e}", "工具内部异常，可换用其它工具或稍后重试")
-        if name == "read_file":
-            # 记录最近读过的文件（供压缩后重注入，见 recent_reads）：失败读取
-            # 不记；列表只留最近 RECENT_READS_KEEP 条，内存占用有界。
-            try:
-                info = json.loads(result)
-                if isinstance(info, dict) and info.get("ok") and info.get("path"):
-                    self.recent_reads.append(
-                        (str(info["path"]), str(info.get("result") or "")[:REINJECT_FILE_CHARS]))
-                    del self.recent_reads[:-RECENT_READS_KEEP]
-            except (json.JSONDecodeError, ValueError, TypeError):
-                pass
+        if executed_args is not None:
+            # ── post 钩子：链式改写工具结果（None = 保持原样）────────────
+            for hook in self.post_tool_hooks:
+                try:
+                    rewritten = hook(name, executed_args, result)
+                except Exception:
+                    log.exception("post_tool_hook 执行失败（忽略）")
+                    continue
+                if isinstance(rewritten, str) and rewritten:
+                    result = rewritten
         if '"error"' in result:
             log.warning("工具 %s 执行出错: %s", name, result)
         return result
+
+    def _record_recent_read(self, name: str, arguments: dict, result: str) -> None:
+        """内置 post 钩子：记录 read_file 的成功读取（供压缩后重注入 recent_reads）。
+
+        失败读取不记（读过失败的没有"已被摘要吸收、需要重注入"的意义）；
+        列表只留最近 RECENT_READS_KEEP 条，内存占用有界。返回 None = 不改写
+        工具结果——本钩子只观察，不干预（见 __init__ 的钩子契约）。
+        """
+        if name != "read_file":
+            return None
+        try:
+            info = json.loads(result)
+            if isinstance(info, dict) and info.get("ok") and info.get("path"):
+                self.recent_reads.append(
+                    (str(info["path"]), str(info.get("result") or "")[:REINJECT_FILE_CHARS]))
+                del self.recent_reads[:-RECENT_READS_KEEP]
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+        return None
 
     def _log(self, text: str, color: str) -> None:
         log.info(text)  # 同步写进 agent.log（无颜色），终端仍走彩色 print
