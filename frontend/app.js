@@ -4927,9 +4927,11 @@ function toggleDocsList() {
 }
 
 // 拖拽把手：按下后跟手改宽度，松开结束。拖拽期间禁用过渡（见 CSS）。
-function bindDocsResizer() {
-  const handle = $("docs-resizer");
-  const p = docsPanelEl();
+// 文档栏与浏览器栏共用 --docs-w（互斥显示），两侧各有一个 resizer，
+// 拖哪个效果一致——所以逻辑收敛到一个通用绑定，按把手→面板配对。
+function bindPanelResizer(handleId, panelId) {
+  const handle = $(handleId);
+  const p = $(panelId);
   if (!handle || !p) return;
   handle.addEventListener("mousedown", (e) => {
     e.preventDefault();
@@ -4956,6 +4958,11 @@ function bindDocsResizer() {
       .getPropertyValue("--docs-w"), 10);
     if (Number.isFinite(cur)) applyDocsWidth(cur);
   });
+}
+
+function bindDocsResizer() {
+  bindPanelResizer("docs-resizer", "docs-panel");
+  bindPanelResizer("browser-resizer", "browser-panel");   // 浏览器栏拖拽（共用宽度记忆）
 }
 
 function toggleDocsPanel() {
