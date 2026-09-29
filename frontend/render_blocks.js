@@ -13,7 +13,9 @@
  *    否则 .bubble.user 的 align-self 会因父级不是 flex 而失效）。
  *
  * 过程块（process）默认折叠：正文区只给答案，点开才看执行痕迹——这与
- * 用户「过程说明弱化、可折叠」的偏好一致。
+ * 用户「过程说明弱化、可折叠」的偏好一致。唯一例外：进行中回合（running，
+ * 切会话/刷新回来的快照）默认展开——用户回来看的正是"现在做到哪了"，
+ * 收起只剩一行秒数等于没回放；仍可点 summary 手动收起，代码不再翻回。
  */
 
 (function (root, factory) {
@@ -116,7 +118,10 @@
       if (block.kind === "process") {
         const d = doc.createElement("details");
         d.className = "trace" + (block.running ? " running" : "");
-        d.open = false;
+        // 进行中的回合默认展开（用户切回会话要立刻看到进行到哪了），已定稿的
+        // 历史回合保持折叠（正文区只给答案）。两种状态都可手动切换，渲染后
+        // 代码不再强制改 open——尤其不能在用户手动收起后翻回展开态。
+        d.open = !!block.running;
         d.appendChild(doc.createElement("summary"));
         for (const it of block.items) d.appendChild(renderProcessItem(it, block.running));
         const label = block.steps > 0 ? "已工作" : "已思考";

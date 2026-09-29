@@ -132,7 +132,7 @@ test("渲染：回答块走 assistant 气泡，流式时带 streaming 类", () =
   assert.equal(node.dataset.role, "assistant");
 });
 
-test("渲染：过程块是折叠的 details.trace，摘要含步数", () => {
+test("渲染：过程块 details.trace，定稿折叠、进行中（running）展开", () => {
   const deps = makeDeps();
   const r = createRenderer(deps);
   const frag = r.renderBlocks([
@@ -144,8 +144,15 @@ test("渲染：过程块是折叠的 details.trace，摘要含步数", () => {
   const d = frag.children[0];
   assert.equal(d.tagName, "DETAILS");
   assert.ok(d.classList.contains("trace"));
-  assert.equal(d.open, false); // 默认折叠
+  assert.equal(d.open, false); // 已定稿：默认折叠
   assert.equal(d.querySelector("summary").textContent, "已工作 3.5s · 2 步");
+
+  // 进行中回合（切会话/刷新回来的 running 快照）：默认展开，用户可手动收起
+  const live = r.renderBlocks([
+    { kind: "process", running: true, startedAt: Date.now() / 1000,
+      steps: 1, elapsed: null, items: [] },
+  ]).children[0];
+  assert.equal(live.open, true);
 });
 
 test("渲染：工具调用与结果配对成两行，写入卡回填徽章", () => {
