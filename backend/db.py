@@ -311,6 +311,8 @@ def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
     if version in (21, 22, 23):   # message_usage.provider_id / model / created
         col = {21: "provider_id", 22: "model", 23: "created"}[version]
         return col in _table_columns(conn, "message_usage")
+    if version == 24:          # providers.reasoning_replay（思考模型回传开关）
+        return "reasoning_replay" in _table_columns(conn, "providers")
     return False
 
 
@@ -1702,6 +1704,7 @@ def list_providers() -> list[dict]:
             "api_format": p["api_format"] or "openai",
             "api_key": p["api_key"], "enabled": bool(p["enabled"]),
             "context_window": p["context_window"] or 128000,  # 供应商级默认窗口（ALTER 补列，旧行也有值）
+            "reasoning_replay": bool(p["reasoning_replay"]),  # 迁移 24 补列，旧行 DEFAULT 0
             "models": [{"name": m["name"], "context_window": m["context_window"],
                         "enabled": bool(m["enabled"]), "vision": bool(m["vision"])}
                        for m in models if m["provider_id"] == p["id"]],
@@ -1717,8 +1720,9 @@ def get_provider(pid: str) -> dict | None:
 
 
 def upsert_provider(pid: str, name: str, base_url: str, api_key: str | None, enabled: bool,
-                    api_format: str | None = None, context_window: int | None = None) -> None:
-    # context_window：None = 保持原值不变（前端编辑时不填窗口就不动它）
+                    api_format: str | None = None, context_window: int | None = None,
+                    reasoning_replay: bool | None = None) -> None:
+    # context_window / reasoning_replay：None = 保持原值不变（前端编辑时不填就不动它）
     with _conn() as conn:
         exists = conn.execute("SELECT 1 FROM providers WHERE id=?", (pid,)).fetchone()
         fmt = api_format if api_format in ("openai", "anthropic") else None
@@ -1731,11 +1735,15 @@ def upsert_provider(pid: str, name: str, base_url: str, api_key: str | None, ena
                 conn.execute("UPDATE providers SET api_format=? WHERE id=?", (fmt, pid))
             if context_window is not None:
                 conn.execute("UPDATE providers SET context_window=? WHERE id=?", (context_window, pid))
+            if reasoning_replay is not None:
+                conn.execute("UPDATE providers SET reasoning_replay=? WHERE id=?",
+                             (int(reasoning_replay), pid))
         else:
             conn.execute("INSERT INTO providers(id, name, base_url, api_format, api_key, enabled, "
-                         "context_window, created) VALUES(?,?,?,?,?,?,?,?)",
+                         "context_window, reasoning_replay, created) VALUES(?,?,?,?,?,?,?,?,?)",
                          (pid, name, base_url, fmt or "openai", api_key or "", int(enabled),
-                          context_window if context_window is not None else 128000, time.time()))
+                          context_window if context_window is not None else 128000,
+                          int(bool(reasoning_replay)), time.time()))
 
 
 def delete_provider(pid: str) -> None:

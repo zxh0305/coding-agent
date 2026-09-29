@@ -242,6 +242,10 @@
               <option value="anthropic">Anthropic Messages（/v1/messages）</option>
             </select>
           </label>
+          <label class="pm-check" title="思考模型的推理内容随消息回传：DeepSeek thinking 系列要求带工具调用的请求必须带回历史 reasoning_content（缺失会 400）；其它供应商请保持关闭。仅 OpenAI 兼容格式生效">
+            <input type="checkbox" id="p-rr">
+            <span>思考推理回传（DeepSeek thinking 等必须开启，一般供应商勿开）</span>
+          </label>
           <label class="field">默认上下文窗口（token）
             <input id="p-win" class="mono" type="number" min="4096" step="1024" placeholder="128000"
                    title="该供应商下模型的默认上下文窗口（留空保持不变）；单个模型可在下方列表单独覆盖。上下文估算超过它的 80% 会自动压缩早期对话">

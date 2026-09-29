@@ -1622,6 +1622,7 @@ function openProvEditor(pid) {
   $("p-name").value = p?.name || "";
   $("p-url").value = p?.base_url || "";
   $("p-format").value = p?.api_format || "openai";
+  $("p-rr").checked = !!(p && p.reasoning_replay);
   $("p-win").value = p?.context_window || 128000;
   $("p-key").value = "";
   $("p-key").placeholder = p?.api_key_masked ? `已保存（${p.api_key_masked}），留空不变` : "输入 API Key";
@@ -1737,6 +1738,7 @@ async function saveProv() {
         id: editingProvId,
         name, base_url: base,
         api_format: $("p-format").value,
+        reasoning_replay: $("p-rr").checked,
         api_key: $("p-key").value.trim(),   // 留空 = 保持已保存的 Key
         context_window: parseInt($("p-win").value) || undefined,  // 不填/非法 = 保持原值
         enabled: $("p-enabled").checked,
@@ -2385,7 +2387,7 @@ let historyMids = new Set();  // 已从分页接口加载进时间线的消息 m
 const TOOL_ICONS = {
   write_file: "✏️", apply_patch: "✏️",
   read_file: "🔍", grep: "🔍", list_dir: "📂",
-  run_bash: "▶️", calculator: "🧮", current_time: "🕐", get_weather: "🌤️",
+  run_bash: "▶️",
   browser_open: "🌐", browser_click: "🖱️", browser_type: "⌨️", browser_screenshot: "📷",
 };
 
@@ -2484,7 +2486,7 @@ function traceLine(text) {
 const TOOL_KIND = {
   write_file: "写入", apply_patch: "修改",
   read_file: "读取", grep: "搜索", list_dir: "列目录",
-  run_bash: "命令", calculator: "计算", current_time: "时间", get_weather: "天气",
+  run_bash: "命令",
   browser_open: "打开", browser_click: "点击", browser_type: "输入", browser_screenshot: "截图",
 };
 

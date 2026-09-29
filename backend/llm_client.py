@@ -228,12 +228,18 @@ class OpenAIChatClient:
     """任意 OpenAI 兼容接口的客户端（纯标准库实现，零依赖）。"""
 
     def __init__(self, api_key: str, base_url: str, model: str, timeout: int = 60,
-                 on_retry=None):
+                 on_retry=None, reasoning_replay: bool = False):
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
         self._stream_usage = True  # 服务商不支持 stream_options 时自动降级为 False
         self.on_retry = on_retry   # 重试观测回调（见 post_json_with_retry），可后置赋值
+        # 思考模型的 reasoning 回传开关（DeepSeek thinking 系列）：开启后，
+        # 流式收到的 reasoning_content 会随最终 assistant 消息一起返回并进历史，
+        # 下一轮请求原样带回——该协议要求带 tools 的请求必须回传历史推理内容，
+        # 缺失直接 400；关闭（默认）则推理只做实时展示、不进历史，与不支持
+        # 该字段的服务商保持兼容。Anthropic 协议的思考块需要签名回传，不走此开关。
+        self.reasoning_replay = bool(reasoning_replay)
         # GLM 的 base_url 以 / 结尾（…/v4/），OpenAI 的不带（…/v1），统一兜一下
         self.api_url = base_url.rstrip("/") + "/chat/completions"
 
@@ -394,6 +400,10 @@ class OpenAIChatClient:
             log.warning("检测到 content 与推理内容完全相同（疑似服务商把推理混入正文），已按空回答处理")
             content = ""
         message: dict = {"role": "assistant", "content": content or None}
+        if self.reasoning_replay and reasoning_parts:
+            # 回传开关开启：推理内容随消息进历史，下一轮请求按协议原样带回。
+            # 只有这里写入历史；实时展示走 reasoning_delta 事件，两条路互不干扰。
+            message["reasoning_content"] = "".join(reasoning_parts)
         if calls:
             message["tool_calls"] = [
                 {
@@ -657,14 +667,17 @@ class AnthropicMessagesClient:
 
 
 def create_client(api_format: str, api_key: str, base_url: str, model: str,
-                  timeout: int = 60, on_retry=None):
+                  timeout: int = 60, on_retry=None, reasoning_replay: bool = False):
     """按供应商的 API 格式选择协议适配器。新协议在这里加一个分支即可。
-    on_retry：重试观测回调（见 post_json_with_retry），Web 层推 api_retry 事件用。"""
+    on_retry：重试观测回调（见 post_json_with_retry），Web 层推 api_retry 事件用。
+    reasoning_replay：思考模型推理回传开关，仅 OpenAI 兼容路径支持（Anthropic
+    的思考块带签名校验，须整块往返，不适配这个简单开关）。"""
     if api_format == "anthropic":
         return AnthropicMessagesClient(api_key=api_key, base_url=base_url, model=model,
                                        timeout=timeout, on_retry=on_retry)
     return OpenAIChatClient(api_key=api_key, base_url=base_url, model=model,
-                            timeout=timeout, on_retry=on_retry)
+                            timeout=timeout, on_retry=on_retry,
+                            reasoning_replay=reasoning_replay)
 
 
 def create_llm_client(env_path: str = ".env") -> OpenAIChatClient:
@@ -682,4 +695,7 @@ def create_llm_client(env_path: str = ".env") -> OpenAIChatClient:
 
     base_url = os.environ.get("LLM_BASE_URL", DEFAULT_BASE_URL).strip()
     model = os.environ.get("LLM_MODEL", DEFAULT_MODEL).strip()
-    return OpenAIChatClient(api_key=api_key, base_url=base_url, model=model)
+    # 命令行版的思考模型回传开关：LLM_REASONING_REPLAY=1（1/true/yes/on 均可）
+    replay = os.environ.get("LLM_REASONING_REPLAY", "").strip().lower() in ("1", "true", "yes", "on")
+    return OpenAIChatClient(api_key=api_key, base_url=base_url, model=model,
+                            reasoning_replay=replay)

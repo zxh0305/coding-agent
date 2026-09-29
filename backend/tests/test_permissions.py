@@ -159,8 +159,7 @@ class TestVerdicts(GateTestBase):
 
     def test_read_tools_allow(self):
         gate = self.make_gate()
-        for tool in ("read_file", "list_dir", "grep", "calculator", "current_time",
-                     "analyze_image"):
+        for tool in ("read_file", "list_dir", "grep", "analyze_image"):
             self.assertEqual(gate.check(tool, {}).verb, ALLOW, tool)
 
     def test_deny_beats_allow(self):
@@ -253,7 +252,7 @@ class TestPermissionModes(GateTestBase):
     def test_readonly_asks_writes_and_commands_allows_reads(self):
         """只读模式：只读工具照常；写文件/命令（含常规命令 ls）一律 ask。"""
         gate = self.make_gate(mode="readonly")
-        for tool in ("read_file", "list_dir", "grep", "calculator"):
+        for tool in ("read_file", "list_dir", "grep"):
             self.assertEqual(gate.check(tool, {"path": "x"}).verb, ALLOW, tool)
         for tool, args in (("write_file", {"path": "a.txt"}),
                            ("apply_patch", {"path": "a.txt"}),

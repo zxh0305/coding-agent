@@ -78,6 +78,29 @@ class TestPromptContract(unittest.TestCase):
         self.assertIn("用户记忆索引（跨会话持久）", system)
         self.assertIn("（暂无记忆）", system)  # 空 workspace 的降级文案
 
+    def test_output_discipline_section_present(self):
+        """汇报纪律进系统提示（借鉴 ZCode 输出纪律）：结论先行/自包含/文件:行号/如实汇报。
+
+        这些条目是纯提示工程的行为约束——零代码成本，改提示词即可上线；
+        断言锁住关键词，防止后续改写时无意丢失。"""
+        for marker in ("结论先行", "自包含", "文件:行号", "如实汇报"):
+            self.assertIn(marker, SYSTEM_PROMPT)
+
+    def test_time_block_injected_once_and_stable(self):
+        """当前时间块：恰好出现一次，且跨调用逐字节稳定（system 前缀缓存的生命线）。
+
+        current_time 工具移除后，时间改由 _system_content 一次性注入。若实现
+        改成每次现取（如直接 datetime.now() 不缓存），同一会话内两次调用结果
+        会随钟表漂移——system 是每轮请求的前缀头，前缀一变整段历史缓存全部
+        失效。这里连续取两次断言相等，就是前缀稳定性的最小验证。"""
+        ws = Path(tempfile.mkdtemp(prefix="prompt_ws_"))
+        self.addCleanup(shutil.rmtree, ws, ignore_errors=True)
+        agent = Agent(llm=_StaticLLM(), verbose=False, workspace=str(ws))
+        system1 = agent._system_content()
+        self.assertEqual(system1.count("【当前时间】"), 1)
+        self.assertIn("会话开始时间", system1)
+        self.assertEqual(agent._system_content(), system1)  # 逐字节稳定
+
 
 class _StaticLLM:
     """Agent 构造冒烟用的假客户端（不发起真实请求）。"""
@@ -287,7 +310,7 @@ class TestUnifiedEnvelope(unittest.TestCase):
                          {"ok", "result"})
 
     def test_every_builtin_tool_returns_envelope(self):
-        """全量扫一遍 10 个注册工具：成功带 result、失败带 error，无一例外。"""
+        """全量扫一遍 7 个自带工具：成功带 result、失败带 error，无一例外。"""
         (self.ws / "b.py").write_text("def hi():\n    return 1\n", encoding="utf-8")
         cases = [
             ("read_file", {"path": "b.py"}),
@@ -296,9 +319,6 @@ class TestUnifiedEnvelope(unittest.TestCase):
             ("list_dir", {}),
             ("grep", {"pattern": "hi"}),
             ("run_bash", {"command": "echo envelopecase"}),
-            ("calculator", {"expression": "6*7"}),
-            ("current_time", {}),
-            ("get_weather", {"city": "北京"}),
             ("analyze_image", {}),  # 无图片 → 失败信封（也必须是统一形状）
         ]
         for name, args in cases:

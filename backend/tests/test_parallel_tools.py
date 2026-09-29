@@ -119,10 +119,10 @@ class TestReadOnlyMetadata(unittest.TestCase):
         self.assertEqual(set(TOOL_REGISTRY), set(TOOL_READ_ONLY))
 
     def test_flags_match_design(self):
-        """五只读：read_file / list_dir / grep / calculator / current_time；其余全为写。"""
-        for name in ("read_file", "list_dir", "grep", "calculator", "current_time"):
+        """四只读：read_file / list_dir / grep / todo_write；其余全为写。"""
+        for name in ("read_file", "list_dir", "grep", "todo_write"):
             self.assertTrue(is_read_only(name), f"{name} 应为只读")
-        for name in ("write_file", "apply_patch", "run_bash", "get_weather", "analyze_image"):
+        for name in ("write_file", "apply_patch", "run_bash", "analyze_image"):
             self.assertFalse(is_read_only(name), f"{name} 应按写处理")
 
     def test_unknown_tool_treated_as_write(self):

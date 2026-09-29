@@ -106,18 +106,18 @@ python3 backend/cli.py "37*89+100 等于多少"  # 单次提问
 
 ### 3.4 一轮工具调用期间，消息历史长什么样
 
-问 `37*89+100 等于多少` 后，`agent.history` 依次变为：
+问 `工作区里有哪些文件` 后，`agent.history` 依次变为：
 
 ```python
 [
-  {"role": "user",      "content": "37*89+100 等于多少"},
+  {"role": "user",      "content": "工作区里有哪些文件"},
   {"role": "assistant", "content": None,
    "tool_calls": [{"id": "call_1", "type": "function",
-                   "function": {"name": "calculator",
-                                "arguments": "{\"expression\": \"37*89+100\"}"}}]},   # ①
+                   "function": {"name": "list_dir",
+                                "arguments": "{}"}}]},                              # ①
   {"role": "tool",      "tool_call_id": "call_1",
-   "content": "{\"expression\": \"37*89+100\", \"result\": 3393}"},                    # ②
-  {"role": "assistant", "content": "37*89+100 = 3393。"}                                # ③
+   "content": "{\"ok\": true, \"path\": \".\", \"result\": [{\"name\": \"demo.py\", \"type\": \"file\", \"bytes\": 88}]}"},   # ②
+  {"role": "assistant", "content": "工作区里有一个 demo.py 文件（88 字节）。"}            # ③
 ]
 ```
 
@@ -139,7 +139,6 @@ python3 backend/cli.py "37*89+100 等于多少"  # 单次提问
 | `list_dir` | 列出目录一层内容 |
 | `grep` | 正则搜索文件内容，返回文件 + 行号 + 原文 |
 | `run_bash` | 执行 shell 命令（黑名单 + 超时） |
-| `calculator` | 四则运算（ast 白名单，不用 `eval`） |
 | `analyze_image` | 借支持视觉的模型"代为看图"，把描述返回给主模型 |
 | `create_doc` | 生成 / 更新会话 Markdown 文档（右侧面板查看） |
 | `todo_write` | 维护多步任务的待办清单（状态 pending / in_progress / done，前端渲染清单卡） |
@@ -218,7 +217,7 @@ python3 backend/cli.py "37*89+100 等于多少"  # 单次提问
 ### 5.11 其他
 
 - **assistant 的工具调用消息必须原样回填历史**——否则出现"没有请求却冒出工具结果"的悬空消息，服务端直接 400。
-- **`calculator` 不用 `eval`**——ast 白名单只允许四则运算，防止执行任意代码。
+- **`run_bash` 高危命令黑名单 + 权限闸门三态判定**——rm -rf / sudo / git push 等先弹确认，不靠模型自觉。
 - **前端一律用 `textContent` 渲染**——不拼 `innerHTML`，天然防 XSS。
 - **发给模型前剥离 `_` 前缀内部字段**——部分服务商会拒绝未知字段。
 

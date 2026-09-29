@@ -664,7 +664,8 @@ def _resolve_client(sid: str | None = None) -> tuple[dict, object, str, str, boo
     if not model:
         raise SystemExit("没有已启用的模型，请在网页「管理模型」里添加并启用")
     client = create_client(prov.get("api_format", "openai"),
-                           api_key=prov["api_key"], base_url=prov["base_url"], model=model)
+                           api_key=prov["api_key"], base_url=prov["base_url"], model=model,
+                           reasoning_replay=bool(prov.get("reasoning_replay")))
     vision = _model_vision(prov, model)
     sig = json.dumps([prov["id"], model, prov["base_url"], prov["api_key"], prov.get("api_format"), vision],
                      ensure_ascii=False)
@@ -1834,7 +1835,10 @@ class Handler(SimpleHTTPRequestHandler):
         except (TypeError, ValueError):
             return self._json({"error": "上下文窗口须为整数（token 数）"}, 400)
         db.upsert_provider(pid, name, base_url, api_key, bool(b.get("enabled", True)),
-                           api_format, context_window=prov_window)
+                           api_format, context_window=prov_window,
+                           # 思考模型的推理回传开关；请求里没带 = 保持原值不变
+                           reasoning_replay=(bool(b["reasoning_replay"])
+                                             if "reasoning_replay" in b else None))
         for m in b.get("models") or []:  # 可选：创建时一并带模型列表
             if (m.get("name") or "").strip():
                 db.upsert_model(pid, m["name"].strip(), int(m.get("context_window") or 262144),
