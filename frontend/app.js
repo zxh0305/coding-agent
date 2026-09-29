@@ -2078,12 +2078,28 @@ function togglePermPop() {
 }
 
 // ---------- 上下文容量 ----------
+// 环形徽章：弧线 = 占用比例，环心 = token 缩写（>80% 切警示百分比）。
+// 查看：hover 预览（200ms 延时防误触，移出即收）与点击钉住共用 ctx-pop；
+// pinned 状态点击才置/清，outside-click 关闭逻辑不变（3520 行处的配对）。
+const CTX_RING_CIRC = 2 * Math.PI * 15.5;   // 与 index.html 的 r=15.5 一致 ≈ 97.4
+
+function ctxUsagePct() {
+  const tokens = usageNow ? (usageNow.context_tokens ?? usageNow.prompt_tokens) : 0;
+  return Math.min(100, (tokens / (contextWindow || 1)) * 100);
+}
+
 function updateCtxChip() {
-  const chip = $("ctx-chip");
-  if (!usageNow) { chip.textContent = "⛁ —"; return; }
+  const chip = $("ctx-chip"), label = $("ctx-ring-label"), arc = chip?.querySelector(".ctx-ring-arc");
+  if (!chip || !label || !arc) return;
+  if (!usageNow) { label.textContent = "—"; arc.style.strokeDasharray = "0 100"; chip.classList.remove("warn"); return; }
   // context_tokens = 最近一次真实请求的 prompt_tokens（模型当前上下文大小）；
   // prompt_tokens 是回合内多轮请求的累加值（历史被重复计数），只作兼容回退。
-  chip.textContent = `⛁ ${fmtWan(usageNow.context_tokens ?? usageNow.prompt_tokens)} / ${fmtWan(contextWindow)}`;
+  const tokens = usageNow.context_tokens ?? usageNow.prompt_tokens;
+  const pct = ctxUsagePct();
+  arc.style.strokeDasharray = `${(pct / 100) * CTX_RING_CIRC} ${CTX_RING_CIRC}`;
+  chip.classList.toggle("warn", pct > 80);
+  // 小数值 token 缩写意义不大时也不切百分比——只在 >80% 才切警示百分比
+  label.textContent = pct > 80 ? Math.round(pct) + "%" : fmtWan(tokens);
 }
 
 async function refreshCtx() {
@@ -2097,14 +2113,50 @@ async function refreshCtx() {
   } catch (e) { /* 忽略 */ }
 }
 
-function toggleCtxPop() {
+let ctxPinned = false;   // 点击钉住：钉住时 hover 移出不收起，再点一次（或点外部）才关
+let ctxHoverTimer = null;
+
+function showCtxPop() {
   const pop = $("ctx-pop");
-  if (!pop.classList.contains("hidden")) { pop.classList.add("hidden"); return; }
   renderCtxPop();
   const rect = $("ctx-chip").getBoundingClientRect();
   pop.style.left = Math.max(8, rect.left) + "px";
   pop.style.bottom = (innerHeight - rect.top + 8) + "px";
   pop.classList.remove("hidden");
+}
+
+function hideCtxPop() {
+  if (ctxPinned) return;               // 钉住中：hover 移出不收
+  $("ctx-pop").classList.add("hidden");
+}
+
+// 悬浮预览：200ms 延时防划过误触；移出立即收（未钉住时）
+function bindCtxHover() {
+  const chip = $("ctx-chip");
+  if (!chip || chip.dataset.hoverBound) return;
+  chip.dataset.hoverBound = "1";
+  chip.addEventListener("mouseenter", () => {
+    clearTimeout(ctxHoverTimer);
+    ctxHoverTimer = setTimeout(() => { if (!ctxPinned) showCtxPop(); }, 200);
+  });
+  chip.addEventListener("mouseleave", () => {
+    clearTimeout(ctxHoverTimer);
+    hideCtxPop();
+  });
+}
+
+function toggleCtxPop() {
+  const pop = $("ctx-pop");
+  if (!pop.classList.contains("hidden") && ctxPinned) {
+    // 钉住中再点 → 取消钉住并关闭
+    ctxPinned = false;
+    $("ctx-chip").classList.remove("pinned");
+    pop.classList.add("hidden");
+    return;
+  }
+  ctxPinned = true;
+  $("ctx-chip").classList.add("pinned");
+  showCtxPop();
 }
 
 // 分段条配色：与 ctx-breakdown 行前的色点一一对应（常量表，不涉不可信内容）
@@ -3467,6 +3519,7 @@ bind("m-up", "click", () => mParent && navTo(mParent));
 bind("m-home", "click", () => navTo(mHome || undefined));
 bind("m-choose", "click", chooseWorkspace);
 bind("ctx-chip", "click", toggleCtxPop);
+bindCtxHover();   // 环形徽章悬浮预览（200ms 延时），点击钉住见 toggleCtxPop
 bind("perm-chip", "click", togglePermPop);
 bind("user-btn", "click", toggleUserPop);
 bind("pop-logout", "click", logoutNow);
@@ -3525,6 +3578,11 @@ document.addEventListener("click", (e) => {
     if (!el.classList.contains("hidden") && !el.contains(e.target) && !inner
         && !e.target.closest?.("#" + btn)) {
       el.classList.add("hidden");
+      if (pop === "ctx-pop") {
+        // 环形徽章点空白关闭 = 解除钉住（否则 hover 移出逻辑以为还钉着）
+        ctxPinned = false;
+        $("ctx-chip")?.classList.remove("pinned");
+      }
       if (pop === "todo-pop") {
         // todo 浮窗与其它浮窗同一逻辑：点空白即收起；等同 ✕ 手动关闭——
         // 本回合不再自动弹开（否则 streaming 中下一个 todo_update 又把它弹回来）

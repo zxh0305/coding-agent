@@ -715,6 +715,34 @@ body.side-resizing .sidebar { transition: none; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .chip:hover { background: var(--hover); color: var(--text); }
+
+/* ---------- 上下文环形徽章（ctx-chip）----------
+   胶囊数字 → 紧凑圆环：底环浅灰 + 进度弧（stroke-dasharray 按百分比），
+   环心极简文字（token 缩写；>80% 切警示百分比）。悬浮预览、点击钉住，
+   两种方式共用同一个 ctx-pop。 */
+.chip.ctx-ring {
+  flex: 0 0 auto; width: 36px; height: 36px; padding: 0;
+  border-radius: 50%; position: relative; overflow: visible;
+}
+.chip.ctx-ring svg { width: 100%; height: 100%; transform: rotate(-90deg); display: block; }
+.chip.ctx-ring circle { fill: none; stroke-width: 3; }
+.ctx-ring-bg { stroke: var(--border); }
+.ctx-ring-arc {
+  stroke: var(--accent); stroke-linecap: round;
+  stroke-dasharray: 0 100;   /* 周长 ≈ 2πr ≈ 97.4，JS 按 pct 覆写 */
+  transition: stroke-dasharray .4s ease, stroke .3s;
+}
+.chip.ctx-ring.warn .ctx-ring-arc { stroke: var(--danger); }
+#ctx-ring-label {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-size: 8.5px; font-weight: 600; color: var(--text-2); pointer-events: none;
+  letter-spacing: -0.3px;
+}
+.chip.ctx-ring.warn #ctx-ring-label { color: var(--danger); }
+/* 悬浮预览：hover 200ms 防误触（延时在 JS），移出即收——除非已被点击钉住 */
+.chip.ctx-ring.pinned { border-color: var(--accent); }
+[data-mode="mobile"] .chip.ctx-ring { width: 32px; height: 32px; }
+[data-mode="mobile"] #ctx-ring-label { font-size: 8px; }
 .model-input { cursor: text; width: 150px; }
 .send-btn { padding: 6px 18px; font-size: 13px; }
 /* 生成中「发送」变「停止」：红色警示，点击即请求服务端掐断当前生成 */
