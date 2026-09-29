@@ -1835,6 +1835,8 @@ function fmtTokens(n) {
 
 // 展开状态：key = "provider_id|model"，值为 true 时该模型行下画会话明细
 const usageExpanded = new Set();
+// 项目组折叠状态：key = "provider_id|model|项目名"，折叠时只留小计行；整表重建时清空
+const usageProjCollapsed = new Set();
 
 async function toggleUsageRows(providerId, model, tr) {
   const key = providerId + "|" + model;
@@ -1870,22 +1872,42 @@ async function toggleUsageRows(providerId, model, tr) {
         prompt: a.prompt + r.prompt_tokens,
         completion: a.completion + r.completion_tokens,
       }), { turns: 0, prompt: 0, completion: 0 });
+      const gkey = key + "|" + proj;
+      const collapsed = usageProjCollapsed.has(gkey);  // 模型收起再展开后保留之前的折叠状态
       const gtr = document.createElement("tr");
       gtr.className = "usage-detail usage-proj-row";
       gtr.dataset.detail = key;
+      gtr.dataset.projKey = gkey;
       gtr.innerHTML =
-        `<td class="mono">▾ ${esc(proj)}</td><td>${sum.turns}</td>` +
-        `<td>${fmtTokens(sum.prompt)}</td><td>${fmtTokens(sum.completion)}</td><td></td>`;
+        `<td class="mono"><span class="usage-arrow">${collapsed ? "▸" : "▾"}</span> ${esc(proj)}</td>` +
+        `<td>${sum.turns}</td><td>${fmtTokens(sum.prompt)}</td><td>${fmtTokens(sum.completion)}</td><td></td>`;
       frag.appendChild(gtr);
-      for (const r of items) {
+      const itemRow = (r) => {
         const dtr = document.createElement("tr");
         dtr.className = "usage-detail";
         dtr.dataset.detail = key;
+        dtr.dataset.projItem = gkey;
         dtr.innerHTML =
           `<td class="mono">└ ${esc(r.session_title)}</td><td>${r.turns}</td>` +
           `<td>${fmtTokens(r.prompt_tokens)}</td><td>${fmtTokens(r.completion_tokens)}</td><td></td>`;
-        frag.appendChild(dtr);
-      }
+        return dtr;
+      };
+      if (!collapsed) for (const r of items) frag.appendChild(itemRow(r));
+      gtr.addEventListener("click", () => {
+        const arrow = gtr.querySelector(".usage-arrow");
+        if (usageProjCollapsed.has(gkey)) {  // 折叠中 → 展开：小计行后重新插入会话行
+          usageProjCollapsed.delete(gkey);
+          arrow.textContent = "▾";
+          const pf = document.createDocumentFragment();
+          for (const r of items) pf.appendChild(itemRow(r));
+          gtr.after(pf);
+        } else {                             // 展开中 → 折叠：只留小计行
+          usageProjCollapsed.add(gkey);
+          arrow.textContent = "▸";
+          gtr.parentElement.querySelectorAll(`tr[data-proj-item="${CSS.escape(gkey)}"]`)
+            .forEach((el) => el.remove());
+        }
+      });
     }
   } else {
     const dtr = document.createElement("tr");
@@ -1913,6 +1935,7 @@ async function loadUsage() {
   const body = $("usage-body");
   body.innerHTML = "";
   usageExpanded.clear();  // 整表重建（含切时间范围），展开状态一并重置
+  usageProjCollapsed.clear();
   if (!rows.length) {
     body.innerHTML = `<div class="usage-empty">该范围内还没有用量记录${days !== "0" ? "，试试切到「全部」" : ""}</div>`;
     return;

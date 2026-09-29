@@ -1168,6 +1168,8 @@ button.primary:hover { background: var(--accent-hover); }
 /* 明细里的项目分组行：比会话行更淡一档，数字列与上下行对齐方便纵向扫读 */
 .usage-proj-row td { padding-top: 5px; color: var(--text-3); font-size: 11px; }
 .usage-proj-row td:first-child { color: var(--text-2); }
+.usage-proj-row { cursor: pointer; }
+.usage-proj-row:hover td { background: color-mix(in srgb, var(--accent) 5%, transparent); }
 
 /* 模型行的带标签勾选框（可用 / 👁视觉） */
 .pm-check {
