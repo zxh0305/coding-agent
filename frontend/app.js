@@ -2461,10 +2461,9 @@ function ensureTrace() {
   }
   traceEl = document.createElement("details");
   traceEl.className = "trace running";  // running：进行中回合标记（切会话定位锚点用）
-  // 默认【收起】：执行过程不是回答。之前生成期间强制展开，几十行浅灰小字
-  // 在正文下方滚动，把真正的答案挤出视口——"看不到重点"的直接来源。
-  // 改成收起后，摘要行持续显示"当前正在做什么"，既有动静又不抢正文。
-  traceEl.open = false;
+  // 初始态不强制收起也不强制展开：实时回合首轮 reasoning/正文流到达时自会
+  // 展开（见 reasoning_delta/answer_delta 分支），done/出错时统一收起。
+  // 这里绝不预设 open——用户若手动收起过，后续代码不得翻回。
   const summary = document.createElement("summary");
   summary.textContent = "已思考 0 秒";
   traceEl.appendChild(summary);
@@ -4511,8 +4510,9 @@ async function loadAttachments() {
 }
 
 // ---------- 附件浮窗：列表宽度拖拽 + 列表收起 ----------
-// 列表 ↔ 正文之间是 4px 分栏条，拖动改 .attach-pop 上的 --attach-list-w
-// 变量；头部 ◧ 按钮整列收起/展开，两者状态都持久化。
+// 列表 ↔ 正文之间是 1px 分隔线（拖拽热区就是这条线本身，好拖但视觉是一条细线），
+// 拖动改 .attach-pop 上的 --attach-list-w 变量；头部箭头按钮整列收起/展开
+// （箭头方向由 .list-collapsed 下的 CSS 旋转），两者状态都持久化。
 const ATTACH_LIST_W_KEY = "attachListW", ATTACH_COLLAPSED_KEY = "attachListCollapsed";
 const ATTACH_LIST_W_MIN = 140, ATTACH_LIST_W_MAX = 480;
 
