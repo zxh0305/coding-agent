@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS message_usage(
     completion_tokens INTEGER,
     cached_tokens INTEGER,
     stats_json TEXT,
+    kind TEXT DEFAULT 'turn',
     PRIMARY KEY(session_id, mid)
 );
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
@@ -257,6 +258,13 @@ MIGRATIONS: list[tuple[int, str | None]] = [
     #    reasoning_content 原样带回，缺失直接 400；不支持该协议的服务商
     #    （GLM/OpenAI 等）则要求不出现该字段。按供应商勾选，默认关。
     (24, "ALTER TABLE providers ADD COLUMN reasoning_replay INTEGER DEFAULT 0"),
+    # 25：用量归账（message_usage.kind）。主回合之外还有三类"隐藏消耗"此前
+    #     不落账：只读侦察子代理（成本大头）、上下文压缩总结、（将来的）标题/
+    #     记忆提取——用量页因此永远比账单少一截。独立行归账：mid 用合成前缀
+    #     （如 subagent:<uuid>），message_usage 对 messages 无外键、孤儿行无害
+    #     （get_messages 按 mid 关联自然忽略）。老数据 kind 为 NULL，聚合一律
+    #     COALESCE(kind,'turn')。
+    (25, "ALTER TABLE message_usage ADD COLUMN kind TEXT DEFAULT 'turn'"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -313,6 +321,8 @@ def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
         return col in _table_columns(conn, "message_usage")
     if version == 24:          # providers.reasoning_replay（思考模型回传开关）
         return "reasoning_replay" in _table_columns(conn, "providers")
+    if version == 25:          # message_usage.kind（用量归账：turn/subagent/compact…）
+        return "kind" in _table_columns(conn, "message_usage")
     return False
 
 
@@ -793,6 +803,8 @@ def delete_session(sid: str) -> None:
     shutil.rmtree(_attachments_dir() / sid, ignore_errors=True)
     # browser-profiles/<sid>/ 同理：该会话的浏览器 profile 副本（~90MB）随会话回收
     shutil.rmtree(DB_PATH.parent / "browser-profiles" / sid, ignore_errors=True)
+    # tool_results/<sid>/ 同理：落盘的工具结果全文随会话一起消失
+    shutil.rmtree(_tool_results_dir() / sid, ignore_errors=True)
     # 附件现在可能落在工作区 .coding-agent/attachments/<sid>/（见
     # _session_attach_root）：只清本会话那个子目录，绝不碰用户工作区的
     # 其它内容、也不动同工作区其它会话的附件。
@@ -1406,15 +1418,47 @@ def _write_artifact(sid: str, mid: str, blob: str) -> tuple[str, int]:
 def _upsert_usage(conn: sqlite3.Connection, sid: str, mid: str, stats: dict) -> None:
     """_stats 落到 message_usage：token 三列按表结构展开（可查询、可聚合），
     完整原样进 stats_json（elapsed_s/cache_hit_rate/stopped 等前端回放要用的
-    字段一个不丢）。"""
+    字段一个不丢）。主回合行固定 kind='turn'。"""
     usage = stats.get("usage") or {}
     conn.execute(
         "INSERT OR REPLACE INTO message_usage(session_id, mid, prompt_tokens, completion_tokens, "
-        "cached_tokens, stats_json, provider_id, model, created) VALUES(?,?,?,?,?,?,?,?,?)",
+        "cached_tokens, stats_json, provider_id, model, kind, created) VALUES(?,?,?,?,?,?,?,?,?,?)",
         (sid, mid, usage.get("prompt_tokens"), usage.get("completion_tokens"),
          usage.get("prompt_cache_hit_tokens"), json.dumps(stats, ensure_ascii=False),
-         stats.get("provider_id"), stats.get("model"), time.time()),
+         stats.get("provider_id"), stats.get("model"), "turn", time.time()),
     )
+
+
+# 用量归账的合法 kind（record_usage 校验；未知值按 'turn' 落，宁可归进主账
+# 也不丢数据）。'title'/'memory' 是预留：标题总结与记忆提取的后台调用目前
+# 未接归账（llm.chat 不回传 usage），接上时直接用。
+USAGE_KINDS = ("turn", "subagent", "compact", "title", "memory")
+
+
+def record_usage(sid: str, kind: str, stats: dict, provider_id: str = "",
+                 model: str = "") -> None:
+    """把一条"隐藏消耗"的用量记进 message_usage（独立行归账，agent 经
+    usage_sink 调用——agent 存储无关，app.py 注入闭包时带上 sid/provider/model）。
+
+    kind 区分消耗来源：'turn'（主回合，随消息 _stats 落库的默认形态）、
+    'subagent'（只读侦察子代理）、'compact'（上下文压缩总结）。mid 用合成
+    前缀 + uuid：没有对应消息行的用量行是预期形态——get_messages 按 mid
+    关联时自然忽略，latest_context_tokens 的 JOIN messages 命中不了，而
+    用量页聚合（usage_summary / usage_session_rows）会把它们并进所属
+    会话/供应商——这正是归账的目的：账单口径完整。
+    """
+    if kind not in USAGE_KINDS:
+        kind = "turn"
+    usage = stats.get("usage") or {}
+    with _conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO message_usage(session_id, mid, prompt_tokens, "
+            "completion_tokens, cached_tokens, stats_json, provider_id, model, kind, created) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (sid, f"{kind}:{uuid.uuid4().hex}", usage.get("prompt_tokens"),
+             usage.get("completion_tokens"), usage.get("prompt_cache_hit_tokens"),
+             json.dumps(stats, ensure_ascii=False), provider_id, model, kind, time.time()),
+        )
 
 
 def usage_summary(days: int | None = None) -> list[dict]:
@@ -1430,7 +1474,11 @@ def usage_summary(days: int | None = None) -> list[dict]:
         args = [time.time() - days * 86400]
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT u.provider_id, u.model, COUNT(*) AS turns, "
+            "SELECT u.provider_id, u.model, "
+            # turns 只数主回合行（kind='turn'）：子代理/压缩是独立归账行，算进
+            # "回合数"会虚高；token 三列是全部 kind 求和（账单口径）。
+            # COALESCE 兜老数据：ALTER ADD COLUMN DEFAULT 不回填存量行。
+            "SUM(CASE WHEN COALESCE(u.kind,'turn')='turn' THEN 1 ELSE 0 END) AS turns, "
             "SUM(u.prompt_tokens) AS prompt_tokens, "
             "SUM(u.completion_tokens) AS completion_tokens, "
             "SUM(u.cached_tokens) AS cached_tokens, p.name AS provider_name "
@@ -1464,7 +1512,7 @@ def usage_session_rows(days: int | None = None, provider_id: str = "",
     with _conn() as conn:
         rows = conn.execute(
             "SELECT u.session_id, s.title AS session_title, s.workspace AS workspace, "
-            "COUNT(*) AS turns, "
+            "SUM(CASE WHEN COALESCE(u.kind,'turn')='turn' THEN 1 ELSE 0 END) AS turns, "
             "SUM(u.prompt_tokens) AS prompt_tokens, "
             "SUM(u.completion_tokens) AS completion_tokens, "
             "MAX(u.created) AS last_used "
@@ -1544,6 +1592,64 @@ def save_messages(sid: str, history: list[dict], saved: dict) -> int:
             saved[mid] = fp
             written += 1
     return written
+
+
+def _tool_results_dir() -> Path:
+    """工具结果落盘根目录（DB_PATH.parent/tool_results，跟随库文件走：
+    测试重定向 DB_PATH 时随之落到临时目录，不污染项目根）。"""
+    return DB_PATH.parent / "tool_results"
+
+
+def write_tool_result(sid: str, content: str) -> dict:
+    """工具结果全文落盘（轻引用，agent._backfill_tool_result 的 sink）。
+
+    历史里只内联头部预览 + 引用（full.path），完整原文在这里按会话隔离存放：
+    data/tool_results/<sid>/<sha1>.txt。文件名取内容 sha1——同一段结果被
+    重复读取/重复执行时天然去重，不产生第二份文件。先写 .tmp 再 os.replace
+    原子改名（与 _write_artifact 同一纪律：绝不留下半个文件）。返回
+    {path, bytes, chars}，path 是相对 tool_results 目录的引用路径。
+    """
+    d = _tool_results_dir() / sid
+    d.mkdir(parents=True, exist_ok=True)
+    name = hashlib.sha1(content.encode("utf-8")).hexdigest() + ".txt"
+    path = d / name
+    if not path.exists():
+        tmp = d / (name + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+    return {"path": f"{sid}/{name}", "bytes": len(content.encode("utf-8")),
+            "chars": len(content)}
+
+
+def read_tool_result(rel_path: str, offset: int = 1, limit: int = 0) -> dict:
+    """按行读回落盘的工具结果全文（read_tool_result 工具的读侧实现）。
+
+    返回 {lines, total_lines, shown}，行号化由工具层（tools.py）统一渲染，
+    本函数只管取数与边界校验。路径校验与 read_artifact 同款白名单口径：
+    rel_path 来自模型（不可信输入），realpath 消解后必须仍严格位于
+    tool_results 目录内且以 .txt 结尾，否则拒绝。
+    """
+    base = _tool_results_dir().resolve()
+    p = (base / rel_path).resolve()
+    if p == base or base not in p.parents or p.suffix != ".txt":
+        log.warning("read_tool_result 拒绝越界路径: %r", rel_path)
+        raise ValueError("非法的结果引用路径")
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    total = len(lines)
+    try:
+        start = max(1, int(offset or 1))
+    except (TypeError, ValueError):
+        start = 1
+    try:
+        limit_n = max(0, int(limit or 0))
+    except (TypeError, ValueError):
+        limit_n = 0
+    end = start + limit_n - 1 if limit_n > 0 else total
+    window = lines[start - 1:end]
+    if not window:
+        raise ValueError(f"读取区间为空：全文共 {total} 行，请求起始行 {start}")
+    return {"lines": window, "total_lines": total,
+            "shown": [start, start + len(window) - 1]}
 
 
 def read_artifact(rel_path: str) -> dict:

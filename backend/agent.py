@@ -31,6 +31,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from code_tools import prepare_workspace
@@ -136,6 +137,11 @@ PARALLEL_TOOL_WORKERS = 4  # 只读组的最大并发数：读文件/搜索以 I
 # 跑满走同一套禁工具收尾轮，结论仍以模型自己的总结收场。
 SUBAGENT_MAX_ROUNDS = 15
 
+# 每个子任务挂进父 trace 的过程条目上限（sub_round/sub_tool_call/sub_tool_result
+# 合计）。父 trace 落库时整体 150 条封顶（app._persist_trace），3 个并发子代理
+# 放任写入会把父回合自己的过程挤出轨迹——超限追加一条 sub_truncated 省略标记。
+SUB_TRACE_MAX_ENTRIES = 30
+
 # 单条工具结果进入历史的长度上限（字符）。这是最后的安全闸：各工具内部虽有
 # 各自的输出上限（MAX_READ_LINES / MAX_OUTPUT_CHARS 等），但工具众多、口径
 # 不一，且 run_bash `cat 100MB文件` 这类组合仍可能漏出巨型结果。巨型结果一旦
@@ -143,6 +149,16 @@ SUBAGENT_MAX_ROUNDS = 15
 # 内容风控（browser-profiles 里扩展文件的域名表被整读进历史 → 全会话 400，
 # 换模型无效，因为污染在 messages 里）。截断保留头部并显式告知余量。
 MAX_TOOL_RESULT_CHARS = 60_000
+
+# ── 结果落盘轻引用（①60k 截断的升级档）──────────────────────────────────
+# 超过内联阈值的工具结果：全文经 result_sink 落盘（db.write_tool_result，
+# app.py 注入），历史里只内联头部预览 + full 引用，模型按需用
+# read_tool_result 工具按行分段读回——"截断即丢失"变成"截断即引用"。
+# 阈值显著低于 60k 才有意义：16k 字符约 5-8k token，作为"单条工具结果在
+# 上下文里的常驻成本"的上限是合适的量级。落盘失败（磁盘异常）退回旧截断，
+# 绝不让存储问题打断工具链路。result_sink 未注入（CLI/单测）时整体退回旧行为。
+TOOL_RESULT_EXTERNALIZE_CHARS = 16_000
+TOOL_RESULT_PREVIEW_CHARS = 4_000
 
 # ---------------------------------------------------------------------------
 # 防失控与收尾（参照 ZCode 的设计哲学：防失控靠「模式检测 + 注入提醒让模型自纠」，
@@ -206,7 +222,8 @@ class Agent:
                  workspace=None, vision_backend=None, context_window: int = 0,
                  artifact_reader=None, permission_gate=None, session_id=None,
                  model_tag: tuple[str, str] | None = None,
-                 allowed_tools: tuple[str, ...] | None = None):
+                 allowed_tools: tuple[str, ...] | None = None,
+                 result_sink=None):
         # max_rounds=40：上限只是兜底（真失控另有指纹提醒拦截），合法的长任务
         # （读代码→改→跑验证→再修）经常要几十轮，40 是给它们的余量；到限走
         # 收尾轮（_wrap_up_round）而不是"强制停止"。
@@ -235,6 +252,18 @@ class Agent:
         # 时靠它把完整正文读回来。存储注入而非直接 import db：本文件保持存储无关，
         # 命令行版与单测不引 db 也能跑。
         self.artifact_reader = artifact_reader
+        # 工具结果落盘 sink（fn(content) -> {path, bytes, chars}，db.write_tool_result
+        # 由 app.py 注入）：超内联阈值的工具结果全文落盘、历史留轻引用（见
+        # _externalize_tool_result）。与 artifact_reader 同构的存储注入——不传 =
+        # 无落盘能力，退回旧的 60k 截断（命令行版与单测保持旧行为）。
+        self.result_sink = result_sink
+        # 事件/用量外发 sink（app.py 在 _run_round 开始时注入，CLI/单测为 None）：
+        # event_sink 把子代理过程事件推上会话事件总线（嵌套 trace，见
+        # _run_one_subagent_inner）；usage_sink 把子代理/压缩等隐藏 LLM 消耗记进
+        # message_usage（用量归账，见 _record_usage）。挂在实例而非构造参数：
+        # event_sink 要耦合 worker 的进行中快照节流（_maybe_snapshot），归 _run_round 管。
+        self.usage_sink = None   # fn(kind: str, stats: dict) -> None
+        self.event_sink = None   # fn(event: dict) -> None
         # 每字符 token 校准系数（真实 prompt_tokens ÷ 当次请求总字符数）。跨轮缓存：
         # 压缩判断发生在回答结束后，那时没有新 usage，只能靠上一轮校准的系数估算。
         # 压缩后置回 None——摘要的 token 密度与原始日志完全不同，旧系数必然失真，
@@ -915,20 +944,25 @@ class Agent:
           * 权限：全新闸门 ask_timeout=0，但【继承用户规则加载器】——自定义
             deny/allow 规则必须对子代理同样生效，否则子代理成了绕过个性化
             禁令的旁路；ask 无卡可弹，按拒绝立即收场（安全侧）；
-          * 事件：过程事件就地消费不外发（契约见 docs/protocol.md §4.3），
-            父回合时间线只见一次 tool_call/tool_result；子代理的 history/
-            trace 随实例销毁，不落库、不进父历史。
+          * 事件：过程按【收窄集合】外发（round/tool_call/tool_result + 一条
+            终态，载荷带 parent 标识，契约见 docs/protocol.md §4.3）——delta
+            流（answer/reasoning）不外发：3 并发 × 十几轮的 delta 会刷穿 500
+            条环形缓冲把 turn_start 挤掉，补发退化为"尽力补尾巴"；子代理的
+            正文/思考对父时间线没有展示价值，工具轨迹足以讲清过程。历史与
+            轨迹只落父回合自己的（子代理 history 随实例销毁，过程条目以
+            sub_* 形态挂进父 trace 供回放/快照）。
         """
         if self.cancel_event is not None and self.cancel_event.is_set():
             return error_result("父回合已停止，子代理未派出")
         if len(tasks) == 1:
-            results = [self._run_one_subagent(tasks[0])]
+            results = [self._run_one_subagent(tasks[0], 0)]
         else:
             with ThreadPoolExecutor(
                     max_workers=min(len(tasks), SUBAGENT_MAX_PARALLEL)) as pool:
                 # futures 顺序 = 提交顺序 = 回填顺序：结果与任务的配对由下标
                 # 保证，与哪个先跑完无关（与工具并行组同一条回填不变式）
-                futures = [pool.submit(self._run_one_subagent, t) for t in tasks]
+                futures = [pool.submit(self._run_one_subagent, t, i)
+                           for i, t in enumerate(tasks)]
                 results = []
                 for task, f in zip(tasks, futures):
                     try:
@@ -940,18 +974,45 @@ class Agent:
                                         "hint": "可缩小任务范围重试，或主代理自行侦察"})
         return json.dumps({"ok": True, "results": results}, ensure_ascii=False)
 
-    def _run_one_subagent(self, task: str) -> dict:
+    def _run_one_subagent(self, task: str, index: int = 0) -> dict:
         """跑一个子代理，返回结果条目。本方法【不抛异常】：单个子代理的任何
         失败都折叠成自己的 error 条目，绝不连坐同批其它任务（并行时它跑在线程
-        池工作线程上，与工具并行组的"单工具异常不连坐"同一纪律）。"""
+        池工作线程上，与工具并行组的"单工具异常不连坐"同一纪律）。
+
+        index 是本批任务的下标：子任务卡/事件的稳定序号（parent 才是归并键，
+        index 只是展示序）。sub_id 在此生成并贯穿事件与 trace 条目。"""
+        sub_id = uuid.uuid4().hex[:12]
         try:
-            return self._run_one_subagent_inner(task)
+            return self._run_one_subagent_inner(task, sub_id, index)
         except Exception as e:
             log.warning("子代理执行失败（task=%.40s）：%s", task, e)
             return {"task": task, "ok": False, "error": f"子代理执行失败: {e}",
                     "hint": "可缩小任务范围重试，或主代理自行侦察"}
 
-    def _run_one_subagent_inner(self, task: str) -> dict:
+    def _record_usage(self, kind: str, stats: dict) -> None:
+        """把隐藏 LLM 消耗（子代理/压缩总结）交给用量归账 sink（app.py 注入 →
+        db.record_usage 落 message_usage 独立行，kind 列区分来源）。未注入
+        （CLI/单测）= 丢弃，与旧行为一致；无 usage 的调用不记账。sink 异常
+        只记日志——归账是旁路观测，绝不打断回合。"""
+        if self.usage_sink is None or not (stats.get("usage") or {}):
+            return
+        try:
+            self.usage_sink(kind, stats)
+        except Exception:
+            log.exception("用量归账失败（忽略）")
+
+    def _emit_sub_event(self, evt: dict) -> None:
+        """子代理过程事件外发（event_sink，app.py 注入 = bus.publish + 快照）。
+        sink 异常一律吞掉——嵌套 trace 是观测面，绝不能反过来影响子代理执行。"""
+        sink = self.event_sink
+        if sink is None:
+            return
+        try:
+            sink(evt)
+        except Exception:
+            log.exception("子代理事件外发失败（忽略）")
+
+    def _run_one_subagent_inner(self, task: str, sub_id: str, index: int) -> dict:
         child = Agent(llm=self.llm,
                       system_prompt=SUBAGENT_SYSTEM_PROMPT,
                       max_rounds=SUBAGENT_MAX_ROUNDS,
@@ -965,7 +1026,11 @@ class Agent:
                       session_id=self.ctx.session_id,  # read_attachment 据此定位上传附件
                       model_tag=self.model_tag,
                       allowed_tools=SUBAGENT_TOOLSET)
+        # 子代理不继承 result_sink：它的结果超长时走 60k 截断兜底——子代理
+        # 没有 read_tool_result 工具（不在 SUBAGENT_TOOLSET），给了引用也无法
+        # 读回，徒增一段"指着够不到"的提示。
         rounds, answer, stopped, usage = 0, "", False, {}
+        trace_budget = SUB_TRACE_MAX_ENTRIES  # 每任务的过程条目预算（防塞爆父 trace）
         for kind, payload in child.run_attached(
                 task, self.cancel_event or threading.Event()):
             if kind == "round":
@@ -973,28 +1038,73 @@ class Agent:
             elif kind == "done":
                 answer = str(payload.get("answer") or "")
                 stopped = bool(payload.get("stopped"))
-                usage = payload.get("usage") or {}
+                # done.usage 是子代理全程的累计口径（usage_total），权威取值
+                usage = dict(payload.get("usage") or {})
+            elif kind == "usage":
+                # usage 事件是【单次请求】口径（与 done.usage 的累计不同）：
+                # done 缺席（被停止/异常收场）时靠逐条累加兜住已烧掉的 token
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens",
+                            "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+                    usage[key] = usage.get(key, 0) + (payload.get(key) or 0)
+            # ── 嵌套 trace（①）：SSE 外发收窄集合 + 父 trace 挂 sub_* 条目 ──
+            if kind in ("round", "tool_call", "tool_result"):
+                self._emit_sub_event({"type": "subagent", "kind": kind,
+                                      "parent": sub_id, "index": index,
+                                      "task": task[:120], **payload})
+            if kind in ("round", "tool_call", "tool_result"):
+                # 预算按【实际入账的条目】扣（usage 事件不产条目、不占预算）
+                if trace_budget > 0:
+                    trace_budget -= 1
+                    if kind == "round":
+                        self.trace.append({"type": "sub_round", "parent": sub_id,
+                                           "round": payload.get("round")})
+                    elif kind == "tool_call":
+                        self.trace.append({"type": "sub_tool_call", "parent": sub_id,
+                                           "name": payload.get("name"),
+                                           "arguments": payload.get("arguments")})
+                    else:
+                        self.trace.append({"type": "sub_tool_result", "parent": sub_id,
+                                           "name": payload.get("name"),
+                                           "result": payload.get("result")})
+                elif trace_budget == 0:
+                    trace_budget = -1
+                    self.trace.append({"type": "sub_truncated", "parent": sub_id,
+                                       "text": "…[子代理过程条目过多，已省略]"})
         # 停止判定必须在结论判定之前：被掐断的子代理走「手动停止」收尾，done
         # 里仍带着半截回答——那是残缺的中间产物，不是结论，回收它并继续跑
         # 父回合等于无视用户刚刚表达的「停下」。
         if stopped or (self.cancel_event and self.cancel_event.is_set()):
-            return {"task": task, "ok": False,
-                    "error": "子代理被用户停止，未回收结论",
-                    "hint": "停止是全局的；需要继续侦察请在下一轮重新派出"}
-        if not answer.strip():
-            return {"task": task, "ok": False,
-                    "error": "子代理未产出结论（轮数耗尽且收尾轮为空）",
-                    "hint": "缩小任务范围后重试，或主代理自行侦察"}
-        report = answer[:SUBAGENT_REPORT_MAX_CHARS]
-        if len(answer) > SUBAGENT_REPORT_MAX_CHARS:
-            report += (f"\n…[报告超长已截断，共 {len(answer)} 字符；"
-                       "需要细节请派边界更窄的子任务分次侦察]")
-        return {"task": task, "ok": True, "report": report, "rounds": rounds,
-                # 子代理用量随信封透出（可观测），但不进父回合的
-                # usage_total/_stats——用量页按主回合消息归账（可优化清单：
-                # 子代理用量归账留后续）
-                "usage": {"prompt_tokens": usage.get("prompt_tokens") or 0,
-                          "completion_tokens": usage.get("completion_tokens") or 0}}
+            entry = {"task": task, "ok": False,
+                     "error": "子代理被用户停止，未回收结论",
+                     "hint": "停止是全局的；需要继续侦察请在下一轮重新派出"}
+        elif not answer.strip():
+            entry = {"task": task, "ok": False,
+                     "error": "子代理未产出结论（轮数耗尽且收尾轮为空）",
+                     "hint": "缩小任务范围后重试，或主代理自行侦察"}
+        else:
+            report = answer[:SUBAGENT_REPORT_MAX_CHARS]
+            if len(answer) > SUBAGENT_REPORT_MAX_CHARS:
+                report += (f"\n…[报告超长已截断，共 {len(answer)} 字符；"
+                           "需要细节请派边界更窄的子任务分次侦察]")
+            entry = {"task": task, "ok": True, "report": report, "rounds": rounds,
+                     # 子代理用量随信封透出（可观测）；独立归账走 _record_usage
+                     "usage": {"prompt_tokens": usage.get("prompt_tokens") or 0,
+                               "completion_tokens": usage.get("completion_tokens") or 0}}
+        # 终态事件：前端子任务卡据此定格（✅ N 轮 / ❌ 原因）。ok 必须显式带上
+        # ——前端按 evt.ok 真值分流，缺键会被误判成失败。
+        done_evt = {"type": "subagent", "kind": "done", "parent": sub_id,
+                    "index": index, "task": task[:120], "rounds": rounds,
+                    "ok": bool(entry.get("ok"))}
+        if entry.get("ok"):
+            done_evt["report_head"] = entry["report"][:300]
+        else:
+            done_evt["error"] = entry.get("error") or ""
+        self._emit_sub_event(done_evt)
+        # 用量归账（②）：子代理全程（含被停止的半程）的真实消耗记一条
+        # kind='subagent' 的 message_usage，供应商/模型随父（同一 llm 实例）
+        self._record_usage("subagent", {"task": task[:200], "ok": entry.get("ok"),
+                                        "rounds": rounds, "usage": usage})
+        return entry
 
     # ------------------------------------------------------------------
     # 上下文压缩
@@ -1121,7 +1231,7 @@ class Agent:
         cleared = 0
         for i, _orig in plan:
             m = self.history[i]
-            m["content"] = CLEARED_TOOL_RESULT_PLACEHOLDER
+            m["content"] = self._cleared_placeholder(_orig)
             m["_tool_result_cleared"] = True  # 标记（下划线前缀，发给模型前会被剥离）
             cleared += 1
 
@@ -1224,12 +1334,15 @@ class Agent:
         log.info("上下文压缩：估算 %d tokens 超阈值，总结 %d 条消息（视图下标 %d..%d）…",
                  est_before, cut - head, head, cut - 1)
         reply = None
+        compact_usage = {}
         try:
             # 复用会话同一个 LLM 与停止开关（chat_stream 带看护线程，用户等不及点
             # 停止也能掐断这次总结）；delta 片段直接丢弃——压缩不产生回答流。
             for kind, payload in self.llm.chat_stream(messages=request, cancel=self.cancel_event):
                 if kind == "message":
                     reply = payload
+                elif kind == "usage":
+                    compact_usage = payload  # 单次请求的用量，最后一次即全程
         except Exception as e:  # 网络/服务商错误：计一次失败（熔断用），本轮跳过
             self._compact_fail_streak += 1
             self._compact_skip_reason = f"压缩调用失败：{e}"
@@ -1271,6 +1384,11 @@ class Agent:
         stats_after = self.context_stats()
         log.info("上下文压缩完成：估算 %d → %d tokens（保留最近 %d 条，摘要 %d 字）",
                  est_before, sum(stats_after.values()), len(view) - cut, len(summary))
+        # 用量归账（②）：压缩总结这次隐藏 LLM 调用的消耗记一条 kind='compact'
+        # 的 message_usage——不记的话用量页永远比账单少这一块。
+        self._record_usage("compact", {"est_tokens": est_before,
+                                       "summary_chars": len(summary),
+                                       "usage": compact_usage})
         self._compact_skip_reason = None
         return {"summary": summary, "prompt_tokens": sum(stats_after.values()), "context": stats_after}
 
@@ -1463,17 +1581,96 @@ class Agent:
                         pass
             idx = end
 
+    # ------------------------------------------------------------------
+    # 结果落盘轻引用：超内联阈值的工具结果全文落盘，历史里只留头部预览 +
+    # full 引用（read_tool_result 工具按行分段读回）。
+    # ------------------------------------------------------------------
+
+    def _externalize_tool_result(self, result: str) -> str:
+        """结果进历史前的最后一道处理（_backfill_tool_result 唯一入口）。
+
+        三档：
+        1. ≤ TOOL_RESULT_EXTERNALIZE_CHARS：原样（绝大多数结果）；
+        2. 超阈值且有 result_sink：全文落盘，历史里换成"预览 + 落盘提示 +
+           full 引用"。JSON 信封（统一失败/成功信封）保留 ok/error/hint 等
+           语义键、只截 result 字段正文——错误信息是模型改道的依据，绝不能
+           因截断丢失；非信封内容（纯文本）直接预览 + 落盘提示；
+        3. 超阈值且无 sink（CLI/单测）：退回旧的 60k 截断行为。
+
+        返回值只可能是"更短或等长"的历史内容——本函数是上下文瘦身闸，任何
+        分支都不得让历史内容比原结果更长。落盘失败按无 sink 处理（退截断），
+        绝不让存储问题打断工具链路。
+        """
+        if len(result) <= TOOL_RESULT_EXTERNALIZE_CHARS:
+            return result
+        # 落盘的是"要读的正文"而不是 JSON 信封壳：信封是单行超长 JSON（正文
+        # 以 \n 转义挤在里面），read_tool_result 按行分页对它退化成"一页一行
+        # 转义串"。信封带 result 字段时落盘其正文（多行可读、天然可分页）；
+        # ok/error/hint 语义键已保留在历史信封里，不随盘丢失。
+        try:
+            info = json.loads(result)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            info = None
+        envelope = info if isinstance(info, dict) and isinstance(info.get("result"), str) else None
+        stored = envelope["result"] if envelope else result
+        ref = None
+        if self.result_sink is not None:
+            try:
+                ref = self.result_sink(stored)
+            except Exception as e:
+                log.warning("工具结果落盘失败（退回截断）：%s", e)
+        if not isinstance(ref, dict) or not ref.get("path"):
+            ref = None
+        if ref is None:
+            if len(result) <= MAX_TOOL_RESULT_CHARS:
+                return result
+            keep = MAX_TOOL_RESULT_CHARS
+            self._log(f"✂️ 工具结果超长，已截断至 {keep} 字符", "yellow")
+            return (result[:keep]
+                    + f"\n…[工具结果过长（共 {len(result)} 字符），已截断至前 {keep} 字符。"
+                      "需要余下内容请用更窄的参数分段读取（offset/limit、grep、head 等），"
+                      "不要重试同样的大范围读取]")
+        note = (f"\n…[结果过长（共 {ref['chars']} 字符），已内联前 "
+                f"{TOOL_RESULT_PREVIEW_CHARS} 字符，完整原文已落盘：{ref['path']}。"
+                f"需要更多内容请调用 read_tool_result（ref=\"{ref['path']}\"，支持 "
+                "offset/limit 行分段），不要重试同样的大范围读取]")
+        if envelope is not None:
+            # 统一信封：语义键原样保留，只截 result 字段正文
+            envelope["result"] = envelope["result"][:TOOL_RESULT_PREVIEW_CHARS] + note
+            envelope["full"] = {"path": ref["path"], "bytes": ref["bytes"],
+                                "chars": ref["chars"]}
+            out = json.dumps(envelope, ensure_ascii=False)
+        else:
+            out = result[:TOOL_RESULT_PREVIEW_CHARS] + note
+        self._log(f"📄 工具结果 {len(result)} 字符已落盘（{ref['path']}），历史内联预览",
+                  "yellow")
+        return out
+
+    @staticmethod
+    def _cleared_placeholder(content: str) -> str:
+        """清理较早工具结果时的占位文案（_clear_old_tool_results 用）。
+
+        带 full 引用的结果升级为"指针占位符"：正文虽被清理，完整原文仍在盘上，
+        模型用 read_tool_result 按需读回即可——被清理的结果从"必须重调工具
+        重新获取"变成"引用还在、随取随读"。这是轻引用最大的收益点之一。
+        """
+        try:
+            info = json.loads(content)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            info = None
+        full = info.get("full") if isinstance(info, dict) else None
+        if isinstance(full, dict) and full.get("path"):
+            return (f"[较早的工具结果已清理以节省上下文；完整原文仍在盘上"
+                    f"（{full['path']}"
+                    + (f"，共 {full['chars']} 字符" if full.get("chars") else "")
+                    + f"），可用 read_tool_result（ref=\"{full['path']}\"）分段读取]")
+        return CLEARED_TOOL_RESULT_PLACEHOLDER
+
     def _backfill_tool_result(self, call: dict, result: str):
         """把一个工具结果按请求位置回填：追加历史、记轨迹、产出事件。
         正常执行与权限拒绝共用同一条回填路径——对下游（历史配对/前端渲染）
         而言，拒绝结果就是一个普通的（带 error 的）工具结果。"""
-        if len(result) > MAX_TOOL_RESULT_CHARS:
-            keep = MAX_TOOL_RESULT_CHARS
-            result = (result[:keep]
-                      + f"\n…[工具结果过长（共 {len(result)} 字符），已截断至前 {keep} 字符。"
-                        "需要余下内容请用更窄的参数分段读取（offset/limit、grep、head 等），"
-                        "不要重试同样的大范围读取]")
-            self._log(f"✂️ 工具结果超长，已截断至 {keep} 字符", "yellow")
+        result = self._externalize_tool_result(result)
         tool_msg = {
             "role": "tool",
             "tool_call_id": call.get("id", ""),  # 与请求里的 id 对应，服务商靠它配对

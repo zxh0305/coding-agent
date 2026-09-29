@@ -20,8 +20,13 @@ agent.py（Agent._spawn_subagent），经 ToolContext.subagent_runner 注入—�
 on_retry；browser_tools.manager_for 有锁；每个子代理有独立的 ToolContext/
 history/权限闸门，只读工具面之间无共享写。子代理自身仍零写入工作区。
 
-事件契约（docs/protocol.md §4.3）：子代理过程不外发，父回合时间线只见一次
-tool_call / tool_result（结论信封）；嵌套 trace 的 parent 标识留后续。
+事件契约（docs/protocol.md §4.3）：子代理过程按【收窄集合】外发——
+round/tool_call/tool_result + 一条终态，载荷带 parent（子任务身份）与
+index（批内序号），前端按 parent 归并进对应 spawn_subagent 工具卡的嵌套
+折叠卡；answer_delta / reasoning_delta 不外发（delta 流会刷穿环形缓冲，
+且正文/思考对父时间线没有展示价值）。回放侧的嵌套过程来自父 trace 的
+sub_* 条目（随最终回答落库）。父回合时间线仍只见一次 tool_call / tool_result
+（结论信封）。
 """
 
 import json

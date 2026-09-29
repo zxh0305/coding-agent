@@ -115,6 +115,9 @@ class ToolContext:
     executor: object = None                     # 命令执行提供者（executor.py seam）：None =
                                                 # 本机子进程；换 Docker 沙箱即注入新提供者
     session_id: str | None = None               # 本会话 id（文档工具据此确定文档归属）
+    tool_result_reader: object = None           # fn(rel_path, offset, limit) -> dict：
+                                                # 落盘工具结果的读侧实现（db.read_tool_result，
+                                                # app.py 注入）。None = 无读回能力
     subagent_runner: object = None              # fn(tasks: list[str]) -> str：只读子代理
                                                 # 运行器（spawn_subagent 用，支持并行扇出）。
                                                 # Agent 构造时自装配，工具层不 import
@@ -132,7 +135,8 @@ TOOL_SCHEMAS += SUBAGENT_TOOL_SCHEMAS
 TOOL_REGISTRY.update(SUBAGENT_TOOL_REGISTRY)
 
 # ---- 合并 Coding 工具（code_tools.py）：读写工作区文件、执行命令 ----
-from code_tools import CODE_TOOL_REGISTRY, CODE_TOOL_READ_ONLY, CODE_TOOL_SCHEMAS
+from code_tools import (CODE_TOOL_REGISTRY, CODE_TOOL_READ_ONLY, CODE_TOOL_SCHEMAS,
+                       format_numbered_lines)
 
 TOOL_SCHEMAS += CODE_TOOL_SCHEMAS
 TOOL_REGISTRY.update(CODE_TOOL_REGISTRY)
@@ -145,6 +149,73 @@ TOOL_REGISTRY.update(CODE_TOOL_REGISTRY)
 # 构造 Agent 时注入（ToolContext.vision_backend）。工具需要的图片数据也不
 # 来自模型参数——模型看不见像素，图片列表由 Agent 每轮从用户消息里提取后
 # 更新到 ToolContext.images。
+
+def read_tool_result(ref: str, offset: int = 1, limit: int = 0, ctx: ToolContext = None) -> str:
+    """分段读回落盘的工具结果全文（结果落盘轻引用的读侧，db.read_tool_result）。
+
+    ref 必须来自工具结果信封里的 full.path——那是结果超长被落盘时留下的引用，
+    不是可以凭空构造的文件名。offset/limit 与 read_file 同轴（1 起的行号），
+    输出同样带行号。读侧经 ctx.tool_result_reader 注入（agent 存储无关），
+    未注入 = 系统未配置，返回可读错误而不是崩溃。
+    """
+    reader = ctx.tool_result_reader if ctx is not None else None
+    if reader is None:
+        return error_result("结果阅读后端未配置（系统内部问题，请联系服务部署者）")
+    if not ref or not isinstance(ref, str):
+        return error_result("ref 不能为空",
+                            'ref 取自工具结果信封里的 full.path 字段，例如 {"full": {"path": "..."}}')
+    try:
+        start = max(1, int(offset or 1))
+    except (TypeError, ValueError):
+        start = 1
+    try:
+        limit_n = max(0, int(limit or 0))
+    except (TypeError, ValueError):
+        limit_n = 0
+    try:
+        info = reader(ref, start, limit_n)
+    except ValueError as e:
+        # 越界路径 / 空区间：给出可操作的改道建议
+        return error_result(str(e),
+                            "ref 必须逐字符取自工具结果信封里的 full.path，不要自己拼造路径；"
+                            "起始行不要超过全文行数")
+    except Exception as e:
+        return error_result(f"{type(e).__name__}: {e}", "读盘失败，可稍后重试或改用其它工具")
+    lines, total = info["lines"], info["total_lines"]
+    content = format_numbered_lines(lines, start)
+    shown_end = (info.get("shown") or [start, start + len(lines) - 1])[1]
+    if shown_end < total:
+        content += (f"\n...[已截断：全文共 {total} 行，本次显示第 {start}-{shown_end} 行。"
+                    f"继续读取请传 offset={shown_end + 1}]")
+    return json.dumps({"ok": True, "ref": ref, "result": content,
+                       "total_lines": total, "shown": [start, shown_end]},
+                      ensure_ascii=False)
+
+
+TOOL_SCHEMAS.append({
+    "type": "function",
+    "function": {
+        "name": "read_tool_result",
+        "description": "分段读回落盘的工具结果全文。什么时候用：某个工具结果超长被落盘时"
+                       "（结果末尾会有「完整原文已落盘：<path>」提示并带 full.path 引用），"
+                       "预览部分不够用、需要看余下内容时。"
+                       "ref 必须逐字符取自该信封的 full.path 字段，不要自己拼造路径；"
+                       "offset/limit 按行分段（1 起的行号），返回带行号原文。"
+                       "示例：read_tool_result {\"ref\": \"<full.path>\", \"offset\": 1, \"limit\": 200}。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string",
+                        "description": "结果引用路径，逐字符取自工具结果信封里的 full.path"},
+                "offset": {"type": "integer", "description": "起始行号（1 起），默认 1"},
+                "limit": {"type": "integer", "description": "最多读的行数，默认 0 = 读到末尾"},
+            },
+            "required": ["ref"],
+        },
+    },
+})
+TOOL_REGISTRY["read_tool_result"] = read_tool_result  # 只读盘上的结果文件（read_only 标记见 TOOL_READ_ONLY）
+
 
 def analyze_image(image_id: str = "", question: str = "请详细描述这张图片的内容", ctx: ToolContext = None) -> str:
     images = ctx.images if ctx is not None else []
@@ -266,6 +337,8 @@ TOOL_READ_ONLY = {
     "analyze_image": False,
     # todo_write 只写 ToolContext 内存（不碰工作区/不出网），并行安全
     "todo_write": True,
+    # read_tool_result 只读盘上的结果文件（路径校验在 db.read_tool_result）
+    "read_tool_result": True,
 }
 TOOL_READ_ONLY.update(CODE_TOOL_READ_ONLY)  # 并入 coding 工具的标记（同样的合并方式）
 TOOL_READ_ONLY.update(DOC_TOOL_READ_ONLY)   # 并入文档工具（create_doc 为非只读，走串行）

@@ -79,6 +79,70 @@
     return x && typeof x === "object" && !Array.isArray(x);
   }
 
+  // ---------- 子代理嵌套归并（实时事件与回放 trace 共用的底座） ----------
+
+  /*
+   * subagent 事件 / sub_* trace 条目都按 parent 归并进对应 spawn_subagent
+   * 工具块的 subtasks 子卡。事件必然落在该块的 tool_call 与 tool_result
+   * 之间（spawn 独占一个串行组，不存在跨 spawn 交错），所以"最近的
+   * running spawn 块"就是唯一宿主；找不到宿主的异常序列直接丢弃——宁缺不串
+   * （子代理的 read_file 与父回合同名，混进平铺配对会把结果安到别的调用头上）。
+   */
+  function lastRunningSpawn(process) {
+    const items = (process && process.items) || [];
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      if (it.kind === "tool" && it.name === "spawn_subagent" &&
+          (it.status === "running" || it.status === "waiting")) return it;
+    }
+    return null;
+  }
+
+  // 按 parent 取（或建）子任务卡。index/task 只在首次建卡时生效（实时事件带、
+  // 回放 trace 条目不带——卡标题退化为"子任务 N"）。
+  function subtaskOf(toolBlock, parent, index, task) {
+    if (!toolBlock.subtasks) toolBlock.subtasks = [];
+    for (const s of toolBlock.subtasks) {
+      if (s.parent === parent) return s;
+    }
+    const st = { parent: parent, index: typeof index === "number" ? index : null,
+                 task: task || "", items: [] };
+    toolBlock.subtasks.push(st);
+    return st;
+  }
+
+  // 一条子代理过程落进子任务卡。tool_result 的配对规则与平铺路径同一套
+  // （最近同名未终态块回填），只是作用域限定在本卡之内。
+  function subApply(st, evt) {
+    if (evt.kind === "round") {
+      st.items.push({ kind: "note", roundHead: true,
+                      text: "🧠 第 " + (evt.round != null ? evt.round : "?") + " 轮" });
+    } else if (evt.kind === "tool_call") {
+      st.items.push({ kind: "tool", name: evt.name || "",
+                      arguments: evt.arguments != null ? evt.arguments : "{}",
+                      result: null, status: "running" });
+    } else if (evt.kind === "tool_result") {
+      for (let i = st.items.length - 1; i >= 0; i--) {
+        const it = st.items[i];
+        if (it.kind === "tool" && (it.status === "running" || it.status === "waiting") &&
+            (!evt.name || it.name === evt.name)) {
+          it.result = evt.result != null ? evt.result : "";
+          it.status = toolStatus(it.result);
+          return;
+        }
+      }
+      st.items.push({ kind: "tool", name: evt.name || "", arguments: "{}",
+                      result: evt.result != null ? evt.result : "",
+                      status: toolStatus(evt.result), orphan: true });
+    } else if (evt.kind === "done") {
+      st.items.push({ kind: "note",
+                      text: evt.ok ? "✅ 完成 · " + (evt.rounds != null ? evt.rounds : "?") + " 轮"
+                                   : "❌ " + (evt.error || "失败") });
+    } else if (evt.kind === "note") {
+      st.items.push({ kind: "note", text: evt.text || "" });
+    }
+  }
+
   // ---------- 实时：SSE 事件 → Block[] ----------
 
   /*
@@ -215,6 +279,12 @@
         // 权限确认也是一次工具调用（后端命中 ask 时不发 tool_call，只发它），
         // 要算一步——否则摘要行会把它漏掉，与「已工作 N 步」的口径不符。
         ensureProcess().steps += 1;
+      } else if (t === "subagent") {
+        // 子代理过程（嵌套 trace）：按 parent 挂进当前 running 的
+        // spawn_subagent 工具块的 subtasks；不进平铺配对、不计步数——
+        // 「已工作 N 步」口径保持为父回合自己的调用。
+        const sp = lastRunningSpawn(process);
+        if (sp) subApply(subtaskOf(sp, evt.parent, evt.index, evt.task), evt);
       } else if (t === "todo_update") {
         // 清单不再进时间线：右上角 📋 浮窗实时更新（回放走 /todos 接口），
         // 这里只吞掉事件，避免回放路径在对话流里画出清单卡。
@@ -318,6 +388,24 @@
           }
         } else if (e.type === "system_reminder") {
           items.push({ kind: "note", text: "🔔 系统提醒", reminder: true });
+        } else if (e.type === "sub_round" || e.type === "sub_tool_call" ||
+                   e.type === "sub_tool_result" || e.type === "sub_truncated") {
+          // 子代理过程条目（agent.py 以 sub_* 形态挂进父 trace）：归并进最近的
+          // spawn_subagent 工具块。条目在 spawn 的 tool_call 与 tool_result
+          // 之间落盘（串行信封），此刻该块必为 running；不带则丢弃。
+          const sp = lastRunningSpawn({ items: items });
+          if (sp) {
+            const st = subtaskOf(sp, e.parent, null, "");
+            if (e.type === "sub_round") {
+              subApply(st, { kind: "round", round: e.round });
+            } else if (e.type === "sub_tool_call") {
+              subApply(st, { kind: "tool_call", name: e.name, arguments: e.arguments });
+            } else if (e.type === "sub_tool_result") {
+              subApply(st, { kind: "tool_result", name: e.name, result: e.result });
+            } else {
+              subApply(st, { kind: "note", text: e.text });
+            }
+          }
         }
       }
       if (!items.length) return null;

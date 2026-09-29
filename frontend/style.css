@@ -562,6 +562,23 @@ body.side-resizing .sidebar { transition: none; }
   margin: 6px 0 0 2px; white-space: pre-wrap; word-break: break-word;
   color: var(--text-3);
 }
+
+/* 子代理嵌套卡（spawn_subagent 专用）：容器挂在调用行与结果行之间，纵向
+   排每张子任务卡；左边线缩进一层，与平铺的 trace-line 视觉同语言。 */
+.subagent-cards {
+  margin: 6px 0 0 2px; padding-left: 10px;
+  border-left: 2px solid var(--border);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.trace-nested { font-size: 11.5px; color: var(--text-4); }
+.trace-nested > summary {
+  cursor: pointer; user-select: none; list-style: none;
+  color: var(--text-3); line-height: 1.5;
+}
+.trace-nested > summary::before { content: "›"; display: inline-block; margin-right: 6px; transition: transform .15s; }
+.trace-nested[open] > summary::before { transform: rotate(90deg); }
+.trace-nested .trace-line, .trace-nested .think-line { margin-top: 4px; }
+.trace-nested .tl { margin-top: 4px; }
 /* 「💬 说明」标记：把过程性正文与它上方的思考流（.think-line）区分开。
    两者字号/灰度接近，而轨迹里 reasoning 条目可能缺失，正文就直接跟在
    「🧠 思考 · 第 N 轮」标题下面——不加标记会被当成该轮的推理内容。

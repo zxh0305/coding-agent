@@ -457,6 +457,19 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 except Exception:
                     log.exception("[会话 %s] 进行中快照落库失败（忽略）", sid)
 
+            # 子代理事件外发（嵌套 trace）与隐藏消耗归账（用量页），每回合开始
+            # 注入一次。事件路径：bus.publish 进环形缓冲/订阅分发（唯一写入路径）；
+            # subagent 事件顺带触发进行中快照——长侦察期间父回合没有任何事件，
+            # 不触发的话刷新/切回页面的快照会缺整个子代理过程段。
+            def _sub_event_sink(evt):
+                bus.publish(evt)
+                if evt.get("type") == "subagent":
+                    _maybe_snapshot()
+
+            agent.event_sink = _sub_event_sink
+            agent.usage_sink = (lambda kind, stats, _sid=sid, _agent=agent:
+                                db.record_usage(_sid, kind, stats,
+                                                _agent.model_tag[0], _agent.model_tag[1]))
             try:
                 for kind, payload in agent.run(plain, user_message):
                     if kind == "round":
@@ -848,9 +861,13 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
                           workspace=workspace, vision_backend=_vision_backend_for(sid),
                           context_window=_active_window(sid),  # 压缩触发线的基准（切换模型后重建实例即更新）
                           artifact_reader=db.read_artifact,  # 外置大消息的还原器（模型视图用）
+                          # 工具结果落盘 sink（结果落盘轻引用）：全文进 data/tool_results/<sid>/
+                          result_sink=lambda content, _sid=sid: db.write_tool_result(_sid, content),
                           permission_gate=_build_permission_gate(workspace),
                           session_id=sid,  # 文档工具据此确定文档归属
                           model_tag=(prov["id"], model))  # 随 _stats 落库，用量页按它聚合
+            # 落盘工具结果的读侧（read_tool_result 工具用，与 result_sink 同一套目录）
+            agent.ctx.tool_result_reader = db.read_tool_result
             # 窗口恢复：从未压缩 = 全量；压缩过 = 锚点 + 最后一条边界及其之后
             # （边界摘要是后续再压缩的输入）。内存占用与当前窗口成正比，而非
             # 全会话长度；模型视图与全量恢复逐字节一致。

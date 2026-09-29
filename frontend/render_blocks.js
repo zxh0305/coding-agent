@@ -92,6 +92,25 @@
           const s = callEl.querySelector("summary");
           if (s) s.textContent = "🔵 " + s.textContent;
         }
+        // 子代理嵌套卡（spawn_subagent 专用）：夹在调用行与结果行之间，每个
+        // 子任务一张折叠卡，内部条目复用同一渲染器（note/reasoning/tool）。
+        if (Array.isArray(item.subtasks) && item.subtasks.length) {
+          const wrap = doc.createElement("div");
+          wrap.className = "subagent-cards";
+          for (const st of item.subtasks) {
+            const d = doc.createElement("details");
+            d.className = "trace-nested";
+            const s = doc.createElement("summary");
+            const idx = typeof st.index === "number" ? " " + (st.index + 1) : "";
+            s.textContent = "🔍 子任务" + idx + "：" + String(st.task || "").slice(0, 60);
+            d.appendChild(s);
+            for (const it of Array.isArray(st.items) ? st.items : []) {
+              d.appendChild(renderProcessItem(it, running));
+            }
+            wrap.appendChild(d);
+          }
+          frag.appendChild(wrap);
+        }
         if (item.status !== "running" && item.status !== "waiting" && item.result != null) {
           if (callEl.classList && callEl.classList.contains("card")) {
             deps.decorateWriteCard(callEl, item.result);

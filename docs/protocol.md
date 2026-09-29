@@ -65,14 +65,28 @@ delta 归并规则：`answer_delta` 带 `mid` → 归并进同一气泡；`reaso
 | `doc_created` | `{name}` | create_doc 成功后（文档栏刷新） |
 | `browser_shot` | `{url, note, shot}` | browser_screenshot 后（shot 是截图读取接口的相对 URL） |
 | `usage` | `{prompt_tokens, completion_tokens, ...}` | 每轮真实用量；进容量缓存 `_ctx[sid]` |
+| `subagent` | `{kind, parent, index, task, ...}` | 子代理过程事件（见下方契约）；按 `parent` 归并进对应 spawn_subagent 工具卡的嵌套折叠卡 |
 
-**子代理（spawn_subagent）契约**：子代理是父回合内部同步跑的只读侦察员，
-其全部过程事件（round/answer_delta/tool_call/…）**就地消费、不外发**——父回合
-时间线只见一对 `tool_call` / `tool_result`。结果信封
-`{ok:true, results:[{task, ok:true, report, rounds?, usage?} | {task, ok:false, error, hint?}]}`：
+**子代理（spawn_subagent）契约**：子代理是父回合内部同步跑的只读侦察员。
+父回合时间线仍只见一对 `tool_call` / `tool_result`（结果信封
+`{ok:true, results:[{task, ok:true, report, rounds?, usage?} | {task, ok:false, error, hint?}]}`，
 `tasks` 数组 1~3 个子任务，多任务并行执行、按提交顺序回填，单任务失败只折损
-自己的条目；参数级失败为 `{ok:false, error, hint?}`。不做任何特殊前端处理。
-嵌套 trace（parent 标识、子代理折叠卡）留后续。
+自己的条目；参数级失败为 `{ok:false, error, hint?}`）。子代理的【过程】以
+独立的 `subagent` 事件外发（嵌套 trace）：
+
+- 载荷：`{type:"subagent", kind, parent, index, task}`，`kind` ∈
+  `round`（`{round}`）/ `tool_call`（`{name, arguments}`）/
+  `tool_result`（`{name, result}`）/ `done`（终态：`{rounds, report_head?}` 或
+  `{rounds, error}`）。`parent` 是子任务身份（归并键），`index` 是批内序号
+  （展示用），`task` 是子任务描述前 120 字（卡标题用）。
+- **收窄集合**：delta 流（answer_delta / reasoning_delta）不外发——多任务
+  并行 × 十几轮的 delta 会刷穿环形缓冲挤掉 turn_start，让补发退化；子代理的
+  正文/思考对父时间线没有展示价值。回放侧的嵌套过程来自 session_traces 的
+  `sub_*` 条目（随最终回答落库），与实时路径同构。
+- 前端归并规则：事件落在对应 spawn_subagent 的 `tool_call` 与 `tool_result`
+  之间（spawn 独占串行组，不存在跨 spawn 交错），按 `parent` 挂进该工具卡
+  的嵌套折叠卡；不参与平铺的 tool_call/tool_result 配对（子代理的 read_file
+  与父回合同名，混配会串）。旧前端不认识此 type，忽略即可（无副作用）。
 
 ### 4.4 压缩与历史
 

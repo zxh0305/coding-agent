@@ -294,3 +294,117 @@ test("追踪器：无关事件返回 null，不误伤", () => {
   assert.equal(tr.feed({ type: "done", answer: "x" }), null);
   assert.equal(tr.feed(null), null);
 });
+
+// ---------- 子代理嵌套 trace（协议 §4.3 的 subagent 事件 / sub_* trace 条目） ----------
+
+const SUB_EVENTS = [
+  { type: "turn_start", input: "派子代理", user_mid: "u1" },
+  { type: "round", round: 1, mid: "a1" },
+  { type: "tool_call", name: "spawn_subagent", arguments: '{"tasks":["读 a.txt"]}' },
+  { type: "subagent", kind: "round", parent: "p1", index: 0, task: "读 a.txt", round: 1 },
+  { type: "subagent", kind: "tool_call", parent: "p1", index: 0, task: "读 a.txt",
+    name: "read_file", arguments: '{"path":"a.txt"}' },
+  { type: "subagent", kind: "tool_result", parent: "p1", index: 0, task: "读 a.txt",
+    name: "read_file", result: '{"ok":true,"result":"hello"}' },
+  { type: "subagent", kind: "round", parent: "p1", index: 0, task: "读 a.txt", round: 2 },
+  { type: "subagent", kind: "done", parent: "p1", index: 0, task: "读 a.txt",
+    ok: true, rounds: 2, report_head: "结论：hello" },
+  { type: "tool_result", name: "spawn_subagent",
+    result: '{"ok":true,"results":[{"task":"读 a.txt","ok":true,"report":"结论：hello"}]}' },
+  { type: "done", mid: "a2", answer: "收到", elapsed_s: 3.0 },
+];
+
+test("嵌套：实时 subagent 事件按 parent 归并进 spawn 工具块", () => {
+  const blocks = blocksFromEvents(SUB_EVENTS);
+  const proc = blocks.find((b) => b.kind === "process");
+  const spawn = proc.items.find((i) => i.kind === "tool" && i.name === "spawn_subagent");
+  assert.equal(spawn.status, "ok");
+  assert.equal(spawn.subtasks.length, 1);
+  const st = spawn.subtasks[0];
+  assert.equal(st.parent, "p1");
+  assert.equal(st.index, 0);
+  // round → note(roundHead)；tool_call/tool_result 卡内配对成 ok 态
+  assert.deepEqual(st.items.map((i) => (i.roundHead ? "round" : i.kind)),
+                   ["round", "tool", "round", "note"]);
+  const subTool = st.items.find((i) => i.kind === "tool");
+  assert.equal(subTool.status, "ok"); // 卡内配对成功，不是孤儿
+  assert.equal(st.items[st.items.length - 1].text, "✅ 完成 · 2 轮");
+  // 不计步数、不进平铺：父回合步数仍是 1
+  assert.equal(proc.steps, 1);
+  assert.deepEqual(proc.items.filter((i) => i.kind === "tool").map((i) => i.name),
+                   ["spawn_subagent"]);
+});
+
+test("嵌套：子代理的同名工具不污染平铺配对", () => {
+  // 子代理先派 read_file 事件、父随后自己调 read_file：两条平铺 tool 块互不串
+  const events = [
+    { type: "turn_start", input: "x", user_mid: "u1" },
+    { type: "tool_call", name: "spawn_subagent", arguments: "{}" },
+    { type: "subagent", kind: "tool_call", parent: "p1", index: 0, task: "t",
+      name: "read_file", arguments: "{}" },
+    { type: "tool_call", name: "read_file", arguments: '{"path":"b.txt"}' },
+    { type: "subagent", kind: "tool_result", parent: "p1", index: 0, task: "t",
+      name: "read_file", result: '{"ok":true,"result":"子代理的"}' },
+    { type: "tool_result", name: "read_file", result: '{"ok":true,"result":"父的"}' },
+  ];
+  const proc = blocksFromEvents(events).find((b) => b.kind === "process");
+  const flat = proc.items.filter((i) => i.kind === "tool" && !i.name.startsWith("spawn"));
+  const parentTool = flat.find((i) => i.name === "read_file");
+  assert.equal(parentTool.result, '{"ok":true,"result":"父的"}'); // 配对没被子代理事件插队
+  const st = proc.items.find((i) => i.name === "spawn_subagent").subtasks[0];
+  assert.equal(st.items.find((i) => i.kind === "tool").status, "ok");
+});
+
+test("嵌套：回放 sub_* 条目与实时事件产出同构的块", () => {
+  const trace = [
+    { type: "round", round: 1 },
+    { type: "tool_call", name: "spawn_subagent", arguments: '{"tasks":["读 a.txt"]}' },
+    { type: "sub_round", parent: "p1", round: 1 },
+    { type: "sub_tool_call", parent: "p1", name: "read_file", arguments: '{"path":"a.txt"}' },
+    { type: "sub_tool_result", parent: "p1", name: "read_file", result: '{"ok":true,"result":"hello"}' },
+    { type: "sub_round", parent: "p1", round: 2 },
+    { type: "sub_tool_result", parent: "p1", name: "spawn_done", result: "done" }, // 孤儿兜底
+    { type: "tool_result", name: "spawn_subagent", result: '{"ok":true,"results":[]}' },
+  ];
+  const msgs = [
+    { role: "user", content: "派子代理", mid: "u1" },
+    { role: "assistant", content: null, tool_calls: [], trace, mid: "a1" },
+  ];
+  const proc = blocksFromHistory(msgs).find((b) => b.kind === "process");
+  const spawn = proc.items.find((i) => i.kind === "tool" && i.name === "spawn_subagent");
+  assert.equal(spawn.status, "ok");
+  assert.equal(spawn.subtasks.length, 1);
+  const st = spawn.subtasks[0];
+  assert.deepEqual(st.items.map((i) => (i.roundHead ? "round" : i.kind)),
+                   ["round", "tool", "round", "tool"]);
+  assert.equal(st.items[1].status, "ok");
+  // 无宿主块的 sub_* 条目丢弃（宁缺不串）：上面孤儿 sub_tool_result 只进卡内
+});
+
+test("嵌套：找不到 running spawn 宿主的 subagent 事件被丢弃", () => {
+  const blocks = blocksFromEvents([
+    { type: "turn_start", input: "x", user_mid: "u1" },
+    { type: "subagent", kind: "round", parent: "p9", index: 0, task: "t", round: 1 },
+  ]);
+  // 无宿主块 → 连 process 块都不会被建出来，更没有孤儿工具卡
+  const tools = blocks.flatMap((b) => b.items || []).filter((i) => i.kind === "tool");
+  assert.equal(tools.length, 0);
+});
+
+test("嵌套：多任务并行各归各卡", () => {
+  const events = [
+    { type: "turn_start", input: "x", user_mid: "u1" },
+    { type: "tool_call", name: "spawn_subagent", arguments: "{}" },
+    { type: "subagent", kind: "round", parent: "pA", index: 0, task: "A", round: 1 },
+    { type: "subagent", kind: "round", parent: "pB", index: 1, task: "B", round: 1 },
+    { type: "subagent", kind: "done", parent: "pB", index: 1, task: "B", ok: false, rounds: 1, error: "boom" },
+    { type: "subagent", kind: "done", parent: "pA", index: 0, task: "A", ok: true, rounds: 1 },
+    { type: "tool_result", name: "spawn_subagent", result: '{"ok":true,"results":[]}' },
+  ];
+  const proc = blocksFromEvents(events).find((b) => b.kind === "process");
+  const st = proc.items.find((i) => i.name === "spawn_subagent").subtasks;
+  assert.equal(st.length, 2);
+  assert.deepEqual(st.map((s) => s.index), [0, 1]);
+  assert.equal(st[0].items.at(-1).text, "✅ 完成 · 1 轮");
+  assert.equal(st[1].items.at(-1).text, "❌ boom");
+});

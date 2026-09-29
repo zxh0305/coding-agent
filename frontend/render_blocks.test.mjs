@@ -247,3 +247,47 @@ test("渲染：空数组与空输入不崩", () => {
   assert.equal(r.renderBlocks([]).children.length, 0);
   assert.equal(r.renderBlocks(null).children.length, 0);
 });
+
+test("渲染：spawn_subagent 工具块的 subtasks 渲染成嵌套折叠卡", () => {
+  const deps = makeDeps();
+  const r = createRenderer(deps);
+  const item = {
+    kind: "tool", name: "spawn_subagent", arguments: '{"tasks":["A","B"]}',
+    result: '{"ok":true,"results":[]}', status: "ok",
+    subtasks: [
+      { parent: "pA", index: 0, task: "任务A", items: [
+        { kind: "note", roundHead: true, text: "🧠 第 1 轮" },
+        { kind: "tool", name: "read_file", arguments: "{}", result: '{"ok":true,"result":"x"}', status: "ok" },
+        { kind: "note", text: "✅ 完成 · 1 轮" },
+      ]},
+      { parent: "pB", index: 1, task: "任务B", items: [
+        { kind: "note", text: "❌ boom" },
+      ]},
+    ],
+  };
+  const frag = r.renderProcessItem(item, false);
+  const wrap = frag.children.find((n) => n.className === "subagent-cards");
+  assert.ok(wrap, "应有嵌套容器");
+  assert.equal(wrap.children.length, 2);
+  const cardA = wrap.children[0];
+  assert.equal(cardA.tagName, "DETAILS");
+  assert.equal(cardA.className, "trace-nested");
+  assert.equal(cardA.children[0].textContent, "🔍 子任务 1：任务A");
+  // 内部条目复用同一渲染器：round 标题 + 工具行（调用 + 结果） + done 注记
+  assert.deepEqual(cardA.children.slice(1).map((c) => c.className || c.tagName),
+                   ["trace-line", "tl", "tl result", "process-text"]);
+  assert.equal(wrap.children[1].children[0].textContent, "🔍 子任务 2：任务B");
+  // 调用行在前、容器居中、结果行在后
+  assert.deepEqual(frag.children.map((c) => c.className || c.tagName),
+                   ["tl", "subagent-cards", "tl result"]);
+});
+
+test("渲染：普通工具块没有 subtasks 不产生容器", () => {
+  const deps = makeDeps();
+  const r = createRenderer(deps);
+  const frag = r.renderProcessItem({
+    kind: "tool", name: "read_file", arguments: "{}",
+    result: '{"ok":true}', status: "ok",
+  }, false);
+  assert.equal(frag.children.find((n) => n.className === "subagent-cards"), undefined);
+});

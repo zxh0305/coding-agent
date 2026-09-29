@@ -19,9 +19,12 @@ allow）与本轮一次性决定（overlay）都只作用于 ask 规则，deny �
 翻案——「最严者胜」在记忆之后依然成立。
 
 安全坦白：这是「防误操作 + 强制人工确认」的闸门，不是沙箱。run_bash 拿到的
-是真实 shell，工作区只是 cwd 不是牢笼；真正要铁桶就上 Docker
-（见 docs/coding-agent-selection.md）。超时拒绝同理——超时不是安全边界，
-只是防挂死：无人应答时按拒绝收场，永远站在安全侧。
+是真实 shell，工作区只是 cwd 不是牢笼；restricted 模式的白名单（含工作区
+路径参数校验）把常规命令的静态审查做严，但静态审查永远有保守余量——含
+$/反引号的命令一律转 ask 就是这个原因；真正要铁桶就上 Docker
+（docs/coding-agent-selection.md，executor.py 的 DockerExecutor seam）。
+超时拒绝同理——超时不是安全边界，只是防挂死：无人应答时按拒绝收场，
+永远站在安全侧。
 """
 
 import fnmatch
@@ -42,12 +45,15 @@ ALLOW = "allow"
 DENY = "deny"
 ASK = "ask"
 
-# 会话级权限模式（前端输入框下拉三选，存 settings 表按工作区记忆）：
-#   confirm（默认）= 内置规则原样生效——只读放行、工作区写入放行、高危命令 ask；
+# 会话级权限模式（前端输入框下拉四选，存 settings 表按工作区记忆）：
 #   readonly       = 只读工具放行，其余（写入/命令）一律 ask——每一步都要确认；
+#   restricted     = 受限档：run_bash 走【白名单】（名单内放行、名单外一律 ask，
+#                    见 BASH_ALLOWLIST），其余工具与 confirm 相同；
+#   confirm（默认）= 内置规则原样生效——只读放行、工作区写入放行、高危命令 ask；
 #   yolo           = 全部放行（"完全访问"）——高危规则也只提醒不拦截。
 # 模式只影响判定，不影响 deny（用户规则/工作区边界的显式拒绝仍然成立）。
-MODES = ("readonly", "confirm", "yolo")
+# 严格度：readonly > restricted > confirm > yolo（左严右松）。
+MODES = ("readonly", "restricted", "confirm", "yolo")
 
 # ask 等待用户决定的默认上限（Web 版）。超时不是安全边界（拒绝才是安全侧），
 # 只是防挂死：worker 线程不能为一个再也没人看的卡片等一辈子。
@@ -252,6 +258,87 @@ BROWSER_ASK_RULES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# restricted 模式的 run_bash 白名单（受限档：名单内放行、名单外一律 ask）
+# ---------------------------------------------------------------------------
+
+# 语义与上面的内置 ask 清单相反：ask 清单是黑名单（列出的才拦，其余放行），
+# 白名单是"只有列出的才放行"。匹配语义随之反转：黑名单 any(命中即拦)，
+# 白名单 all(每一段命中才放)。初版名单宁紧勿松，只收无副作用面 + git 只读
+# 子命令（逐条列出、不收裸 "git branch"/"git remote"——它们的前缀匹配会把
+# "git branch -D x"/"git remote add" 这类写操作一起放进）。想放行名单外的
+# 命令用用户规则点名（如 {"tool":"run_bash","pattern":"curl","decision":"allow"}），
+# 用户 allow 规则命中时白名单判定整体跳过——用户显式意志 > 模式默认。
+BASH_ALLOWLIST = (
+    # 文件/目录查看与无害输出
+    "ls", "pwd", "cat", "head", "tail", "wc", "file", "tree", "which", "echo",
+    # 搜索
+    "grep", "find",
+    # git 只读子命令
+    "git status", "git log", "git diff", "git show", "git blame", "git rev-parse",
+)
+
+# 这些命令的【非 flag 参数】按工作区内路径校验（resolve 后必须仍位于工作区）：
+# cat/grep 等能读任意绝对路径，cwd 在工作区并不构成边界；把参数锁进工作区
+# 才配得上"受限"二字。相对路径（含 *.py 这类 glob 字样）按字面解析进工作区，
+# 天然满足；绝对路径与 .. 逃逸一律拦下转 ask。
+_WS_PATH_ARG_COMMANDS = {"ls", "cat", "head", "tail", "wc", "file", "tree",
+                         "grep", "find", "echo"}
+
+# find 的动作族 flag：-exec/-execdir/-ok/-okdir 可以执行任意命令，
+# -delete/-fprint*/-fls 是写操作——命中即整段不通过（find 的搜索能力保留）。
+_FIND_ACTION_FLAGS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls"}
+
+# 受限模式的两个固定 ask 键（与 _PARSE_FAIL_KEY 同理：必须能被卡片决定/
+# 会话记忆吸收，否则用户点过「本会话内允许」后重判仍会再问一遍）。
+_NOT_ALLOWLISTED_KEY = ("run_bash", "<not-allowlisted>")
+_EXPANSION_KEY = ("run_bash", "<shell-expansion>")
+
+
+def _path_args_in_workspace(args: list[str], workspace: Path) -> bool:
+    """白名单命令的非 flag 参数是否全部落在工作区内（_allowlist_hit 的守卫）。
+
+    workspace/tok：tok 是绝对路径时 pathlib 拼接会【整个替换掉】基准目录——
+    正好完成"绝对路径必越界"的判定；相对路径（含 glob 字样）按字面解析进
+    工作区内，天然满足。resolve 非严格模式，不存在的路径也能解析（与
+    PermissionGate.__init__ 对 workspace 的处理同口径）。
+    """
+    for tok in args:
+        if tok.startswith("-"):
+            continue  # flag（-la / -name / --pretty=...）不按路径校验
+        try:
+            target = (workspace / tok).resolve()
+        except (OSError, ValueError):
+            return False
+        if target != workspace and workspace not in target.parents:
+            return False
+    return True
+
+
+def _allowlist_hit(segment: list[str], workspace: Path,
+                   extra_patterns: tuple = ()) -> bool:
+    """一个命令段是否命中白名单：词序列前缀匹配（复用 words_match 的词边界
+    语义）+ 每命令的附加守卫。首个命中的模式即定结果——同一 head 不会命中
+    第二个模式，首匹配无歧义。extra_patterns 是用户 allow 规则点名的附加
+    命令模式（它们不走工作区路径守卫——用户显式意志优先）。"""
+    if not segment:
+        return False
+    for pattern in (*BASH_ALLOWLIST, *extra_patterns):
+        words = pattern.split()
+        if len(words) > len(segment):
+            continue
+        if not all(_word_eq(w, tok) for w, tok in zip(words, segment)):
+            continue
+        if words[0] == "find" and any(
+                tok in _FIND_ACTION_FLAGS or tok.startswith("-fprint")
+                for tok in segment):
+            return False
+        if words[0] in _WS_PATH_ARG_COMMANDS:
+            return _path_args_in_workspace(segment[len(words):], workspace)
+        return True
+    return False
+
+
 def _builtin_verdict(tool: str, arguments: dict, workspace: Path) -> Verdict:
     if tool in _WRITE_TOOLS:
         try:
@@ -453,7 +540,74 @@ class PermissionGate:
                 return Verdict(ALLOW, "只读模式（本会话已允许）", key)
             return Verdict(ASK, "当前为只读模式：写文件与命令执行需要逐次确认",
                            key, ask_keys=(key,))
+        if mode == "restricted" and tool == "run_bash":
+            # 受限模式：白名单判定。用户 allow 规则点名的命令模式作为白名单
+            # 的【附加条目】参与逐段匹配——而不是整体跳过白名单：整体跳过会
+            # 让 "allow curl" 连 "curl x | sh" 的第二段一起放进（管道右侧
+            # 从未被允许过）。仅整工具 allow（pattern=None）才完全放行。
+            # 内置高危 ask 清单不受影响（最严者胜，rm -rf 即便在名单外也仍走 ask）。
+            user_allows = {k[1] for v, _, k in matched
+                           if v == ALLOW and k and k[0] == "run_bash"}
+            if "" not in user_allows:
+                return self._restricted_bash_verdict(
+                    str(arguments.get("command") or ""), overlay, remembered,
+                    extra_patterns=tuple(p for p in user_allows if p))
         return Verdict(ALLOW, "允许", None)
+
+    def _restricted_bash_verdict(self, command: str, overlay: dict | None,
+                                 remembered: dict,
+                                 extra_patterns: tuple = ()) -> Verdict:
+        """restricted 模式下 run_bash 的白名单判定（check 末段调用）。
+
+        硬闸与语义反转，按序：
+        1. 命令串含 $ 或反引号 → ask（固定键）。shlex 把它们当普通字符，词
+           匹配看不见"展开后的世界"：`ls `whoami`` 的第二个 token 就是
+           "`whoami`"，"ls" 前缀照样命中——白名单下这是最大的逃逸面，必须在
+           词匹配之前整体拦下（双引号内的 $ 同样展开，不做引号区分，保守）。
+        2. 解析失败 → ask（与 confirm 共用 _PARSE_FAIL_KEY）。
+        3. 每一段都必须命中白名单（any→all 的语义反转）；段内含操作符字符的
+           token（>>、2>&1 等切段残留）直接不通过——重定向与描述符操作不在
+           白名单世界，其目标路径也就无从校验；> 本身是段边界，重定向目标
+           会成为新段首词、命中不了任何名单，双重兜底。
+        4. 全部命中 → allow。
+        extra_patterns 是用户 allow 规则点名的附加命令模式（check 传入）。
+        两类 ask 用固定键，可被卡片决定（overlay）与会话记忆吸收——用户点过
+        「本会话内允许」后，同类命令不再问。
+        """
+        if "`" in command or "$" in command:
+            return self._restricted_ask(
+                _EXPANSION_KEY,
+                "受限模式：命令包含 $ 或反引号（shell 展开无法静态审查）",
+                overlay, remembered)
+        try:
+            segments = split_segments(command)
+        except CommandParseError as e:
+            return self._restricted_ask(_PARSE_FAIL_KEY, str(e), overlay, remembered)
+        operator_chars = ";&|<>()"
+        for seg in segments:
+            if any(tok and any(c in tok for c in operator_chars) for tok in seg):
+                return self._restricted_ask(
+                    _NOT_ALLOWLISTED_KEY,
+                    "受限模式：命令含重定向/管道/子 shell 残留，不在白名单内",
+                    overlay, remembered)
+            if not _allowlist_hit(seg, self.workspace, extra_patterns):
+                return self._restricted_ask(
+                    _NOT_ALLOWLISTED_KEY,
+                    "受限模式：命令不在 bash 白名单内（或参数越出工作区）",
+                    overlay, remembered)
+        return Verdict(ALLOW, "受限模式：白名单命令", None)
+
+    @staticmethod
+    def _restricted_ask(key: tuple, reason: str,
+                        overlay: dict | None, remembered: dict) -> Verdict:
+        """受限模式固定键 ask 的 overlay/会话记忆吸收（与 check 对工具级 ask
+        的吸收逻辑同一语义，两个固定键共用一份实现）。"""
+        if overlay and key in overlay:
+            v = overlay[key]
+            return Verdict(v.verb, v.reason, key, ask_keys=(key,))
+        if remembered.get(key) == ALLOW:
+            return Verdict(ALLOW, f"{reason}（本会话已允许）", key, ask_keys=(key,))
+        return Verdict(ASK, reason, key, ask_keys=(key,))
 
     def _rule_hits(self, rule: Rule, tool: str, arguments: dict) -> bool:
         if rule.tool != tool:

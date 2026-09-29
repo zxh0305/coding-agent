@@ -80,11 +80,15 @@ class TestEstimateTokens(unittest.TestCase):
         self.assertGreater(stats["system"] + stats["tools"], 0)
 
     def test_context_stats_calibrated_overrides(self):
-        """有真实 prompt_tokens 时仍走校准分摊（最准的口径不被替换）。"""
+        """有真实 prompt_tokens 时仍走校准分摊（最准的口径不被替换）。
+
+        总量断言用 ±3 容差：校准值按字符占比分摊后逐桶 round（6 个桶），
+        各桶 ±0.5 的舍入误差合计量级 ≤3——工具面增减（字符占比变化）会
+        让漂移方向翻转，精确相等断言对这种舍入噪声过严。"""
         agent = AgentBase.make_agent(self)
         agent.history = [user("中文内容"), msg("reply")]
         stats = agent.context_stats(prompt_tokens=1000)
-        self.assertEqual(sum(stats.values()), 1000)
+        self.assertAlmostEqual(sum(stats.values()), 1000, delta=3)
         self.assertIsNotNone(agent._token_ratio)
 
 

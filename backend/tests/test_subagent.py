@@ -276,6 +276,114 @@ class TestSubagentReplay(unittest.TestCase):
         self.assertLess(len(item["report"]), 200)
 
 
+class TestNestedTrace(unittest.TestCase):
+    """嵌套 trace（①）：event_sink 外发收窄集合、父 trace 挂 sub_* 条目、
+    每任务条目预算与省略标记、多任务 parent/index 归并键。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="subagent_trace_")
+        self.ws = Path(self._tmp.name)
+        (self.ws / "a.txt").write_text("hello", encoding="utf-8")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _agent(self, llm, **kw):
+        return Agent(llm=llm, verbose=False, workspace=str(self.ws), **kw)
+
+    def test_narrow_event_set_forwarded_with_parent(self):
+        """外发集合 = round/tool_call/tool_result + 一条终态；载荷带 parent/
+        index/task；answer_delta/reasoning_delta 不外发（收窄契约）。"""
+        llm = ScriptedLLM([
+            {"tool_calls": [{"name": "spawn_subagent",
+                             "arguments": {"tasks": ["读 a.txt"]}}]},
+            {"tool_calls": [{"name": "read_file", "arguments": {"path": "a.txt"}}]},
+            {"content": "结论：hello"},
+            {"content": "收到"},
+        ])
+        agent = self._agent(llm)
+        forwarded = []
+        agent.event_sink = forwarded.append
+        list(agent.run("派子代理"))
+        kinds = [e["kind"] for e in forwarded]
+        # 子代理 2 轮：r1 发出 tool_call/tool_result，r2 出结论 → 两个 round
+        self.assertEqual(kinds, ["round", "tool_call", "tool_result", "round", "done"])
+        parents = {e["parent"] for e in forwarded}
+        self.assertEqual(len(parents), 1)  # 单任务一个 parent
+        first = forwarded[0]
+        self.assertEqual(first["index"], 0)
+        self.assertTrue(first["task"].startswith("读 a.txt"))
+        done = forwarded[-1]
+        self.assertTrue(done["report_head"].startswith("结论"))
+        self.assertEqual(done["rounds"], 2)
+        self.assertNotIn("error", done)
+        # 收窄：任何 delta 都不外发
+        self.assertTrue(all("delta" not in e["kind"] for e in forwarded))
+
+    def test_trace_entries_carry_parent_and_stay_grouped(self):
+        """父 trace 挂 sub_* 条目（带 parent），父自己的 tool_call 序列不掺
+        子代理调用（回放归并与「父上下文不渗漏」都靠这个）。"""
+        llm = ScriptedLLM([
+            {"tool_calls": [{"name": "spawn_subagent",
+                             "arguments": {"tasks": ["侦察"]}}]},
+            {"tool_calls": [{"name": "read_file", "arguments": {"path": "a.txt"}}]},
+            {"content": "结论：ok"},
+            {"content": "收到"},
+        ])
+        agent = self._agent(llm)
+        agent.event_sink = lambda evt: None
+        list(agent.run("派子代理"))
+        types = [t["type"] for t in agent.trace]
+        self.assertIn("sub_round", types)
+        self.assertIn("sub_tool_call", types)
+        self.assertIn("sub_tool_result", types)
+        parent = next(t["parent"] for t in agent.trace if t["type"] == "sub_round")
+        for t in agent.trace:
+            if t["type"].startswith("sub_"):
+                self.assertEqual(t["parent"], parent)
+        # 父的工具调用轨迹仍然只有 spawn_subagent 自己
+        self.assertEqual([t["name"] for t in agent.trace if t["type"] == "tool_call"],
+                         ["spawn_subagent"])
+
+    def test_per_task_trace_budget_appends_marker(self):
+        """每任务条目预算：超限追加一条 sub_truncated 省略标记，不再继续写入
+        （父 trace 落库 150 条封顶，子代理不能挤掉父回合自己的过程）。"""
+        llm = ScriptedLLM([
+            {"tool_calls": [{"name": "spawn_subagent", "arguments": {"tasks": ["侦察"]}}]},
+            {"tool_calls": [{"name": "read_file", "arguments": {"path": "a.txt"}}]},
+            {"tool_calls": [{"name": "read_file", "arguments": {"path": "a.txt"}}]},
+            {"tool_calls": [{"name": "read_file", "arguments": {"path": "a.txt"}}]},
+            {"content": "结论：ok"},
+            {"content": "收到"},
+        ])
+        agent = self._agent(llm)
+        with mock.patch("agent.SUB_TRACE_MAX_ENTRIES", 2):
+            list(agent.run("派子代理"))
+        sub = [t for t in agent.trace if t["type"].startswith("sub_")]
+        self.assertEqual(len(sub), 3)  # 预算 2 + 一条省略标记
+        self.assertEqual(sub[-1]["type"], "sub_truncated")
+
+    def test_parallel_tasks_get_distinct_parents_and_indices(self):
+        barrier = threading.Barrier(2, timeout=15)
+        llm = RoutingLLM(
+            parent_turns=[
+                {"tool_calls": [{"name": "spawn_subagent",
+                                 "arguments": {"tasks": ["T1", "T2"]}}]},
+                {"content": "都回来了"},
+            ],
+            child_first_call=lambda task, cancel: barrier.wait())
+        agent = self._agent(llm)
+        forwarded = []
+        agent.event_sink = forwarded.append
+        list(agent.run("并行派子代理"))
+        by_parent = {}
+        for e in forwarded:
+            if e["kind"] == "done":
+                by_parent[e["parent"]] = e
+        self.assertEqual(len(by_parent), 2)
+        self.assertEqual(sorted(e["index"] for e in by_parent.values()), [0, 1])
+
+
 class TestParallelFanout(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="subagent_par_")

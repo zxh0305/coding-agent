@@ -290,5 +290,56 @@ class TestSSEFrame(unittest.TestCase):
         self.assertEqual(SSE_HEARTBEAT, b": ping\n\n")
 
 
+# ---------------------------------------------------------------------------
+# 七、subagent 事件（协议 §4.3 嵌套 trace）：普通业务事件的待遇
+# ---------------------------------------------------------------------------
+
+class TestSubagentEvents(SSETestBase):
+    """子代理过程事件走与其它业务事件完全相同的通道（publish 唯一写入
+    路径）：占 seq、进缓冲、补发段照常重放——刷新/断线回来嵌套卡不丢。
+    同时它不是回合边界事件，不得影响 running/round_seq 的记账。"""
+
+    def test_subagent_events_are_business_events(self):
+        bus = self.wired_bus()
+        bus.publish({"type": "turn_start", "nonce": "n", "input": "x",
+                     "started_at": 1.0, "user_mid": "u1"})
+        bus.publish({"type": "tool_call", "name": "spawn_subagent",
+                     "arguments": "{}"})
+        seqs = [bus.publish({"type": "subagent", "kind": k, "parent": "p1",
+                             "index": 0, "task": "t"})
+                for k in ("round", "tool_call", "tool_result", "done")]
+        self.assertEqual(seqs, [3, 4, 5, 6])  # 连续 seq，无旁路
+        self.assertEqual([s for s, _ in bus.buffered()], [1, 2, 3, 4, 5, 6])
+
+    def test_subagent_events_replayed_with_running_round(self):
+        """回合进行中断线重连：replay 从 turn_start 起整段补发，subagent
+        事件按原序在内——前端据此重建嵌套卡（多补无害少补致命的同一条规则）。"""
+        bus = self.wired_bus()
+        bus.publish({"type": "turn_start", "nonce": "n", "input": "x",
+                     "started_at": 1.0, "user_mid": "u1"})
+        bus.publish({"type": "subagent", "kind": "round", "parent": "p1",
+                     "index": 0, "task": "t", "round": 1})
+        bus.publish({"type": "subagent", "kind": "done", "parent": "p1",
+                     "index": 0, "task": "t", "ok": True, "rounds": 2})
+        mode, items = bus.replay_plan(position=None)  # 全新观看者接正在跑的回合
+        self.assertEqual(mode, "replay")
+        self.assertEqual([e["type"] for _, e in items],
+                         ["turn_start", "subagent", "subagent"])
+
+    def test_subagent_events_do_not_touch_round_bookkeeping(self):
+        """subagent 事件不是 turn_start/turn_end：running 与回合起点记账
+        不受影响（长侦察期间父回合仍算"进行中"，断线重连能接上）。"""
+        bus = self.wired_bus()
+        bus.publish({"type": "turn_start", "nonce": "n", "input": "x",
+                     "started_at": 1.0, "user_mid": "u1"})
+        for k in ("round", "tool_call", "tool_result", "done"):
+            bus.publish({"type": "subagent", "kind": k, "parent": "p1",
+                         "index": 0, "task": "t"})
+        self.assertTrue(bus.running)
+        self.assertIsNotNone(bus.round_started_at)
+        bus.publish({"type": "turn_end", "user_mid": "u1"})
+        self.assertFalse(bus.running)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

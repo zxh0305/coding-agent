@@ -2166,7 +2166,7 @@ async function chooseWorkspace() {
 }
 
 // ---------- 权限模式（按工作区记忆；闸门每次判定现读，切换立即生效） ----------
-const PERM_LABELS = { readonly: "只读", confirm: "确认", yolo: "完全访问" };
+const PERM_LABELS = { readonly: "只读", restricted: "受限", confirm: "确认", yolo: "完全访问" };
 let permMode = "confirm";
 
 async function loadPermMode() {
@@ -2517,6 +2517,7 @@ const TOOL_ICONS = {
   write_file: "✏️", apply_patch: "✏️",
   read_file: "🔍", grep: "🔍", list_dir: "📂",
   run_bash: "▶️",
+  spawn_subagent: "🕵️", read_tool_result: "📄",
   browser_open: "🌐", browser_click: "🖱️", browser_type: "⌨️", browser_screenshot: "📷",
 };
 
@@ -2615,6 +2616,7 @@ const TOOL_KIND = {
   write_file: "写入", apply_patch: "修改",
   read_file: "读取", grep: "搜索", list_dir: "列目录",
   run_bash: "命令",
+  spawn_subagent: "侦察", read_tool_result: "读结果",
   browser_open: "打开", browser_click: "点击", browser_type: "输入", browser_screenshot: "截图",
 };
 
@@ -2757,6 +2759,11 @@ function makeToolResultLine(name, resultStr, dur = "") {
     summary.textContent = `↩ ${summarize(resultStr, 60)}${dur}`;
     pre.textContent = resultStr;
   }
+  if (parsed && typeof parsed === "object" && parsed.full && parsed.full.path) {
+    // 结果落盘轻引用：完整原文已落盘、历史里是预览 + full 引用（协议见
+    // agent._externalize_tool_result）——摘要行加一枚 📄 提示有全文可读
+    summary.textContent += " 📄";
+  }
   d.append(summary, pre);
   return d;
 }
@@ -2805,6 +2812,59 @@ function decorateWriteCard(callEl, resultStr) {
   b.className = "tl-badge";
   b.textContent = text;
   s.appendChild(b);
+}
+
+// ---------- 子代理嵌套卡（实时路径，协议 §4.3 的 subagent 事件） ----------
+// spawn_subagent 独占一个串行组：同一时刻最多一个 spawn 在跑，嵌套容器用
+// 单实例变量即可。subagentCards 以 parent（子任务身份）为键，各任务的行进
+// 各自的卡里互不交错。容器缺失时就地补建（补发/切回场景 tool_call 可能已
+// 被快照或早前事件画过）——宁可多画一张卡，不丢过程。
+let subagentBox = null;
+const subagentCards = new Map();
+
+function subagentCardFor(evt) {
+  if (!subagentBox) {
+    subagentBox = document.createElement("div");
+    subagentBox.className = "subagent-cards";
+    appendTrace(subagentBox);
+  }
+  let c = subagentCards.get(evt.parent);
+  if (!c) {
+    const d = document.createElement("details");
+    d.className = "trace-nested";
+    const s = document.createElement("summary");
+    const idx = evt.index != null ? " " + (evt.index + 1) : "";
+    s.textContent = `🔍 子任务${idx}：${String(evt.task || "").slice(0, 60)}`;
+    d.appendChild(s);
+    subagentBox.appendChild(d);
+    c = { card: d, lastCall: null };
+    subagentCards.set(evt.parent, c);
+  }
+  return c;
+}
+
+function traceLineInto(container, text) {
+  const div = document.createElement("div");
+  div.className = "trace-line";
+  div.textContent = text;
+  container.appendChild(div);
+}
+
+function applySubagentEvent(evt) {
+  const c = subagentCardFor(evt);
+  if (evt.kind === "round") {
+    traceLineInto(c.card, `🧠 第 ${evt.round != null ? evt.round : "?"} 轮`);
+  } else if (evt.kind === "tool_call") {
+    const el = makeToolCallLine(evt.name, evt.arguments || "{}");
+    c.card.appendChild(el);
+    c.lastCall = el;
+  } else if (evt.kind === "tool_result") {
+    c.card.appendChild(makeToolResultLine(evt.name, evt.result || "{}"));
+    c.lastCall = null;
+  } else if (evt.kind === "done") {
+    traceLineInto(c.card, evt.ok ? `✅ 完成 · ${evt.rounds != null ? evt.rounds : "?"} 轮`
+                                 : `❌ ${evt.error || "失败"}`);
+  }
 }
 
 // 🔐 权限确认卡片：闸门命中 ask 时，回合暂停等用户三选一。
@@ -3016,6 +3076,7 @@ function applyEvent(evt, seq) {
     liveBubble = null; traceEl = null; traceCurrent = "";
     tracePhase = "正在理解问题…";  // 回合开场：模型还没吐任何内容时的友好占位
     metaEl = null; thinkEl = null; pendingCalls = [];
+    subagentBox = null; subagentCards.clear();  // 子代理嵌套卡随回合重置
     liveTracker.reset();  // 工具记账随回合重置（与 blocksFromEvents 的 turn_start 行为一致）
     // 服务端回合起点喂给记账器：补发/切会话场景下 qStart 为 0，traceTick 的
     // traceStart() 退回 tracker.startedAt——没有这条，秒数基准会漂移闪跳。
@@ -3080,9 +3141,18 @@ function applyEvent(evt, seq) {
     const act = liveTracker.feed(evt);
     if (act && act.kind === "tool_open") toolCallLine(act.tool.name, act.tool.arguments);
     else toolCallLine(evt.name, evt.arguments);  // 兜底：极端序列下仍画出来
+    if (evt.name === "spawn_subagent") {
+      // 新一次派出开始：子代理嵌套容器随调用行重建（上一批的卡已定格在原处）
+      subagentBox = null;
+      subagentCards.clear();
+    }
   } else if (t === "tool_result") {
     const act = liveTracker.feed(evt);
     toolResultLine(evt.name, evt.result, act && act.kind === "tool_close" ? act.tool : null);
+  } else if (t === "subagent") {
+    // 子代理过程（嵌套 trace，协议 §4.3）：按 parent 挂进当前 spawn_subagent
+    // 调用行下方的嵌套卡；不进平铺配对、不计步数（与回放/记账器同一口径）。
+    applySubagentEvent(evt);
   } else if (t === "permission_request") {
     liveTracker.feed(evt);  // 记账（tool_wait），DOM 由 showPermissionCard 画
     showPermissionCard(evt);
