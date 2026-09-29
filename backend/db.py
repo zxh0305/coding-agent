@@ -1448,6 +1448,7 @@ def usage_session_rows(days: int | None = None, provider_id: str = "",
 
     与 usage_summary 同口径（days 按 message_usage.created 过滤），按总用量
     倒序、最多 100 条。会话被删除的显示"（已删除会话）"。
+    每行带 project（会话绑定目录的末段，未绑定/已删除为空串，前端归"其他"组）。
     """
     conds, args = [], []
     if days:
@@ -1462,14 +1463,18 @@ def usage_session_rows(days: int | None = None, provider_id: str = "",
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT u.session_id, s.title AS session_title, COUNT(*) AS turns, "
+            "SELECT u.session_id, s.title AS session_title, s.workspace AS workspace, "
+            "COUNT(*) AS turns, "
             "SUM(u.prompt_tokens) AS prompt_tokens, "
             "SUM(u.completion_tokens) AS completion_tokens, "
             "MAX(u.created) AS last_used "
             "FROM message_usage u LEFT JOIN sessions s ON s.id = u.session_id "
             f"{where} GROUP BY u.session_id "
             "ORDER BY prompt_tokens + completion_tokens DESC LIMIT 100", args).fetchall()
+    # project 与任务列表分组同口径 = workspace 末段；行序仍是总用量倒序，
+    # 分组次序由前端按首次出现保持（用量大的项目组排前面）
     return [{"session_id": r["session_id"], "session_title": r["session_title"] or "（已删除会话）",
+             "project": (r["workspace"] or "").rstrip("/").split("/")[-1] if r["workspace"] else "",
              "turns": r["turns"], "prompt_tokens": r["prompt_tokens"] or 0,
              "completion_tokens": r["completion_tokens"] or 0,
              "last_used": r["last_used"]} for r in rows]

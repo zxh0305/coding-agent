@@ -1854,18 +1854,40 @@ async function toggleUsageRows(providerId, model, tr) {
     usageExpanded.delete(key);
     return toast("加载会话明细失败：" + e.message, "error");
   }
-  // 明细行插在本模型行之后；切时间范围重载时整表重建，状态自然重置
+  // 明细行插在本模型行之后，按项目分组：项目小计行（▾）+ 组内会话行（└）。
+  // 组顺序沿用明细行的用量倒序（Map 保持首次出现序）；切时间范围重载时整表重建，状态自然重置
   const frag = document.createDocumentFragment();
-  for (const r of rows) {
-    const dtr = document.createElement("tr");
-    dtr.className = "usage-detail";
-    dtr.dataset.detail = key;
-    dtr.innerHTML =
-      `<td class="mono">└ ${r.session_title}</td><td>${r.turns}</td>` +
-      `<td>${fmtTokens(r.prompt_tokens)}</td><td>${fmtTokens(r.completion_tokens)}</td><td></td>`;
-    frag.appendChild(dtr);
-  }
-  if (!rows.length) {
+  if (rows.length) {
+    const groups = new Map();  // 项目名 → 组内会话明细（未绑定项目/已删除会话归"其他"）
+    for (const r of rows) {
+      const p = r.project || "其他";
+      if (!groups.has(p)) groups.set(p, []);
+      groups.get(p).push(r);
+    }
+    for (const [proj, items] of groups) {
+      const sum = items.reduce((a, r) => ({
+        turns: a.turns + r.turns,
+        prompt: a.prompt + r.prompt_tokens,
+        completion: a.completion + r.completion_tokens,
+      }), { turns: 0, prompt: 0, completion: 0 });
+      const gtr = document.createElement("tr");
+      gtr.className = "usage-detail usage-proj-row";
+      gtr.dataset.detail = key;
+      gtr.innerHTML =
+        `<td class="mono">▾ ${esc(proj)}</td><td>${sum.turns}</td>` +
+        `<td>${fmtTokens(sum.prompt)}</td><td>${fmtTokens(sum.completion)}</td><td></td>`;
+      frag.appendChild(gtr);
+      for (const r of items) {
+        const dtr = document.createElement("tr");
+        dtr.className = "usage-detail";
+        dtr.dataset.detail = key;
+        dtr.innerHTML =
+          `<td class="mono">└ ${esc(r.session_title)}</td><td>${r.turns}</td>` +
+          `<td>${fmtTokens(r.prompt_tokens)}</td><td>${fmtTokens(r.completion_tokens)}</td><td></td>`;
+        frag.appendChild(dtr);
+      }
+    }
+  } else {
     const dtr = document.createElement("tr");
     dtr.className = "usage-detail";
     dtr.dataset.detail = key;
