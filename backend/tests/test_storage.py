@@ -596,5 +596,43 @@ class TestSessionTitle(StorageTestBase):
         self.assertFalse(db.session_title_contains("ghost", "任意"))
 
 
+class TestLastMessagePreviews(StorageTestBase):
+    """会话列表预览行：每会话最后一条消息的压平摘要（一条 SQL 批量取）。
+
+    覆盖：普通文本带角色前缀 / 多部分 user 只取文本 / tool_calls 消息降级为
+    工具名列表 / 空会话与解析失败行不在结果里。"""
+
+    def test_text_multimodal_and_toolcall_shapes(self):
+        db.save_messages("s1", [
+            {"role": "user", "content": "先看看\n  有哪些  文件"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "list_dir", "arguments": "{}"}},
+                            {"id": "c2", "type": "function",
+                             "function": {"name": "grep", "arguments": "{}"}}]},
+        ], {})
+        p = db.last_message_previews(["s1"])
+        self.assertEqual(p["s1"], "[调用工具 list_dir, grep]")  # 最后一条是 tool_calls
+
+        db.save_messages("s1", [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,xx"}},
+            {"type": "text", "text": "  这张图  是什么  "},
+        ]}], {})
+        p = db.last_message_previews(["s1"])
+        self.assertEqual(p["s1"], "你：这张图 是什么")  # 多部分只取文本 + 压平空白 + 前缀
+
+        db.save_messages("s1", [{"role": "assistant", "content": "完成了。"}], {})
+        self.assertEqual(db.last_message_previews(["s1"])["s1"], "完成了。")
+
+    def test_empty_and_broken_inputs(self):
+        self.assertEqual(db.last_message_previews([]), {})
+        self.assertEqual(db.last_message_previews(["s1"]), {})  # 空会话
+        db.save_messages("s1", [{"role": "user", "content": "正常消息"}], {})
+        with sqlite3.connect(db.DB_PATH) as conn:  # 手写坏行：解析失败 → 跳过不炸
+            conn.execute("INSERT INTO messages(mid, session_id, ord, role, content) "
+                         "VALUES('bad', 's1', 99999, 'user', 'not-json{')")
+        self.assertEqual(db.last_message_previews(["s1"]), {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

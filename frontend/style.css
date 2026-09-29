@@ -295,6 +295,12 @@ body.side-resizing .sidebar { transition: none; }
 .task.empty:hover { background: none; }
 .t-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .t-time { font-size: 11px; color: var(--text-3); flex-shrink: 0; }
+/* 会话列表预览行：标题列转纵向，第二行放最后一条消息的摘要（两行各自省略） */
+.t-title.has-prev { display: flex; flex-direction: column; gap: 1px; white-space: normal; }
+.t-title .t-name, .t-title .t-prev {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.t-prev { font-size: 11px; color: var(--text-3); }
 /* 任务状态徽标：running 呼吸圆点 / waiting 圆点+文字。不靠颜色单独表意。 */
 .t-state { font-size: 11px; flex-shrink: 0; white-space: nowrap; }
 .t-state.running { color: var(--accent); animation: t-pulse 1.4s ease-in-out infinite; }

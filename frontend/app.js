@@ -412,7 +412,17 @@ function taskRow(s, list) {
 
   const title = document.createElement("div");
   title.className = "t-title";
-  title.textContent = s.title || "新任务";
+  const name = document.createElement("span");
+  name.className = "t-name";
+  name.textContent = s.title || "新任务";
+  title.appendChild(name);
+  if (s.preview) {  // 预览行：最后一条消息的一句话摘要（无消息的会话不占位）
+    const prev = document.createElement("span");
+    prev.className = "t-prev";
+    prev.textContent = s.preview;
+    title.appendChild(prev);
+    title.classList.add("has-prev");
+  }
   const time = document.createElement("span");
   time.className = "t-time";
   time.textContent = fmtTime(s.updated);

@@ -1055,6 +1055,10 @@ class Handler(SimpleHTTPRequestHandler):
             rows = db.list_sessions(self.user["id"], archived=int(archived == "1"))
             for r in rows:  # state 是内存态，db 层不掺和，在这里现算后随列表带回
                 r["state"] = _session_state(r["id"])
+            # 预览行：每会话最后一条消息的一句话摘要（一条 SQL 批量取，不逐会话查）
+            previews = db.last_message_previews([r["id"] for r in rows])
+            for r in rows:
+                r["preview"] = previews.get(r["id"], "")
             self._json(rows)
         elif re.fullmatch(r"/api/sessions/[^/]+/perm_mode", path):
             # 会话的权限模式（前端输入框下拉）：闸门 mode_loader 每次判定现读

@@ -718,6 +718,51 @@ def list_sessions(user_id: int, archived: int = 0) -> list[dict]:
              "archived_at": r["archived_at"]} for r in rows]
 
 
+def last_message_previews(sids: list[str], chars: int = 300) -> dict[str, str]:
+    """每会话最后一条消息的一句话摘要（会话列表预览行用）。
+
+    一次查询取全部会话：按 (session_id, ord) 取每会话 ord 最大的一条，
+    content 只取前 chars 字符（预览用不到完整正文；外置 stub 行本身就短）。
+    返回 {sid: "角色前缀 + 压平的文本"}；没有消息/正文解析失败的会话不在
+    字典里（前端退化为不显示预览行）。role 为 user 时带"你："前缀区分立场，
+    assistant 的 tool_calls 消息（content 为 null）降级为"[调用工具 x, y]"。
+    """
+    if not sids:
+        return {}
+    placeholders = ",".join("?" * len(sids))
+    with _conn() as conn:
+        rows = conn.execute(
+            f"SELECT m.session_id AS sid, m.role AS role, substr(m.content, 1, ?) AS head "
+            f"FROM messages m JOIN (SELECT session_id, MAX(ord) AS ord FROM messages "
+            f"WHERE session_id IN ({placeholders}) GROUP BY session_id) t "
+            f"ON m.session_id = t.session_id AND m.ord = t.ord",
+            [chars, *sids]).fetchall()
+    out: dict[str, str] = {}
+    for r in rows:
+        try:
+            msg = json.loads(r["head"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):  # 多部分 user 消息：只取文本部分
+            text = " ".join(str(p.get("text") or "") for p in content
+                            if isinstance(p, dict) and p.get("type") == "text")
+        else:
+            text = ""
+        text = " ".join(text.split())  # 压平换行与连续空白（预览是单行省略）
+        if not text:
+            calls = msg.get("tool_calls") or []
+            if not calls:
+                continue
+            names = ", ".join(((c.get("function") or {}).get("name") or "?") for c in calls)
+            text = f"[调用工具 {names}]"
+        prefix = {"user": "你：", "tool": "🔧 "}.get(r["role"], "")
+        out[r["sid"]] = prefix + text[:120]
+    return out
+
+
 def archive_session(sid: str, archived: int) -> None:
     """归档 / 取消归档。取消归档时清掉 archived_at，会话按 updated 回任务栏原位。"""
     with _conn() as conn:
