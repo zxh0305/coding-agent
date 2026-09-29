@@ -112,6 +112,8 @@ class ToolContext:
     vision_backend: object = None               # fn(image_parts, question) -> str，由 app.py 注入
     browser: object = None                      # BrowserManager（browser_tools），由 agent.py 按
                                                 # 会话注入；工具层不持有实例（与会话生命周期同寿）
+    executor: object = None                     # 命令执行提供者（executor.py seam）：None =
+                                                # 本机子进程；换 Docker 沙箱即注入新提供者
     session_id: str | None = None               # 本会话 id（文档工具据此确定文档归属）
 
 TOOL_REGISTRY = {

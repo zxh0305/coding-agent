@@ -20,8 +20,9 @@ Coding 工具集
 import json
 import os
 import re
-import subprocess
 from pathlib import Path
+
+from executor import default_executor
 
 _PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_WORKSPACE = _PROJECT_DIR / "workspace"
@@ -419,28 +420,30 @@ def run_bash(command: str, ctx=None) -> str:
     拆解与用户确认）在调度前的权限闸门（permissions.py）完成——那里能把
     `ls;rm -rf /` 拆开看、也能让 `rm -rf /tmp/test` 这类操作先过问用户。
     到达这里 = 已获放行。
+
+    "怎么跑"由执行提供者决定（ctx.executor，executor.py seam）：默认本机
+    子进程；注入 Docker 提供者即得沙箱隔离，本函数与权限闸门一行不改。
+    提供者契约：run(command, cwd, timeout) -> ExecResult，超时以
+    timed_out=True 返回而非抛异常；输出不截断不合并（截断拼合是工具层职责）。
     """
     if not command or not isinstance(command, str):
         return _err("command 不能为空", "把要执行的命令写进 command 参数")
-    try:
-        proc = subprocess.run(
-            command, shell=True, cwd=_ws(ctx),
-            capture_output=True, text=True, timeout=BASH_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
+    executor = getattr(ctx, "executor", None) or default_executor()
+    res = executor.run(command, cwd=_ws(ctx), timeout=BASH_TIMEOUT)
+    if res.timed_out:
         return _err(f"命令执行超过 {BASH_TIMEOUT} 秒被终止",
                     "拆成更小的步骤分次执行，或给命令加超时/分页控制（如 head 限制输出）")
-    stdout = (proc.stdout or "")[-MAX_OUTPUT_CHARS:]
-    stderr = (proc.stderr or "")[-MAX_OUTPUT_CHARS // 2:]
+    stdout = (res.stdout or "")[-MAX_OUTPUT_CHARS:]
+    stderr = (res.stderr or "")[-MAX_OUTPUT_CHARS // 2:]
     combined = (stdout + ("\n[stderr]\n" + stderr if stderr else "")).strip() or "（无输出）"
     # 输出只进 result 一个字段（已含 stdout 与 [stderr] 段，各自截断过）。
     # 之前 payload 同时带 stdout/stderr/result 三份——同一段输出在工具结果里
     # 存两遍，而工具结果一旦进历史就会随之后每轮请求重复携带，纯浪费。
-    payload = {"exit_code": proc.returncode, "result": combined}
-    if proc.returncode != 0:
+    payload = {"exit_code": res.exit_code, "result": combined}
+    if res.exit_code != 0:
         # 非零退出走失败信封：模型看 ok 就能分流；原始输出保留在 result 里
         # 供定位（命令失败不是工具失败，输出本身就是最重要的错误信息）
-        payload["error"] = f"命令退出码 {proc.returncode}"
+        payload["error"] = f"命令退出码 {res.exit_code}"
         payload["hint"] = "先读 stderr 定位原因再调整命令；不要原样重试同一条命令"
         return json.dumps({"ok": False, **payload}, ensure_ascii=False)
     return _ok(payload)
