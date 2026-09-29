@@ -243,6 +243,9 @@ class Agent:
         self._time_block: str | None = None
         # 压缩摘要连续失败计数（熔断，见 MAX_COMPACT_FAILURES）：成功清零。
         self._compact_fail_streak = 0
+        # 最近一次压缩放弃的原因（_maybe_compact 各早退分支写入；/compact
+        # 手动触发时反馈给用户，自动路径只进日志）。
+        self._compact_skip_reason: str | None = None
         # 最近读取的文件（read_file 的实际返回片段，最旧在前，容量见
         # RECENT_READS_KEEP）：压缩后据此重注入"读过但已被摘要吸收"的文件，
         # 模型不必盲目重读就能继续任务（参照 ZCode compact-post-reminders）。
@@ -958,7 +961,7 @@ class Agent:
                      cleared, saved, keep_recent)
         return cleared
 
-    def _maybe_compact(self) -> dict | None:
+    def _maybe_compact(self, force: bool = False) -> dict | None:
         """回答结束后调用：估算超阈值就把中段历史压缩成一条边界标记。
 
         分级：超阈值先试**无损**的"清旧工具结果"（_clear_old_tool_results），
@@ -969,13 +972,21 @@ class Agent:
         故障）后停止自动压缩——每次失败都让回合收尾白等一次超时；成功一次
         即清零。被用户停止掐断的总结不算失败（不是服务商的错）。
 
-        返回给前端的事件载荷（未触发/失败返回 None）。任何异常都不往外抛——
+        force=True 供 /compact 手动触发：跳过窗口/熔断/阈值三道自动闸（用户
+        点名要压缩，清完旧工具结果后无论是否已降到阈值以下都继续摘要），
+        但保留"没有可安全压缩的段落"的保护（历史太短时切不出切段就放弃）。
+
+        返回给前端的事件载荷（未触发/失败返回 None，原因记在
+        _compact_skip_reason 供手动触发时反馈）。任何异常都不往外抛——
         压缩是"锦上添花"，绝不能让它打断会话；失败就跳过，下一轮回答结束后
         阈值依然超着，自然会重试。
         """
-        if not self.context_window:
+        self._compact_skip_reason = None
+        if not force and not self.context_window:
+            self._compact_skip_reason = "未配置上下文窗口，自动压缩关闭"
             return None
-        if self._compact_fail_streak >= MAX_COMPACT_FAILURES:
+        if not force and self._compact_fail_streak >= MAX_COMPACT_FAILURES:
+            self._compact_skip_reason = f"连续压缩失败 {self._compact_fail_streak} 次，已熔断"
             log.warning("上下文压缩已连续失败 %d 次，熔断暂停自动压缩（本会话内）",
                         self._compact_fail_streak)
             return None
@@ -985,24 +996,25 @@ class Agent:
         # COMPACTION_TARGET_TOKENS（成本口径，env 可选）取较小者。窗口是
         # "模型能吃多少"，成本线是"愿意为单次请求的历史付多少"——大窗口模型
         # 配小成本线，历史瘦身更勤而不牺牲单轮能力；0/未设置 = 关闭，维持纯
-        # 窗口口径（现网默认）。
-        threshold = self.context_window * COMPACT_THRESHOLD
+        # 窗口口径（现网默认）。force 时无窗口则阈值为 0（比较被跳过，仅日志用）。
+        threshold = (self.context_window or 0) * COMPACT_THRESHOLD
         try:
             target = int(os.environ.get("COMPACTION_TARGET_TOKENS") or 0)
         except ValueError:
             target = 0
         if target > 0:
             threshold = min(threshold, target)
-        if est_before <= threshold:
+        if not force and est_before <= threshold:
             return None
 
         # ── 分级压缩第一档：先清较早的工具结果（无损、不花 LLM 调用）──
         # 清完重新估算；降到阈值以下就直接收工，不必动摘要——省下一次有损
         # 总结，也省一次 LLM 调用。前端不产卡片（没有语义损失，无需告知）。
+        # force 时只清不判：用户点名压缩，摘要这一步一定要走。
         if self._clear_old_tool_results():
             stats = self.context_stats()
             est_after_clear = sum(stats.values())
-            if est_after_clear <= threshold:
+            if not force and est_after_clear <= threshold:
                 log.info("分级压缩①后已降至阈值以下（估算 %d → %d tokens），跳过摘要",
                          est_before, est_after_clear)
                 return None
@@ -1015,6 +1027,7 @@ class Agent:
             elif first_user < 0 and m.get("role") == "user":
                 first_user = i
         if first_user < 0:
+            self._compact_skip_reason = "历史里还没有用户消息"
             return None
         # 视图结构：[首条用户消息] + [旧摘要(若有)] + [活区消息]。
         # head = 活区在视图里的起始下标（第一条"可压缩"消息）；无边界时视图就是
@@ -1023,6 +1036,7 @@ class Agent:
         head = 2 if has_boundary else first_user + 1
         cut = self._compact_split(view, head)
         if cut is None:
+            self._compact_skip_reason = "没有可安全压缩的段落（历史太短，或刚压缩过）"
             log.warning("上下文估算 %d tokens 超过阈值 %d，但没有可安全压缩的段落，跳过",
                         est_before, threshold)
             return None
@@ -1046,11 +1060,13 @@ class Agent:
                     reply = payload
         except Exception as e:  # 网络/服务商错误：计一次失败（熔断用），本轮跳过
             self._compact_fail_streak += 1
+            self._compact_skip_reason = f"压缩调用失败：{e}"
             log.warning("上下文压缩失败（%s），连续第 %d 次；将在下一轮回答结束后重试（达 %d 次熔断）",
                         e, self._compact_fail_streak, MAX_COMPACT_FAILURES)
             return None
         summary = ((reply or {}).get("content") or "").strip()
         if not summary or self.cancel_event.is_set():
+            self._compact_skip_reason = "总结为空或被停止掐断"
             return None  # 被停止掐断的半截总结不可信，作废重来（不算服务商失败）
 
         marker = {
@@ -1083,7 +1099,28 @@ class Agent:
         stats_after = self.context_stats()
         log.info("上下文压缩完成：估算 %d → %d tokens（保留最近 %d 条，摘要 %d 字）",
                  est_before, sum(stats_after.values()), len(view) - cut, len(summary))
+        self._compact_skip_reason = None
         return {"summary": summary, "prompt_tokens": sum(stats_after.values()), "context": stats_after}
+
+    def compact_now(self) -> dict:
+        """手动触发一次压缩（/compact 斜杠命令）。
+
+        走 _maybe_compact 的 force 路径：不看阈值/熔断/窗口，但保留"没有可
+        安全压缩的段落"保护。返回统一载荷：compacted=True 时带 summary/
+        prompt_tokens/context（与自动压缩事件同形，前端处理可复用）；
+        compacted=False 时带 reason（取自 _compact_skip_reason）。
+        注意：本方法只改内存历史，落盘与 SSE 事件由调用方（app.py）负责——
+        与回合收尾的分工一致（agent 不碰存储层）。
+        """
+        if self.cancel_event is None:
+            # 从未跑过回合的会话（服务重启后恢复、没发过消息）：run() 还没机会
+            # 创建停止开关。给一个全新的 Event——is_set() 恒 False，压缩不被掐。
+            self.cancel_event = threading.Event()
+        payload = self._maybe_compact(force=True)
+        if payload is None:
+            return {"ok": True, "compacted": False,
+                    "reason": self._compact_skip_reason or "没有可压缩的内容"}
+        return {"ok": True, "compacted": True, **payload}
 
     @staticmethod
     def _build_post_compact_reminder(tail_text: str,

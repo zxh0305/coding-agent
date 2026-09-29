@@ -46,6 +46,8 @@ Web 服务
   POST /api/chat/stop             停止指定任务的生成 {"session_id"}
   POST /api/sessions/<sid>/truncate  回退编辑：删除某条用户消息及其后的全部
                                   消息 {"mid"}（被压缩进摘要的旧消息拒绝）
+  POST /api/sessions/<sid>/compact  /compact 斜杠命令：手动触发上下文压缩
+                                  （无视阈值强制走分级压缩；运行中 409）
 
 命令与事件解耦：POST 只入队（HTTP/1.0 时代的"每轮一个流"被替换掉），回合
 由后台线程按会话锁串行执行，全部过程事件经统一发布口（events.SessionEvents
@@ -1134,6 +1136,12 @@ class Handler(SimpleHTTPRequestHandler):
                 if db.session_owner(sid) != self.user["id"]:
                     return self._json({"error": "任务不存在或不属于当前用户"}, 404)
                 self._handle_truncate(sid)
+            elif re.fullmatch(r"/api/sessions/[^/]+/compact", path):
+                # /compact 斜杠命令：手动触发上下文压缩
+                sid = path.split("/")[3]
+                if db.session_owner(sid) != self.user["id"]:
+                    return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+                self._handle_compact(sid)
             elif path == "/api/active-model":
                 self._handle_active_model()
             elif self.path == "/api/providers/save":
@@ -1505,6 +1513,34 @@ class Handler(SimpleHTTPRequestHandler):
             log.info("[会话 %s] 回退编辑：删除 %d 条消息（切点 ord=%d）",
                      sid, out["removed"], out["ord"])
             self._json({"ok": True, "removed": out["removed"]})
+
+    def _handle_compact(self, sid: str):
+        """/compact 斜杠命令：手动触发上下文压缩（agent.compact_now 的 force 路径）。
+
+        会话锁内执行（与回合 worker 串行）、锁内确认无运行中回合——压缩要改
+        agent.history，与正在流式写历史的回合并发会互相踩。成功后做三件收尾
+        （与回合收尾的自动压缩同口径）：增量落盘、推 compacted 事件（前端复用
+        自动压缩的处理：插分隔卡 + 刷容量徽章）、更新容量缓存。
+        """
+        with _session_lock(sid):
+            if _running_agents.get(sid) is not None:
+                return self._json({"error": "任务正在运行，请先停止再压缩"}, 409)
+            agent = _agents.get(sid)
+            if agent is None:
+                return self._json({"error": "会话未加载（服务重启后发一条消息即可恢复）"}, 409)
+            result = agent.compact_now()
+            if result.get("compacted"):
+                written = db.save_messages(sid, agent.history, agent.saved)
+                db.touch_session(sid)
+                log.info("[会话 %s] /compact 压缩完成，落盘 %d 行", sid, written)
+                payload = {"summary": result.get("summary"),
+                           "prompt_tokens": result.get("prompt_tokens"),
+                           "context": result.get("context")}
+                _event_bus(sid).publish({"type": "compacted", **payload})
+                _ctx[sid] = payload
+            else:
+                log.info("[会话 %s] /compact 未触发：%s", sid, result.get("reason"))
+            self._json(result)
 
     def _handle_permission(self, sid: str, pid: str):
         """权限确认的决定回令：{"decision": "allow"|"allow_session"|"deny"}。

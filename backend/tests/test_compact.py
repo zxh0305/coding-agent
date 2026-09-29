@@ -18,7 +18,8 @@ import tempfile
 import threading
 import unittest
 
-from agent import Agent, COMPACT_MIN_SEGMENT, COMPACT_SUMMARY_NOTE, COMPACT_KEEP_TAIL
+from agent import (Agent, COMPACT_MIN_SEGMENT, COMPACT_SUMMARY_NOTE, COMPACT_KEEP_TAIL,
+                   MAX_COMPACT_FAILURES)
 
 
 # ---------- 消息构造小工具 ----------
@@ -469,6 +470,66 @@ class TieredCompactionTest(CompactTestBase):
         self.assertIsNotNone(result, "清完仍超阈值，应当摘要")
         self.assertIn("summary", result)
         self.assertTrue(llm.calls, "应当发起过总结调用")
+
+
+# ---------------------------------------------------------------------------
+# /compact 手动触发（force 路径）：无视阈值/熔断/窗口，保留段落保护
+# ---------------------------------------------------------------------------
+
+class TestManualCompact(CompactTestBase):
+    """/compact 斜杠命令：compact_now 的 force 路径与自动压缩的分工。
+
+    自动路径的三道闸（窗口配置/失败熔断/80% 阈值）保护的是"别让收尾白等"，
+    用户点名压缩时全部让位；但"没有可安全压缩的段落"的保护必须还在——
+    短历史硬压只会产出一文不值的摘要，还要白花一次 LLM 调用。"""
+
+    def test_force_compacts_even_without_window(self):
+        """窗口未配置（自动压缩关闭）时手动 /compact 依然可用。"""
+        llm = FakeLLM(summary="手动摘要：任务已完成")
+        agent = self.make_agent(history=list(TestMaybeCompact.HISTORY), llm=llm)
+        result = agent.compact_now()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["compacted"])
+        self.assertEqual(result["summary"], "手动摘要：任务已完成")
+        self.assertEqual(sum(1 for m in agent.history if m["role"] == "compact"), 1)
+        self.assertEqual(len(llm.calls), 1)
+        self.assertIsNone(agent._compact_skip_reason)
+
+    def test_force_below_threshold_still_compacts(self):
+        """低于阈值：自动路径不触发（不调 LLM），force 路径照常压缩。"""
+        llm = FakeLLM()
+        agent = self.make_agent(history=list(TestMaybeCompact.HISTORY), llm=llm,
+                                context_window=10 ** 9)
+        self.assertIsNone(agent._maybe_compact())
+        self.assertEqual(llm.calls, [])
+        self.assertTrue(agent.compact_now()["compacted"])
+        self.assertEqual(len(llm.calls), 1)
+
+    def test_force_ignores_fail_streak(self):
+        """熔断只保护自动路径：连续失败达阈后手动 /compact 仍尝试（成功清零）。"""
+        llm = FakeLLM()
+        agent = self.make_agent(history=list(TestMaybeCompact.HISTORY), llm=llm,
+                                context_window=300)
+        agent._compact_fail_streak = MAX_COMPACT_FAILURES
+        self.assertIsNone(agent._maybe_compact())
+        self.assertTrue(agent.compact_now()["compacted"])
+        self.assertEqual(agent._compact_fail_streak, 0)
+
+    def test_force_llm_failure_reports_reason(self):
+        """压缩调用失败：compacted=False 且 reason 说明真实原因（不是"没得压"）。"""
+        agent = self.make_agent(history=list(TestMaybeCompact.HISTORY), llm=ExplodingLLM(),
+                                context_window=300)
+        result = agent.compact_now()
+        self.assertFalse(result["compacted"])
+        self.assertIn("压缩调用失败", result["reason"])
+
+    def test_force_short_history_reports_reason(self):
+        """没有可安全压缩的段落：compacted=False + 可读原因（不假装成功）。"""
+        agent = self.make_agent(history=[user("hi"), asst("hello")], llm=FakeLLM())
+        result = agent.compact_now()
+        self.assertFalse(result["compacted"])
+        self.assertIn("没有", result["reason"])
+        self.assertEqual(agent.history, [user("hi"), asst("hello")])  # 历史不动
 
 
 if __name__ == "__main__":

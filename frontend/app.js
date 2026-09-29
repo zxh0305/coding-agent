@@ -3227,12 +3227,33 @@ let pendingQueue = [];  // {text, payloadAtts, sessionId, immediate}
 let lastSent = null;    // 本 tab 最近一次成功发出的 {text, payloadAtts, outAtts}：出错重试用
 let roundErrored = false;  // 本回合是否发过 error 事件：turn_end 的通知去重
 
+// /compact：手动触发上下文压缩。压缩成功后服务端会推 compacted 事件——
+// 分隔卡片、容量徽章、提示 toast 都由那条事件的既有处理完成，这里只在
+// "没压成"时给原因（压成了再 toast 会和事件处理里的重复）。
+async function runManualCompact() {
+  if (!currentSession) { toast("先选择一个任务再执行 /compact", "error"); return; }
+  if (streaming) { toast("回合进行中，等回答结束再压缩"); return; }
+  try {
+    const r = await api(`/api/sessions/${currentSession}/compact`,
+                        { method: "POST", body: "{}" });
+    if (!r.compacted) toast(r.reason || "没有需要压缩的内容");
+  } catch (e) {
+    toast("/compact 失败：" + e.message, "error");
+  }
+}
+
+
 let pendingProjectPath = null;  // 项目组头「＋」/chip 预选的项目：首条消息建会话时绑定
 
 function send() {
   if (currentSessionArchived) return;  // 归档任务只读：兜底拦截（正常情况下输入框已禁用）
   const text = inputEl.value.trim();
   if (!text && !attachments.length) return;
+  if (text === "/compact") {  // 斜杠命令：手动压缩，不作为消息发送
+    inputEl.value = "";
+    runManualCompact();
+    return;
+  }
   if (attachments.some(a => !a.data)) {  // 占位附件还在读文件：等下一拍
     toast("附件还在读取中，请稍候一秒再发送");
     return;
