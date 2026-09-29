@@ -1718,20 +1718,22 @@ button.primary:hover { background: var(--accent-hover); }
   padding: 12px 16px 10px; border-bottom: 1px solid var(--border);
 }
 .attach-head b { font-size: 14px; }
-/* 列表收起/展开按钮：细线人字箭头（内联 SVG，继承文字色），与右边 ✕ 一起
-   收拢在头部右上角（推挤由 .attach-scope 的 margin-left:auto 负责，这里不能
-   再写 auto，否则按钮会被推到头部正中）。收起态（.list-collapsed 在浮窗根
-   上）旋转 180° 指向左，语义变成"展开"，方向切换带 0.16s 过渡。 */
-#attach-list-toggle {
+/* 头部图标按钮基类（左侧收起箭头、右侧关闭 ✕）。关键：不要复用 .git-x——
+   那个类自带 margin-left:auto（供 git 面板的单个 ✕ 右推），在本头部里会让按钮
+   被顶到标题右侧的正中。这里不写 auto，右推由 .attach-scope 单独完成。 */
+.icon-btn {
   border: none; background: transparent;
-  color: var(--text-3); cursor: pointer;
-  padding: 3px 5px; line-height: 0; border-radius: 6px;
+  color: var(--text-3); cursor: pointer; padding: 3px 5px;
+  line-height: 0; border-radius: 6px;
 }
+.icon-btn:hover { color: var(--text); background: var(--hover-soft); }
+/* 列表收起/展开箭头：头部最左，细线人字箭头（内联 SVG，继承文字色）。
+   收起态（.list-collapsed 在浮窗根上）旋转 180° 指向左，语义变成"展开"，
+   方向切换带 0.16s 过渡。 */
 #attach-list-toggle svg { transition: transform .16s ease; }
 .attach-pop.list-collapsed #attach-list-toggle svg { transform: rotate(180deg); }
-#attach-list-toggle:hover { color: var(--text); background: var(--hover-soft); }
 /* 头部右侧的文件数/总大小：次要信息，弱化；margin-left:auto 把右侧一组
-   （信息 + 收起按钮 + ✕）整体推到最右，中间留白 */
+   （信息 + ✕）整体推到最右，中间留白 */
 .attach-scope {
   margin-left: auto;
   font-size: 11px; color: var(--text-3);
