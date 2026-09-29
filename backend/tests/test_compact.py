@@ -13,6 +13,7 @@
     first_user+1 而不是 last_boundary+1，差一位就会把边界插错位置、吞掉活消息。
 """
 
+import json
 import shutil
 import tempfile
 import threading
@@ -391,6 +392,41 @@ class ClearOldToolResultsTest(CompactTestBase):
         self.assertEqual(agent._clear_old_tool_results(), 0)
         self.assertTrue(all(m["content"] == "x" * 1000
                             for m in agent.history if m.get("role") == "tool"))
+
+    def test_error_envelopes_exempt(self):
+        """失败信封按 JSON 语义豁免：ok:false / 带 error 键的旧结果不清——
+        错误信息是模型"换道"的依据。注意豁免条目不贡献节省量，需多备一条
+        可清结果才过 MIN_SAVING 阈值。"""
+        n = CLEAR_TOOL_RESULTS_KEEP_RECENT + 4
+        err_body = json.dumps({"ok": False, "error": "e" * 900,
+                               "hint": "换个路径"}, ensure_ascii=False)
+        hist = [user("开始干活")]
+        for i in range(n):
+            hist.append(tool_call_asst(call_id=f"c{i}"))
+            body = err_body if i % 2 == 0 else "x" * 1000
+            hist.append(tool_result(body, call_id=f"c{i}"))
+        agent = self.make_agent(history=hist)
+        cleared = agent._clear_old_tool_results()
+        self.assertEqual(cleared, 2)  # 最老 4 条里恰好 2 条可清（奇数位）
+        old = [m for m in agent.history if m.get("role") == "tool"][:-CLEAR_TOOL_RESULTS_KEEP_RECENT]
+        for m in old:
+            if m["content"] == CLEARED_TOOL_RESULT_PLACEHOLDER:
+                continue
+            info = json.loads(m["content"])  # 留下的必须是可解析的错误信封
+            self.assertFalse(info.get("ok", True))
+
+    def test_error_substring_in_success_result_still_cleared(self):
+        """豁免按信封语义而非子串匹配：正文里引用了 "error" 字样的成功结果
+        （如 grep 命中错误处理代码）不豁免，照常清理。"""
+        n = CLEAR_TOOL_RESULTS_KEEP_RECENT + 2
+        body = json.dumps({"ok": True, "result": '处理 "error" 的代码示例 ' + "y" * 1500},
+                          ensure_ascii=False)
+        hist = [user("开始干活")]
+        for i in range(n):
+            hist.append(tool_call_asst(call_id=f"c{i}"))
+            hist.append(tool_result(body, call_id=f"c{i}"))
+        agent = self.make_agent(history=hist)
+        self.assertEqual(agent._clear_old_tool_results(), 2)
 
     def test_small_saving_noop(self):
         """省的字符不到阈值：不动手，保护原始内容。"""

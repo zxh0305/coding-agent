@@ -115,9 +115,10 @@ class ToolContext:
     executor: object = None                     # 命令执行提供者（executor.py seam）：None =
                                                 # 本机子进程；换 Docker 沙箱即注入新提供者
     session_id: str | None = None               # 本会话 id（文档工具据此确定文档归属）
-    subagent_runner: object = None              # fn(task) -> str：只读子代理运行器（spawn_subagent
-                                                # 用）。Agent 构造时自装配为 _spawn_subagent，
-                                                # 工具层不 import agent——依赖保持单向
+    subagent_runner: object = None              # fn(tasks: list[str]) -> str：只读子代理
+                                                # 运行器（spawn_subagent 用，支持并行扇出）。
+                                                # Agent 构造时自装配，工具层不 import
+                                                # agent——依赖保持单向
 
 TOOL_REGISTRY = {
     "todo_write": todo_write,

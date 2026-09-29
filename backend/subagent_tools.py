@@ -1,6 +1,6 @@
 """
-子代理工具（spawn_subagent）——读侧扇出的最小闭环
-====================================================
+子代理工具（spawn_subagent）——读侧扇出
+==========================================
 
 定位（2026-09-29 多 agent 调研定论）：完整的 supervisor/swarm 协作架构不做，
 只做「读侧子代理扇出」——大范围探索/检索/交叉核对派出独立上下文的只读子代理，
@@ -14,12 +14,14 @@ agent.py（Agent._spawn_subagent），经 ToolContext.subagent_runner 注入—�
 依赖，反向 import 会成环）。本地 _err 与 code_tools._err 同理：失败信封
 不向 tools.py 借，避免环。
 
-v0 边界（路线图设计笔记）：
-  * 子代理只读：工具面锁死在 SUBAGENT_TOOLSET；spawn_subagent 不在其中——
-    递归派生在 schema（模型看不见）与执行（_run_tool 名单把关）两处被挡；
-  * 串行：read_only=False，同一轮的多个派生按序跑（并行扇出留 v1）；
-  * 事件不外发：子代理过程不进 SSE，父回合时间线只见一次 tool_call /
-    tool_result（嵌套 trace 的 parent 标识留 v1，契约见 docs/protocol.md）。
+并行扇出（v1）：tasks 数组一次派出多个子任务，运行器在线程池里并发驱动。
+安全前提已逐项核实（2026-09-29）：llm_client.chat_stream 全部状态是调用内
+局部变量，实例上只有 _stream_usage 幂等布尔降级（GIL 下良性竞态）与只读的
+on_retry；browser_tools.manager_for 有锁；每个子代理有独立的 ToolContext/
+history/权限闸门，只读工具面之间无共享写。子代理自身仍零写入工作区。
+
+事件契约（docs/protocol.md §4.3）：子代理过程不外发，父回合时间线只见一次
+tool_call / tool_result（结论信封）；嵌套 trace 的 parent 标识留后续。
 """
 
 import json
@@ -31,10 +33,16 @@ import json
 SUBAGENT_TOOLSET = ("read_file", "list_dir", "grep",
                     "list_attachments", "read_attachment")
 
-# 结论报告长度上限（字符）：上下文隔离的全部意义在于"主代理只付结论的钱"，
-# 一份 60k 的报告等于把子代理的上下文又搬回主代理。超限截断并提示派更窄的
-# 子任务（60k 的硬闸在 agent._backfill_tool_result，这里是刻意更紧的软闸）。
+# 结论报告长度上限（字符，每个子任务各算各的）：上下文隔离的全部意义在于
+# "主代理只付结论的钱"，一份 60k 的报告等于把子代理的上下文又搬回主代理。
+# 超限截断并提示派更窄的子任务（60k 的硬闸在 agent._backfill_tool_result，
+# 这里是刻意更紧的软闸）。
 SUBAGENT_REPORT_MAX_CHARS = 12_000
+
+# 单次派出的并行上限。子代理以 LLM 流式请求为主要等待，3 个并发已能覆盖
+# "多角度同时调查"的常见形态；再多的任务应该分轮派——每多一个并发就多一份
+# 供应商限流/配额压力，收益边际递减。
+SUBAGENT_MAX_PARALLEL = 3
 
 
 def _err(msg: str, hint: str = "") -> str:
@@ -44,23 +52,33 @@ def _err(msg: str, hint: str = "") -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def spawn_subagent(task: str = "", ctx=None) -> str:
-    """派出一个只读侦察子代理，同步跑完，回收最终结论。
+def spawn_subagent(tasks=None, ctx=None) -> str:
+    """派出只读侦察子代理（可并行多个），同步跑完，回收结论。
 
-    task 必须自包含：子代理看不到主对话的任何历史，只看得到这一段描述——
-    目标（要回答什么）/ 期望输出（结论里要有什么）/ 边界（哪些目录、不要
-    做什么）缺一样，侦察就会跑偏。运行器由 agent.py 装配（见模块注释）；
-    未装配（理论上不会发生——Agent 构造时自装配）按配置错误拒绝。
+    tasks 是非空字符串数组（每项一个自包含的子任务），≤SUBAGENT_MAX_PARALLEL
+    个时并发执行、按提交顺序回填结果。每项必须自包含：子代理看不到主对话的
+    任何历史，只看得到这一段描述——目标（要回答什么）/ 期望输出（结论里要
+    有什么）/ 边界（哪些目录、不要做什么）缺一样，侦察就会跑偏。运行器由
+    agent.py 装配（见模块注释）；未装配按配置错误拒绝。
     """
-    task = str(task or "").strip()
-    if not task:
-        return _err("task 不能为空",
-                    "子代理看不到主对话历史，task 必须自包含：目标/期望输出/边界")
+    # 容错：模型把单个任务写成字符串也能接住（按 [tasks] 归一）
+    if isinstance(tasks, str):
+        tasks = [tasks]
+    if not isinstance(tasks, list) or not tasks:
+        return _err("tasks 必须是非空数组",
+                    '示例：{"tasks": ["目标：找出裸 except；边界：只查 *.py；'
+                    '期望输出：文件:行号 列表"]}')
+    clean = [str(t or "").strip() for t in tasks]
+    if any(not t for t in clean):
+        return _err("tasks 里存在空任务", "每个元素都必须是自包含的任务描述")
+    if len(clean) > SUBAGENT_MAX_PARALLEL:
+        return _err(f"一次最多并行派出 {SUBAGENT_MAX_PARALLEL} 个子任务（收到 {len(clean)} 个）",
+                    "把相关的任务合并描述，或分多轮派出")
     runner = getattr(ctx, "subagent_runner", None) if ctx is not None else None
     if runner is None:
         return _err("子代理运行器未注入（系统内部配置问题）")
     try:
-        return runner(task)
+        return runner(clean)
     except Exception as e:  # 运行器内部已兜一层；这里守住"工具绝不抛"的契约
         return _err(f"子代理执行失败: {type(e).__name__}: {e}",
                     "可缩小任务范围重试，或主代理自行侦察")
@@ -71,9 +89,10 @@ SUBAGENT_TOOL_REGISTRY = {
 }
 
 SUBAGENT_TOOL_READ_ONLY = {
-    # 刻意的 False：子代理一跑十几轮、数分钟，串行保证同一轮派多个时按序
-    # 执行、结果可预期；并行扇出（取最慢者的收益）留 v1，前提是先确认
-    # llm 客户端多请求并发安全。
+    # 刻意的 False：本工具一次调用内部自带并发（≤3 个子代理），不需要、也不
+    # 应该靠"同轮多个调用并行"的分组调度来扇出——那会让多个子代理调用挤进
+    # 只读并行组，与父回合其余只读工具混跑，失败面和事件序都更难推理。
+    # 单个调用独占一个串行组，并发被封装在信封之内。
     "spawn_subagent": False,
 }
 
@@ -81,25 +100,28 @@ SUBAGENT_TOOL_SCHEMAS = [{
     "type": "function",
     "function": {
         "name": "spawn_subagent",
-        "description": "派出一个只读侦察子代理，在独立上下文里替你完成大范围探索/检索/"
-                       "交叉核对，跑完后只把最终结论回收给你（它的中间读取不占用你的上下文）。"
-                       "适用：要读很多文件才能回答的定位问题、全库模式调查、多文件交叉核对；"
+        "description": "派出只读侦察子代理，在独立上下文里替你完成大范围探索/检索/"
+                       "交叉核对，跑完后只把结论回收给你（它们的中间读取不占用你的上下文）。"
+                       "tasks 数组一次可派 1~3 个子任务，多角度的调查应一次并行派出；"
                        "一两次 read_file/grep 就能答的简单问题不要派，直接自己查更快。"
-                       "task 必须自包含（子代理看不到主对话历史），写清三件事："
+                       "每个 task 必须自包含（子代理看不到主对话历史），写清三件事："
                        "目标（要回答什么问题）/ 期望输出（结论里要有什么）/ "
                        "边界（限定哪些目录或文件、不要做什么）。"
-                       "子代理没有写权限：它只侦察，改文件/跑命令仍由你自己决定。"
-                       "示例：{\"task\": \"目标：找出 workspace 里所有裸 except 的位置；"
-                       "边界：只查 *.py；期望输出：文件:行号 列表\"}。",
+                       "子代理没有写权限：它们只侦察，改文件/跑命令仍由你自己决定。"
+                       '示例：{"tasks": ["目标：找出 workspace 里所有裸 except 的位置；'
+                       '边界：只查 *.py；期望输出：文件:行号 列表"]}',
         "parameters": {
             "type": "object",
             "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "侦察任务描述（自包含：目标/期望输出/边界）",
+                "tasks": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "子任务描述数组（1~3 个，每个自包含：目标/期望输出/边界）",
+                    "minItems": 1,
+                    "maxItems": SUBAGENT_MAX_PARALLEL,
                 },
             },
-            "required": ["task"],
+            "required": ["tasks"],
         },
     },
 }]

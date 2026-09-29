@@ -66,11 +66,13 @@ delta 归并规则：`answer_delta` 带 `mid` → 归并进同一气泡；`reaso
 | `browser_shot` | `{url, note, shot}` | browser_screenshot 后（shot 是截图读取接口的相对 URL） |
 | `usage` | `{prompt_tokens, completion_tokens, ...}` | 每轮真实用量；进容量缓存 `_ctx[sid]` |
 
-**子代理（spawn_subagent）v0 契约**：子代理是父回合内部同步跑的只读侦察员，
+**子代理（spawn_subagent）契约**：子代理是父回合内部同步跑的只读侦察员，
 其全部过程事件（round/answer_delta/tool_call/…）**就地消费、不外发**——父回合
-时间线只见一对 `tool_call` / `tool_result`，后者是结论信封
-`{ok, report, rounds, usage}`（失败为 `{ok:false, error, hint?}`）。不做任何
-特殊前端处理。嵌套 trace（parent 标识、子代理折叠卡）留 v1。
+时间线只见一对 `tool_call` / `tool_result`。结果信封
+`{ok:true, results:[{task, ok:true, report, rounds?, usage?} | {task, ok:false, error, hint?}]}`：
+`tasks` 数组 1~3 个子任务，多任务并行执行、按提交顺序回填，单任务失败只折损
+自己的条目；参数级失败为 `{ok:false, error, hint?}`。不做任何特殊前端处理。
+嵌套 trace（parent 标识、子代理折叠卡）留后续。
 
 ### 4.4 压缩与历史
 

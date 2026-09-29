@@ -354,6 +354,14 @@ class PermissionGate:
         return self._mode
 
     @property
+    def user_rules_loader(self):
+        """用户规则加载器的只读暴露。子代理构造自己的闸门（ask_timeout=0）
+        时必须复用同一加载器：用户的自定义 deny 规则若不跟过去，子代理就成了
+        绕过个性化禁令的旁路（父代理被禁读的路径子代理能读）；allow 规则同理
+        生效。ask 规则带下去无害——子代理 ask_timeout=0，ask 立即按拒绝收场。"""
+        return self._user_rules_loader
+
+    @property
     def pending_count(self) -> int:
         """当前有多少 ask 请求正等用户确认（0 = 没卡在闸门上）。
 

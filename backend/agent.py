@@ -36,7 +36,8 @@ from concurrent.futures import ThreadPoolExecutor
 from code_tools import prepare_workspace
 from memory import memory_dir, memory_index_block
 from permissions import ALLOW, ASK, DENY, PermissionGate, Verdict, rejection_result
-from subagent_tools import SUBAGENT_REPORT_MAX_CHARS, SUBAGENT_TOOLSET
+from subagent_tools import (SUBAGENT_MAX_PARALLEL, SUBAGENT_REPORT_MAX_CHARS,
+                            SUBAGENT_TOOLSET)
 from system_prompt import SUBAGENT_SYSTEM_PROMPT, SYSTEM_PROMPT
 from tools import TOOL_SCHEMAS, ToolContext, error_result, execute_tool, is_read_only, tool_schema
 from ui import colored
@@ -588,7 +589,6 @@ class Agent:
             self.trace.append({"type": "round", "round": round_no})
             yield "round", {"round": round_no}
 
-            # 每轮都重发【系统提示 + 完整历史】—— 这就是 LLM 的全部"记忆"
             # 每轮都重发【系统提示 + 完整历史】—— 这就是 LLM 的全部"记忆"。
             # 主模型不支持视觉时，先把历史里的图片剥离成文字提示（图片数据留在
             # self.ctx.images，由 analyze_image 工具借视觉模型识别）。
@@ -898,26 +898,60 @@ class Agent:
         self.cancel_event = cancel_event
         yield from self._run(user_input)
 
-    def _spawn_subagent(self, task: str) -> str:
-        """构造并同步驱动一个只读侦察子代理，返回结论信封 JSON（spawn_subagent
-        的运行器，装配在 ctx.subagent_runner）。
+    def _spawn_subagent(self, tasks: list[str]) -> str:
+        """构造并同步驱动只读侦察子代理（tasks 数组），返回结论信封 JSON
+        （spawn_subagent 的运行器，装配在 ctx.subagent_runner）。
+
+        并行扇出：>1 个任务时交给线程池并发驱动，上限 SUBAGENT_MAX_PARALLEL
+        （工具层已把关）。安全前提已逐项核实（论证见 subagent_tools.py 模块
+        注释）：llm 客户端请求间无共享可变状态、子代理各自持有独立的
+        ToolContext/history/闸门、工具面只读无共享写。线程池只在本次工具调用
+        内存在，spawn_subagent 独占一个串行组，父循环此刻不做任何其它动作。
 
         与主代理的四个刻意差异：
           * 工具面：SUBAGENT_TOOLSET（只读侦察），spawn_subagent 不在其中——
             递归派生在 schema（模型看不见）与 _run_tool 名单闸两处被挡；
           * 轮数：SUBAGENT_MAX_ROUNDS 兜底，跑满走同一套禁工具收尾轮；
-          * 权限：全新闸门 ask_timeout=0——只读工具走内置放行规则；万一命中
-            ask（如幻觉出的 run_bash）无卡可弹，按拒绝立即收场（安全侧），
-            绝不允许子代理在无人应答的等待里挂死父回合；
-          * 事件：过程事件就地消费不外发（v0 契约，docs/protocol.md §4.3），
+          * 权限：全新闸门 ask_timeout=0，但【继承用户规则加载器】——自定义
+            deny/allow 规则必须对子代理同样生效，否则子代理成了绕过个性化
+            禁令的旁路；ask 无卡可弹，按拒绝立即收场（安全侧）；
+          * 事件：过程事件就地消费不外发（契约见 docs/protocol.md §4.3），
             父回合时间线只见一次 tool_call/tool_result；子代理的 history/
             trace 随实例销毁，不落库、不进父历史。
-
-        同步跑完是刻意的：spawn_subagent 标记 read_only=False，天然独占一个
-        串行组，父循环在工具结果回填前不会有其它动作——本方法内直接迭代生成
-        器没有并发问题。"""
+        """
         if self.cancel_event is not None and self.cancel_event.is_set():
             return error_result("父回合已停止，子代理未派出")
+        if len(tasks) == 1:
+            results = [self._run_one_subagent(tasks[0])]
+        else:
+            with ThreadPoolExecutor(
+                    max_workers=min(len(tasks), SUBAGENT_MAX_PARALLEL)) as pool:
+                # futures 顺序 = 提交顺序 = 回填顺序：结果与任务的配对由下标
+                # 保证，与哪个先跑完无关（与工具并行组同一条回填不变式）
+                futures = [pool.submit(self._run_one_subagent, t) for t in tasks]
+                results = []
+                for task, f in zip(tasks, futures):
+                    try:
+                        results.append(f.result())
+                    except Exception as e:  # 单任务意外炸穿：只折损自己，不连坐同批
+                        log.warning("子代理线程意外失败（task=%.40s）：%s", task, e)
+                        results.append({"task": task, "ok": False,
+                                        "error": f"子代理执行失败: {e}",
+                                        "hint": "可缩小任务范围重试，或主代理自行侦察"})
+        return json.dumps({"ok": True, "results": results}, ensure_ascii=False)
+
+    def _run_one_subagent(self, task: str) -> dict:
+        """跑一个子代理，返回结果条目。本方法【不抛异常】：单个子代理的任何
+        失败都折叠成自己的 error 条目，绝不连坐同批其它任务（并行时它跑在线程
+        池工作线程上，与工具并行组的"单工具异常不连坐"同一纪律）。"""
+        try:
+            return self._run_one_subagent_inner(task)
+        except Exception as e:
+            log.warning("子代理执行失败（task=%.40s）：%s", task, e)
+            return {"task": task, "ok": False, "error": f"子代理执行失败: {e}",
+                    "hint": "可缩小任务范围重试，或主代理自行侦察"}
+
+    def _run_one_subagent_inner(self, task: str) -> dict:
         child = Agent(llm=self.llm,
                       system_prompt=SUBAGENT_SYSTEM_PROMPT,
                       max_rounds=SUBAGENT_MAX_ROUNDS,
@@ -925,44 +959,42 @@ class Agent:
                       vision_supported=False,   # 工具面里没有 analyze_image
                       workspace=self.ctx.workspace,
                       context_window=self.context_window,
-                      permission_gate=PermissionGate(self.ctx.workspace, ask_timeout=0.0),
+                      permission_gate=PermissionGate(
+                          self.ctx.workspace, ask_timeout=0.0,
+                          user_rules_loader=self.permissions.user_rules_loader),
                       session_id=self.ctx.session_id,  # read_attachment 据此定位上传附件
                       model_tag=self.model_tag,
                       allowed_tools=SUBAGENT_TOOLSET)
         rounds, answer, stopped, usage = 0, "", False, {}
-        try:
-            for kind, payload in child.run_attached(
-                    task, self.cancel_event or threading.Event()):
-                if kind == "round":
-                    rounds = payload.get("round") or rounds
-                elif kind == "done":
-                    answer = str(payload.get("answer") or "")
-                    stopped = bool(payload.get("stopped"))
-                    usage = payload.get("usage") or {}
-        except Exception as e:  # LLM 层的 RuntimeError 等：转失败信封交主模型改道
-            log.warning("子代理执行失败：%s", e)
-            return error_result(f"子代理执行失败: {e}",
-                                "可缩小任务范围重试，或主代理自行侦察")
+        for kind, payload in child.run_attached(
+                task, self.cancel_event or threading.Event()):
+            if kind == "round":
+                rounds = payload.get("round") or rounds
+            elif kind == "done":
+                answer = str(payload.get("answer") or "")
+                stopped = bool(payload.get("stopped"))
+                usage = payload.get("usage") or {}
         # 停止判定必须在结论判定之前：被掐断的子代理走「手动停止」收尾，done
         # 里仍带着半截回答——那是残缺的中间产物，不是结论，回收它并继续跑
         # 父回合等于无视用户刚刚表达的「停下」。
         if stopped or (self.cancel_event and self.cancel_event.is_set()):
-            return error_result("子代理被用户停止，未回收结论",
-                                "停止是全局的；需要继续侦察请在下一轮重新派出")
+            return {"task": task, "ok": False,
+                    "error": "子代理被用户停止，未回收结论",
+                    "hint": "停止是全局的；需要继续侦察请在下一轮重新派出"}
         if not answer.strip():
-            return error_result("子代理未产出结论（轮数耗尽且收尾轮为空）",
-                                "缩小任务范围后重试，或主代理自行侦察")
+            return {"task": task, "ok": False,
+                    "error": "子代理未产出结论（轮数耗尽且收尾轮为空）",
+                    "hint": "缩小任务范围后重试，或主代理自行侦察"}
         report = answer[:SUBAGENT_REPORT_MAX_CHARS]
         if len(answer) > SUBAGENT_REPORT_MAX_CHARS:
             report += (f"\n…[报告超长已截断，共 {len(answer)} 字符；"
                        "需要细节请派边界更窄的子任务分次侦察]")
-        return json.dumps({"ok": True, "report": report, "rounds": rounds,
-                           # 子代理用量随信封透出（可观测），但不进父回合的
-                           # usage_total/_stats——用量页按主回合消息归账（见
-                           # 可优化清单：子代理用量归账留后续）
-                           "usage": {"prompt_tokens": usage.get("prompt_tokens") or 0,
-                                     "completion_tokens": usage.get("completion_tokens") or 0}},
-                          ensure_ascii=False)
+        return {"task": task, "ok": True, "report": report, "rounds": rounds,
+                # 子代理用量随信封透出（可观测），但不进父回合的
+                # usage_total/_stats——用量页按主回合消息归账（可优化清单：
+                # 子代理用量归账留后续）
+                "usage": {"prompt_tokens": usage.get("prompt_tokens") or 0,
+                          "completion_tokens": usage.get("completion_tokens") or 0}}
 
     # ------------------------------------------------------------------
     # 上下文压缩
@@ -1017,6 +1049,20 @@ class Agent:
             lines.append(f"—— {label} ——\n" + ("\n".join(parts) if parts else "（无正文）"))
         return "\n\n".join(lines)
 
+    @staticmethod
+    def _is_error_envelope(content: str) -> bool:
+        """工具结果是否为失败信封（{ok:false,…} 或带 error 键的 JSON 对象）。
+
+        按信封语义判断而非子串匹配（'"error" in content' 会把正文里恰好引用
+        了 error 字样的成功结果误判成错误，比如 grep 命中错误处理代码）。宽
+        容错口径：解析不出 JSON 的历史内容一律当非错误——清掉它无损，误豁免
+        反而让大块可清的内容一直留着。"""
+        try:
+            info = json.loads(content)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return False
+        return isinstance(info, dict) and (info.get("ok") is False or "error" in info)
+
     def _clear_old_tool_results(self, keep_recent: int = CLEAR_TOOL_RESULTS_KEEP_RECENT) -> int:
         """分级压缩第一档（无损、便宜）：把较早的工具结果正文换成一行占位符。
 
@@ -1059,10 +1105,12 @@ class Agent:
                 continue  # 已经是占位符/空：跳过（幂等，可反复调用）
             if content == CLEARED_TOOL_RESULT_PLACEHOLDER:
                 continue
-            if '"error"' in content or '"ok": false' in content:
+            if self._is_error_envelope(content):
                 # 豁免白名单：失败结果不清。错误信息（含权限拒绝）是模型判断
                 # "此路不通、换道"的依据，清掉它，模型再遇同类场景会原样重踩；
-                # 且错误结果通常很短，清了也省不了多少。
+                # 且错误结果通常很短，清了也省不了多少。按信封语义判断而非
+                # 子串匹配：正文里恰好引用了 "error" 字样的成功结果（grep 命中
+                # 错误处理代码等）不该被误豁免。
                 continue
             saved += len(content)
             plan.append((i, content))
