@@ -303,6 +303,9 @@ coding-agent/
 │   ├── cli.py        # 命令行版入口
 │   ├── agent.py      # ★ Agent 核心循环
 │   ├── code_tools.py # ★ coding 工具集：工作区 + 读写/patch/grep/bash
+│   ├── browser_tools.py # 内置 Chromium：打开/点击/输入/截图（可选依赖 playwright）
+│   ├── attachment_tools.py # 会话附件：按需分页读取用户上传的文本/代码
+│   ├── archive_tools.py # 历史会话归档/恢复
 │   ├── doc_tools.py  # 文档工具：写会话 Markdown（右侧面板查看）
 │   ├── git_tools.py  # Git 只读查询（前端提交记录浮窗）
 │   ├── llm_client.py # LLM 客户端（OpenAI 兼容 + Anthropic）+ .env 读写
@@ -315,14 +318,21 @@ coding-agent/
 │   ├── logger.py     # 日志配置（data/logs/，按天切分，自动清理）
 │   ├── ui.py         # 终端彩色输出（CLI 用）
 │   ├── tests/        # 单元测试（cd backend && python3 -m unittest discover -s tests -t .）
-│   └── manual/       # 真机手测脚本 + 迁移演练
+│   └── manual/       # 真机手测脚本 + 迁移演练 + 冒烟脚本（node backend/manual/smoke_*.js）
 ├── frontend/
 │   ├── index.html    # 页面结构：任务列表 + 对话区 + 文档栏 + 各种浮窗
 │   ├── app.js        # 前端逻辑：fetch API、EventSource、渲染、交互
-│   └── style.css     # 样式
+│   ├── blocks.js / render_blocks.js # 回合块状态机与渲染（实时/回放两条路径）
+│   ├── md.js         # Markdown 渲染引擎（vendor marked/DOMPurify/hljs，白名单消毒）
+│   ├── mode.js       # 权限模式切换
+│   ├── *.test.mjs    # 前端单元测试（node --test，Node 原生 runner，零依赖）
+│   └── vendor/       # 第三方库本地副本（marked、DOMPurify、highlight.js）
 ├── data/             # 全部运行时数据（不进 git）
 │   ├── agent_data.db # SQLite 数据库：任务、消息历史、供应商与模型配置
 │   ├── artifacts/    # 超大消息正文的外置 JSON
+│   ├── attachments/  # 会话附件（按会话 id 隔离）
+│   ├── browser-profiles/ # 内置浏览器的独立 profile（带登录态）
+│   ├── docs/         # agent 生成的会话文档
 │   ├── logs/         # 运行日志（按天切分）
 │   └── backups/      # 手工备份
 ├── workspace/        # Agent 的默认工作区（每个任务可单独切换）
@@ -351,8 +361,15 @@ coding-agent/
 ## 十二、开发
 
 ```bash
-# 单元测试
+# 后端单元测试（纯标准库零依赖）
 cd backend && python3 -m unittest discover -s tests -t .
+
+# 前端单元测试（Node 原生 runner，零依赖；CI 同款命令）
+node --test frontend/blocks.test.mjs frontend/event_contract.test.mjs frontend/render_blocks.test.mjs
+
+# 冒烟脚本：进行中回合 trace 的两条渲染路径（需 Node，不发请求）
+node backend/manual/smoke_running_trace.js
+node backend/manual/smoke_trace_takeover.js
 
 # 真机手测脚本（临时库，可重复跑）
 cd backend/manual

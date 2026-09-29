@@ -1,5 +1,5 @@
 // 冒烟验证②：快照卡与 SSE 补发实时卡的互斥（tagLiveTrace 打标 + ensureTrace 接管）
-// 用法：node tests/smoke_trace_takeover.js
+// 用法：node backend/manual/smoke_trace_takeover.js
 // 做法：从 frontend/app.js 源码里按花括号配平截取这两个函数体（测的是本体不是复刻），
 // 把模块级 let traceEl 的读写替换为注入的 ref，chatEl/document 走最小 DOM stub。
 const fs = require("fs");
@@ -61,7 +61,7 @@ global.document = {
 };
 
 // —— 花括号配平截取函数体（非贪婪正则会吃掉嵌套块，不能用）——
-const src = fs.readFileSync(path.join(__dirname, "../frontend/app.js"), "utf8");
+const src = fs.readFileSync(path.join(__dirname, "../../frontend/app.js"), "utf8");
 function grabFn(name) {
   const start = src.indexOf("function " + name + "(");
   if (start < 0) throw new Error("找不到函数 " + name);

@@ -12,3 +12,6 @@ data/
 
 # 真机评估脚本的一次性结果
 backend/manual/eval_patch_*.json
+
+# pytest 试验残留（本项目用 unittest；目录已删，防再生成）
+.pytest_cache/

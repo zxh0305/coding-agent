@@ -1,5 +1,5 @@
 // 冒烟验证：进行中回合快照（_runningTrace）在两条渲染路径下都能画出 process 块
-// 用法：node tests/smoke_running_trace.js
+// 用法：node backend/manual/smoke_running_trace.js
 const path = require("path");
 const fs = require("fs");
 
@@ -29,13 +29,13 @@ global.document = {
 };
 
 // 加载两个模块（frontend 下是 UMD 风格：优先 module.exports，其次 window）
-const src = fs.readFileSync(path.join(__dirname, "../frontend/blocks.js"), "utf8");
+const src = fs.readFileSync(path.join(__dirname, "../../frontend/blocks.js"), "utf8");
 const window = {};
 const mod = { exports: {} };
 new Function("module", "window", "document", src)(mod, window, global.document);
 const Blocks = mod.exports || window.CodingAgentBlocks;
 
-const src2 = fs.readFileSync(path.join(__dirname, "../frontend/render_blocks.js"), "utf8");
+const src2 = fs.readFileSync(path.join(__dirname, "../../frontend/render_blocks.js"), "utf8");
 const mod2 = { exports: {} };
 new Function("module", "window", "document", src2)(mod2, window, global.document);
 const RB = mod2.exports || window.CodingAgentRenderBlocks;
