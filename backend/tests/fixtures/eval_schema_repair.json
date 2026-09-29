@@ -1,0 +1,18 @@
+{
+  "name": "schema_repair",
+  "description": "回归剧本：模型把 arguments 的 JSON 写坏 → 收到带 schema 的错误信封 → 同轮修正重试成功。锁『参数解析失败回传 schema』的端到端回路（agent 收到错误后无需用户介入自行恢复）。",
+  "workspace_files": {
+    "note.txt": "hello world"
+  },
+  "user": "读出 note.txt 的内容。",
+  "turns": [
+    {"tool_calls": [{"name": "read_file", "arguments_raw": "{\"pth\": \"note.txt\""}]},
+    {"tool_calls": [{"name": "read_file", "arguments": {"path": "note.txt"}}]},
+    {"content": "note.txt 的内容是 hello world。"}
+  ],
+  "expect": {
+    "tool_sequence": ["read_file", "read_file"],
+    "first_result_has_schema": true,
+    "answer_contains": "hello world"
+  }
+}

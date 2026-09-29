@@ -1,0 +1,20 @@
+{
+  "name": "fix_bug_verify",
+  "description": "回归剧本：用户报 bug → read_file → apply_patch → run_bash 验证 → 中文总结。锁『读-改-验』主干动作序列与改动在工作区的真实落地。",
+  "workspace_files": {
+    "demo.py": "def add(a, b):\n    return a - b\n"
+  },
+  "user": "demo.py 的 add 函数有 bug：2 加 2 应该等于 4。修复并用 python3 验证。",
+  "turns": [
+    {"tool_calls": [{"name": "read_file", "arguments": {"path": "demo.py"}}]},
+    {"tool_calls": [{"name": "apply_patch", "arguments": {"path": "demo.py", "search": "    return a - b", "replace": "    return a + b"}}]},
+    {"tool_calls": [{"name": "run_bash", "arguments": {"command": "python3 -c \"import demo; print(demo.add(2, 2))\""}}]},
+    {"content": "已修复：add 原来返回 a - b，已改为 a + b；python3 运行 add(2, 2) 输出 4，验证通过。"}
+  ],
+  "expect": {
+    "tool_sequence": ["read_file", "apply_patch", "run_bash"],
+    "tool_results_ok": [true, true, true],
+    "answer_contains": "已修复",
+    "file_contains": {"demo.py": "return a + b"}
+  }
+}
