@@ -23,6 +23,7 @@ Agent 核心循环 —— 本项目最值得精读的文件
 Function Calling、Tool Use、ReAct……底层都是这个循环的不同包装。
 """
 
+import datetime
 import hashlib
 import json
 import logging
@@ -237,6 +238,9 @@ class Agent:
         # 每一轮的整段历史缓存全部失效、按全价重算。快照保住前缀；跨回合的
         # 新鲜度不受影响——下一回合开始时重新快照，刚写的记忆那时自然可见。
         self._memory_snapshot: str | None = None
+        # 当前时间块（_system_content 首次调用时生成并缓存，见其 docstring）。
+        # 会话开始时刻的一次性快照：逐轮现取会改坏 system 前缀的 KV 缓存。
+        self._time_block: str | None = None
         # 压缩摘要连续失败计数（熔断，见 MAX_COMPACT_FAILURES）：成功清零。
         self._compact_fail_streak = 0
         # 最近读取的文件（read_file 的实际返回片段，最旧在前，容量见
@@ -277,6 +281,11 @@ class Agent:
         关键不变式：记忆只进 system 消息，绝不进消息历史——上下文压缩只重写
         消息历史的模型视图（_visible_history）、从不修改 system，因此 compact
         之后记忆原样保留，也不会被重复注入。
+
+        当前时间块：早期的 current_time 工具（已移除）让模型"问一次时间花一轮
+        调用"，而这里按会话开始时刻一次性注入、逐字节缓存——模型随时知道
+        "今天是几号"，长会话里流逝的分钟数不值得用"每轮改坏 system 前缀缓存"
+        去换精确。排在记忆索引之后：最稳定的部分在前（前缀缓存从头部命中）。
         CLI（cli.py）与 Web（app.py）都不传 system_prompt，默认值即
         SYSTEM_PROMPT，注入自动生效；轮末【自动提取】目前只挂 Web worker
         （app.py _run_round 收尾处），CLI 不触发——后续要挂时调
@@ -284,7 +293,12 @@ class Agent:
         """
         block = (self._memory_snapshot if self._memory_snapshot is not None
                  else memory_index_block(memory_dir(self.ctx.workspace)))
-        return self.system_prompt + block
+        if self._time_block is None:
+            now = datetime.datetime.now()
+            self._time_block = (
+                f"\n\n【当前时间】{now:%Y-%m-%d %H:%M} 周{'一二三四五六日'[now.weekday()]}"
+                "（会话开始时间；此后经过的时长请按对话推进自行估算）")
+        return self.system_prompt + block + self._time_block
 
     def _visible_history(self) -> list[dict]:
         """模型视图的"该看哪些消息"——压缩的唯一生效点（纯函数，测试覆盖）。
@@ -1149,9 +1163,9 @@ class Agent:
 
         为什么"读写分组"能保证顺序安全（效果等价于纯串行执行）：
         1. 组内并行不改变任何结果：read_only 工具对工作区和会话状态零写入
-           （read_file / list_dir / grep 只打开文件读，calculator / current_time
-           是纯函数），彼此没有数据依赖——谁先谁后执行，各自的输出都一样。
-           并行只是把总耗时从"各调用相加"变成"取最慢者"；
+           （read_file / list_dir / grep 只打开文件读，todo_write 只写
+           ToolContext 内存），彼此没有数据依赖——谁先谁后执行，各自的输出
+           都一样。并行只是把总耗时从"各调用相加"变成"取最慢者"；
         2. 组间屏障保住读写顺序：非只读工具会改工作区状态（写文件/改代码/
            跑命令），它与前后的调用存在真实依赖——写之前的读组必须全部
            完成（不能读到"尚未发生的写"），写之后的调用必须等写落地（才能

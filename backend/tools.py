@@ -2,7 +2,7 @@
 工具层（Tools / Function Calling）
 ==================================
 
-LLM 本身只会"生成文字"，不能算数、不知道现在几点、查不了天气。
+LLM 本身只会"生成文字"，改不了文件、跑不了命令。
 工具就是给 Agent 装上的"手脚"：
 
   1. schema —— JSON 格式的"说明书"，随每次请求发给 LLM。
@@ -12,13 +12,15 @@ LLM 本身只会"生成文字"，不能算数、不知道现在几点、查不�
 
 一个工具什么时候被调用、传什么参数，是 LLM 决定的；
 但真正执行的一定是我们本地的 Python 代码 —— 这就是 Function Calling 的本质。
+
+工具面收敛原则（对齐 Claude Code / ZCode 的"少而强"）：能被 run_bash 覆盖的
+小工具不单列（早期 demo 工具 calculator / current_time / get_weather 已移除，
+时间改为 system 消息注入，见 agent._system_content）——每个工具的 schema 都
+随每次请求全量发送，砍掉冗余工具就是省上下文。
 """
 
-import ast
-import datetime
 import inspect
 import json
-import operator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,77 +28,7 @@ from pathlib import Path
 # 第一部分：工具实现（普通 Python 函数，返回值统一转成字符串）
 # ---------------------------------------------------------------------------
 
-# calculator 用"白名单"方式做安全求值：只允许数字和四则运算，
-# 绝不能直接 eval() 用户/模型给来的字符串（会被注入任意代码）。
-_ALLOWED_BINOPS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv,
-    ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
-}
-_ALLOWED_UNARYOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
 
-
-def _safe_eval(node):
-    if isinstance(node, ast.Expression):
-        return _safe_eval(node.body)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
-        return _ALLOWED_BINOPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
-        return _ALLOWED_UNARYOPS[type(node.op)](_safe_eval(node.operand))
-    raise ValueError(f"表达式中含有不允许的元素：{ast.dump(node)}")
-
-
-def calculator(expression: str) -> str:
-    """计算四则运算表达式，如 '37*89+100'。"""
-    try:
-        value = _safe_eval(ast.parse(expression.strip(), mode="eval"))
-    except ZeroDivisionError:
-        return error_result("除数为 0", "改写表达式避开除零，或先算分母确认非零")
-    except (SyntaxError, ValueError) as e:
-        return error_result(f"表达式不合法: {e}", "只允许数字、四则运算符（+ - * / // % **）和括号，检查后再试")
-    # 演示约定：工具返回值统一是 JSON 字符串（LLM 读起来最稳定）
-    return json.dumps({"ok": True, "result": f"{expression} = {value}"}, ensure_ascii=False)
-
-
-def current_time() -> str:
-    """返回当前本地时间。"""
-    now = datetime.datetime.now()
-    return json.dumps(
-        {"ok": True,
-         "result": f"{now.strftime('%Y-%m-%d %H:%M:%S')} 周{'一二三四五六日'[now.weekday()]}"},
-        ensure_ascii=False,
-    )
-
-
-# 模拟数据：真实项目里这里往往是调外部 API（高德/和风天气等）
-_FAKE_WEATHER = {
-    "北京": ("晴", 22, "西北风 3 级"),
-    "上海": ("多云", 26, "东南风 2 级"),
-    "广州": ("阵雨", 31, "南风 2 级"),
-    "深圳": ("雷阵雨", 30, "东风 3 级"),
-    "杭州": ("晴转多云", 27, "微风"),
-}
-
-
-def get_weather(city: str) -> str:
-    """查询某城市天气（本 demo 返回模拟数据）。"""
-    if city not in _FAKE_WEATHER:
-        return error_result(f"没有 {city} 的天气数据",
-                            f"模拟库只收录：{'、'.join(_FAKE_WEATHER)}，请换这些城市之一")
-    sky, temp, wind = _FAKE_WEATHER[city]
-    return json.dumps(
-        {"ok": True, "result": f"{city}：{sky}，{temp}℃，{wind}（模拟数据）"},
-        ensure_ascii=False,
-    )
-
-
-# ---------------------------------------------------------------------------
 # 任务清单工具（todo_write）：长任务的可见进度条
 # 对齐 Claude Code TodoWrite / ZCode todo.ts 的设计：模型把多步任务拆成清单，
 # 随进度更新状态（pending → in_progress → done）。清单内容存在 ToolContext
@@ -158,51 +90,10 @@ def error_result(error: str, hint: str = "") -> str:
 # 第二部分：工具 schema（发给 LLM 的"说明书"，格式与 OpenAI 兼容接口一致）
 # ---------------------------------------------------------------------------
 
-TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "calculator",
-            "description": "精确计算四则运算（+ - * / // % ** 与括号）。任何算术都必须用它，禁止心算——多位数、小数、"
-                           "大数的心算必错。什么时候不用：一眼可判的比较（3 和 5 谁大）不必调用。"
-                           "示例：{\"expression\": \"(1024*768)/8/1024\"}。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {"type": "string", "description": "要计算的表达式，例如 '37*89+100'"},
-                },
-                "required": ["expression"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "current_time",
-            "description": "获取当前本地日期、时间与星期。凡涉及「现在几点 / 今天几号 / 截止日期还有几天」一律用它，"
-                           "不要凭感觉报时间。无参数。",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "查询指定城市今天的天气（演示用模拟数据，非真实天气，回复用户时须说明）。"
-                           "只支持：北京、上海、广州、深圳、杭州。示例：{\"city\": \"北京\"}。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {"type": "string", "description": "城市名，例如 '北京'"},
-                },
-                "required": ["city"],
-            },
-        },
-    },
-]
+TOOL_SCHEMAS: list[dict] = []
 
 # ---------------------------------------------------------------------------
-# 第三部分：注册表 + 统一执行器（Agent 只跟这里打交道）
+# 第二部分：注册表 + 统一执行器（Agent 只跟这里打交道）
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -224,9 +115,6 @@ class ToolContext:
     session_id: str | None = None               # 本会话 id（文档工具据此确定文档归属）
 
 TOOL_REGISTRY = {
-    "calculator": calculator,
-    "current_time": current_time,
-    "get_weather": get_weather,
     "todo_write": todo_write,
 }
 
@@ -354,17 +242,14 @@ TOOL_REGISTRY.update(BROWSER_TOOL_REGISTRY)
 # 工具元数据：read_only（是否只读、能否并行）
 #
 # 标记原则：只有"对工作区与会话状态零写入"的工具才标 True——
-# read_file / list_dir / grep 只打开文件读，calculator / current_time 是
-# 纯函数，它们与同组其它只读工具并行执行的结果和串行完全一致。
+# read_file / list_dir / grep 只打开文件读，todo_write 只写 ToolContext 内存，
+# 它们与同组其它只读工具并行执行的结果和串行完全一致。
 # 其余一律 False（按写操作串行）：write_file / apply_patch / run_bash 真的
-# 会写；get_weather / analyze_image 虽不写工作区，但要出网/跨模型调用，
-# 保守起见也不并行。Agent 的分组调度完全依据这份表（见 agent.py）。
+# 会写；analyze_image 虽不写工作区，但要出网/跨模型调用，保守起见也不并行。
+# Agent 的分组调度完全依据这份表（见 agent.py）。
 # ---------------------------------------------------------------------------
 
 TOOL_READ_ONLY = {
-    "calculator": True,
-    "current_time": True,
-    "get_weather": False,
     "analyze_image": False,
     # todo_write 只写 ToolContext 内存（不碰工作区/不出网），并行安全
     "todo_write": True,
@@ -387,8 +272,7 @@ def execute_tool(name: str, arguments: dict, ctx: ToolContext | None = None) -> 
     直接告知用户），绝不静默失败。
 
     ctx：本次调用的执行上下文（工作区、图片、看图后端），由 Agent 注入。
-    声明了 ctx 形参的工具（文件/命令/看图类）才拿到它；calculator 这类
-    纯函数工具不声明、也不感知。ctx 不出现在 schema 里——"在哪个工作区
+    声明了 ctx 形参的工具才拿到它。ctx 不出现在 schema 里——"在哪个工作区
     干活"是会话属性，由服务端决定，不该是模型可填的参数。
     """
     func = TOOL_REGISTRY.get(name)
