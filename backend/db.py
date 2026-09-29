@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS providers(
     api_key TEXT DEFAULT '',
     enabled INTEGER DEFAULT 1,
     context_window INTEGER DEFAULT 128000,
+    reasoning_replay INTEGER DEFAULT 0,
     created REAL
 );
 CREATE TABLE IF NOT EXISTS provider_models(
@@ -251,6 +252,11 @@ MIGRATIONS: list[tuple[int, str | None]] = [
     (21, "ALTER TABLE message_usage ADD COLUMN provider_id TEXT"),
     (22, "ALTER TABLE message_usage ADD COLUMN model TEXT"),
     (23, "ALTER TABLE message_usage ADD COLUMN created REAL"),
+    # 24：供应商级 reasoning 回传开关。思考模型（如 DeepSeek thinking 系列）的
+    #    OpenAI 兼容协议要求：带 tools 的请求必须把历史 assistant 消息的
+    #    reasoning_content 原样带回，缺失直接 400；不支持该协议的服务商
+    #    （GLM/OpenAI 等）则要求不出现该字段。按供应商勾选，默认关。
+    (24, "ALTER TABLE providers ADD COLUMN reasoning_replay INTEGER DEFAULT 0"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
