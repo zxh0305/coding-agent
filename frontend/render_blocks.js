@@ -162,9 +162,12 @@
         const t = secs != null ? ` ${deps.fmtElapsed ? deps.fmtElapsed(secs) : secs + "s"}` : "";
         d.querySelector("summary").textContent = `${label}${t} · ${block.steps} 步`;
         if (live != null) {
-          // 生成期间让秒数自己跳动（数据到齐，行为与实时折叠条一致）
+          // 生成期间让秒数自己跳动（数据到齐，行为与实时折叠条一致）。
+          // 停止条件除了节点被移除，还要看 running 类：回合定稿/出错时 app.js 只
+          // 摘 running 不移除节点（用户还要点开回看过程），本计时器必须跟着停，
+          // 否则已结束的回合秒数永远在涨（步数还是渲染时的冻结快照，越走越假）。
           const timer = setInterval(() => {
-            if (!d.isConnected) { clearInterval(timer); return; }
+            if (!d.isConnected || !d.classList.contains("running")) { clearInterval(timer); return; }
             d.querySelector("summary").textContent =
               `${label} ${deps.fmtElapsed ? deps.fmtElapsed(Math.max(0, Date.now() / 1000 - block.startedAt)) : Math.round(Date.now() / 1000 - block.startedAt) + "s"} · ${block.steps} 步`;
           }, 200);

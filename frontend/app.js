@@ -2417,16 +2417,7 @@ function finishBoot(caughtUp) {
     // 连上时服务端已无进行中回合，而本页还挂在"生成中"：回合在断线/服务
     // 重启之间死掉了（未落盘）。手动收尾不挂起——手测②"刷新接上进行中
     // 回合"的正常路径不会走到这里（running=true）。
-    setStreaming(false);
-    clearInterval(metaTimer);
-    if (liveBubble) {
-      liveBubble.classList.remove("streaming");
-      const note = document.createElement("div");
-      note.className = "meta";
-      note.textContent = "（连接中断，本回合未完成，输入未保存）";
-      chatEl.appendChild(note);
-    }
-    toast("连接已恢复；中断的回合未保存，请重新发送");
+    finalizeInterruptedRound();
   }
   const segments = [];  // 每段 = { events: [{seq,evt}...], userMid, closed }
   let cur = { events: [], userMid: null, closed: false };
@@ -2451,17 +2442,9 @@ function finishBoot(caughtUp) {
   if (caughtUp && caughtUp.running === false && streaming && !anyRecovered) {
     // 连上时服务端已无进行中回合，而本页还挂在"生成中"：回合在断线/服务
     // 重启之间死掉了（未落盘）。手动收尾不挂起——手测②"刷新接上进行中
-    // 回合"的正常路径不会走到这里（running=true）。
-    setStreaming(false);
-    clearInterval(metaTimer);
-    if (liveBubble) {
-      liveBubble.classList.remove("streaming");
-      const note = document.createElement("div");
-      note.className = "meta";
-      note.textContent = "（连接中断，本回合未完成，输入未保存）";
-      chatEl.appendChild(note);
-    }
-    toast("连接已恢复；中断的回合未保存，请重新发送");
+    // 回合"的正常路径不会走到这里（running=true）。anyRecovered 时段内
+    // 该回合其实已正常落盘（历史里已有），保持静默，只走收尾。
+    finalizeInterruptedRound();
   }
   for (const seg of segments) {
     if (!seg.events.length) continue;
@@ -2474,6 +2457,24 @@ function finishBoot(caughtUp) {
       applyEvent(evt, s);
     }
   }
+}
+
+// 断线/重启后回合已死（服务端 running=false 但本页挂着"生成中"）的统一收尾。
+// 原来这段在 finishBoot 里逐字重复两份，收敛到一处；渲染器路径的过程卡计时器
+// （render_blocks）见 running 类被摘即自停——这里必须摘 running，否则已死回合
+// 的秒数会在屏上永远走字。
+function finalizeInterruptedRound() {
+  setStreaming(false);
+  clearInterval(metaTimer);
+  if (traceEl) traceEl.classList.remove("running");
+  if (liveBubble) {
+    liveBubble.classList.remove("streaming");
+    const note = document.createElement("div");
+    note.className = "meta";
+    note.textContent = "（连接中断，本回合未完成，输入未保存）";
+    chatEl.appendChild(note);
+  }
+  toast("连接已恢复；中断的回合未保存，请重新发送");
 }
 
 // resync：服务端判定缺口补不齐（缓冲被挤掉 / 服务重启内存清空）。
@@ -3035,7 +3036,9 @@ function flushStreamBuffers() {
   if (pendingThink) {
     if (thinkEl) {
       thinkEl.textContent += pendingThink;
-      thinkEl.scrollTop = thinkEl.scrollHeight;
+      // 块内贴底跟随，但用户上滑回看前面的思考时不再拽回——离底一屏内才算"在跟"
+      const nearBottom = thinkEl.scrollHeight - thinkEl.scrollTop - thinkEl.clientHeight < 48;
+      if (nearBottom) thinkEl.scrollTop = thinkEl.scrollHeight;
     }
     pendingThink = "";
     scrollBottom();
@@ -3196,6 +3199,9 @@ function applyEvent(evt, seq) {
     if (traceEl) {
       // 做完任务自动折叠：正文回归"只要答案"；点折叠条仍可回看全过程
       traceEl.open = false;
+      // 摘掉 running：渲染器路径的秒数计时器（render_blocks）见此标记即自停，
+      // 快照卡与实时卡共用这一收尾；本 tab 的 metaTimer 已在上面 clearInterval。
+      traceEl.classList.remove("running");
       const st = liveTracker.state();
       traceEl.querySelector("summary").textContent =
         `已工作 ${fmtElapsed(evt.elapsed_s)} · ${st ? st.steps : 0} 步`;
@@ -3284,6 +3290,7 @@ function applyEvent(evt, seq) {
     retireLiveBubble();
     if (traceEl) {
       traceEl.open = false;  // 出错同样收起过程；点开可排查卡在哪一步
+      traceEl.classList.remove("running");  // 摘标记：渲染器计时器据此自停（同 done 分支）
       traceEl.querySelector("summary").textContent =
         `已工作 ${fmtElapsed((Date.now() - traceStart()) / 1000)} · 出错`;
     }
