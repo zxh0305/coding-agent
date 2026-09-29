@@ -1470,7 +1470,10 @@ def usage_session_rows(days: int | None = None, provider_id: str = "",
             "MAX(u.created) AS last_used "
             "FROM message_usage u LEFT JOIN sessions s ON s.id = u.session_id "
             f"{where} GROUP BY u.session_id "
-            "ORDER BY prompt_tokens + completion_tokens DESC LIMIT 100", args).fetchall()
+            # 裸列名在含 MAX() 的聚合查询里会取"最后一条记录"的值（SQLite 怪癖），
+            # 导致实际按"最后一次请求"排序——必须写全聚合表达式才是会话总用量
+            "ORDER BY SUM(u.prompt_tokens) + SUM(u.completion_tokens) DESC LIMIT 100",
+            args).fetchall()
     # project 与任务列表分组同口径 = workspace 末段；行序仍是总用量倒序，
     # 分组次序由前端按首次出现保持（用量大的项目组排前面）
     return [{"session_id": r["session_id"], "session_title": r["session_title"] or "（已删除会话）",
