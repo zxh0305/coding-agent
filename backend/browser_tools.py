@@ -94,10 +94,17 @@ def cleanup_stale_profiles(keep_days: int) -> int:
 
 
 def close_session(sid: str) -> None:
-    """回合收尾：关掉该会话的浏览器（playwright 进程一并退出），丢掉 profile 引用。
-    profile 目录保留在磁盘上——下次同会话再用时登录态还在。"""
+    """回合收尾：关掉该会话的浏览器进程（playwright 线程一并退出），但
+    manager 实例保留在字典里。profile 目录保留在磁盘上——下次同会话再用
+    时登录态还在。
+
+    不能从 _MANAGERS 删除实例：Agent 构造时把 manager 绑进 ctx.browser
+    （agent.py:259），Agent 实例跨回合复用——删掉后旧引用指向已 close 的
+    死线程，下次 browser_* 工具报 "cannot switch to a different thread
+    (which happens to have exited)"。保留实例则 _ensure 检查 _page 为空
+    会重新惰性拉起新线程，引用始终有效。"""
     with _MANAGERS_LOCK:
-        mgr = _MANAGERS.pop(sid, None)
+        mgr = _MANAGERS.get(sid)
     if mgr:
         mgr.close()
 
