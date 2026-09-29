@@ -133,6 +133,11 @@ async function api(path, options = {}) {
 // Markdown 渲染引擎在 md.js（marked+DOMPurify+hljs，加载顺序见 index.html）；
 // 这里只保留调用方。小工具（格式化/JSON 美化等）继续在本文件。
 
+// 复制按钮用的「消息原文」登记表：Markdown 定稿（renderIntoBubble）会把气泡
+// 子节点整体重建，之后再想从 DOM 拼回带换行的原文已经不可能——所以在构造/
+// 定稿的时刻把原文存进来，📋 点击时取。key 是气泡节点，节点移除后自动回收。
+const msgRawText = new WeakMap();
+
 // 回答气泡：assistant 走 Markdown 渲染，user/error/note 保持纯文本。
 // 纯文本路径用 textContent —— 与旧行为逐字节一致，不引入任何回归。
 function buildBubble(className, text) {
@@ -141,6 +146,7 @@ function buildBubble(className, text) {
   if (className === "assistant") {
     div.classList.add("md");
     div.appendChild(renderMarkdown(text));
+    msgRawText.set(div, text);  // 📋 复制的是 Markdown 源码，不是渲染后的文字
   } else {
     div.textContent = text;
   }
@@ -152,6 +158,61 @@ function buildBubble(className, text) {
 function renderIntoBubble(el, text) {
   el.classList.add("md");
   el.replaceChildren(renderMarkdown(text));
+  msgRawText.set(el, text);  // 定稿才登记：流式期间的半截话不值得复制
+}
+
+// ---------- 气泡动作条：📋 复制 / ✏️ 回退编辑 ----------
+
+// 气泡 + 动作条打包成一组：悬停组内任意位置（包括气泡与按钮之间的空隙）
+// 动作条都保持可见，不会在鼠标从气泡移向下排按钮的半路消失。组是普通
+// 纵向容器，内部元素各自的 align-self 不受影响，布局与气泡直挂等价。
+function wrapWithActions(bubbleEl, actionsEl) {
+  const group = document.createElement("div");
+  group.className = "msg-group";
+  // 对齐方向记在组上（用户消息的动作条靠右、助手靠左），CSS 不必用 :has 反查
+  if (bubbleEl.classList.contains("user")) group.classList.add("is-user");
+  group.appendChild(bubbleEl);
+  group.appendChild(actionsEl);
+  return group;
+}
+
+// 剪贴板：优先 async API；非 https 环境（局域网手机访问 http://ip:端口）
+// 没有 navigator.clipboard，退回 execCommand——两条路都失败才算失败。
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.cssText = "position:fixed;top:0;left:0;opacity:0;pointer-events:none";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch (e2) {
+      return false;
+    }
+  }
+}
+
+// 📋 复制按钮：复制一条消息的原文（助手=Markdown 源码，用户=输入原文）。
+// 点击后短暂变 ✅/❌ 给个反馈，再弹 toast 兜底说明。
+function makeCopyBtn(rawText) {
+  const btn = document.createElement("button");
+  btn.className = "msg-copy";
+  btn.textContent = "📋";
+  btn.title = "复制原文";
+  btn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const ok = await copyText(rawText);
+    btn.textContent = ok ? "✅" : "❌";
+    setTimeout(() => { btn.textContent = "📋"; }, 1200);
+    toast(ok ? "已复制到剪贴板" : "复制失败：浏览器拒绝了剪贴板访问", ok ? "success" : "error");
+  });
+  return btn;
 }
 
 // ---------- 贴底滚动（stick-to-bottom） ----------
@@ -640,6 +701,12 @@ let railScheduled = false;
 // 给一个消息节点打锚（幂等）：mid 用于跳转查找，role 用于 rail 过滤与样式。
 // 返回原节点，方便在 return 语句里链式包一层。
 function railTag(node, mid, role) {
+  // 动作条组：锚点仍打在里面的气泡上（导航条查找选择器只认气泡），
+  // 但返回组本身——调用方插入的是组，气泡与下方的动作条不会分离。
+  if (node && node.classList && node.classList.contains("msg-group")) {
+    railTag(node.firstElementChild, mid, role);
+    return node;
+  }
   if (!node || !node.classList || !node.classList.contains("bubble") &&
       !node.classList.contains("artifact")) return node;
   if (mid) node.dataset.mid = mid;
@@ -1023,6 +1090,8 @@ const blocksRenderer = window.CodingAgentRenderBlocks.createRenderer({
   metaText: metaText,
   compactCard: compactCard,
   fmtElapsed: fmtElapsed,
+  makeCopyBtn: makeCopyBtn,          // 答案气泡下方的 📋 复制原文按钮
+  wrapWithActions: wrapWithActions,  // 气泡 + 动作条悬停组
   // 历史回放错误卡的"重试上一条"按钮：复用与实时 error 事件相同的
   // retryLast() 路径（与 send() 同一条发送链路）。
   makeRetryButton: () => {
@@ -1400,7 +1469,8 @@ function msgImage(src, gallery) {
 // 见 blocks.js 的 blocksFromHistory + render_blocks.js 的 process 分支。
 // 此处不再保留旧实现：同一语义只留一处，避免两边再次不同步。
 
-// 带附件的用户气泡：文字 + 图片缩略图（多图走 2 列网格）/文件名
+// 带附件的用户气泡：文字 + 图片缩略图（多图走 2 列网格）/文件名。
+// 返回「气泡 + 下方动作条」的 msg-group（📋 复制 / ✏️ 回退编辑）。
 function buildUserBubble(text, atts) {
   const div = document.createElement("div");
   div.className = "bubble user";
@@ -1410,27 +1480,17 @@ function buildUserBubble(text, atts) {
     t.textContent = text;
     div.appendChild(t);
   }
-  // ✏️ 回退编辑入口（ZCode editUserQuery）：悬停浮现，点击把这一轮退回输入框。
-  // mid 在点击时从最近的 [data-role="user"] 上读——自己刚发的气泡要等 turn_end
-  // 才回填 mid，构造时不知道，所以不能在渲染期绑定。
-  const edit = document.createElement("button");
-  edit.className = "ub-edit";
-  edit.textContent = "✏️";
-  edit.title = "退回到这一轮重新编辑";
-  div.appendChild(edit);
+  // 附件部分与旧实现一致：图片进灯箱、文件名点开附件浮窗
   const imgs = (atts || []).filter(a => a.kind === "image" && a.preview);
   const sources = imgs.map(a => a.preview);  // 同组：灯箱左右切换的序列
   for (const a of atts || []) {
     if (a.kind === "image" && a.preview) {
       div.appendChild(msgImage(a.preview, sources));
     } else {
-      // 文件名可点：直接打开会话附件浮窗并定位到这份文件——否则附件发出去
-      // 之后就只剩这行死文本，用户想再看一眼只能去翻磁盘。
-      if (a.kind === "image") {
-        // 图片但 preview 为空（turn_start 补发路径只带 kind/name，不落盘所以
-        // 没有可回放的预览）：直接跳过不渲染。占位芯片既无信息量又误导
-        // （点了没反应），宁缺勿滥——文字正文不受影响。
-      } else {
+      // 图片但 preview 为空（turn_start 补发路径只带 kind/name，不落盘所以
+      // 没有可回放的预览）：直接跳过不渲染。占位芯片既无信息量又误导
+      // （点了没反应），宁缺勿滥——文字正文不受影响。
+      if (a.kind !== "image") {
         // 文件名可点：直接打开会话附件浮窗并定位到这份文件——否则附件发出去
         // 之后就只剩这行死文本，用户想再看一眼只能去翻磁盘。
         const f = document.createElement("div");
@@ -1451,7 +1511,18 @@ function buildUserBubble(text, atts) {
     }
   }
   if (imgs.length > 1) div.classList.add("multi-img");
-  return div;
+  // ✏️ 回退编辑（ZCode editUserQuery）：点击把这一轮退回输入框。mid 在点击时
+  // 从最近的 [data-role="user"] 上读——自己刚发的气泡要等 turn_end 才回填 mid，
+  // 构造时不知道，所以不能在渲染期绑定。动作条在气泡下方，不再叠在文字上。
+  const actions = document.createElement("div");
+  actions.className = "msg-actions";
+  actions.appendChild(makeCopyBtn(text || ""));
+  const edit = document.createElement("button");
+  edit.className = "ub-edit";
+  edit.textContent = "✏️";
+  edit.title = "退回到这一轮重新编辑";
+  actions.appendChild(edit);
+  return wrapWithActions(div, actions);
 }
 
 function userBubble(text, atts, mid) {
@@ -1487,7 +1558,10 @@ chatEl.addEventListener("click", (e) => {
   const btn = e.target.closest(".ub-edit");
   if (!btn) return;
   e.stopPropagation();
-  startEdit(btn.closest('[data-role="user"]'));
+  // 动作条移到气泡下方后，[data-role=user] 是按钮的【兄弟】而非祖先，
+  // closest() 找不到——改从所在的 msg-group 里向下找。
+  const scope = btn.closest(".msg-group") || chatEl;
+  startEdit(scope.querySelector('[data-role="user"]'));
 });
 
 // ---------- 模型：激活切换（工具栏气泡）+ 供应商管理（弹窗） ----------
@@ -2871,9 +2945,14 @@ function demoteLiveBubbleToTrace() {
 function finalizeAnswer(el, text, mid) {
   el.classList.remove("streaming", "process-text", "demoted");  // 去掉过程小字样式与「💬 说明」标记，换成正文卡
   el.classList.add("bubble", "assistant");
-  traceEl.after(el);  // 紧跟折叠条：答案在执行过程之后，符合阅读顺序
   renderIntoBubble(el, text);
-  railTag(el, mid, "assistant");  // 仍打锚（保留 mid 标识），但导航条只画用户提问
+  // 答案下方挂 📋 复制动作条（与用户气泡的 ✏️ 条同一套悬停交互）
+  const actions = document.createElement("div");
+  actions.className = "msg-actions";
+  actions.appendChild(makeCopyBtn(text));
+  const group = wrapWithActions(el, actions);
+  traceEl.after(group);  // 紧跟折叠条：答案在执行过程之后，符合阅读顺序
+  railTag(group, mid, "assistant");  // 锚点落到组内气泡上；导航条只画用户提问
 }
 
 // 流式增量按帧合并：delta 到达频率远高于屏幕刷新率，逐条 textContent += 和

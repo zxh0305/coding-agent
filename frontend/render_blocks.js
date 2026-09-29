@@ -40,6 +40,8 @@
    *   buildBubble(cls, text)   → 气泡节点（assistant 走 Markdown）
    *   buildUserBubble(t, atts) → 带附件的用户气泡
    *   railTag(node, mid, role) → 打上 mid/role 锚点（导航条定位用）
+   *   makeCopyBtn(text) / wrapWithActions(bubble, actions) → 可选；
+   *     答案气泡下方的 📋 动作条（不注入则退回裸气泡，测试用）
    *   makeToolCallLine(name, argsStr)
    *   makeToolResultLine(name, resultStr)
    *   decorateWriteCard(callEl, resultStr)
@@ -112,6 +114,14 @@
       if (block.kind === "answer") {
         const el = deps.buildBubble("assistant", block.text);
         if (block.streaming) el.classList.add("streaming");
+        // 答案气泡下挂 📋 复制动作条（与用户消息同一套 msg-group 悬停交互）。
+        // deps 未注入（Node 测试的假 deps）时退回裸气泡，行为与旧版一致。
+        if (deps.makeCopyBtn && deps.wrapWithActions) {
+          const actions = doc.createElement("div");
+          actions.className = "msg-actions";
+          actions.appendChild(deps.makeCopyBtn(block.text));
+          return deps.railTag(deps.wrapWithActions(el, actions), block.mid, "assistant");
+        }
         return deps.railTag(el, block.mid, "assistant");
       }
 

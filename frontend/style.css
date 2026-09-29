@@ -649,6 +649,9 @@ body.side-resizing .sidebar { transition: none; }
   margin-top: -6px; padding-left: 4px;
   opacity: 0.55; transition: opacity .15s;
 }
+/* 答案进了 msg-group（下方带 📋 动作条）后，meta 的兄弟是组而非气泡，
+   悬停判定要跟着升级到组一级，否则"悬停回答 → 统计行变清晰"失效 */
+.msg-group:hover ~ .meta,
 .bubble.assistant:hover ~ .meta,
 .bubble.error:hover ~ .meta,
 .meta:hover { opacity: 1; }
@@ -674,16 +677,38 @@ body.side-resizing .sidebar { transition: none; }
 }
 .back-bottom:hover { background: var(--hover); }
 
-/* 用户气泡上的 ✏️ 回退编辑：悬停浮现（触屏常显低透明度），点击退回输入框 */
-.bubble.user { position: relative; }
-.ub-edit {
-  position: absolute; top: 6px; right: 8px;
-  border: none; background: transparent; cursor: pointer;
-  font-size: 12px; opacity: 0; transition: opacity .15s;
-  color: inherit; padding: 2px 4px;
+/* ---------- 气泡动作条：气泡正下方的 📋 复制 / ✏️ 编辑 ---------- */
+/* 之前 ✏️ 绝对定位在气泡右上角内部，长句换行时正好叠在字上（"太丑了"）。
+   改挂在气泡外正下方：组内任一元素悬停即浮现，平时完全隐藏不占视觉。 */
+.msg-group {
+  display: flex; flex-direction: column; max-width: 76%;
 }
-.bubble.user:hover .ub-edit { opacity: .75; }
-.ub-edit:hover { opacity: 1 !important; }
+.msg-group.is-user { align-self: flex-end; align-items: flex-end; }
+.msg-group:not(.is-user) { align-self: flex-start; align-items: flex-start; }
+.msg-group .bubble { max-width: 100%; }  /* 76% 上限移到组上，气泡在组内铺满 */
+
+/* 动作条本体：一排小幽灵按钮 */
+.msg-actions {
+  display: flex; gap: 4px; margin-top: 5px;
+  opacity: 0; visibility: hidden; transform: translateY(-2px);
+  transition: opacity .15s ease, visibility .15s, transform .15s ease;
+}
+.msg-group:hover .msg-actions,
+.msg-actions:focus-within {
+  opacity: 1; visibility: visible; transform: translateY(0);
+}
+.msg-actions button {
+  display: inline-flex; align-items: center;
+  border: 1px solid var(--border); background: var(--panel);
+  color: var(--text-2); cursor: pointer;
+  font-size: 11px; line-height: 1; padding: 3px 8px; border-radius: 7px;
+}
+.msg-actions button:hover { background: var(--hover); color: var(--text); border-color: var(--border-strong); }
+.msg-actions button:active { transform: scale(.94); }
+
+/* ✏️ 回退编辑（ZCode editUserQuery）：现在与 📋 同排在用户气泡下方的动作条里 */
+.ub-edit { border: none; background: transparent; padding: 3px 8px; }
+.ub-edit:hover { background: var(--hover); }
 
 /* 回退编辑横幅：composer 顶部的模式提示条 */
 .edit-banner {
@@ -2039,8 +2064,8 @@ body.docs-resizing .docs-panel { transition: none; }
 }
 .docs-view .md-table th { background: var(--bg); font-weight: 600; }
 
-/* 触屏没有 hover：回退按钮常显低透明度（mode.js 判定，非媒体查询） */
-[data-mode="mobile"] .ub-edit { opacity: .5; }
+/* 触屏没有 hover：动作条按钮常显半透明（mode.js 判定，非媒体查询） */
+[data-mode="mobile"] .msg-actions { opacity: .6; visibility: visible; transform: none; }
 
 /* ================= 手机端（html[data-mode="mobile"]） ================= */
 /* 判定源是 mode.js（视口 ≤720px，或触摸设备），不是媒体查询，所以本节统一用
