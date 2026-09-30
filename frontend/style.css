@@ -14,6 +14,8 @@
   --hover-soft: #f5f7fb;    /* 列表行 hover 底（更浅） */
   --selected: #e8efff;      /* 选中行/激活项底 */
   --selected-soft: #eef2ff; /* 弱选中（列表项/标签）底 */
+  --think-bg: #eef1f7;      /* 执行过程·思考流块软底（比页面底深一档，成"块"） */
+  --think-border: #dfe4ef;  /* 执行过程·思考流块边框 */
 
   /* ---- 文本层：主 → 次 → 弱 → 反白 ---- */
   --text: #1f2430;          /* 正文（也作 hover 加深色） */
@@ -542,15 +544,35 @@ body.side-resizing .sidebar { transition: none; }
   color: var(--text-4);
 }
 
-/* 思考模型的推理流：最浅灰小字，限高滚动，避免长思考把时间线撑爆。
-   高度压到 140px：思考是过程噪声，展开时间线时也不该盖过工具行的信息量。 */
+/* 思考模型的推理流：固定高度的"小监视窗"——软底圆角块，文字只在窗内流动
+   （内部滚动 + 流式贴底），窗子从出现起就占定 140px，页面不随思考变长往下刷。
+   历史回放同一副面孔：每轮思考一个等大的窗，扫读有节奏。
+   子代理嵌套卡里退回内容自适应：嵌套卡本来就折叠/多层，等大窗会把卡撑爆。 */
 .think-line {
   font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 10.5px; line-height: 1.5;
-  padding: 4px 0 4px 10px; border-left: 2px solid var(--border);
-  margin: 6px 0 0 2px; white-space: pre-wrap; word-break: break-all;
+  font-size: 10.5px; line-height: 1.55;
+  padding: 8px 10px; margin: 6px 0 0 2px;
+  word-break: break-all;
   color: var(--text-4);
-  max-height: 140px; overflow-y: auto;
+  background: var(--think-bg);
+  border: 1px solid var(--think-border);
+  border-radius: 8px;
+  height: 140px; overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+/* 窗内分段：整回合所有轮次的思考共居一窗，轮次标题降为窗内小节头 */
+.think-seg-head {
+  font-size: 9.5px; letter-spacing: .05em;
+  color: var(--text-4); opacity: .75;
+  margin: 8px 0 2px;
+}
+.think-seg-head:first-child { margin-top: 0; }
+.think-seg-body { white-space: pre-wrap; word-break: break-all; }
+/* 进行中快照的末段思考：光标提示还在流 */
+.think-seg-body.live::after {
+  content: "▍"; color: var(--accent);
+  animation: blink 0.9s steps(2) infinite;
 }
 
 /* 过程性正文：中间轮次模型输出的说明文字（不是最终答案）。比正文小一号、
@@ -578,17 +600,42 @@ body.side-resizing .sidebar { transition: none; }
 .trace-nested > summary::before { content: "›"; display: inline-block; margin-right: 6px; transition: transform .15s; }
 .trace-nested[open] > summary::before { transform: rotate(90deg); }
 .trace-nested .trace-line, .trace-nested .think-line { margin-top: 4px; }
+.trace-nested .think-line { height: auto; max-height: 140px; }
 .trace-nested .tl { margin-top: 4px; }
-/* 「💬 说明」标记：把过程性正文与它上方的思考流（.think-line）区分开。
-   两者字号/灰度接近，而轨迹里 reasoning 条目可能缺失，正文就直接跟在
-   「🧠 思考 · 第 N 轮」标题下面——不加标记会被当成该轮的推理内容。
-   只在 .demoted（已确认是过程说明）上加：流式期间那段文字仍可能是最终
-   答案，此时不该贴"说明"标签（done 会把它升级为正文卡）。 */
-.process-text.demoted::before {
+/* 「💬 说明」卡：整回合所有过程性正文（中间轮模型输出，不是最终答案）共居
+   的一张卡。白卡 + 品牌色左缘 + 卡级「💬 说明」chip（整卡一枚），与思考窗、
+   工具行一眼区分——思考归思考、说明归说明。chip 只在 .demoted（已确认卡里
+   是过程说明）后出现：流式期间那段文字仍可能是最终答案，不该贴"说明"标签。 */
+.note-box {
+  font-size: 12px; line-height: 1.6;
+  padding: 8px 12px; margin: 8px 0 0 2px;
+  color: var(--text-2);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-weak-border);
+  border-radius: 8px;
+  max-height: 140px; overflow-y: auto;
+  scrollbar-width: thin;
+}
+.note-box.demoted::before {
   content: "💬 说明";
-  display: block;
+  display: inline-block;
   font-size: 10px; letter-spacing: .04em;
-  color: var(--text-4); margin-bottom: 2px;
+  color: var(--text-3);
+  background: var(--accent-weak);
+  border-radius: 999px;
+  padding: 1px 8px 2px;
+  margin-bottom: 6px;
+}
+/* 卡内的说明段：贴掉段级缩进/边线（卡容器自己承担），多段之间细分割线 */
+.note-box .process-text {
+  font-size: inherit; line-height: inherit;
+  padding: 0; margin: 0; border-left: none;
+  color: inherit;
+}
+.note-box .process-text + .process-text {
+  margin-top: 8px; padding-top: 8px;
+  border-top: 1px dashed var(--border);
 }
 /* 流式中的过程正文：尾部光标——面板收起时也看得到它在动，不会以为卡死 */
 .process-text.streaming::after {

@@ -2452,7 +2452,7 @@ function finishBoot(caughtUp) {
     for (const { seq: s, evt } of seg.events) {
       // 与实时路径同一条 seq 闸门：补发段会故意从 turn_start 起整段重发
       // 与本页已渲染部分重叠的事件，不跳过的话 turn_start 被重复应用——
-      // traceEl/thinkEl 被强制清空重建（秒数闪跳回 0、思考流凭空消失）。
+      // traceEl/思考窗被强制清空重建（秒数闪跳回 0、思考流凭空消失）。
       if (s != null && lastSeq != null && s <= lastSeq) continue;
       applyEvent(evt, s);
     }
@@ -2493,7 +2493,11 @@ function handleResync(evt) {
 
 // ---------- 流式渲染：执行过程时间线 + 打字机回答 ----------
 let liveBubble = null, metaEl = null, metaTimer = null, qStart = 0;
-let thinkEl = null;  // 当前轮次的思考流块（思考模型的 reasoning_delta 实时显示用）
+let thinkBox = null;  // 本回合唯一的思考窗：整回合所有轮次的思考都在这一个窗里流动
+let thinkSeg = null;  // 窗内当前轮次的正文段（round 事件换段，轮次标题降为窗内分段头）
+let noteBox = null;   // 本回合唯一的「💬 说明」卡：整回合所有过程说明共居一卡
+let curRoundNo = 0;       // 当前轮次号（round 事件携带）
+let roundNeedHead = true; // 本轮还没见到思考流：轮次标题画回时间线（非思考模型/纯工具轮）
 let traceEl = null;
 let traceCurrent = "";  // 当前正在执行的工具（收起状态下摘要行显示的"此刻在干嘛"）
 let tracePhase = "";    // 当前阶段文案（"正在理解问题…/深度思考中…/正在撰写回答…"），
@@ -2533,6 +2537,10 @@ function ensureTrace() {
   if (existing) {
     existing.removeAttribute("data-livetrace");
     traceEl = existing;
+    // 快照卡里可能有回放已画出的思考窗/说明卡：原地认领，后续实时流接着写，
+    // 否则接管后会在卡里再建一个窗，出现双窗/双卡叠着。
+    thinkBox = existing.querySelector(".think-line");
+    noteBox = existing.querySelector(".note-box");
     return;
   }
   traceEl = document.createElement("details");
@@ -2962,7 +2970,9 @@ function ensureLiveMsg(mid) {
     traceEl.open = true;
     const el = document.createElement("div");
     el.className = "process-text streaming";
-    traceEl.appendChild(el);
+    // 流式正文直接住进说明卡：降级后原地留下（所有轮次的说明共居一卡），
+    // 若最终是答案，done 时由 finalizeAnswer 移出面板、升级为正文卡。
+    ensureNoteBox().appendChild(el);
     b = { el, text: "" };
     liveMsgs.set(mid, b);
     if (!metaEl) {
@@ -2975,6 +2985,30 @@ function ensureLiveMsg(mid) {
   liveBubble = b.el;  // 兼容既有的"当前气泡"语义（retire/done 收尾用）
   scrollBottom();
   return b;
+}
+
+// 「💬 说明」卡：整回合所有过程说明（中间轮正文）共居的一张卡。流式正文
+// 直接住进来（可能还是最终答案），降级时原地留下、卡上出现 chip；若最终
+// 升级为答案被移走，空卡随之摘除。
+function ensureNoteBox() {
+  if (!noteBox) {
+    ensureTrace();
+    // 接管快照卡时卡里可能已有回放画出的说明卡：认领，避免双卡
+    noteBox = traceEl.querySelector(".note-box");
+  }
+  if (!noteBox) {
+    noteBox = document.createElement("div");
+    noteBox.className = "note-box";
+    traceEl.appendChild(noteBox);
+  }
+  return noteBox;
+}
+
+function pruneNoteBox() {
+  if (noteBox && !noteBox.firstElementChild) {
+    noteBox.remove();
+    noteBox = null;
+  }
 }
 
 // SSE 事件 → 页面更新（事件类型见 backend/app.py 的 _run_round）
@@ -2993,10 +3027,15 @@ function demoteLiveBubbleToTrace() {
   const el = liveBubble;
   if (!el) return;
   el.classList.remove("streaming");
-  if (!el.textContent.trim()) { el.remove(); return; }
-  // 确认是过程说明：补上「💬 说明」标记（.demoted），与上方思考流区分开。
-  // 与历史回放（blocks.js 的 process_text → note.demoted）保持同一副面孔。
+  if (!el.textContent.trim()) {
+    el.remove();
+    pruneNoteBox();  // 流式段是空的：别留一张空说明卡
+    return;
+  }
+  // 确认是过程说明：原地留在卡里；「💬 说明」chip 打在卡上（整卡一次），
+  // 不再逐段贴标——与历史回放（渲染器归组成 note-box）同一副面孔。
   el.classList.add("demoted");
+  ensureNoteBox().classList.add("demoted");
 }
 
 // 最终答案定稿：把流式期间挂在执行过程面板里的那个气泡【移出面板】，插到
@@ -3014,6 +3053,7 @@ function finalizeAnswer(el, text, mid) {
   const group = wrapWithActions(el, actions);
   traceEl.after(group);  // 紧跟折叠条：答案在执行过程之后，符合阅读顺序
   railTag(group, mid, "assistant");  // 锚点落到组内气泡上；导航条只画用户提问
+  pruneNoteBox();  // 正文从说明卡里搬走了：卡若因此空了（首段即答案），整卡摘除
 }
 
 // 流式增量按帧合并：delta 到达频率远高于屏幕刷新率，逐条 textContent += 和
@@ -3029,19 +3069,26 @@ function flushStreamBuffers() {
       const b = ensureLiveMsg(mid);
       b.text += text;
       b.el.textContent = b.text;
+      // 流式正文住在说明卡里：内容超过卡高时卡内贴底跟随（近底才拽）
+      if (b.el.parentElement === noteBox) {
+        const near = noteBox.scrollHeight - noteBox.scrollTop - noteBox.clientHeight < 48;
+        if (near) noteBox.scrollTop = noteBox.scrollHeight;
+      }
     }
     pendingDeltas.clear();
     scrollBottom();  // 流式增量：只在用户贴底时跟随，上滑看历史时不打扰
   }
   if (pendingThink) {
-    if (thinkEl) {
-      thinkEl.textContent += pendingThink;
-      // 块内贴底跟随，但用户上滑回看前面的思考时不再拽回——离底一屏内才算"在跟"
-      const nearBottom = thinkEl.scrollHeight - thinkEl.scrollTop - thinkEl.clientHeight < 48;
-      if (nearBottom) thinkEl.scrollTop = thinkEl.scrollHeight;
+    if (thinkSeg) {
+      thinkSeg.textContent += pendingThink;
+      // 窗内贴底跟随，但用户上滑回看前面的思考时不再拽回——离底一屏内才算"在跟"
+      const box = thinkSeg.parentElement || thinkBox;
+      const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+      if (nearBottom) box.scrollTop = box.scrollHeight;
     }
     pendingThink = "";
-    scrollBottom();
+    // 这里刻意不 scrollBottom：思考只在固定小窗内流动，窗子高度恒定，
+    // 外层页面保持纹丝不动；轮次标题/工具行等离散事件各自带滚动。
   }
 }
 
@@ -3078,7 +3125,8 @@ function applyEvent(evt, seq) {
     liveMsgs = new Map();
     liveBubble = null; traceEl = null; traceCurrent = "";
     tracePhase = "正在理解问题…";  // 回合开场：模型还没吐任何内容时的友好占位
-    metaEl = null; thinkEl = null; pendingCalls = [];
+    metaEl = null; pendingCalls = [];
+    thinkBox = null; thinkSeg = null; noteBox = null; curRoundNo = 0; roundNeedHead = true;
     subagentBox = null; subagentCards.clear();  // 子代理嵌套卡随回合重置
     liveTracker.reset();  // 工具记账随回合重置（与 blocksFromEvents 的 turn_start 行为一致）
     // 服务端回合起点喂给记账器：补发/切会话场景下 qStart 为 0，traceTick 的
@@ -3100,27 +3148,37 @@ function applyEvent(evt, seq) {
   } else if (t === "round") {
     flushStreamBuffers();  // 上一轮的增量先落进旧气泡，再开新一轮
     // 上一段正文（若有）是"过程性说明"：新轮次已开，证明它不是最终答案。
-    // 先降级进执行过程面板（顺序在轮次标题之前，读起来才顺），再写标题。
+    // 降级进说明卡（所有轮次的说明共居一卡），思考窗内则开新一轮的分段。
     demoteLiveBubbleToTrace();
-    traceLine(`🧠 思考 · 第 ${evt.round} 轮`);
     tracePhase = "深度思考中…";  // 推理/正文还没来，先给个阶段占位
-    thinkEl = null;  // 新一轮的思考流开一个新块
+    thinkSeg = null;  // 新一轮：思考窗【只有一个】，窗内开新分段（标题随段）
+    curRoundNo = evt.round || 0;
+    roundNeedHead = true;  // 这轮若始终没有思考流（非思考模型），标题在工具行前补画
     curMid = evt.mid;  // 本轮回答段落的 mid：后续 delta/done 归并的键
   } else if (t === "reasoning_delta") {
-    // 思考模型的推理过程实时流进「执行过程」面板当前轮次下方：
-    // 思考阶段再长界面也有动静，不会再像假死；面板收起后不占聊天区。
+    // 整回合所有轮次的思考都流进同一个固定小窗：窗子高度恒定、内部滚动贴底，
+    // 页面不随思考往下刷；轮次标题不再是时间线上的一行，降为窗内分段头。
     // 推理与回答是两个流：这里绝不带 mid（后端也不再发），否则同一 mid 会
     // 把推理归并进回答气泡——思考过程冒充正文正是要杜绝的那个 bug。
-    if (!thinkEl) {
+    if (!thinkBox) {
       ensureTrace();
       // 本轮已经有过工具调用（在收起面板里跑完了一堆步骤）——说明用户是在
       // 生成中途切回/刷新回来的，此刻补发的推理流属于「过去」。这时不再强制
       // 展开面板：否则切会话的瞬间会看到过程面板"啪"地弹开、正文区跟着跳一下。
       // 当前正在产出的推理会实时填进去，用户点开折叠条一样能看到。
       if (!liveTracker.state()?.steps) traceEl.open = true;
-      thinkEl = document.createElement("div");
-      thinkEl.className = "think-line";
-      traceEl.appendChild(thinkEl);  // 不走 appendTrace：思考流不算一步
+      thinkBox = document.createElement("div");
+      thinkBox.className = "think-line";
+      traceEl.appendChild(thinkBox);  // 不走 appendTrace：思考流不算一步
+    }
+    if (!thinkSeg) {
+      roundNeedHead = false;  // 这轮的思考来了：标题进窗内，时间线不用补
+      const head = document.createElement("div");
+      head.className = "think-seg-head";
+      head.textContent = `🧠 思考 · 第 ${curRoundNo || "?"} 轮`;
+      thinkSeg = document.createElement("div");
+      thinkSeg.className = "think-seg-body";
+      thinkBox.append(head, thinkSeg);
     }
     queueStreamDelta("think", null, evt.delta);
   } else if (t === "answer_delta") {
@@ -3137,8 +3195,10 @@ function applyEvent(evt, seq) {
     setSessionTodos(todos);
   } else if (t === "tool_call") {
     flushStreamBuffers();
-    // 调工具前输出的正文同样是过程说明（"我先看看这个文件…"），一并降级
     demoteLiveBubbleToTrace();
+    // 这轮始终没有思考流（非思考模型/纯工具轮）：轮次标题画回时间线，分隔工具组
+    if (roundNeedHead && curRoundNo) traceLine(`🧠 思考 · 第 ${curRoundNo} 轮`);
+    roundNeedHead = false;
     tracePhase = "";  // 阶段让位：接下来摘要行显示具体的工具名（"正在读取…"）
     // 记账交给共用追踪器（与回放同一套配对逻辑），DOM 侧只负责画这一行
     const act = liveTracker.feed(evt);
@@ -3375,7 +3435,8 @@ function resetStreamState() {
   $("todo-pop").classList.add("hidden");
   setStreaming(false);
   myNonce = null;
-  liveBubble = null; metaEl = null; thinkEl = null;
+  liveBubble = null; metaEl = null;
+  thinkBox = null; thinkSeg = null; noteBox = null; curRoundNo = 0; roundNeedHead = true;
   traceEl = null;
   liveMsgs = new Map(); pendingCalls = [];
   permissionCards = new Map();

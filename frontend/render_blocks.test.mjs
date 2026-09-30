@@ -198,9 +198,61 @@ test("渲染：思考流与过程说明用不同类名（不冒充）", () => {
   ]);
   const d = frag.children[0];
   const think = d.children[1];
-  const note = d.children[2];
+  const noteBox = d.children[2];
   assert.equal(think.className, "think-line");
-  assert.equal(note.className, "process-text demoted");
+  assert.equal(noteBox.className, "note-box demoted");
+  // 思考在窗内的正文段里，说明在卡的子段里——两类文字绝不共用一个容器
+  assert.equal(think.children[0].className, "think-seg-body");
+  assert.equal(think.children[0].textContent, "先看目录");
+  assert.equal(noteBox.children[0].className, "process-text");
+  assert.equal(noteBox.children[0].textContent, "我打算这样做");
+});
+
+test("渲染：整回合思考归一窗、说明归一卡，轮次标题变窗内分段头", () => {
+  const deps = makeDeps();
+  const r = createRenderer(deps);
+  const frag = r.renderBlocks([
+    { kind: "process", running: true, steps: 1, elapsed: null, items: [
+      { kind: "note", text: "🧠 思考 · 第 1 轮", roundHead: true },
+      { kind: "reasoning", text: "先看目录" },
+      { kind: "note", text: "我打算这样做", demoted: true },
+      { kind: "tool", name: "grep", arguments: "{}", result: null, status: "running" },
+      { kind: "note", text: "🧠 思考 · 第 2 轮", roundHead: true },
+      { kind: "reasoning", text: "再看结果", live: true },
+      { kind: "note", text: "还是不对", demoted: true },
+    ] },
+  ]);
+  const d = frag.children[0];
+  // 顶层顺序：summary → 思考窗 → 说明卡 → 工具行（保持时序的唯一幸存者）
+  assert.deepEqual(d.children.slice(1).map((c) => c.className),
+                   ["think-line", "note-box demoted", "tl"]);
+  // 两轮思考进同一个窗，轮次标题降为窗内分段头；快照末段带 live 光标
+  const think = d.children[1];
+  assert.deepEqual(think.children.map((c) => c.className),
+                   ["think-seg-head", "think-seg-body",
+                    "think-seg-head", "think-seg-body live"]);
+  assert.equal(think.children[0].textContent, "🧠 思考 · 第 1 轮");
+  assert.equal(think.children[1].textContent, "先看目录");
+  assert.equal(think.children[2].textContent, "🧠 思考 · 第 2 轮");
+  assert.equal(think.children[3].textContent, "再看结果");
+  // 两轮说明进同一张卡
+  const nb = d.children[2];
+  assert.deepEqual(nb.children.map((c) => c.textContent), ["我打算这样做", "还是不对"]);
+});
+
+test("渲染：没跟思考流的轮次标题留在时间线（非思考模型回合）", () => {
+  const deps = makeDeps();
+  const r = createRenderer(deps);
+  const frag = r.renderBlocks([
+    { kind: "process", steps: 1, elapsed: null, items: [
+      { kind: "note", text: "🧠 思考 · 第 1 轮", roundHead: true },
+      { kind: "tool", name: "grep", arguments: "{}", result: '{"ok":true}', status: "ok" },
+    ] },
+  ]);
+  const d = frag.children[0];
+  // 没有任何 reasoning：不产生思考窗，轮次标题保持 trace-line 平铺
+  assert.deepEqual(d.children.slice(1).map((c) => c.className || c.tagName),
+                   ["trace-line", "tl", "tl result"]);
 });
 
 test("渲染：压缩卡与统计行", () => {

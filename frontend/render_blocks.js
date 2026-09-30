@@ -104,9 +104,7 @@
             const idx = typeof st.index === "number" ? " " + (st.index + 1) : "";
             s.textContent = "🔍 子任务" + idx + "：" + String(st.task || "").slice(0, 60);
             d.appendChild(s);
-            for (const it of Array.isArray(st.items) ? st.items : []) {
-              d.appendChild(renderProcessItem(it, running));
-            }
+            d.appendChild(renderProcessGroup(Array.isArray(st.items) ? st.items : [], running));
             wrap.appendChild(d);
           }
           frag.appendChild(wrap);
@@ -121,6 +119,79 @@
       }
 
       return doc.createDocumentFragment();
+    }
+
+    // ---- 过程条目按类型归组：思考一窗、说明一卡、其余保持时序 ----
+    // 顶层过程块与子代理嵌套卡共用。reasoning 全部收进一个 think-line 固定窗
+    // （轮次标题 roundHead 降为窗内分段头），demoted 说明全部收进一张 note-box
+    // 卡；工具行/权限卡/系统提醒等仍按原顺序平铺。与实时路径（app.js 整回合
+    // 单窗单卡）同一副面孔——思考归思考、说明归说明、调用归调用。
+    function renderProcessGroup(items, running) {
+      const frag = doc.createDocumentFragment();
+      const segs = [];   // 思考分段：{ head, text, live }
+      const notes = [];  // 说明文本
+      const inline = []; // 保持时序的其余条目
+      let pendingHead = null;  // 待定性的轮次标题：跟思考进窗，否则留在时间线
+      let curSeg = null;
+      for (const it of Array.isArray(items) ? items : []) {
+        if (it && it.kind === "note" && it.roundHead) {
+          pendingHead = it;  // 等下一个条目定性
+          continue;
+        }
+        if (it && it.kind === "reasoning") {
+          const t = it.text || "";
+          if (t || curSeg) {
+            // 新轮次标题在手（或本就是新段）：开新分段；同轮工具后的思考
+            // （无标题）续写当前段——与实时路径"一轮一段"的口径一致
+            if (pendingHead || !curSeg) {
+              curSeg = { head: pendingHead ? pendingHead.text : null, text: "", live: false };
+              segs.push(curSeg);
+            }
+            curSeg.text += t;
+            if (it.live) curSeg.live = true;
+            pendingHead = null;
+          }
+          continue;
+        }
+        if (it && it.kind === "note" && it.demoted) {
+          notes.push(it.text || "");
+          continue;  // 轮次标题保持待定：它可能属于时间线上的下一个工具组
+        }
+        if (pendingHead) { inline.push(pendingHead); pendingHead = null; }
+        inline.push(it);
+      }
+      if (pendingHead) inline.push(pendingHead);  // 尾部悬挂的轮次标题归时间线
+
+      if (segs.length) {
+        const box = doc.createElement("div");
+        box.className = "think-line";
+        for (const s of segs) {
+          if (s.head) {
+            const h = doc.createElement("div");
+            h.className = "think-seg-head";
+            h.textContent = s.head;
+            box.appendChild(h);
+          }
+          const b = doc.createElement("div");
+          b.className = "think-seg-body" + (running && s.live ? " live" : "");
+          b.textContent = s.text;
+          box.appendChild(b);
+        }
+        frag.appendChild(box);
+      }
+      if (notes.length) {
+        const nb = doc.createElement("div");
+        nb.className = "note-box demoted";
+        for (const t of notes) {
+          const n = doc.createElement("div");
+          n.className = "process-text";
+          n.textContent = t;
+          nb.appendChild(n);
+        }
+        frag.appendChild(nb);
+      }
+      for (const it of inline) frag.appendChild(renderProcessItem(it, running));
+      return frag;
     }
 
     // ---- 顶层块 ----
@@ -152,7 +223,7 @@
         // 代码不再强制改 open——尤其不能在用户手动收起后翻回展开态。
         d.open = !!block.running;
         d.appendChild(doc.createElement("summary"));
-        for (const it of block.items) d.appendChild(renderProcessItem(it, block.running));
+        d.appendChild(renderProcessGroup(block.items, block.running));
         const label = block.steps > 0 ? "已工作" : "已思考";
         // 秒数：已定稿的回合用固定值；进行中的回合（block.running）现算——
         // 它的起点来自服务端（补发/切会话路径），不现算就会显示成 0 秒。
