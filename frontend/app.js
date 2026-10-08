@@ -2680,10 +2680,9 @@ function appendTrace(el) {
   if (toEdit) syncEditBox();  // 首条修改到达即让修改区显形
   orderTraceSections();       // 显式 DOM 重排，不依赖 CSS order
   traceTick();
-  // 窗内贴底（近底才跟）+ 页面级跟随：新工具行让过程区变高，页面必须往下走，
-  // 否则刚插入的行落在输入框下方看不见。scrollBottom 有 stickBottom 保护。
-  if (!toEdit) scrollInside(procBox);
-  else if (editBox) scrollInside(editBox);
+  // 框内【强制】贴底：新工具行要立刻可见（近底阈值会让框停在旧内容上）。
+  // 页面级跟随用 scrollBottom（有 stickBottom 保护，上滑看历史时不打扰）。
+  pinInside(toEdit ? editBox : procBox);
   scrollBottom();
 }
 
@@ -3252,6 +3251,16 @@ function scrollInside(box) {
   if (near) box.scrollTop = box.scrollHeight;
 }
 
+// 【强制框内贴底】过程窗/修改区是"正在发生什么"的直播，必须始终钉在最底部：
+// 用户扫一眼要看到最新几条。用近底阈值（scrollInside）会有致命问题——内容一旦
+// 把框顶上去超过 48px，就永远不再跟随，框停在早期内容上（用户反馈"思考框和
+// 说明框都不会自动贴底"）。所以这两处直接 scrollTop = scrollHeight，不看阈值。
+// 说明卡/思考窗的流式贴底同理（flushStreamBuffers 里已是强制贴底）。
+function pinInside(box) {
+  if (!box) return;
+  box.scrollTop = box.scrollHeight;
+}
+
 function queueStreamDelta(kind, mid, text) {
   if (kind === "answer") pendingDeltas.set(mid, (pendingDeltas.get(mid) || "") + text);
   else pendingThink += text;
@@ -3349,6 +3358,9 @@ function applyEvent(evt, seq) {
       thinkBox.append(head, thinkSeg);
     }
     queueStreamDelta("think", null, evt.delta);
+    // 兜底贴底：内容经 rAF 合帧写入，帧回调若被节流/丢帧，窗就停在旧位置。
+    // 事件到达即钉一次底（同帧重复设置 scrollTop 开销可忽略）。
+    pinInside(thinkBox || procBox);
   } else if (t === "answer_delta") {
     takePlaceholderOpen();  // 真实内容来了：收回"正在思考…"占位时的展开
     tracePhase = "正在撰写回答…";
@@ -3360,6 +3372,8 @@ function applyEvent(evt, seq) {
     // 用户只会看到折叠条摘要行实时更新（"正在撰写回答… · 已思考 N 秒"），
     // 页面不再被流式文字推着往下滚。用户若想细看过程，手动展开折叠条即可。
     queueStreamDelta("answer", evt.mid, evt.delta);
+    // 兜底贴底：说明卡与过程窗同口径，事件到达即钉一次底（不依赖 rAF 帧）
+    pinInside(noteBox);
   } else if (t === "todo_update") {
     // 任务清单不再画进对话流：改为驱动右上角 📋 浮窗实时更新（后端同时已落库，
     // 重进会话走 loadTodos() 仍能看到）。
