@@ -2519,7 +2519,9 @@ let curRoundNo = 0;       // 当前轮次号（round 事件携带）
 let roundNeedHead = true; // 本轮还没见到思考流：轮次标题画回时间线（非思考模型/纯工具轮）
 let traceEl = null;
 let placeholderOpen = false;  // 过程面板的"展开"是否只是为了 show 即时占位（见 performSend）。
-                              // 首个真实内容到达时据此自动收回，用户手动展开则不动它。
+                              // 【方案A】首个思考流到达后无缝转入思考展开（traceOpenForThinking）。
+let autoThinkOpen = false;    // 【方案A】面板当前因"思考流阶段"而自动展开：正文开始输出时收回。
+let userToggledTrace = false; // 用户手动点过折叠条（点按/回车/空格）：此后一切自动开合让位。
 let traceCurrent = "";  // 当前正在执行的工具（收起状态下摘要行显示的"此刻在干嘛"）
 let tracePhase = "";    // 当前阶段文案（"正在理解问题…/深度思考中…/正在撰写回答…"），
                         // 随事件切换、由 traceTick 拼进摘要行；工具执行期间被
@@ -2547,6 +2549,15 @@ const TOOL_ICONS = {
   browser_open: "🌐", browser_click: "🖱️", browser_type: "⌨️", browser_screenshot: "📷",
 };
 
+// 折叠条用户手动开合监听：只挂 summary 上的原生 click/keydown，程序置 .open
+// 不触发这些事件，天然区分"人点的"与"代码开的"。点过之后自动开合全部让位。
+function watchUserToggle(el) {
+  const s = el.querySelector(":scope > summary");
+  if (!s) return;
+  s.addEventListener("click", () => { userToggledTrace = true; });
+  s.addEventListener("keydown", () => { userToggledTrace = true; });
+}
+
 function ensureTrace() {
   if (traceEl) return;
   // 接管已有快照卡：切会话/刷新回来时，历史接口的 running_trace 已在时间线里
@@ -2563,6 +2574,7 @@ function ensureTrace() {
     thinkBox = existing.querySelector(".proc-line, .think-line");
     procBox = thinkBox;
     noteBox = existing.querySelector(".note-box");
+    watchUserToggle(existing);
   return;
   }
   // 认领本 tab 的乐观占位卡（performSend 在 POST 前画的"正在思考…"卡）：
@@ -2574,6 +2586,7 @@ function ensureTrace() {
     thinkBox = ph.querySelector(".proc-line, .think-line");
     procBox = thinkBox;
     noteBox = ph.querySelector(".note-box");
+    watchUserToggle(ph);
     return;
   }
   traceEl = document.createElement("details");
@@ -2585,6 +2598,7 @@ function ensureTrace() {
   summary.textContent = "已思考 0 秒";
   traceEl.appendChild(summary);
   chatEl.appendChild(traceEl);
+  watchUserToggle(traceEl);
 }
 
 // 生成中的折叠条文案：有工具步显示"已工作"，纯思考阶段（reasoning 流不算步）
@@ -2613,15 +2627,21 @@ function turnStartFromEvent(evt) {
 // 摘要行 = 一行"当前状态"：正在跑的工具 + 已工作多久 + 步数。
 // 这是收起状态下用户唯一能看到的过程信息，必须把"此刻在干嘛"说清楚。
 // 步数与"正在跑什么"都取自 liveTracker（与回放同一套记账），不再另立计数器。
-// 即时占位展开的"回收"：performSend 为了给发送即时反馈，会把刚建的过程卡展开
-// 显示"正在思考…"。首个真实内容（推理/正文）一到就收回，避免长回合面板一直
-// 敞着、内容在里面刷屏。只回收"因占位而开"的那次（placeholderOpen 标记），
-// 用户手动展开的绝不代收。
-function takePlaceholderOpen() {
-  if (placeholderOpen) {
-    placeholderOpen = false;
-    if (traceEl) traceEl.open = false;
-  }
+// 【方案A：思考展开状态机】思考流阶段保持展开——思考最浓的阶段正是用户最想
+// 盯着的阶段（2026-10-08 拍板，替代旧"首个真实内容到达即收回"的口径）；
+// 首个正文增量到达时收回。占位展开无缝转入思考展开，不闪收。用户手动开合
+// 过（userToggledTrace）之后，两个方向都不再自动动面板。
+function traceOpenForThinking() {
+  placeholderOpen = false;
+  if (userToggledTrace || autoThinkOpen) return;
+  autoThinkOpen = true;
+  if (traceEl) traceEl.open = true;
+}
+function traceCloseForAnswer() {
+  placeholderOpen = false;
+  if (userToggledTrace || !autoThinkOpen) return;
+  autoThinkOpen = false;
+  if (traceEl) traceEl.open = false;
 }
 
 function traceTick() {
@@ -2825,10 +2845,9 @@ function toolDoingLabel(name, argsStr) {
 
 function toolCallLine(name, argsStr) {
   ensureTrace();
-  // 【三窗可见】首个工具调用到来时自动展开折叠条：思考窗/说明卡/正文流都收敛
-  // 在恒定高的小框里（不刷屏），但得先看得见框。之后一律不强制开合——用户手动
-  // 收起过就不再翻回，尊重用户意图（与"真实内容不弹开"的既有口径一致）。
-  if (liveTracker.state() && liveTracker.state().steps <= 1) traceEl.open = true;
+  // 【三窗可见】首个工具调用到来时兜底展开折叠条：【方案A】下思考流阶段通常
+  // 已展开，这里主要覆盖非思考模型直接进工具轮的场景。用户手动开合过后让位。
+  if (!userToggledTrace && liveTracker.state() && liveTracker.state().steps <= 1) traceEl.open = true;
   const d = makeToolCallLine(name, argsStr);
   appendTrace(d);
   pendingCalls.push({ name, el: d, t: Date.now() });
@@ -3344,7 +3363,8 @@ function applyEvent(evt, seq) {
     // 正在进行的回合也走同一套初始化）
     liveMsgs = new Map();
     liveBubble = null; traceEl = null; procBox = null; traceCurrent = "";
-    placeholderOpen = false;  // 占位标记随回合重建作废（新卡、新开合语义）
+    placeholderOpen = false; autoThinkOpen = false; userToggledTrace = false;
+    // ↑ 开合状态随回合重建作废（新卡、新开合语义）
     tracePhase = "正在理解问题…";  // 回合开场：模型还没吐任何内容时的友好占位
     metaEl = null; pendingCalls = [];
     thinkBox = null; thinkSeg = null; noteBox = null; curRoundNo = 0; roundNeedHead = true;
@@ -3377,7 +3397,7 @@ function applyEvent(evt, seq) {
     roundNeedHead = true;  // 这轮若始终没有思考流（非思考模型），标题在工具行前补画
     curMid = evt.mid;  // 本轮回答段落的 mid：后续 delta/done 归并的键
   } else if (t === "reasoning_delta") {
-    takePlaceholderOpen();  // 真实内容来了：收回"正在思考…"占位时的展开
+    traceOpenForThinking();  // 【方案A】思考流阶段保持展开（首个正文增量才收回）
     // 整回合所有轮次的思考都流进同一个固定小窗：窗子高度恒定、内部滚动贴底，
     // 页面不随思考往下刷；轮次标题不再是时间线上的一行，降为窗内分段头。
     // 推理与回答是两个流：这里绝不带 mid（后端也不再发），否则同一 mid 会
@@ -3410,15 +3430,13 @@ function applyEvent(evt, seq) {
     }
     queueStreamDelta("think", null, evt.delta);
   } else if (t === "answer_delta") {
-    takePlaceholderOpen();  // 真实内容来了：收回"正在思考…"占位时的展开
+    traceCloseForAnswer();  // 【方案A】正文开始输出：收起思考期自动展开的面板
     tracePhase = "正在撰写回答…";
-    // 【不刷屏】原实现在这里（以及 ensureLiveMsg 新建气泡时）无条件把过程面板
-    // 撑开，导致整段回答/推理文字在展开的面板里逐字往下刷——用户明确反馈
-    // "思考过程直接刷屏，动态框没生效"。回答的正文流本就不该住在展开面板里：
-    // 它已在 ensureLiveMsg 里按过程小字流进「💬 说明」卡，done 时由
-    // finalizeAnswer 移出面板、升级为正文卡。这里保持面板的原开合状态不动，
-    // 用户只会看到折叠条摘要行实时更新（"正在撰写回答… · 已思考 N 秒"），
-    // 页面不再被流式文字推着往下滚。用户若想细看过程，手动展开折叠条即可。
+    // 【不刷屏】回答的正文流不住在展开面板里：它已在 ensureLiveMsg 里按过程
+    // 小字流进「💬 说明」卡，done 时由 finalizeAnswer 移出面板、升级为正文卡。
+    // 【方案A】思考期自动展开的面板在这里收回（traceCloseForAnswer）——正文
+    // 阶段用户只会看到折叠条摘要行实时更新（"正在撰写回答… · 已思考 N 秒"），
+    // 页面不再被流式文字推着往下滚；想细看过程可手动展开（之后自动逻辑让位）。
     queueStreamDelta("answer", evt.mid, evt.delta);
   } else if (t === "todo_update") {
     // 任务清单不再画进对话流：改为驱动右上角 📋 浮窗实时更新（后端同时已落库，
@@ -3502,6 +3520,7 @@ function applyEvent(evt, seq) {
     if (traceEl) {
       // 做完任务自动折叠：正文回归"只要答案"；点折叠条仍可回看全过程
       traceEl.open = false;
+      autoThinkOpen = false;  // 【方案A】思考期自动展开的标记随收尾清掉
       // 摘掉 running：渲染器路径的秒数计时器（render_blocks）见此标记即自停，
       // 快照卡与实时卡共用这一收尾；本 tab 的 metaTimer 已在上面 clearInterval。
       traceEl.classList.remove("running");
@@ -3593,6 +3612,7 @@ function applyEvent(evt, seq) {
     retireLiveBubble();
     if (traceEl) {
       traceEl.open = false;  // 出错同样收起过程；点开可排查卡在哪一步
+      autoThinkOpen = false;  // 【方案A】同 done：自动展开标记随收尾清掉
       traceEl.classList.remove("running");  // 摘标记：渲染器计时器据此自停（同 done 分支）
       traceEl.querySelector("summary").textContent =
         `已工作 ${fmtElapsed((Date.now() - traceStart()) / 1000)} · 出错`;
@@ -3925,9 +3945,9 @@ async function performSend(item) {
     tracePhase = "正在思考…";  // 占位阶段文案：turn_start 到达后会校正为"正在理解问题…"
     ensureTrace();
     // 占位卡默认展开：此刻还没有任何内容，展开让用户看到"正在思考…"的明确回执。
-    // placeholderOpen 标记"展开是为了给即时反馈"，首个真实内容（推理/正文）到达
-    // 时由 takePlaceholderOpen() 自动收回——否则长推理回合会把面板一直敞着，
-    // 又变成"思考刷屏"。用户自己手动展开的不受影响（标记只在占位态为真）。
+    // 【方案A】placeholderOpen 标记"这次展开是为了即时反馈"：首个思考流到达后
+    // 由 traceOpenForThinking() 无缝转入"思考展开"（不再闪收），首个正文增量
+    // 到达时 traceCloseForAnswer() 才收回。用户手动点过折叠条则一切自动让位。
     traceEl.open = true;
     placeholderOpen = true;
   }
