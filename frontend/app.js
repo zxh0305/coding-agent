@@ -2666,6 +2666,7 @@ function procBoxEl() {
     // 挂在 summary 之后、说明卡之前；order 由 CSS 保证（窗1/卡2）
     traceEl.appendChild(procBox);
   }
+  bindBoxScroll(procBox);   // 框内贴底 + 上滚停止跟随（与主页面同套规则）
   return procBox;
 }
 
@@ -2715,6 +2716,7 @@ function editBoxEl() {
     editBox.className = "edit-box hidden";  // 有第一条修改才显形
     traceEl.appendChild(editBox);
   }
+  bindBoxScroll(editBox);   // 修改区同样自动贴底、上滚停止跟随
   return editBox;
 }
 
@@ -3135,6 +3137,7 @@ function ensureNoteBox() {
     traceEl.appendChild(noteBox);
     orderTraceSections();  // 说明卡先建也要排在过程窗/修改区之后
   }
+  bindBoxScroll(noteBox);   // 说明卡同样自动贴底、上滚停止跟随
   return noteBox;
 }
 
@@ -3222,8 +3225,8 @@ function flushStreamBuffers() {
     pendingDeltas.clear();
     // 正文/说明流住在说明卡（.note-box）里：卡限高内滚，页面不被流式文字撑长
     // （那正是"刷屏"的观感来源；实测模型把逐轮推理都发进这个流）。
-    // 【持续贴底】卡内强制滚到底，扫一眼能看到最新内容。
-    if (noteBox) noteBox.scrollTop = noteBox.scrollHeight;
+    // 【贴底】走 pinInside：跟随态才拽，用户上滚看历史时不打扰。
+    pinInside(noteBox);
     // 【页面跟随】过程区在长高（卡变高/新工具行插入），页面必须跟着往下走，
     // 否则最新内容停在输入框下方看不见（用户反馈"不会自动到底部"）。
     // scrollBottom 内部有 stickBottom 保护：用户上滑看历史时不会被打扰。
@@ -3234,10 +3237,8 @@ function flushStreamBuffers() {
       thinkSeg.textContent += pendingThink;
     }
     pendingThink = "";
-    // 【持续贴底】思考窗流式期间强制滚到底：思考是"正在发生什么"的直播，用户
-    // 扫一眼必须看到最新几行；若按"近底才跟"的口径，窗停在中段看起来就像卡住
-    // 了（用户明确反馈）。这里不看 nearBottom，直接 scrollTop = scrollHeight。
-    if (thinkBox) thinkBox.scrollTop = thinkBox.scrollHeight;
+    // 【贴底】思考窗同口径：跟随态钉底，用户上滚即停止跟随。
+    pinInside(thinkBox || procBox);
     scrollBottom();  // 同上：页面级跟随（有 stickBottom 保护）
   }
 }
@@ -3251,14 +3252,47 @@ function scrollInside(box) {
   if (near) box.scrollTop = box.scrollHeight;
 }
 
-// 【强制框内贴底】过程窗/修改区是"正在发生什么"的直播，必须始终钉在最底部：
-// 用户扫一眼要看到最新几条。用近底阈值（scrollInside）会有致命问题——内容一旦
-// 把框顶上去超过 48px，就永远不再跟随，框停在早期内容上（用户反馈"思考框和
-// 说明框都不会自动贴底"）。所以这两处直接 scrollTop = scrollHeight，不看阈值。
-// 说明卡/思考窗的流式贴底同理（flushStreamBuffers 里已是强制贴底）。
+// 【框内贴底】过程窗/修改区/说明卡三个框与主页面同一套规则：内容增长时自动
+// 贴底；用户一旦手动往上滚就停止跟随（不打扰看历史）；滚回底部自动恢复。
+// 早期版本 pinInside 是无条件强拽——用户上滚会被每帧拉回，根本翻不了历史。
+// 这里用 WeakMap 记每个框的"是否贴底"，侦听挂在框自身（框是动态创建的，用
+// 事件委托挂在 chatEl 上统一处理）。
+const boxStick = new WeakMap();   // box -> true(跟随) / false(用户在看历史)
+
+function boxIsSticky(box) {
+  const v = boxStick.get(box);
+  return v === undefined ? true : v;   // 默认跟随（新框首次出现即贴底）
+}
+
+// 强制贴底：仅当该框处于"跟随"态才拽（用户上滚后不打扰）
 function pinInside(box) {
   if (!box) return;
+  if (!boxIsSticky(box)) return;
   box.scrollTop = box.scrollHeight;
+}
+
+// 上滚意图 → 立刻退出跟随（与主页面 onWheelUp 同思路：靠方向判定，不靠阈值，
+// 否则流式期间上滚的头几帧仍满足阈值、每帧被拽回，产生拉扯感）
+function boxOnWheelUp(box) {
+  if (boxIsSticky(box)) boxStick.set(box, false);
+}
+// 滚回底部（<4px）→ 恢复跟随。scroll 侦听挂在框上，动态框由 ensure 时注册。
+function boxOnScroll(box) {
+  const away = box.scrollHeight - box.scrollTop - box.clientHeight;
+  if (away < 4) boxStick.set(box, true);
+}
+// 统一注册：框创建时调一次即可（弱表去重）
+function bindBoxScroll(box) {
+  if (!box || box.__stickBound) return;
+  box.__stickBound = true;
+  box.addEventListener("wheel", (e) => { if (e.deltaY < 0) boxOnWheelUp(box); }, { passive: true });
+  let lastY = null;
+  box.addEventListener("touchstart", (e) => { lastY = e.touches[0].clientY; }, { passive: true });
+  box.addEventListener("touchmove", (e) => {
+    if (lastY != null && e.touches[0].clientY > lastY) boxOnWheelUp(box);  // 手指下移=内容上划
+    lastY = e.touches[0].clientY;
+  }, { passive: true });
+  box.addEventListener("scroll", () => boxOnScroll(box), { passive: true });
 }
 
 function queueStreamDelta(kind, mid, text) {
