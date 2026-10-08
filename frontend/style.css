@@ -695,10 +695,18 @@ body.side-resizing .sidebar { transition: none; }
   border-left: 3px solid var(--accent-weak-border);
   border-radius: 8px;
   letter-spacing: .01em;
-  /* 【直接展开、不内滚】说明是给用户看的阅读内容：整回合说明一次性铺开，
-     不做限高/内滚（用户明确要求"说明栏不用滚动，直接输出就行，方便查看"）。 */
-  overflow: visible;
+  /* 【限高内滚】实测（2026-10-08，maiya测试/glm-5.3-flash 真回合）发现：
+     模型把【每一轮的推理】都发成 answer_delta，这些短句全落进本卡，一个
+     5 步任务就攒出 7~8 段过程性文字。此前按"说明是给用户读的正文"改成
+     overflow:visible 不限高，结果整页被这些逐轮推理撑长——正是用户反馈的
+     "刷屏"。结论：本卡实际承载的是【过程性内容】，必须限高内滚，让它只在
+     框内滚动；真正给用户读的最终汇报由 finalizeAnswer 升级为正文卡移出。
+     保留阅读型排版（14px/1.8/段间虚线），滚动只是防止撑长页面。 */
+  max-height: 260px; overflow-y: auto; overscroll-behavior: contain;
+  scrollbar-width: thin;
 }
+.note-box::-webkit-scrollbar { width: 6px; }
+.note-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
 .note-box.demoted::before {
   content: "💬 说明";
   display: inline-block;

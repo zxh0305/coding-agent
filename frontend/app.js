@@ -2678,10 +2678,25 @@ function appendTrace(el) {
   const toEdit = el.classList.contains("card") || (el.dataset && el.dataset.editBy === "1");
   (toEdit ? editBoxEl() : procBoxEl()).appendChild(el);
   if (toEdit) syncEditBox();  // 首条修改到达即让修改区显形
+  orderTraceSections();       // 显式 DOM 重排，不依赖 CSS order
   traceTick();
   // 修改区常驻展开、过程窗内滚：只有过程窗需要贴底跟随
   if (!toEdit) scrollInside(procBox);
   else if (editBox) scrollInside(editBox);
+}
+
+// 【显式排序】把 .trace 内的三栏按 proc → edit → note 的 DOM 顺序重排。
+// 为什么不用 CSS order：order 只在元素同为其父 flex 子项时生效，而 .trace 的
+// 子项集合会随"接管快照卡 / 历史回放"变化，实测出现过说明卡跑到过程窗上面的
+// 反例（用户截图）。直接在 DOM 上重排，与容器是否 flex、元素从哪条路径来都无关。
+function orderTraceSections() {
+  if (!traceEl) return;
+  const order = [procBox, editBox, noteBox];
+  const anchor = traceEl.querySelector("summary");
+  for (const el of order) {
+    if (el && el.parentElement === traceEl) traceEl.appendChild(el);
+  }
+  // 权限确认卡等其它子项天然排在末尾（appendChild 依次后移），顺序保持 proc→edit→note→其它
 }
 
 // 【修改区】.edit-box：写文件/改代码（apply_patch / write_file）的操作单独成区，
@@ -3117,6 +3132,7 @@ function ensureNoteBox() {
     noteBox = document.createElement("div");
     noteBox.className = "note-box";
     traceEl.appendChild(noteBox);
+    orderTraceSections();  // 说明卡先建也要排在过程窗/修改区之后
   }
   return noteBox;
 }
@@ -3203,10 +3219,11 @@ function flushStreamBuffers() {
       // 流式正文不住对话框：它挂在顶部折叠条里，或已升级为底部答案气泡。
     }
     pendingDeltas.clear();
-    // 正文/说明流住在说明卡（.note-box）里：卡有 220px 上限并内滚，这里只让
-    // 卡内贴底——页面不再被流式文字推着往下滚（那正是"刷屏"的观感来源）。
-    // 只有最终答案升级为正文卡后（finalizeAnswer 移出面板）才推页面。
-    scrollInside(noteBox);
+    // 正文/说明流住在说明卡（.note-box）里：卡限高内滚，页面不被流式文字撑长
+    // （那正是"刷屏"的观感来源；实测模型把逐轮推理都发进这个流）。
+    // 【持续贴底】与思考窗同口径：流式期间强制滚到底，扫一眼能看到最新内容，
+    // 否则卡停在中段看着像卡住。只有最终答案升级为正文卡后才推页面。
+    if (noteBox) noteBox.scrollTop = noteBox.scrollHeight;
   }
   if (pendingThink) {
     if (thinkSeg) {
