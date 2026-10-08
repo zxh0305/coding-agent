@@ -13,6 +13,10 @@ data/
 # 真机评估脚本的一次性结果
 backend/manual/eval_patch_*.json
 
+# 压测脚本与压测数据播种：仅本地压测/优化用，不进版本库（用户要求）
+backend/manual/stress_*.py
+backend/manual/seed_render_fixtures.py
+
 # pytest 试验残留（本项目用 unittest；目录已删，防再生成）
 .pytest_cache/
 
