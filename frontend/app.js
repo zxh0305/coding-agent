@@ -3035,7 +3035,17 @@ function demoteLiveBubbleToTrace() {
   // 确认是过程说明：原地留在卡里；「💬 说明」chip 打在卡上（整卡一次），
   // 不再逐段贴标——与历史回放（渲染器归组成 note-box）同一副面孔。
   el.classList.add("demoted");
-  ensureNoteBox().classList.add("demoted");
+  const nb = ensureNoteBox();
+  nb.classList.add("demoted");
+  // 补发重放会把同一段说明再降级一次（快照卡里已有一份）：文字相同就让位，
+  // 保留快照份、丢弃重放份，卡里不出现重复段落。
+  for (const p of nb.querySelectorAll(".process-text")) {
+    if (p !== el && p.textContent === el.textContent) {
+      el.remove();
+      pruneNoteBox();
+      return;
+    }
+  }
 }
 
 // 最终答案定稿：把流式期间挂在执行过程面板里的那个气泡【移出面板】，插到
@@ -3162,20 +3172,34 @@ function applyEvent(evt, seq) {
     // 把推理归并进回答气泡——思考过程冒充正文正是要杜绝的那个 bug。
     if (!thinkBox) {
       ensureTrace();
-      // 本轮已经有过工具调用（在收起面板里跑完了一堆步骤）——说明用户是在
-      // 生成中途切回/刷新回来的，此刻补发的推理流属于「过去」。这时不再强制
-      // 展开面板：否则切会话的瞬间会看到过程面板"啪"地弹开、正文区跟着跳一下。
-      // 当前正在产出的推理会实时填进去，用户点开折叠条一样能看到。
-      if (!liveTracker.state()?.steps) traceEl.open = true;
-      thinkBox = document.createElement("div");
-      thinkBox.className = "think-line";
-      traceEl.appendChild(thinkBox);  // 不走 appendTrace：思考流不算一步
+      // 接管快照卡（刷新/切回进行中回合）时，卡里可能已有回放画好的思考窗：
+      // ensureTrace 已把它认领进 thinkBox——有就复用，再新建就是截图里的双窗。
+      if (!thinkBox) {
+        // 本轮已经有过工具调用（在收起面板里跑完了一堆步骤）——说明用户是在
+        // 生成中途切回/刷新回来的，此刻补发的推理流属于「过去」。这时不再强制
+        // 展开面板：否则切会话的瞬间会看到过程面板"啪"地弹开、正文区跟着跳一下。
+        // 当前正在产出的推理会实时填进去，用户点开折叠条一样能看到。
+        if (!liveTracker.state()?.steps) traceEl.open = true;
+        thinkBox = document.createElement("div");
+        thinkBox.className = "think-line";
+        traceEl.appendChild(thinkBox);  // 不走 appendTrace：思考流不算一步
+      }
     }
     if (!thinkSeg) {
       roundNeedHead = false;  // 这轮的思考来了：标题进窗内，时间线不用补
+      const headText = `🧠 思考 · 第 ${curRoundNo || "?"} 轮`;
+      // 快照窗里可能已有同一轮的思考段（切回时快照只存到当下，补发却从轮首
+      // 重放整轮）：整段让位给补发的完整流，避免同轮思考出现"前缀段+全文段"。
+      for (const h of thinkBox.querySelectorAll(".think-seg-head")) {
+        if (h.textContent === headText) {
+          if (h.nextElementSibling) h.nextElementSibling.remove();
+          h.remove();
+          break;
+        }
+      }
       const head = document.createElement("div");
       head.className = "think-seg-head";
-      head.textContent = `🧠 思考 · 第 ${curRoundNo || "?"} 轮`;
+      head.textContent = headText;
       thinkSeg = document.createElement("div");
       thinkSeg.className = "think-seg-body";
       thinkBox.append(head, thinkSeg);
@@ -3237,7 +3261,7 @@ function applyEvent(evt, seq) {
     if (!authoritative) {
       // 正文为空：保留已流出的增量（若有），一条都没有则不留空白气泡
       b.text = b.text || "";
-      if (!b.text) b.el.remove();
+      if (!b.text) { b.el.remove(); pruneNoteBox(); }  // 气泡曾住说明卡：别留空卡
       else finalizeAnswer(b.el, b.text, evt.mid);
     } else if (authoritative === b.text) {
       finalizeAnswer(b.el, b.text, evt.mid);  // 与增量一致：照常定稿

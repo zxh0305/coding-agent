@@ -569,10 +569,15 @@ body.side-resizing .sidebar { transition: none; }
 }
 .think-seg-head:first-child { margin-top: 0; }
 .think-seg-body { white-space: pre-wrap; word-break: break-all; }
-/* 进行中快照的末段思考：光标提示还在流 */
-.think-seg-body.live::after {
+/* 进行中快照的末段思考：光标提示还在流（随 running 类一起熄灭） */
+.trace.running .think-seg-body.live::after {
   content: "▍"; color: var(--accent);
   animation: blink 0.9s steps(2) infinite;
+}
+/* 回合定稿后思考窗塌缩成内容高：短思考不留大片空白，长思考仍限高滚动。
+   流式中的窗保持固定高度——思考只在恒定小窗里流动，页面不往下刷。 */
+.trace:not(.running) .think-line {
+  height: auto; max-height: 140px;
 }
 
 /* 过程性正文：中间轮次模型输出的说明文字（不是最终答案）。比正文小一号、
