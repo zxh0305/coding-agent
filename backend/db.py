@@ -43,6 +43,7 @@ import os
 import secrets
 import shutil
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -428,6 +429,10 @@ def init_db() -> None:
                 "INSERT INTO settings(key, value) VALUES('active_model', ?)",
                 (json.dumps({"provider_id": "default", "model": model}, ensure_ascii=False),),
             )
+    # 测试通过换 DB_PATH + init_db 隔离用例：换库后旧缓存必须作废，
+    # 否则上一用例的聚合结果会串进当前用例（仅测试受影响，但缓存以库为键之外
+    # 没有更细的标识，随 init_db 全清最稳）。
+    _usage_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +645,7 @@ def truncate_from(sid: str, mid: str) -> dict:
         conn.execute(f"DELETE FROM messages WHERE session_id=? AND mid IN ({q})", (sid, *mids))
         conn.execute(f"DELETE FROM message_usage WHERE session_id=? AND mid IN ({q})", (sid, *mids))
         conn.execute(f"DELETE FROM session_traces WHERE session_id=? AND mid IN ({q})", (sid, *mids))
+    _usage_cache_invalidate()  # 删了 usage 行，聚合缓存一并作废
     return {"removed": len(mids), "ord": target_ord}
 
 
@@ -795,6 +801,7 @@ def delete_session(sid: str) -> None:
         conn.execute("DELETE FROM messages WHERE session_id=?", (sid,))
         conn.execute("DELETE FROM message_usage WHERE session_id=?", (sid,))
         conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
+    _usage_cache_invalidate()  # 会话整删，usage 行随之清空
     # artifacts/<sid>/ 整棵删掉（该任务全部外置正文，随会话一起消失）
     shutil.rmtree(_artifacts_dir() / sid, ignore_errors=True)
     # docs/<sid>/ 同理：该任务生成的文档随会话一起消失，避免留下孤儿文件
@@ -1288,6 +1295,7 @@ def cleanup_orphans() -> dict:
             counts[name] = conn.execute(sql).rowcount
     if any(counts.values()):
         log.info("清理孤儿行: %s", counts)
+        _usage_cache_invalidate()  # 孤儿 usage 行被清，缓存作废
     return counts
 
 
@@ -1480,6 +1488,47 @@ def _upsert_usage(conn: sqlite3.Connection, sid: str, mid: str, stats: dict) -> 
 USAGE_KINDS = ("turn", "subagent", "compact", "title", "memory")
 
 
+# ---------------------------------------------------------------------------
+# 用量聚合的进程级 TTL 缓存（方案A，2026-10-08）
+#
+# 压测定位（50 万行 message_usage）：单次聚合 P50 仅 61ms，但并发 32 时
+# P50 407ms / P99 638ms——瓶颈是 N 个冷连接同时全表聚合的争用，不是查询本身。
+# 用量页是低频查看场景，秒级陈旧无感：读走 TTL 缓存，写入口主动失效。
+# 键空间极小（days/provider/model 组合），无需淘汰策略。
+# ---------------------------------------------------------------------------
+
+_USAGE_TTL = 5.0  # 秒；record_usage 等写入口会主动失效，TTL 只兜其它路径
+_usage_cache: dict[tuple, tuple[float, object]] = {}
+_usage_locks: dict[tuple, threading.Lock] = {}
+_usage_locks_guard = threading.Lock()
+
+
+def _usage_cache_get(key):
+    hit = _usage_cache.get(key)
+    if not hit:
+        return None
+    ts, val = hit
+    return val if (time.time() - ts) < _USAGE_TTL else None
+
+
+def _usage_cache_put(key, val):
+    _usage_cache[key] = (time.time(), val)
+
+
+def _usage_key_lock(key) -> threading.Lock:
+    """按缓存键取锁：TTL 过期/失效后并发 miss 时只放一个请求去聚合
+    （single-flight），其余在锁上等它填好缓存后直接取——否则 64 并发
+    同时全表聚合会互相拖垮（压测实测 P99 5.9s、还伴随写超时错误）。
+    键空间极小（days/provider/model 组合），锁表不回收无妨。"""
+    with _usage_locks_guard:
+        return _usage_locks.setdefault(key, threading.Lock())
+
+
+def _usage_cache_invalidate():
+    """message_usage 的任何写入（记账/删行/孤儿清理）后调用。"""
+    _usage_cache.clear()
+
+
 def record_usage(sid: str, kind: str, stats: dict, provider_id: str = "",
                  model: str = "") -> None:
     """把一条"隐藏消耗"的用量记进 message_usage（独立行归账，agent 经
@@ -1504,6 +1553,7 @@ def record_usage(sid: str, kind: str, stats: dict, provider_id: str = "",
              usage.get("completion_tokens"), usage.get("prompt_cache_hit_tokens"),
              json.dumps(stats, ensure_ascii=False), provider_id, model, kind, time.time()),
         )
+    _usage_cache_invalidate()
 
 
 def usage_summary(days: int | None = None) -> list[dict]:
@@ -1513,26 +1563,36 @@ def usage_summary(days: int | None = None) -> list[dict]:
     老数据（迁移 23 之前落库的）created 为 NULL，只出现在"全部"口径里。
     供应商被删除的用量归进 provider_name="（已删除）"——数据不能凭空消失。
     """
-    where, args = "", []
-    if days:
-        where = "WHERE u.created >= ?"
-        args = [time.time() - days * 86400]
-    with _conn() as conn:
-        rows = conn.execute(
-            "SELECT u.provider_id, u.model, "
-            # turns 只数主回合行（kind='turn'）：子代理/压缩是独立归账行，算进
-            # "回合数"会虚高；token 三列是全部 kind 求和（账单口径）。
-            # COALESCE 兜老数据：ALTER ADD COLUMN DEFAULT 不回填存量行。
-            "SUM(CASE WHEN COALESCE(u.kind,'turn')='turn' THEN 1 ELSE 0 END) AS turns, "
-            "SUM(u.prompt_tokens) AS prompt_tokens, "
-            "SUM(u.completion_tokens) AS completion_tokens, "
-            "SUM(u.cached_tokens) AS cached_tokens, p.name AS provider_name "
-            "FROM message_usage u LEFT JOIN providers p ON p.id = u.provider_id "
-            f"{where} GROUP BY u.provider_id, u.model ORDER BY prompt_tokens DESC", args).fetchall()
-    return [{"provider_id": r["provider_id"] or "", "model": r["model"] or "—",
-             "provider_name": r["provider_name"] or "（已删除）", "turns": r["turns"],
-             "prompt_tokens": r["prompt_tokens"] or 0, "completion_tokens": r["completion_tokens"] or 0,
-             "cached_tokens": r["cached_tokens"] or 0} for r in rows]
+    ck = ("summary", days)
+    cached = _usage_cache_get(ck)
+    if cached is not None:
+        return cached
+    with _usage_key_lock(ck):  # single-flight：并发 miss 只放一个去聚合
+        cached = _usage_cache_get(ck)  # 等锁期间可能已被前一个填好
+        if cached is not None:
+            return cached
+        where, args = "", []
+        if days:
+            where = "WHERE u.created >= ?"
+            args = [time.time() - days * 86400]
+        with _conn() as conn:
+            rows = conn.execute(
+                "SELECT u.provider_id, u.model, "
+                # turns 只数主回合行（kind='turn'）：子代理/压缩是独立归账行，算进
+                # "回合数"会虚高；token 三列是全部 kind 求和（账单口径）。
+                # COALESCE 兜老数据：ALTER ADD COLUMN DEFAULT 不回填存量行。
+                "SUM(CASE WHEN COALESCE(u.kind,'turn')='turn' THEN 1 ELSE 0 END) AS turns, "
+                "SUM(u.prompt_tokens) AS prompt_tokens, "
+                "SUM(u.completion_tokens) AS completion_tokens, "
+                "SUM(u.cached_tokens) AS cached_tokens, p.name AS provider_name "
+                "FROM message_usage u LEFT JOIN providers p ON p.id = u.provider_id "
+                f"{where} GROUP BY u.provider_id, u.model ORDER BY prompt_tokens DESC", args).fetchall()
+        out = [{"provider_id": r["provider_id"] or "", "model": r["model"] or "—",
+                "provider_name": r["provider_name"] or "（已删除）", "turns": r["turns"],
+                "prompt_tokens": r["prompt_tokens"] or 0, "completion_tokens": r["completion_tokens"] or 0,
+                "cached_tokens": r["cached_tokens"] or 0} for r in rows]
+        _usage_cache_put(ck, out)
+        return out
 
 
 def usage_session_rows(days: int | None = None, provider_id: str = "",
@@ -1553,27 +1613,37 @@ def usage_session_rows(days: int | None = None, provider_id: str = "",
     if model:
         conds.append("u.model = ?")
         args.append(model)
-    where = ("WHERE " + " AND ".join(conds)) if conds else ""
-    with _conn() as conn:
-        rows = conn.execute(
-            "SELECT u.session_id, s.title AS session_title, s.workspace AS workspace, "
-            "SUM(CASE WHEN COALESCE(u.kind,'turn')='turn' THEN 1 ELSE 0 END) AS turns, "
-            "SUM(u.prompt_tokens) AS prompt_tokens, "
-            "SUM(u.completion_tokens) AS completion_tokens, "
-            "MAX(u.created) AS last_used "
-            "FROM message_usage u LEFT JOIN sessions s ON s.id = u.session_id "
-            f"{where} GROUP BY u.session_id "
-            # 裸列名在含 MAX() 的聚合查询里会取"最后一条记录"的值（SQLite 怪癖），
-            # 导致实际按"最后一次请求"排序——必须写全聚合表达式才是会话总用量
-            "ORDER BY SUM(u.prompt_tokens) + SUM(u.completion_tokens) DESC LIMIT 100",
-            args).fetchall()
-    # project 与任务列表分组同口径 = workspace 末段；行序仍是总用量倒序，
-    # 分组次序由前端按首次出现保持（用量大的项目组排前面）
-    return [{"session_id": r["session_id"], "session_title": r["session_title"] or "（已删除会话）",
-             "project": (r["workspace"] or "").rstrip("/").split("/")[-1] if r["workspace"] else "",
-             "turns": r["turns"], "prompt_tokens": r["prompt_tokens"] or 0,
-             "completion_tokens": r["completion_tokens"] or 0,
-             "last_used": r["last_used"]} for r in rows]
+    ck = ("session_rows", days, provider_id, model)
+    cached = _usage_cache_get(ck)
+    if cached is not None:
+        return cached
+    with _usage_key_lock(ck):  # single-flight：同 usage_summary
+        cached = _usage_cache_get(ck)
+        if cached is not None:
+            return cached
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        with _conn() as conn:
+            rows = conn.execute(
+                "SELECT u.session_id, s.title AS session_title, s.workspace AS workspace, "
+                "SUM(CASE WHEN COALESCE(u.kind,'turn')='turn' THEN 1 ELSE 0 END) AS turns, "
+                "SUM(u.prompt_tokens) AS prompt_tokens, "
+                "SUM(u.completion_tokens) AS completion_tokens, "
+                "MAX(u.created) AS last_used "
+                "FROM message_usage u LEFT JOIN sessions s ON s.id = u.session_id "
+                f"{where} GROUP BY u.session_id "
+                # 裸列名在含 MAX() 的聚合查询里会取"最后一条记录"的值（SQLite 怪癖），
+                # 导致实际按"最后一次请求"排序——必须写全聚合表达式才是会话总用量
+                "ORDER BY SUM(u.prompt_tokens) + SUM(u.completion_tokens) DESC LIMIT 100",
+                args).fetchall()
+        # project 与任务列表分组同口径 = workspace 末段；行序仍是总用量倒序，
+        # 分组次序由前端按首次出现保持（用量大的项目组排前面）
+        out = [{"session_id": r["session_id"], "session_title": r["session_title"] or "（已删除会话）",
+                "project": (r["workspace"] or "").rstrip("/").split("/")[-1] if r["workspace"] else "",
+                "turns": r["turns"], "prompt_tokens": r["prompt_tokens"] or 0,
+                "completion_tokens": r["completion_tokens"] or 0,
+                "last_used": r["last_used"]} for r in rows]
+        _usage_cache_put(ck, out)
+        return out
 
 
 def save_messages(sid: str, history: list[dict], saved: dict) -> int:
