@@ -4955,7 +4955,14 @@ function renderTodoPop() {
     state.appendChild(ico);
     state.appendChild(document.createTextNode("运行中…"));
   } else {
-    state = null;
+    // 回合已结束但清单还有剩余项：明确交代"还有 N 项未完成"，而不是留白让
+    // 用户对着徽章上的数字猜（2026-10-08 反馈：会话结束了徽章还挂着 1）。
+    // 常见成因：agent 把备忘/清理项写成了 pending 且回合已收尾。清单条目本身
+    // 没有点击交互（勿写"点条目勾掉"这种不存在的操作），出路是让 agent 继续
+    // 或更新清单。
+    state.className = "todo-foot-state paused";
+    state.textContent = `还有 ${total - done} 项未完成`;
+    state.title = "上一回合结束时清单未全部完成；让我继续处理，或要求我更新/清空清单";
   }
   if (state) foot.appendChild(state);
 }
