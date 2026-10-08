@@ -2070,10 +2070,22 @@ def main():
     load_env_file(str(ENV_FILE))   # 读 .env（首库播种 / 默认供应商 / 默认工作区用）
     db.init_db()                   # 建表 + 播种（已初始化则跳过）
     db.cleanup_orphan_attachments()  # 兜底：清理无主会话的附件目录（防 kill -9 残留）
+    orphan = db.cleanup_orphans()    # 兜底：清理无主行（历史遗留 / 旧版漏删）
+    if any(orphan.values()):
+        print(f"🧹 已清理孤儿行: {orphan}", flush=True)
+    db.optimize_db()                 # 回收删会话留下的空洞，缩小库文件
     from browser_tools import cleanup_stale_profiles  # noqa: E402
     n = cleanup_stale_profiles(int(os.environ.get("BROWSER_PROFILE_KEEP_DAYS", "7")))
     if n:
         print(f"🧹 已清理 {n} 个陈旧浏览器 profile 目录", flush=True)
+    # 日志兜底回收：TimedRotatingFileHandler 只在跨零点删「条数超限」的备份，
+    # 单日暴涨的大日志（曾达 367MB）与长期不重启的目录都不会被清，这里补一刀。
+    from logger import prune_old_logs  # noqa: E402
+    log_dir = os.environ.get("LOG_DIR") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "logs")
+    m = prune_old_logs(log_dir, int(os.environ.get("LOG_KEEP_DAYS", "14")))
+    if m:
+        print(f"🧹 已回收 {m} 个过期日志文件", flush=True)
     log_file = setup_logging(console=True)
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)

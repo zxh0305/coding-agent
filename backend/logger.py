@@ -18,6 +18,7 @@ logging 是"给机器/给自己查的档案"。tail -f data/logs/agent.log 可�
 import logging
 import os
 import shutil
+import time
 from logging.handlers import TimedRotatingFileHandler
 
 # 日志文件夹固定在项目根目录的 data/ 下（logger.py 位于 backend/ 下，往上跳一级），
@@ -25,6 +26,61 @@ from logging.handlers import TimedRotatingFileHandler
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _FMT = "%(asctime)s [%(levelname)s] %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+
+def prune_old_logs(log_dir: str, keep_days: int, max_total_mb: float = 200.0) -> int:
+    """启动时主动回收过期日志，返回删除的文件数。
+
+    为什么需要它：TimedRotatingFileHandler 的 backupCount 只在「跨零点切分」
+    那一刻，对已被重命名的 agent.log.* 做删除，且只按【条数】比较——目录里
+    的历史文件数不足 backupCount 时一个都不会删。后果就是单个暴涨的日志
+    （曾观测到一天 367MB）会永久残留在 data/logs 下。此外进程若长期不在零点
+    前后运行，跨天切分从不发生，清理逻辑根本不执行。
+
+    这里补一道与清理 browser-profiles 同思路的启动兜底：
+      * 按 mtime 删除超过 keep_days 的 agent.log.*；
+      * 若剩余日志总量仍超 max_total_mb，从最旧的开始继续删，直到压回限额
+        （但永不删今天正在写的 agent.log 本体）。
+    keep_days<=0 表示关闭。单文件删除失败不阻断其余。
+    """
+    if keep_days <= 0 or not os.path.isdir(log_dir):
+        return 0
+    current = os.path.join(log_dir, "agent.log")
+    backups = sorted(
+        (os.path.join(log_dir, f) for f in os.listdir(log_dir)
+         if f.startswith("agent.log.") and f != "agent.log"),
+        key=lambda p: os.path.getmtime(p),
+    )
+    removed = 0
+    deadline = time.time() - keep_days * 86400
+    survivors: list[str] = []
+    for p in backups:
+        try:
+            if os.path.getmtime(p) < deadline:
+                os.remove(p)
+                removed += 1
+            else:
+                survivors.append(p)
+        except OSError:
+            continue
+    # 总量兜底：仍在的备份（+ 当天文件）合计超限就从最旧的删起
+    limit = max_total_mb * 1024 * 1024
+    def _size(paths):
+        total = 0
+        for p in paths:
+            try:
+                total += os.path.getsize(p)
+            except OSError:
+                pass
+        return total
+    while survivors and _size(survivors + [current]) > limit:
+        oldest = survivors.pop(0)
+        try:
+            os.remove(oldest)
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def setup_logging(console: bool = False) -> str:

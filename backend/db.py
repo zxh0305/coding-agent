@@ -803,6 +803,9 @@ def delete_session(sid: str) -> None:
     shutil.rmtree(_attachments_dir() / sid, ignore_errors=True)
     # browser-profiles/<sid>/ 同理：该会话的浏览器 profile 副本（~90MB）随会话回收
     shutil.rmtree(DB_PATH.parent / "browser-profiles" / sid, ignore_errors=True)
+    # browser-shots/<sid>/ 同理：该会话的浏览器截图随会话一起消失（此前是漏项，
+    # 截图的清理完全没人管，用的越久攒的越多）
+    shutil.rmtree(DB_PATH.parent / "browser-shots" / sid, ignore_errors=True)
     # tool_results/<sid>/ 同理：落盘的工具结果全文随会话一起消失
     shutil.rmtree(_tool_results_dir() / sid, ignore_errors=True)
     # 附件现在可能落在工作区 .coding-agent/attachments/<sid>/（见
@@ -1259,6 +1262,42 @@ def cleanup_orphan_attachments() -> int:
     if removed:
         log.info("清理孤儿附件目录 %d 个", removed)
     return removed
+
+
+def cleanup_orphans() -> dict:
+    """启动兜底：清掉三类"无主行"——属于已不存在会话的 messages /
+    session_traces / message_usage，以及已删用户的 auth_tokens。
+
+    正常路径由 delete_session 的显式 DELETE 覆盖；这里是历史遗留与异常退出
+    （kill -9、旧版本曾漏删 session_traces）的清扫。返回各表删除行数。
+    """
+    counts = {}
+    with _conn() as conn:
+        for name, sql in (
+            ("messages", "DELETE FROM messages WHERE session_id NOT IN (SELECT id FROM sessions)"),
+            ("session_traces", "DELETE FROM session_traces WHERE session_id NOT IN (SELECT id FROM sessions)"),
+            ("message_usage", "DELETE FROM message_usage WHERE session_id NOT IN (SELECT id FROM sessions)"),
+            ("auth_tokens", "DELETE FROM auth_tokens WHERE user_id NOT IN (SELECT id FROM users)"),
+        ):
+            counts[name] = conn.execute(sql).rowcount
+    if any(counts.values()):
+        log.info("清理孤儿行: %s", counts)
+    return counts
+
+
+def optimize_db() -> None:
+    """回收 freelist 空洞并重排，缩小库文件（删会话留下的碎片）。启动时跑一次。
+
+    PRAGMA optimize 刷新统计信息供查询计划使用；VACUUM 需要独占，包在 try 里，
+    失败（如别的连接在用）不阻断启动。
+    """
+    try:
+        with _conn() as conn:
+            conn.execute("PRAGMA optimize")
+        with _conn() as conn:
+            conn.execute("VACUUM")
+    except sqlite3.Error as e:  # 库被占用等情况下跳过，不影响服务启动
+        log.warning("VACUUM 跳过: %s", e)
 
 
 def _storable_body(m: dict) -> dict:

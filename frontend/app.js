@@ -1024,7 +1024,14 @@ async function loadHistoryPage() {
     }
     for (const m of data.messages) {
       if (m.mid) historyMids.add(m.mid);  // 事件流补发去重的比对基准
-      frag.appendChild(historyNode(m));
+      // 逐条隔离：单条消息渲染异常（脏数据）不应连累其后整批消息不渲染——
+      // 过去的写法是一条抛异常就中断整个循环，用户看到「一片空白 + 红条」，
+      // 其余本来完好的消息全部丢失。
+      try {
+        frag.appendChild(historyNode(m));
+      } catch (e) {
+        console.error("单条历史消息渲染失败，已跳过", m && m.mid, e);
+      }
     }
     const btn = $("load-older");
     if (btn) {
@@ -3278,6 +3285,14 @@ function applyEvent(evt, seq) {
       finalizeAnswer(b.el, authoritative, evt.mid);
     }
     clearInterval(metaTimer);
+    // metaEl 可能为 null：本轮没有任何正文增量（模型只调工具 / 只推理），
+    // 气泡未建成，metaEl 不会创建。此处若无保护会抛 TypeError，令其后的
+    // 「摘 running / 折叠过程卡 / 刷新会话列表」全被跳过——过程卡秒数永不停走。
+    if (!metaEl) {
+      metaEl = document.createElement("div");
+      metaEl.className = "meta";
+      (traceEl || chatEl).appendChild(metaEl);
+    }
     metaEl.textContent = metaText(evt.elapsed_s, evt.usage);
     if (evt.mid) historyMids.add(evt.mid);  // 已在屏上：防后续补发重复渲染
     if (traceEl) {
