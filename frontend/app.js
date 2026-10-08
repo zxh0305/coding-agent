@@ -2933,17 +2933,27 @@ function toolResultLine(name, resultStr, tool) {
     // 写入类：把结果里的增删行数回填成调用卡上的徽章，让"改了多大"一眼可见
     if (call.el && call.el.classList.contains("card")) { decorateWriteCard(call.el, resultStr); callWasEdit = true; }
   }
-  const line = makeToolResultLine(name, resultStr, dur);
-  // 结果行跟随调用行的归属：修改类工具的结果也留在修改区（结果摘要是"改了多少"
-  // 的补充信息，拆到过程窗会让用户两头找）
-  if (callWasEdit) line.dataset.editBy = "1";
-  // 追踪器判定的状态落成 DOM 标记：denied（权限拒绝）与 err（失败）都标 err 样式，
-  // 与历史回放同一判据（blocks.js 的 toolStatus）——不再各判一次。
-  if (tool && (tool.status === "err" || tool.status === "denied")) {
-    const sum = line.querySelector("summary");
-    if (sum) sum.classList.add("err");
+  // 写入类的成功结果不再画小行：修改区的调用卡上已回填 +N −M / 新建 N 行徽章，
+  // 再来一行 `↩ +30 −19` 与卡片完全重复（2026-10-08 用户反馈去掉）。
+  // 失败/拒绝（error 信封）与非标准返回仍照旧画，保留可展开的详情。
+  // 下面的 ✓ 摘要行状态更新不依赖结果行存在，照常执行。
+  let earlyParsed = null;
+  try { earlyParsed = JSON.parse(resultStr); } catch { /* 纯文本 */ }
+  const editSuccess = callWasEdit && earlyParsed && typeof earlyParsed === "object"
+    && (("added" in earlyParsed) || ("lines" in earlyParsed))
+    && !("error" in earlyParsed);
+  if (!editSuccess) {
+    const line = makeToolResultLine(name, resultStr, dur);
+    // 结果行跟随调用行的归属：修改类工具的结果也留在修改区（失败详情要在卡片旁）
+    if (callWasEdit) line.dataset.editBy = "1";
+    // 追踪器判定的状态落成 DOM 标记：denied（权限拒绝）与 err（失败）都标 err 样式，
+    // 与历史回放同一判据（blocks.js 的 toolStatus）——不再各判一次。
+    if (tool && (tool.status === "err" || tool.status === "denied")) {
+      const sum = line.querySelector("summary");
+      if (sum) sum.classList.add("err");
+    }
+    appendTrace(line);
   }
-  appendTrace(line);
   // 工具已返回：摘要行从"▶️ 正在命令 xxx"切换为"✓ 命令 xxx · 完成(0.4s)"并
   // 定格到下一次事件——而不是清空退回阶段文案。否则秒回的命令会让"正在→思考
   // 中→正在"来回横跳（闪烁来源）；"call+result 合并为一个连续状态"也符合直觉。
