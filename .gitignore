@@ -15,3 +15,6 @@ backend/manual/eval_patch_*.json
 
 # pytest 试验残留（本项目用 unittest；目录已删，防再生成）
 .pytest_cache/
+
+# 会话绑定"未命名工作区"时 agent 的落盘目录（压测/试验产物，运行时生成）
+workspace/

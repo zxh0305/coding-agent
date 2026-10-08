@@ -3125,9 +3125,10 @@ function flushStreamBuffers() {
       // 流式正文不住对话框：它挂在顶部折叠条里，或已升级为底部答案气泡。
     }
     pendingDeltas.clear();
-    // 正文/答案流继续推动页面贴底（与思考/说明两窗的"窗内滚动"分工明确：
-    // 前者是用户要看的输出，后者是收敛在框里的过程）。
-    scrollBottom();
+    // 正文/说明流住在说明卡（.note-box）里：卡有 220px 上限并内滚，这里只让
+    // 卡内贴底——页面不再被流式文字推着往下滚（那正是"刷屏"的观感来源）。
+    // 只有最终答案升级为正文卡后（finalizeAnswer 移出面板）才推页面。
+    scrollInside(noteBox);
   }
   if (pendingThink) {
     if (thinkSeg) {

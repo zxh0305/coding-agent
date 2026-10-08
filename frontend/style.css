@@ -622,9 +622,10 @@ body.side-resizing .sidebar { transition: none; }
 .trace > .note-box { margin-top: 8px; order: 2; }
 .trace > .think-line { order: 1; }
 
-/* 说明卡是可以刷屏的那一块——它是给用户看的内容，不做限高/内滚：正文流
-   逐字在卡里长高，页面随之推进（用户此刻想看的就是这些字）。收纳只针对
-   思考：思考收敛在上方的固定高滚动窗里，说明不需要再被二次收敛。 */
+/* 说明卡：在思考窗【下方】，是本回合所有过程说明的阅读区。它比思考窗大，
+   但同样要有上限并内滚——否则长回合的说明会把整个页面撑长、看起来像刷屏
+   （用户反馈："说明对了，思考还是刷屏"实际是这张卡不限高把页面顶长了）。
+   给 220px 上限：足够一次读几段，超出在卡内滚动，页面高度稳定。 */
 .note-box {
   font-size: 12px; line-height: 1.6;
   padding: 8px 12px; margin: 8px 0 0 2px;
@@ -633,11 +634,11 @@ body.side-resizing .sidebar { transition: none; }
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent-weak-border);
   border-radius: 8px;
-  /* 说明卡是可以刷屏的那一块——它是给用户看的内容，不做限高/内滚：正文流
-     逐字在卡里长高，页面随之推进（用户此刻想看的就是这些字）。收纳只针对
-     思考：思考收敛在上方的固定高滚动窗里，说明不需要再被二次收敛。 */
-  overflow: visible;
+  max-height: 220px; overflow-y: auto; overscroll-behavior: contain;
+  scrollbar-width: thin;
 }
+.note-box::-webkit-scrollbar { width: 6px; }
+.note-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
 .note-box.demoted::before {
   content: "💬 说明";
   display: inline-block;
