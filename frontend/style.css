@@ -681,41 +681,43 @@ body.side-resizing .sidebar { transition: none; }
 /* 修改区内的卡片沿用写入卡外观，去掉窗内压缩的额外间距影响 */
 .edit-box .tl { margin: 0; }
 
-/* 说明卡：在思考窗【下方】，是本回合所有过程说明的阅读区。它比思考窗大，
-   但同样要有上限并内滚——否则长回合的说明会把整个页面撑长、看起来像刷屏
-   （用户反馈："说明对了，思考还是刷屏"实际是这张卡不限高把页面顶长了）。
-   给 220px 上限：足够一次读几段，超出在卡内滚动，页面高度稳定。 */
+/* 说明卡：整回合过程说明的【阅读区】，排在过程窗/修改区之后（order:3）。
+   它是这三栏里唯一面向"阅读"的区块——字号比过程区（10.5~11.5px）大一档、
+   行高更松、段间距更明显，视觉上按"正文"对待（用户要求："字体大一点，
+   排版好一点，看得清楚些"）。过程内容已收进上方两栏，这里不做限高/内滚，
+   整回合说明一次铺开。 */
 .note-box {
-  font-size: 12px; line-height: 1.6;
-  padding: 8px 12px; margin: 8px 0 0 2px;
-  color: var(--text-2);
+  font-size: 14px; line-height: 1.8;
+  padding: 14px 18px; margin: 10px 0 0 2px;
+  color: var(--text-1);
   background: var(--panel);
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent-weak-border);
   border-radius: 8px;
+  letter-spacing: .01em;
   /* 【直接展开、不内滚】说明是给用户看的阅读内容：整回合说明一次性铺开，
-     不做限高/内滚（用户明确要求"说明栏不用滚动，直接输出就行，方便查看"）。
-     过程内容已被收进上方的过程窗与修改区，说明卡不再有把页面撑长的压力。 */
+     不做限高/内滚（用户明确要求"说明栏不用滚动，直接输出就行，方便查看"）。 */
   overflow: visible;
 }
 .note-box.demoted::before {
   content: "💬 说明";
   display: inline-block;
-  font-size: 10px; letter-spacing: .04em;
+  font-size: 11px; letter-spacing: .04em;
   color: var(--text-3);
   background: var(--accent-weak);
   border-radius: 999px;
-  padding: 1px 8px 2px;
-  margin-bottom: 6px;
+  padding: 2px 10px 3px;
+  margin-bottom: 10px;
 }
-/* 卡内的说明段：贴掉段级缩进/边线（卡容器自己承担），多段之间细分割线 */
+/* 卡内的说明段：贴掉段级缩进/边线（卡容器自己承担）；多段之间留出明显
+   间距 + 细分割线——说明是要读的正文，段落界线要一眼可辨。 */
 .note-box .process-text {
   font-size: inherit; line-height: inherit;
   padding: 0; margin: 0; border-left: none;
   color: inherit;
 }
 .note-box .process-text + .process-text {
-  margin-top: 8px; padding-top: 8px;
+  margin-top: 12px; padding-top: 12px;
   border-top: 1px dashed var(--border);
 }
 /* 流式中的过程正文：尾部光标——面板收起时也看得到它在动，不会以为卡死 */
