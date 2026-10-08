@@ -746,6 +746,7 @@ def _vision_backend_for(sid: str | None):
 
 
 MAX_IMAGE_B64 = 6_000_000   # 单张图片 base64 长度上限（约 4.5MB 原图）
+MAX_BODY_BYTES = 12_000_000  # 单请求体上限：覆盖"消息 + 若干内联附件"，防超大 body 撑内存
 
 
 def _build_user_message(body: dict, sid: str) -> tuple[str, dict | None]:
@@ -956,6 +957,14 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _body(self) -> dict:
         length = int(self.headers.get("Content-Length", 0))
+        # 请求体上限：单用户本地服务，但没上限的话一个超大 body 会被原样
+        # read 进内存再 json.loads——白白占用内存与一个线程。图片附件走
+        # base64 内联（单图上限 MAX_IMAGE_B64≈6MB），12MB 足够覆盖"一条消息
+        # + 若干附件"。超限时不读、返回 {}，各 handler 会按"输入为空/字段缺失"
+        # 走干净的 400，而不是把超大内容读进来。
+        if length > MAX_BODY_BYTES:
+            log.warning("请求体超限已拒绝: %d 字节 > %d", length, MAX_BODY_BYTES)
+            return {}
         return json.loads(self.rfile.read(length) or b"{}")
 
     def _query(self) -> dict:
@@ -1365,6 +1374,30 @@ class Handler(SimpleHTTPRequestHandler):
         nonce，会按事件里的原文补画）。
         """
         body = self._body()
+        # 【先验校验，再建会话】空输入必须在调用 get_session 之前拦掉：
+        # get_session 会在解析模型客户端后【落库创建会话行】；若等到
+        # _build_user_message 之后再判空，每个被拒绝的空请求都会在库里留下
+        # 一个"空标题、零消息"的孤儿会话（实测：发 5 次空输入 = 5 个垃圾会话，
+        # 既脏了任务列表又持续涨库）。这里用与 _build_user_message 同口径的
+        # 廉价预检：有正文、或有任一有效附件（图片带 data、文本可解码非空）
+        # 才算有输入；预检通过后再走 get_session。
+        _text = (body.get("message") or "").strip()
+        _has_att = False
+        for _a in (body.get("attachments") or [])[:6]:
+            _d = str(_a.get("data") or "")
+            if not _d:
+                continue
+            if _a.get("kind") == "image":
+                _has_att = True
+                break
+            try:
+                if base64.b64decode(_d):
+                    _has_att = True
+                    break
+            except Exception:
+                continue
+        if not _text and not _has_att:
+            return self._json({"error": "输入不能为空"}, 400)
         # 会话 id 要先拿到：文本附件需要按会话落盘（data/attachments/<sid>/）。
         # get_session 内部只短持锁（见其注释）；本接口本身毫秒级返回，回合不在
         # 本请求内执行，这里提前取不会拉长锁窗口。
