@@ -164,9 +164,12 @@ test("渲染：工具调用与结果配对成两行，写入卡回填徽章", ()
     ] },
   ]);
   const d = frag.children[0];
-  // summary + 调用卡 + 结果行
-  assert.equal(d.children.length, 3);
-  assert.ok(d.children[1].classList.contains("card"));
+  // summary + 修改区（写入类工具单独成区，夹在过程窗与说明卡之间）
+  assert.equal(d.children.length, 2);
+  const win = d.children[1];
+  assert.equal(win.className, "edit-box");
+  assert.equal(win.children.length, 2);  // 调用卡 + 结果行，区内配对
+  assert.ok(win.children[0].classList.contains("card"));
   assert.ok(deps.calls.some((c) => c[0] === "decorate"), "写入卡应回填徽章");
   assert.ok(deps.calls.some((c) => c[0] === "result"), "应有结果行");
 });
@@ -182,7 +185,9 @@ test("渲染：running / waiting 的工具不画结果行（还没有结果）",
       ] },
     ]);
     const d = frag.children[0];
-    assert.equal(d.children.length, 2, status + " 只应有 summary + 调用行");
+    assert.equal(d.children.length, 2, status + " 只应有 summary + 过程窗");
+    assert.equal(d.children[1].className, "proc-line");
+    assert.equal(d.children[1].children.length, 1, status + " 窗内只有调用行");
     assert.ok(!deps.calls.some((c) => c[0] === "result"), status + " 不该有结果行");
   }
 });
@@ -197,13 +202,13 @@ test("渲染：思考流与过程说明用不同类名（不冒充）", () => {
     ] },
   ]);
   const d = frag.children[0];
-  const think = d.children[1];
+  const win = d.children[1];   // 过程监视窗（思考+工具共居一窗）
   const noteBox = d.children[2];
-  assert.equal(think.className, "think-line");
+  assert.equal(win.className, "proc-line");
   assert.equal(noteBox.className, "note-box demoted");
   // 思考在窗内的正文段里，说明在卡的子段里——两类文字绝不共用一个容器
-  assert.equal(think.children[0].className, "think-seg-body");
-  assert.equal(think.children[0].textContent, "先看目录");
+  assert.equal(win.children[0].className, "think-seg-body");
+  assert.equal(win.children[0].textContent, "先看目录");
   assert.equal(noteBox.children[0].className, "process-text");
   assert.equal(noteBox.children[0].textContent, "我打算这样做");
 });
@@ -223,18 +228,19 @@ test("渲染：整回合思考归一窗、说明归一卡，轮次标题变窗�
     ] },
   ]);
   const d = frag.children[0];
-  // 顶层顺序：summary → 思考窗 → 说明卡 → 工具行（保持时序的唯一幸存者）
+  // 顶层顺序：summary → 过程窗（思考+工具共居） → 说明卡（沉底）
   assert.deepEqual(d.children.slice(1).map((c) => c.className),
-                   ["think-line", "note-box demoted", "tl"]);
-  // 两轮思考进同一个窗，轮次标题降为窗内分段头；快照末段带 live 光标
-  const think = d.children[1];
-  assert.deepEqual(think.children.map((c) => c.className),
-                   ["think-seg-head", "think-seg-body",
+                   ["proc-line", "note-box demoted"]);
+  // 两轮思考进同一个窗，轮次标题降为窗内分段头；快照末段带 live 光标；
+  // running 工具行也进窗、按真实时序插在两轮思考之间
+  const win = d.children[1];
+  assert.deepEqual(win.children.map((c) => c.className),
+                   ["think-seg-head", "think-seg-body", "tl",
                     "think-seg-head", "think-seg-body live"]);
-  assert.equal(think.children[0].textContent, "🧠 思考 · 第 1 轮");
-  assert.equal(think.children[1].textContent, "先看目录");
-  assert.equal(think.children[2].textContent, "🧠 思考 · 第 2 轮");
-  assert.equal(think.children[3].textContent, "再看结果");
+  assert.equal(win.children[0].textContent, "🧠 思考 · 第 1 轮");
+  assert.equal(win.children[1].textContent, "先看目录");
+  assert.equal(win.children[3].textContent, "🧠 思考 · 第 2 轮");
+  assert.equal(win.children[4].textContent, "再看结果");
   // 两轮说明进同一张卡
   const nb = d.children[2];
   assert.deepEqual(nb.children.map((c) => c.textContent), ["我打算这样做", "还是不对"]);
@@ -250,8 +256,10 @@ test("渲染：没跟思考流的轮次标题留在时间线（非思考模型�
     ] },
   ]);
   const d = frag.children[0];
-  // 没有任何 reasoning：不产生思考窗，轮次标题保持 trace-line 平铺
-  assert.deepEqual(d.children.slice(1).map((c) => c.className || c.tagName),
+  // 没有任何 reasoning：轮次标题与工具条目共同收进过程窗（proc-line）
+  assert.deepEqual(d.children.slice(1).map((c) => c.className),
+                   ["proc-line"]);
+  assert.deepEqual(d.children[1].children.map((c) => c.className || c.tagName),
                    ["trace-line", "tl", "tl result"]);
 });
 
@@ -325,8 +333,11 @@ test("渲染：spawn_subagent 工具块的 subtasks 渲染成嵌套折叠卡", (
   assert.equal(cardA.tagName, "DETAILS");
   assert.equal(cardA.className, "trace-nested");
   assert.equal(cardA.children[0].textContent, "🔍 子任务 1：任务A");
-  // 内部条目复用同一渲染器：round 标题 + 工具行（调用 + 结果） + done 注记
+  // 内部条目复用同一渲染器：round 标题 + 工具行 + done 注记 → 归组进一个过程窗
   assert.deepEqual(cardA.children.slice(1).map((c) => c.className || c.tagName),
+                   ["proc-line"]);
+  const winA = cardA.children[1];
+  assert.deepEqual(winA.children.map((c) => c.className || c.tagName),
                    ["trace-line", "tl", "tl result", "process-text"]);
   assert.equal(wrap.children[1].children[0].textContent, "🔍 子任务 2：任务B");
   // 调用行在前、容器居中、结果行在后

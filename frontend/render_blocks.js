@@ -128,9 +128,8 @@
     // 单窗单卡）同一副面孔——思考归思考、说明归说明、调用归调用。
     function renderProcessGroup(items, running) {
       const frag = doc.createDocumentFragment();
-      const segs = [];   // 思考分段：{ head, text, live }
-      const notes = [];  // 说明文本
-      const inline = []; // 保持时序的其余条目
+      const notes = [];  // 说明文本（全部沉到窗下的说明卡里）
+      const ops = [];    // 过程窗的真实时间线：{ seg } 或 { it }，按序交错渲染
       let pendingHead = null;  // 待定性的轮次标题：跟思考进窗，否则留在时间线
       let curSeg = null;
       for (const it of Array.isArray(items) ? items : []) {
@@ -145,7 +144,7 @@
             // （无标题）续写当前段——与实时路径"一轮一段"的口径一致
             if (pendingHead || !curSeg) {
               curSeg = { head: pendingHead ? pendingHead.text : null, text: "", live: false };
-              segs.push(curSeg);
+              ops.push({ seg: curSeg });
             }
             curSeg.text += t;
             if (it.live) curSeg.live = true;
@@ -157,35 +156,62 @@
           notes.push(it.text || "");
           continue;  // 轮次标题保持待定：它可能属于时间线上的下一个工具组
         }
-        if (pendingHead) { inline.push(pendingHead); pendingHead = null; }
-        inline.push(it);
+        if (pendingHead) {
+          // 标题没等到思考流（非思考模型/纯工具轮）：留在窗内条目流里
+          ops.push({ it: pendingHead });
+          pendingHead = null;
+        }
+        // 工具/提醒等条目：打断当前思考段——后续 reasoning 会开新段，
+        // 窗内时序与实时 DOM 顺序一致（想到哪、跑到哪、接着想）。
+        ops.push({ it });
+        curSeg = null;
       }
-      if (pendingHead) inline.push(pendingHead);  // 尾部悬挂的轮次标题归时间线
+      if (pendingHead) ops.push({ it: pendingHead });  // 尾部悬挂的标题归窗内
 
-      if (segs.length) {
+      // 【过程监视窗 + 修改区】回放与实时同序：思考分段与普通工具条目进
+      // .proc-line（内滚）；写/改文件的条目（apply_patch/write_file）另收进
+      // .edit-box 修改区，夹在过程窗与说明卡之间（order:2）——用户要一眼看清
+      // 这轮动了哪些文件。ops 记录真实时间线（想→跑→再想），按序渲染。
+      const isEditItem = (it) => it && it.kind === "tool" &&
+        (it.name === "apply_patch" || it.name === "write_file");
+      const procOps = [], editOps = [];
+      for (const op of ops) {
+        if (op.it && isEditItem(op.it)) editOps.push(op);
+        else procOps.push(op);
+      }
+      if (procOps.length) {
         const box = doc.createElement("div");
-        box.className = "think-line";
-        for (const s of segs) {
-          if (s.head) {
-            const h = doc.createElement("div");
-            h.className = "think-seg-head";
-            h.textContent = s.head;
-            box.appendChild(h);
+        box.className = "proc-line";
+        for (const op of procOps) {
+          if (op.seg) {
+            const s = op.seg;
+            if (s.head) {
+              const h = doc.createElement("div");
+              h.className = "think-seg-head";
+              h.textContent = s.head;
+              box.appendChild(h);
+            }
+            const b = doc.createElement("div");
+            b.className = "think-seg-body" + (running && s.live ? " live" : "");
+            b.textContent = s.text;
+            box.appendChild(b);
+          } else {
+            box.appendChild(renderProcessItem(op.it, running));
           }
-          const b = doc.createElement("div");
-          b.className = "think-seg-body" + (running && s.live ? " live" : "");
-          b.textContent = s.text;
-          box.appendChild(b);
         }
         frag.appendChild(box);
+      }
+      if (editOps.length) {
+        const eb = doc.createElement("div");
+        eb.className = "edit-box";
+        for (const op of editOps) eb.appendChild(renderProcessItem(op.it, running));
+        frag.appendChild(eb);
       }
       if (notes.length) {
         const nb = doc.createElement("div");
         nb.className = "note-box demoted";
-        // 说明卡排在思考窗下方（.trace 是列向 flex + order，见 style.css）：
-        // 思考收敛在上方固定高滚动窗里，说明在它下面展开。说明是给用户看的
-        // 内容——可以刷屏、不做 DrainMode 截断：整回合所有过程说明依次列出，
-        // 用户展开过程卡就能按顺序读完全部说明。
+        // 说明卡直接展开（CSS 不再限高内滚）：整回合所有轮次的说明依次列出，
+        // 用户展开过程卡一眼就能读完，不用在卡里滚。
         for (const t of notes) {
           const n = doc.createElement("div");
           n.className = "process-text";
@@ -194,7 +220,6 @@
         }
         frag.appendChild(nb);
       }
-      for (const it of inline) frag.appendChild(renderProcessItem(it, running));
       return frag;
     }
 

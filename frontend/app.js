@@ -2556,10 +2556,22 @@ function ensureTrace() {
   if (existing) {
     existing.removeAttribute("data-livetrace");
     traceEl = existing;
-    // 快照卡里可能有回放已画出的思考窗/说明卡：原地认领，后续实时流接着写，
+    // 快照卡里可能有回放已画出的过程窗/说明卡：原地认领，后续实时流接着写，
     // 否则接管后会在卡里再建一个窗，出现双窗/双卡叠着。
-    thinkBox = existing.querySelector(".think-line");
+    thinkBox = existing.querySelector(".proc-line, .think-line");
+    procBox = thinkBox;
     noteBox = existing.querySelector(".note-box");
+  return;
+  }
+  // 认领本 tab 的乐观占位卡（performSend 在 POST 前画的"正在思考…"卡）：
+  // turn_start 复位过 traceEl=null，不认领就会另建一张——页面上出现两张
+  // 过程卡，占位那张永远停在"已思考 0.0 秒 · 0 步"（用户截图抓到过）。
+  const ph = chatEl.querySelector("details.trace.running");
+  if (ph) {
+    traceEl = ph;
+    thinkBox = ph.querySelector(".proc-line, .think-line");
+    procBox = thinkBox;
+    noteBox = ph.querySelector(".note-box");
     return;
   }
   traceEl = document.createElement("details");
@@ -2636,12 +2648,69 @@ function traceTick() {
     `${prefix}${label} ${el} · ${steps} 步`;
 }
 
-// 追加一行执行痕迹。步数已由 liveTracker 记账（tool_call 时 +1），这里不再自增。
-function appendTrace(el) {
+// 【过程监视窗】：思考流 + 工具行 + 子代理卡共居的【一个】内滚框。它是整个
+// 执行过程的唯一收敛区——窗子高度恒定、内部滚动贴底，页面高度不随过程内容
+// 增长；窗子下面只有说明卡（沉底）和最终答案。工具行原先平铺在面板上，长
+// 回合几十步把说明卡顶到页面中间、过程内容铺满全屏——正是用户截图指出的
+// "命令这些放外面还是会刷屏"。窗内顺序仍按时序：思考段与工具行交错可读。
+let procBox = null;
+
+function procBoxEl() {
   ensureTrace();
-  traceEl.appendChild(el);
+  if (procBox && procBox.isConnected) return procBox;
+  // 接管快照卡：回放已画出的窗（.proc-line，渲染器同款）或旧版思考窗都认领
+  procBox = traceEl.querySelector(".proc-line, .think-line");
+  if (!procBox) {
+    procBox = document.createElement("div");
+    procBox.className = "proc-line";
+    // 挂在 summary 之后、说明卡之前；order 由 CSS 保证（窗1/卡2）
+    traceEl.appendChild(procBox);
+  }
+  return procBox;
+}
+
+// 追加一行执行痕迹：一律进过程监视窗（不再平铺面板）。步数已由 liveTracker
+// 记账（tool_call 时 +1），这里不再自增。
+function appendTrace(el) {
+  // 修改类工具行（write/apply_patch）进「修改区」常驻可见；其余（命令/读取/
+  // 搜索/截图…）进过程监视窗内滚。结果行跟随其调用行的归属（result 行的
+  // dataset.editBy 在 toolResultLine 里按配对设置）。
+  const toEdit = el.classList.contains("card") || (el.dataset && el.dataset.editBy === "1");
+  (toEdit ? editBoxEl() : procBoxEl()).appendChild(el);
+  if (toEdit) syncEditBox();  // 首条修改到达即让修改区显形
   traceTick();
-  scrollBottom();  // 执行步骤追加：只在用户本来贴底时跟随
+  // 修改区常驻展开、过程窗内滚：只有过程窗需要贴底跟随
+  if (!toEdit) scrollInside(procBox);
+  else if (editBox) scrollInside(editBox);
+}
+
+// 【修改区】.edit-box：写文件/改代码（apply_patch / write_file）的操作单独成区，
+// 夹在过程窗（上）与说明卡（下）之间——用户要一眼看清"这轮动了哪些文件"。
+// 它不参与过程窗内滚（窗内滚就看漏了），而是像说明卡一样常驻展开；条目多时
+// 自身限高内滚，页面不被撑长。order:1.5 由 CSS 落在两窗之间。
+let editBox = null;
+
+function editBoxEl() {
+  ensureTrace();
+  if (editBox && editBox.isConnected) return editBox;
+  editBox = traceEl.querySelector(".edit-box");  // 接管快照卡：认领回放已画的区
+  if (!editBox) {
+    editBox = document.createElement("div");
+    editBox.className = "edit-box hidden";  // 有第一条修改才显形
+    traceEl.appendChild(editBox);
+  }
+  return editBox;
+}
+
+// 修改区显隐：有 .tl 条目才展示（空的框连标题都不该出现）
+function syncEditBox() {
+  if (!editBox) return;
+  editBox.classList.toggle("hidden", !editBox.querySelector(".tl"));
+}
+
+// 判断一个工具是否为"改文件"类（决定它进过程窗还是修改区）
+function isEditTool(name) {
+  return name === "apply_patch" || name === "write_file";
 }
 
 function traceLine(text) {
@@ -2818,13 +2887,17 @@ function toolResultLine(name, resultStr, tool) {
   // 持续时长：配对最近一次同名调用
   let dur = "";
   const idx = pendingCalls.map(c => c.name).lastIndexOf(name);
+  let callWasEdit = isEditTool(name);  // 未配对也按工具名判归属（补发场景）
   if (idx >= 0) {
     const call = pendingCalls.splice(idx, 1)[0];
     dur = ` · ${((Date.now() - call.t) / 1000).toFixed(1)}s`;
     // 写入类：把结果里的增删行数回填成调用卡上的徽章，让"改了多大"一眼可见
-    if (call.el && call.el.classList.contains("card")) decorateWriteCard(call.el, resultStr);
+    if (call.el && call.el.classList.contains("card")) { decorateWriteCard(call.el, resultStr); callWasEdit = true; }
   }
   const line = makeToolResultLine(name, resultStr, dur);
+  // 结果行跟随调用行的归属：修改类工具的结果也留在修改区（结果摘要是"改了多少"
+  // 的补充信息，拆到过程窗会让用户两头找）
+  if (callWasEdit) line.dataset.editBy = "1";
   // 追踪器判定的状态落成 DOM 标记：denied（权限拒绝）与 err（失败）都标 err 样式，
   // 与历史回放同一判据（blocks.js 的 toolStatus）——不再各判一次。
   if (tool && (tool.status === "err" || tool.status === "denied")) {
@@ -2966,7 +3039,10 @@ function showPermissionCard(evt) {
   note.className = "perm-note";
   note.textContent = "等待你的决定（5 分钟未确认将按拒绝处理）";
   card.append(title, reason, pre, btns, note);
-  traceEl.appendChild(card);  // 不走 appendTrace：确认卡不算执行步骤
+  // 确认卡不进过程监视窗（窗内滚、会被滚走）：它是必须看到并操作的交互卡，
+  // 挂在面板底部（说明卡 order:2 之后）常驻可见。不算执行步骤。
+  traceEl.appendChild(card);
+  card.style.order = "3";
   permissionCards.set(evt.id, card);
   scrollBottom(true);  // 确认卡是必须看到的交互：强制贴底
 }
@@ -3022,7 +3098,9 @@ function ensureLiveMsg(mid) {
     chatEl.appendChild(metaEl);  // 统计行留在正文区末尾，跟随最终答案
   }
   liveBubble = b.el;  // 兼容既有的"当前气泡"语义（retire/done 收尾用）
-  scrollBottom();
+  // 不再 scrollBottom：流式正文住在说明卡里（220px 上限内滚），flushStreamBuffers
+  // 每帧做卡内贴底；页面级滚动只留给最终答案（finalizeAnswer）与确认卡。
+  scrollInside(noteBox);
   return b;
 }
 
@@ -3135,9 +3213,11 @@ function flushStreamBuffers() {
       thinkSeg.textContent += pendingThink;
     }
     pendingThink = "";
-    // 【收敛】思考流只在恒定高的小窗（.think-line）内滚动贴底，绝不 scrollBottom
-    // ——页面纹丝不动，长思考不再把页面推着往下刷。说明/答案两窗同理。
-    scrollInside(thinkSeg ? (thinkSeg.parentElement || thinkBox) : null);
+    // 【持续贴底】思考窗流式期间强制滚到底：思考是"正在发生什么"的直播，用户
+    // 扫一眼必须看到最新几行；若按"近底才跟"的口径，窗停在中段看起来就像卡住
+    // 了（用户明确反馈）。这里不看 nearBottom，直接 scrollTop = scrollHeight。
+    // 仍绝不 scrollBottom——页面纹丝不动，只有窗内内容在滚。
+    if (thinkBox) thinkBox.scrollTop = thinkBox.scrollHeight;
   }
 }
 
@@ -3181,7 +3261,7 @@ function applyEvent(evt, seq) {
     // 回合级状态复位（原在 performSend 里；改为事件驱动后，刷新页面接上
     // 正在进行的回合也走同一套初始化）
     liveMsgs = new Map();
-    liveBubble = null; traceEl = null; traceCurrent = "";
+    liveBubble = null; traceEl = null; procBox = null; traceCurrent = "";
     placeholderOpen = false;  // 占位标记随回合重建作废（新卡、新开合语义）
     tracePhase = "正在理解问题…";  // 回合开场：模型还没吐任何内容时的友好占位
     metaEl = null; pendingCalls = [];
@@ -3221,19 +3301,11 @@ function applyEvent(evt, seq) {
     // 推理与回答是两个流：这里绝不带 mid（后端也不再发），否则同一 mid 会
     // 把推理归并进回答气泡——思考过程冒充正文正是要杜绝的那个 bug。
     if (!thinkBox) {
-      ensureTrace();
-      // 接管快照卡（刷新/切回进行中回合）时，卡里可能已有回放画好的思考窗：
-      // ensureTrace 已把它认领进 thinkBox——有就复用，再新建就是截图里的双窗。
-      if (!thinkBox) {
-        // 【不刷屏】原实现在"本轮还没跑过工具"时强制展开面板，于是首批推理
-        // 一到就把过程面板弹开、整个页面被推理文字往下顶——用户反馈的"思考
-        // 刷屏"主因之一。推理流本就住在恒定 140px 的 .think-line 小窗里
-        // （窗内滚动、页面不随内容变长），无需展开面板即可自查；摘要行的
-        // "已思考 N 秒"是收起态下的实时信号。这里保持面板原开合状态不动。
-        thinkBox = document.createElement("div");
-        thinkBox.className = "think-line";
-        traceEl.appendChild(thinkBox);  // 不走 appendTrace：思考流不算一步
-      }
+      // 【单窗】思考流与工具行共用同一个过程监视窗（procBoxEl）：思考是窗内
+      // 的一个分段，工具行是窗内的条目，时序交错、共居一窗——这正是"过程收敛
+      // 在一个框里滚"的终态。旧版思考单独开 .think-line、工具行平铺面板，
+      // 长回合时过程内容铺满页面（用户截图指出的刷屏）。
+      thinkBox = procBoxEl();  // 不走 appendTrace：思考流不算一步
     }
     if (!thinkSeg) {
       roundNeedHead = false;  // 这轮的思考来了：标题进窗内，时间线不用补
@@ -3526,6 +3598,7 @@ function resetStreamState() {
   myNonce = null;
   liveBubble = null; metaEl = null;
   thinkBox = null; thinkSeg = null; noteBox = null; curRoundNo = 0; roundNeedHead = true;
+  procBox = null;  // 过程监视窗引用随会话作废（窗子元素挂在旧 traceEl 上）
   traceEl = null;
   liveMsgs = new Map(); pendingCalls = [];
   permissionCards = new Map();
