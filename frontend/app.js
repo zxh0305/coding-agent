@@ -2680,9 +2680,11 @@ function appendTrace(el) {
   if (toEdit) syncEditBox();  // 首条修改到达即让修改区显形
   orderTraceSections();       // 显式 DOM 重排，不依赖 CSS order
   traceTick();
-  // 修改区常驻展开、过程窗内滚：只有过程窗需要贴底跟随
+  // 窗内贴底（近底才跟）+ 页面级跟随：新工具行让过程区变高，页面必须往下走，
+  // 否则刚插入的行落在输入框下方看不见。scrollBottom 有 stickBottom 保护。
   if (!toEdit) scrollInside(procBox);
   else if (editBox) scrollInside(editBox);
+  scrollBottom();
 }
 
 // 【显式排序】把 .trace 内的三栏按 proc → edit → note 的 DOM 顺序重排。
@@ -3221,9 +3223,12 @@ function flushStreamBuffers() {
     pendingDeltas.clear();
     // 正文/说明流住在说明卡（.note-box）里：卡限高内滚，页面不被流式文字撑长
     // （那正是"刷屏"的观感来源；实测模型把逐轮推理都发进这个流）。
-    // 【持续贴底】与思考窗同口径：流式期间强制滚到底，扫一眼能看到最新内容，
-    // 否则卡停在中段看着像卡住。只有最终答案升级为正文卡后才推页面。
+    // 【持续贴底】卡内强制滚到底，扫一眼能看到最新内容。
     if (noteBox) noteBox.scrollTop = noteBox.scrollHeight;
+    // 【页面跟随】过程区在长高（卡变高/新工具行插入），页面必须跟着往下走，
+    // 否则最新内容停在输入框下方看不见（用户反馈"不会自动到底部"）。
+    // scrollBottom 内部有 stickBottom 保护：用户上滑看历史时不会被打扰。
+    scrollBottom();
   }
   if (pendingThink) {
     if (thinkSeg) {
@@ -3233,8 +3238,8 @@ function flushStreamBuffers() {
     // 【持续贴底】思考窗流式期间强制滚到底：思考是"正在发生什么"的直播，用户
     // 扫一眼必须看到最新几行；若按"近底才跟"的口径，窗停在中段看起来就像卡住
     // 了（用户明确反馈）。这里不看 nearBottom，直接 scrollTop = scrollHeight。
-    // 仍绝不 scrollBottom——页面纹丝不动，只有窗内内容在滚。
     if (thinkBox) thinkBox.scrollTop = thinkBox.scrollHeight;
+    scrollBottom();  // 同上：页面级跟随（有 stickBottom 保护）
   }
 }
 
