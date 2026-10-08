@@ -2520,7 +2520,7 @@ let roundNeedHead = true; // 本轮还没见到思考流：轮次标题画回时
 let traceEl = null;
 let placeholderOpen = false;  // 过程面板的"展开"是否只是为了 show 即时占位（见 performSend）。
                               // 【方案A】首个思考流到达后无缝转入思考展开（traceOpenForThinking）。
-let autoThinkOpen = false;    // 【方案A】面板当前因"思考流阶段"而自动展开：正文开始输出时收回。
+let autoThinkOpen = false;    // 【方案A v2】面板处于自动展开（工作期全程保持）：done/出错收尾时收回。
 let userToggledTrace = false; // 用户手动点过折叠条（点按/回车/空格）：此后一切自动开合让位。
 let traceCurrent = "";  // 当前正在执行的工具（收起状态下摘要行显示的"此刻在干嘛"）
 let tracePhase = "";    // 当前阶段文案（"正在理解问题…/深度思考中…/正在撰写回答…"），
@@ -2627,17 +2627,22 @@ function turnStartFromEvent(evt) {
 // 摘要行 = 一行"当前状态"：正在跑的工具 + 已工作多久 + 步数。
 // 这是收起状态下用户唯一能看到的过程信息，必须把"此刻在干嘛"说清楚。
 // 步数与"正在跑什么"都取自 liveTracker（与回放同一套记账），不再另立计数器。
-// 【方案A：思考展开状态机】思考流阶段保持展开——思考最浓的阶段正是用户最想
-// 盯着的阶段（2026-10-08 拍板，替代旧"首个真实内容到达即收回"的口径）；
-// 首个正文增量到达时收回。占位展开无缝转入思考展开，不闪收。用户手动开合
-// 过（userToggledTrace）之后，两个方向都不再自动动面板。
+// 【方案A v2：工作期全程展开】占位展开无缝转入自动展开后，整个回合工作期
+// （思考/工具/中间说明段）保持展开——代理式回合中间也会吐正文段（"接下来
+// 我会…"），v1 把收起挂在首个正文增量上，导致面板在工作半途被一句过渡话
+// 收起，后续步骤又被藏住（2026-10-08 用户反馈"过程中自己收起"）。
+// 现在收起只发生在 done/出错收尾（traceCloseForAnswer 仅由收尾处调用）。
+// 用户手动开合过（userToggledTrace）之后，两个方向都不再自动动面板。
 function traceOpenForThinking() {
   placeholderOpen = false;
   if (userToggledTrace || autoThinkOpen) return;
   autoThinkOpen = true;
   if (traceEl) traceEl.open = true;
 }
-function traceCloseForAnswer() {
+function traceCloseAtEnd() {
+  // 仅限 done/出错收尾路径调用（app.js:3533/3625 的 open=false + 清标志即本语义
+  // 的内联实现；此函数保留给将来需要"程序化收尾"的场景）。注意：收起只应该
+  // 发生在回合结束，严禁把它挂回流式事件（v1 的教训，见上方 v2 注释）。
   placeholderOpen = false;
   if (userToggledTrace || !autoThinkOpen) return;
   autoThinkOpen = false;
@@ -3440,13 +3445,11 @@ function applyEvent(evt, seq) {
     }
     queueStreamDelta("think", null, evt.delta);
   } else if (t === "answer_delta") {
-    traceCloseForAnswer();  // 【方案A】正文开始输出：收起思考期自动展开的面板
+    // 【方案A v2】不再因正文增量收起面板：代理式回合中间会吐正文段（过渡说明），
+    // v1 在这里收起导致面板工作半途被藏住。最终回答在 done 时由 finalizeAnswer
+    // 从「💬 说明」卡移出、升级为正文卡，面板届时由收尾逻辑统一收起——正文
+    // 阶段不会被流式文字推着滚屏（收尾收起 + 说明卡内小字流动，同旧不刷屏口径）。
     tracePhase = "正在撰写回答…";
-    // 【不刷屏】回答的正文流不住在展开面板里：它已在 ensureLiveMsg 里按过程
-    // 小字流进「💬 说明」卡，done 时由 finalizeAnswer 移出面板、升级为正文卡。
-    // 【方案A】思考期自动展开的面板在这里收回（traceCloseForAnswer）——正文
-    // 阶段用户只会看到折叠条摘要行实时更新（"正在撰写回答… · 已思考 N 秒"），
-    // 页面不再被流式文字推着往下滚；想细看过程可手动展开（之后自动逻辑让位）。
     queueStreamDelta("answer", evt.mid, evt.delta);
   } else if (t === "todo_update") {
     // 任务清单不再画进对话流：改为驱动右上角 📋 浮窗实时更新（后端同时已落库，
@@ -3955,9 +3958,10 @@ async function performSend(item) {
     tracePhase = "正在思考…";  // 占位阶段文案：turn_start 到达后会校正为"正在理解问题…"
     ensureTrace();
     // 占位卡默认展开：此刻还没有任何内容，展开让用户看到"正在思考…"的明确回执。
-    // 【方案A】placeholderOpen 标记"这次展开是为了即时反馈"：首个思考流到达后
-    // 由 traceOpenForThinking() 无缝转入"思考展开"（不再闪收），首个正文增量
-    // 到达时 traceCloseForAnswer() 才收回。用户手动点过折叠条则一切自动让位。
+    // 【方案A v2】placeholderOpen 标记"这次展开是为了即时反馈"：首个思考流到达
+    // 后由 traceOpenForThinking() 无缝转入"工作期展开"（不再闪收），此后思考/
+    // 工具/中间正文段全程保持展开，done/出错收尾才统一收起。用户手动点过折叠
+    // 条则一切自动让位。
     traceEl.open = true;
     placeholderOpen = true;
   }
