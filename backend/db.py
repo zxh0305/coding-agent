@@ -1241,26 +1241,32 @@ def migrate_attachments_to_workspace(sid: str) -> int:
 
 
 def cleanup_orphan_attachments() -> int:
-    """清理孤儿附件目录：DB 里已无对应会话的 attachments/<sid>/ 整棵删除。
+    """清理孤儿会话目录：DB 里已无对应会话的 <dir>/<sid>/ 整棵删除。
 
-    正常路径靠 delete_session 的 rmtree 就够；这里是兜底——进程被强杀
-    （kill -9）时 rmtree 不会执行，残留目录会永久占盘。启动时扫一遍即可。
-    返回清理掉的目录数。
+    覆盖所有「按会话隔离落盘」的目录：attachments / docs / artifacts /
+    tool_results / browser-shots / browser-profiles。正常路径靠 delete_session
+    的 rmtree 就够；这里是兜底——进程被强杀（kill -9）时 rmtree 不会执行，
+    或早期版本漏删（如 browser-shots 曾完全没人清），残留目录会永久占盘。
+    启动时扫一遍即可。返回清理掉的目录数。
     """
-    root = _attachments_dir()
-    if not root.is_dir():
-        return 0
+    roots = [
+        _attachments_dir(), _docs_dir(), _artifacts_dir(), _tool_results_dir(),
+        DB_PATH.parent / "browser-shots", DB_PATH.parent / "browser-profiles",
+    ]
     with _conn() as conn:
         rows = conn.execute("SELECT id FROM sessions").fetchall()
     alive = {r["id"] for r in rows}
     removed = 0
-    for d in root.iterdir():
-        if not d.is_dir() or d.name in alive:
+    for root in roots:
+        if not root.is_dir():
             continue
-        shutil.rmtree(d, ignore_errors=True)
-        removed += 1
+        for d in root.iterdir():
+            if not d.is_dir() or d.name in alive:
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
     if removed:
-        log.info("清理孤儿附件目录 %d 个", removed)
+        log.info("清理孤儿会话目录 %d 个", removed)
     return removed
 
 

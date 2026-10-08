@@ -2357,6 +2357,16 @@ let lastSeq = null;          // 本页已应用（渲染过）的最大事件 se
 let bootBuffer = null;       // 补发段缓冲：caught_up 到达前无法判定回合完整性，先攒着
 let myNonce = null;          // 本 tab 发出的当前回合 nonce：turn_start 不重复画自己的气泡
 
+// —— 会话任务清单状态 ——
+// 必须声明在这里（而非清单 UI 函数附近的文件后段）：resetStreamState() 在
+// showLogin() 里被同步调用，而 showLogin 可能在本文件顶层求值完成前就跑
+// （首屏无有效 token）。若声明留在后面，resetStreamState 对 todoAutoOpened
+// 的写入落在 let 的 TDZ 内 → ReferenceError，其后的状态复位全部被跳过。
+let sessionTodos = [];          // [{content, status}]，空数组 = 当前会话没有清单
+let todoAutoOpened = false;     // 本回合是否由 streaming 自动展开过（防重复触发）
+let todoDoneAnnounced = false;  // "全部完成"是否已展示过（边沿触发，一回合只弹一次）
+let todoDoneTimer = null;       // 完成展示的自动收起定时器
+
 const seqKey = (sid) => `sse_seq_${sid}`;
 
 function closeEvents() {
@@ -3285,9 +3295,11 @@ function applyEvent(evt, seq) {
       finalizeAnswer(b.el, authoritative, evt.mid);
     }
     clearInterval(metaTimer);
-    // metaEl 可能为 null：本轮没有任何正文增量（模型只调工具 / 只推理），
-    // 气泡未建成，metaEl 不会创建。此处若无保护会抛 TypeError，令其后的
-    // 「摘 running / 折叠过程卡 / 刷新会话列表」全被跳过——过程卡秒数永不停走。
+    // 防御性空值保护：正常路径下上一行 ensureLiveMsg() 已保证 metaEl 非空
+    // （见其内部 !metaEl 时新建），此处几乎不会命中。但反例存在——若将来
+    // ensureLiveMsg 的建 metaEl 分支被改/被提前 return 绕过，这里就是裸的
+    // TypeError，会连带跳过其后的「摘 running / 折叠过程卡 / 刷新列表」，
+    // 表现为过程卡秒数永不停走。保留空值兜底的成本近乎为零。
     if (!metaEl) {
       metaEl = document.createElement("div");
       metaEl.className = "meta";
@@ -4581,10 +4593,9 @@ function bindSideResizer() {
 // ---------- 会话任务清单（右上角 📋 入口 + 浮窗） ----------
 // 数据源两路：实时 = todo_update 事件；回放 = GET /api/sessions/<id>/todos。
 // 全部完成不自动消失：徽标变 ✅，用户点开仍能看到完成状态；手动关闭只收起浮窗。
-let sessionTodos = [];   // [{content, status}]，空数组 = 当前会话没有清单
-let todoAutoOpened = false;  // 本回合是否由 streaming 自动展开过（防重复触发）
-let todoDoneAnnounced = false;  // "全部完成"是否已展示过（边沿触发，一回合只弹一次）
-let todoDoneTimer = null;       // 完成展示的自动收起定时器
+// 注意：这几个状态变量声明在文件前部（见「会话任务清单状态」块）。它们被
+// resetStreamState()/setStreaming() 等早于此处的函数读写——声明留在本段会
+// 造成 TDZ（首屏 showLogin → resetStreamState 即在 let 初始化前写入变量）。
 
 function setSessionTodos(todos) {
   sessionTodos = Array.isArray(todos) ? todos : [];
