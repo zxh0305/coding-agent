@@ -2735,6 +2735,11 @@ function toolDoingLabel(name, argsStr) {
 }
 
 function toolCallLine(name, argsStr) {
+  ensureTrace();
+  // 【三窗可见】首个工具调用到来时自动展开折叠条：思考窗/说明卡/正文流都收敛
+  // 在恒定高的小框里（不刷屏），但得先看得见框。之后一律不强制开合——用户手动
+  // 收起过就不再翻回，尊重用户意图（与"真实内容不弹开"的既有口径一致）。
+  if (liveTracker.state() && liveTracker.state().steps <= 1) traceEl.open = true;
   const d = makeToolCallLine(name, argsStr);
   appendTrace(d);
   pendingCalls.push({ name, el: d, t: Date.now() });
@@ -2999,6 +3004,9 @@ function ensureLiveMsg(mid) {
     // 往下刷，把页面推着滚。改为不主动改变面板开合：正文流仍按过程小字悄悄
     // 累积在「💬 说明」卡里，折叠条的摘要行（"正在撰写回答… · 已思考 N 秒"）
     // 负责给用户"它在动"的实时信号；done 时正文被 finalizeAnswer 升级为正文卡。
+    // 新一轮正文进来：说明卡不做 DrainMode——说明是给用户看的内容，整回合
+    // 所有轮次的说明依次累积在卡里（卡不限高、可刷屏），用户随时能回看全文。
+    // 收敛只针对思考（上方固定高滚动窗），不针对说明。
     const el = document.createElement("div");
     el.className = "process-text streaming";
     // 流式正文直接住进说明卡：降级后原地留下（所有轮次的说明共居一卡），
@@ -3084,6 +3092,10 @@ function demoteLiveBubbleToTrace() {
 // 这是"先小字流出、完成后升级"的落点——升级只发生一次，且是"小→大"的揭晓，
 // 不像旧实现每段都"大→小"地缩一次。
 function finalizeAnswer(el, text, mid) {
+  // 定稿插到折叠条之后：用户若手动展开过折叠条，答案流可能正挂在面板【内部】，
+  // 此时也用 traceEl.after 把它挪出面板，不能盲信 el.after（会把答案留在框里）。
+  const holder = document.createDocumentFragment();
+  holder.appendChild(el);
   el.classList.remove("streaming", "process-text", "demoted");  // 去掉过程小字样式与「💬 说明」标记，换成正文卡
   el.classList.add("bubble", "assistant");
   renderIntoBubble(el, text);
@@ -3110,27 +3122,31 @@ function flushStreamBuffers() {
       const b = ensureLiveMsg(mid);
       b.text += text;
       b.el.textContent = b.text;
-      // 流式正文住在说明卡里：内容超过卡高时卡内贴底跟随（近底才拽）
-      if (b.el.parentElement === noteBox) {
-        const near = noteBox.scrollHeight - noteBox.scrollTop - noteBox.clientHeight < 48;
-        if (near) noteBox.scrollTop = noteBox.scrollHeight;
-      }
+      // 流式正文不住对话框：它挂在顶部折叠条里，或已升级为底部答案气泡。
     }
     pendingDeltas.clear();
-    scrollBottom();  // 流式增量：只在用户贴底时跟随，上滑看历史时不打扰
+    // 正文/答案流继续推动页面贴底（与思考/说明两窗的"窗内滚动"分工明确：
+    // 前者是用户要看的输出，后者是收敛在框里的过程）。
+    scrollBottom();
   }
   if (pendingThink) {
     if (thinkSeg) {
       thinkSeg.textContent += pendingThink;
-      // 窗内贴底跟随，但用户上滑回看前面的思考时不再拽回——离底一屏内才算"在跟"
-      const box = thinkSeg.parentElement || thinkBox;
-      const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
-      if (nearBottom) box.scrollTop = box.scrollHeight;
     }
     pendingThink = "";
-    // 这里刻意不 scrollBottom：思考只在固定小窗内流动，窗子高度恒定，
-    // 外层页面保持纹丝不动；轮次标题/工具行等离散事件各自带滚动。
+    // 【收敛】思考流只在恒定高的小窗（.think-line）内滚动贴底，绝不 scrollBottom
+    // ——页面纹丝不动，长思考不再把页面推着往下刷。说明/答案两窗同理。
+    scrollInside(thinkSeg ? (thinkSeg.parentElement || thinkBox) : null);
   }
+}
+
+// 把内容区固定在一个框内滚动贴底（近底才拽）：思考窗、说明卡、正文流共用。
+// 思考/说明两窗高度恒定、只在窗内滚动，是"页面不随过程刷屏"的关键——它们
+// 一律不走 scrollBottom（外层页面不动），只有最终答案（真正的输出）才推页面。
+function scrollInside(box) {
+  if (!box) return;
+  const near = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+  if (near) box.scrollTop = box.scrollHeight;
 }
 
 function queueStreamDelta(kind, mid, text) {
@@ -3257,8 +3273,9 @@ function applyEvent(evt, seq) {
   } else if (t === "tool_call") {
     flushStreamBuffers();
     demoteLiveBubbleToTrace();
-    // 这轮始终没有思考流（非思考模型/纯工具轮）：轮次标题画回时间线，分隔工具组
-    if (roundNeedHead && curRoundNo) traceLine(`🧠 思考 · 第 ${curRoundNo} 轮`);
+    // 这轮没有思考流（非思考模型/纯工具轮）：不再往时间线插一行"🧠 思考 · 第 N 轮"
+    // ——那是截图里"两个思考栏"的第二个来源（第一个是折叠条 summary）。思考一律
+    // 收敛进唯一的滚动窗；纯工具轮没有推理内容，就不该在时间线上凭空多一行标题。
     roundNeedHead = false;
     tracePhase = "";  // 阶段让位：接下来摘要行显示具体的工具名（"正在读取…"）
     // 记账交给共用追踪器（与回放同一套配对逻辑），DOM 侧只负责画这一行

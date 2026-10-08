@@ -182,6 +182,10 @@
       if (notes.length) {
         const nb = doc.createElement("div");
         nb.className = "note-box demoted";
+        // 说明卡排在思考窗下方（.trace 是列向 flex + order，见 style.css）：
+        // 思考收敛在上方固定高滚动窗里，说明在它下面展开。说明是给用户看的
+        // 内容——可以刷屏、不做 DrainMode 截断：整回合所有过程说明依次列出，
+        // 用户展开过程卡就能按顺序读完全部说明。
         for (const t of notes) {
           const n = doc.createElement("div");
           n.className = "process-text";
@@ -222,6 +226,14 @@
         // 历史回合保持折叠（正文区只给答案）。两种状态都可手动切换，渲染后
         // 代码不再强制改 open——尤其不能在用户手动收起后翻回展开态。
         d.open = !!block.running;
+        // 进行中快照卡打接管标记：实时 SSE 补发到达时，app.js 的 ensureTrace 按
+        // 此属性原地认领这张卡继续实时更新（否则时间线尾部会再建一张，快照卡 +
+        // 实时卡两张叠着）。原先只有 historyNode 事后打标，但带附件的归档路径
+        // 在此之前就 return 了——渲染器自己打标，两条路径都不漏。
+        // 标签只是 DOM 数据属性，Node 假 doc 环境用 dataset 兜底，不影响结构测试。
+        if (block.running && block.startedAt != null && d.dataset) {
+          d.dataset.livetrace = String(block.startedAt);
+        }
         d.appendChild(doc.createElement("summary"));
         d.appendChild(renderProcessGroup(block.items, block.running));
         const label = block.steps > 0 ? "已工作" : "已思考";

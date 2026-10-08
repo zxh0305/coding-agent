@@ -531,6 +531,9 @@ body.side-resizing .sidebar { transition: none; }
   background: transparent; border: none;
   border-bottom: 1px solid var(--border);
   padding: 2px 0 6px;
+  /* 列向 flex：让思考窗（order:1）恒在说明卡（order:2）之上，与 DOM 顺序
+     解耦——接管快照卡时 noteBox 可能先于 thinkBox 存在，视觉层级不能跟着乱。 */
+  display: flex; flex-direction: column;
 }
 .trace summary { cursor: pointer; user-select: none; font-weight: 500; list-style: none; }
 .trace summary::before { content: "›"; display: inline-block; margin-right: 6px; transition: transform .15s; }
@@ -557,8 +560,10 @@ body.side-resizing .sidebar { transition: none; }
   background: var(--think-bg);
   border: 1px solid var(--think-border);
   border-radius: 8px;
-  height: 140px; overflow-y: auto;
-  scrollbar-width: thin;
+  /* 固定小窗：思考只在窗内滚动贴底，绝不推页面（收敛不刷屏）。120px 足够
+     放下几行"当前在推什么"，又不至于把过程面板撑成信息墙。 */
+  height: 120px; overflow-y: auto;
+  scrollbar-width: thin; overscroll-behavior: contain;
 }
 
 /* 窗内分段：整回合所有轮次的思考共居一窗，轮次标题降为窗内小节头 */
@@ -577,7 +582,7 @@ body.side-resizing .sidebar { transition: none; }
 /* 回合定稿后思考窗塌缩成内容高：短思考不留大片空白，长思考仍限高滚动。
    流式中的窗保持固定高度——思考只在恒定小窗里流动，页面不往下刷。 */
 .trace:not(.running) .think-line {
-  height: auto; max-height: 140px;
+  height: auto; max-height: 120px;
 }
 
 /* 过程性正文：中间轮次模型输出的说明文字（不是最终答案）。比正文小一号、
@@ -611,6 +616,15 @@ body.side-resizing .sidebar { transition: none; }
    的一张卡。白卡 + 品牌色左缘 + 卡级「💬 说明」chip（整卡一枚），与思考窗、
    工具行一眼区分——思考归思考、说明归说明。chip 只在 .demoted（已确认卡里
    是过程说明）后出现：流式期间那段文字仍可能是最终答案，不该贴"说明"标签。 */
+/* 思考窗与说明卡的层级：整回合只有一个思考滚动窗（.think-line），说明卡
+   （.note-box）永远排在它下方。思考是收敛区、说明是阅读区，两者用 8px 拉开。
+   note-box 用 order 兜底：即便 DOM 里因接管快照卡而顺序颠倒，视觉上仍居下。 */
+.trace > .note-box { margin-top: 8px; order: 2; }
+.trace > .think-line { order: 1; }
+
+/* 说明卡是可以刷屏的那一块——它是给用户看的内容，不做限高/内滚：正文流
+   逐字在卡里长高，页面随之推进（用户此刻想看的就是这些字）。收纳只针对
+   思考：思考收敛在上方的固定高滚动窗里，说明不需要再被二次收敛。 */
 .note-box {
   font-size: 12px; line-height: 1.6;
   padding: 8px 12px; margin: 8px 0 0 2px;
@@ -619,8 +633,10 @@ body.side-resizing .sidebar { transition: none; }
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent-weak-border);
   border-radius: 8px;
-  max-height: 140px; overflow-y: auto;
-  scrollbar-width: thin;
+  /* 说明卡是可以刷屏的那一块——它是给用户看的内容，不做限高/内滚：正文流
+     逐字在卡里长高，页面随之推进（用户此刻想看的就是这些字）。收纳只针对
+     思考：思考收敛在上方的固定高滚动窗里，说明不需要再被二次收敛。 */
+  overflow: visible;
 }
 .note-box.demoted::before {
   content: "💬 说明";
