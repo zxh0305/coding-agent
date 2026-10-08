@@ -225,8 +225,10 @@ let stickBottom = true;
 // 就是上滑卡顿的主源。因此改判方向：任何向上滚动意图（wheel deltaY<0 或
 // touchmove 上划）直接 stickBottom=false，scroll 只负责「滚回底才恢复跟随」。
 let histLoading = false;
+let mainStickHoldUntil = 0;  // 上滚后冷静期：期间 scroll 不把跟随抢回来
 function onWheelUp(e) {
   if (e.deltaY < 0 && stickBottom) { stickBottom = false; updateBackBottom(); }
+  if (e.deltaY < 0) mainStickHoldUntil = Date.now() + 900;  // 与框内同一冷静期
 }
 chatEl.addEventListener("wheel", onWheelUp, { passive: true });
 let lastTouchY = null;
@@ -252,7 +254,9 @@ chatEl.addEventListener("scroll", () => {
     const away = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight;
     if (snapping) {
       if (away < 4) snapping = false;  // 平滑滚动到位，交还判定
-    } else if (away < 4) stickBottom = true;  // 真正回到底部才恢复跟随
+    } else if (away < 4 && Date.now() >= mainStickHoldUntil) {
+      stickBottom = true;  // 真正回到底部、且不在上滚冷静期内才恢复跟随
+    }
     updateBackBottom();
     if (!histLoading && histHasMore && chatEl.scrollTop < 120 && currentSession) {
       histLoading = true;
@@ -3268,16 +3272,25 @@ function boxIsSticky(box) {
 function pinInside(box) {
   if (!box) return;
   if (!boxIsSticky(box)) return;
-  box.scrollTop = box.scrollHeight;
+  // 【防掉帧】只有真的不在底部时才写 scrollTop。rAF 每帧调用本函数，若无条件
+  // 赋值会每帧触发一次同步布局（读 scrollHeight + 写 scrollTop），流式期间
+  // 叠加在 DOM 写入上就是明显卡顿。差值 <1px 直接跳过。
+  const target = box.scrollHeight - box.clientHeight;
+  if (Math.abs(box.scrollTop - target) < 1) return;
+  box.scrollTop = target;
 }
 
 // 上滚意图 → 立刻退出跟随（与主页面 onWheelUp 同思路：靠方向判定，不靠阈值，
 // 否则流式期间上滚的头几帧仍满足阈值、每帧被拽回，产生拉扯感）
 function boxOnWheelUp(box) {
-  if (boxIsSticky(box)) boxStick.set(box, false);
+  boxStick.set(box, false);
+  box.__stickHoldUntil = Date.now() + 900;  // 上滚后 900ms 内不自动恢复跟随
 }
-// 滚回底部（<4px）→ 恢复跟随。scroll 侦听挂在框上，动态框由 ensure 时注册。
+// 滚回底部 → 恢复跟随。【关键】仅在"用户没有上滚意图"（超过 hold 窗口）时才
+// 恢复。早期版本只看 away<4 就恢复，而上滚一格时 away 往往仍 <4——scroll 一触发
+// 就恢复跟随，下一帧又拽到底，形成"上滑不动 + 每帧强制滚动掉帧"的死循环。
 function boxOnScroll(box) {
+  if (Date.now() < (box.__stickHoldUntil || 0)) return;  // 上滚冷静期内不抢回
   const away = box.scrollHeight - box.scrollTop - box.clientHeight;
   if (away < 4) boxStick.set(box, true);
 }
@@ -3292,7 +3305,13 @@ function bindBoxScroll(box) {
     if (lastY != null && e.touches[0].clientY > lastY) boxOnWheelUp(box);  // 手指下移=内容上划
     lastY = e.touches[0].clientY;
   }, { passive: true });
-  box.addEventListener("scroll", () => boxOnScroll(box), { passive: true });
+  // scroll 高频触发，且流式期间每帧都有 DOM 写入——回调里读 scrollHeight 会强制
+  // 同步布局（掉帧源之一）。用 rAF 合并：一帧最多判定一次。
+  box.addEventListener("scroll", () => {
+    if (box.__scrollRafQueued) return;
+    box.__scrollRafQueued = true;
+    requestAnimationFrame(() => { box.__scrollRafQueued = false; boxOnScroll(box); });
+  }, { passive: true });
 }
 
 function queueStreamDelta(kind, mid, text) {
@@ -3392,9 +3411,6 @@ function applyEvent(evt, seq) {
       thinkBox.append(head, thinkSeg);
     }
     queueStreamDelta("think", null, evt.delta);
-    // 兜底贴底：内容经 rAF 合帧写入，帧回调若被节流/丢帧，窗就停在旧位置。
-    // 事件到达即钉一次底（同帧重复设置 scrollTop 开销可忽略）。
-    pinInside(thinkBox || procBox);
   } else if (t === "answer_delta") {
     takePlaceholderOpen();  // 真实内容来了：收回"正在思考…"占位时的展开
     tracePhase = "正在撰写回答…";
@@ -3406,8 +3422,6 @@ function applyEvent(evt, seq) {
     // 用户只会看到折叠条摘要行实时更新（"正在撰写回答… · 已思考 N 秒"），
     // 页面不再被流式文字推着往下滚。用户若想细看过程，手动展开折叠条即可。
     queueStreamDelta("answer", evt.mid, evt.delta);
-    // 兜底贴底：说明卡与过程窗同口径，事件到达即钉一次底（不依赖 rAF 帧）
-    pinInside(noteBox);
   } else if (t === "todo_update") {
     // 任务清单不再画进对话流：改为驱动右上角 📋 浮窗实时更新（后端同时已落库，
     // 重进会话走 loadTodos() 仍能看到）。
