@@ -2122,6 +2122,17 @@ def main():
     log_file = setup_logging(console=True)
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    # 长连接并发调优（SSE 每连接一个线程、常驻不释放）：
+    # 1) daemon_threads：主线程退出时不被常驻 SSE 线程卡住；同时让线程池
+    #    在客户端断开后立即回收，不 join 等待；
+    # 2) request_queue_size：listen 的 accept  backlog。默认 5 太小——多个
+    #    标签页/手机端同时连接时，超出 backlog 的握手会排在内核队列里迟迟
+    #    不被 accept，表现为"页面转圈几秒才连上"（压测 60 条 SSE 建连
+    #    P50 曾达 3.1s，正是 backlog 打满 + 逐条 accept 的排队现象）；
+    # 3) block_on_close=False：连接关闭不在 shutdown 时阻塞 join。
+    server.daemon_threads = True
+    server.request_queue_size = 256
+    server.block_on_close = False
     log.info("Web 服务启动 0.0.0.0:%d（数据文件 %s）", port, db.DB_PATH)
     print(f"🤖 Agent Demo 已启动:  http://127.0.0.1:{port}   （数据: {db.DB_PATH.name}，日志: {log_file}，Ctrl+C 退出）", flush=True)
     for ip in _lan_ips():

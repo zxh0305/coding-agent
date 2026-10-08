@@ -2516,6 +2516,8 @@ let noteBox = null;   // 本回合唯一的「💬 说明」卡：整回合所�
 let curRoundNo = 0;       // 当前轮次号（round 事件携带）
 let roundNeedHead = true; // 本轮还没见到思考流：轮次标题画回时间线（非思考模型/纯工具轮）
 let traceEl = null;
+let placeholderOpen = false;  // 过程面板的"展开"是否只是为了 show 即时占位（见 performSend）。
+                              // 首个真实内容到达时据此自动收回，用户手动展开则不动它。
 let traceCurrent = "";  // 当前正在执行的工具（收起状态下摘要行显示的"此刻在干嘛"）
 let tracePhase = "";    // 当前阶段文案（"正在理解问题…/深度思考中…/正在撰写回答…"），
                         // 随事件切换、由 traceTick 拼进摘要行；工具执行期间被
@@ -2597,6 +2599,17 @@ function turnStartFromEvent(evt) {
 // 摘要行 = 一行"当前状态"：正在跑的工具 + 已工作多久 + 步数。
 // 这是收起状态下用户唯一能看到的过程信息，必须把"此刻在干嘛"说清楚。
 // 步数与"正在跑什么"都取自 liveTracker（与回放同一套记账），不再另立计数器。
+// 即时占位展开的"回收"：performSend 为了给发送即时反馈，会把刚建的过程卡展开
+// 显示"正在思考…"。首个真实内容（推理/正文）一到就收回，避免长回合面板一直
+// 敞着、内容在里面刷屏。只回收"因占位而开"的那次（placeholderOpen 标记），
+// 用户手动展开的绝不代收。
+function takePlaceholderOpen() {
+  if (placeholderOpen) {
+    placeholderOpen = false;
+    if (traceEl) traceEl.open = false;
+  }
+}
+
 function traceTick() {
   if (!traceEl) return;
   const st = liveTracker.state();
@@ -2982,9 +2995,10 @@ function ensureLiveMsg(mid) {
     // 若最终是答案，done 时把它移出面板、升级为正常正文卡（见 finalizeAnswer）。
     // 这样避免了"先大字流出、再缩成小字"的跳动（旧实现每段都缩一次）。
     ensureTrace();
-    // 展开面板：正文流式输出必须让用户看得见"它在动"——收起状态下过程文字
-    // 不可见，用户会以为卡死。done 时统一收起（答案回归正文区）。
-    traceEl.open = true;
+    // 【不刷屏】这里原先把面板强制撑开，于是正文/说明文字在展开的面板里逐字
+    // 往下刷，把页面推着滚。改为不主动改变面板开合：正文流仍按过程小字悄悄
+    // 累积在「💬 说明」卡里，折叠条的摘要行（"正在撰写回答… · 已思考 N 秒"）
+    // 负责给用户"它在动"的实时信号；done 时正文被 finalizeAnswer 升级为正文卡。
     const el = document.createElement("div");
     el.className = "process-text streaming";
     // 流式正文直接住进说明卡：降级后原地留下（所有轮次的说明共居一卡），
@@ -3151,6 +3165,7 @@ function applyEvent(evt, seq) {
     // 正在进行的回合也走同一套初始化）
     liveMsgs = new Map();
     liveBubble = null; traceEl = null; traceCurrent = "";
+    placeholderOpen = false;  // 占位标记随回合重建作废（新卡、新开合语义）
     tracePhase = "正在理解问题…";  // 回合开场：模型还没吐任何内容时的友好占位
     metaEl = null; pendingCalls = [];
     thinkBox = null; thinkSeg = null; noteBox = null; curRoundNo = 0; roundNeedHead = true;
@@ -3183,6 +3198,7 @@ function applyEvent(evt, seq) {
     roundNeedHead = true;  // 这轮若始终没有思考流（非思考模型），标题在工具行前补画
     curMid = evt.mid;  // 本轮回答段落的 mid：后续 delta/done 归并的键
   } else if (t === "reasoning_delta") {
+    takePlaceholderOpen();  // 真实内容来了：收回"正在思考…"占位时的展开
     // 整回合所有轮次的思考都流进同一个固定小窗：窗子高度恒定、内部滚动贴底，
     // 页面不随思考往下刷；轮次标题不再是时间线上的一行，降为窗内分段头。
     // 推理与回答是两个流：这里绝不带 mid（后端也不再发），否则同一 mid 会
@@ -3192,11 +3208,11 @@ function applyEvent(evt, seq) {
       // 接管快照卡（刷新/切回进行中回合）时，卡里可能已有回放画好的思考窗：
       // ensureTrace 已把它认领进 thinkBox——有就复用，再新建就是截图里的双窗。
       if (!thinkBox) {
-        // 本轮已经有过工具调用（在收起面板里跑完了一堆步骤）——说明用户是在
-        // 生成中途切回/刷新回来的，此刻补发的推理流属于「过去」。这时不再强制
-        // 展开面板：否则切会话的瞬间会看到过程面板"啪"地弹开、正文区跟着跳一下。
-        // 当前正在产出的推理会实时填进去，用户点开折叠条一样能看到。
-        if (!liveTracker.state()?.steps) traceEl.open = true;
+        // 【不刷屏】原实现在"本轮还没跑过工具"时强制展开面板，于是首批推理
+        // 一到就把过程面板弹开、整个页面被推理文字往下顶——用户反馈的"思考
+        // 刷屏"主因之一。推理流本就住在恒定 140px 的 .think-line 小窗里
+        // （窗内滚动、页面不随内容变长），无需展开面板即可自查；摘要行的
+        // "已思考 N 秒"是收起态下的实时信号。这里保持面板原开合状态不动。
         thinkBox = document.createElement("div");
         thinkBox.className = "think-line";
         traceEl.appendChild(thinkBox);  // 不走 appendTrace：思考流不算一步
@@ -3223,11 +3239,15 @@ function applyEvent(evt, seq) {
     }
     queueStreamDelta("think", null, evt.delta);
   } else if (t === "answer_delta") {
+    takePlaceholderOpen();  // 真实内容来了：收回"正在思考…"占位时的展开
     tracePhase = "正在撰写回答…";
-    // 非思考模型没有 reasoning_delta，正文流就是它"思考过程"的唯一可见形态
-    // （多轮工具回合尤其如此）——与 reasoning_delta 同样展开面板，避免收起
-    // 状态下过程静默累积、用户只见秒数跳动。
-    if (!liveTracker.state()?.steps) traceEl.open = true;
+    // 【不刷屏】原实现在这里（以及 ensureLiveMsg 新建气泡时）无条件把过程面板
+    // 撑开，导致整段回答/推理文字在展开的面板里逐字往下刷——用户明确反馈
+    // "思考过程直接刷屏，动态框没生效"。回答的正文流本就不该住在展开面板里：
+    // 它已在 ensureLiveMsg 里按过程小字流进「💬 说明」卡，done 时由
+    // finalizeAnswer 移出面板、升级为正文卡。这里保持面板的原开合状态不动，
+    // 用户只会看到折叠条摘要行实时更新（"正在撰写回答… · 已思考 N 秒"），
+    // 页面不再被流式文字推着往下滚。用户若想细看过程，手动展开折叠条即可。
     queueStreamDelta("answer", evt.mid, evt.delta);
   } else if (t === "todo_update") {
     // 任务清单不再画进对话流：改为驱动右上角 📋 浮窗实时更新（后端同时已落库，
@@ -3721,6 +3741,24 @@ async function performSend(item) {
   todoDoneAnnounced = false;
   clearTimeout(todoDoneTimer);
   setStreaming(true);
+  // 【即时反馈】回合真起点此刻还不知道（turn_start 要等 POST 返回 + 事件流送达，
+  // 后端还要先抢到会话锁——上一回合收尾/冷启动时这里能空白好几秒，用户以为
+  // "没反应"）。这里先乐观地画一张占位过程卡："正在思考…" + 本地计时起跳，
+  // 让用户点了发送立刻有视觉回执。turn_start 到达后走 ensureTrace() 原地接管
+  // 这张卡（找到 traceEl 直接复用，不会出现两张卡），秒数基准也会校正成服务端
+  // 的真实起点。失败回滚时 resetStreamState() 会清掉它。
+  qStart = qStart || Date.now();
+  if (!traceEl) {
+    tracePhase = "正在思考…";  // 占位阶段文案：turn_start 到达后会校正为"正在理解问题…"
+    ensureTrace();
+    // 占位卡默认展开：此刻还没有任何内容，展开让用户看到"正在思考…"的明确回执。
+    // placeholderOpen 标记"展开是为了给即时反馈"，首个真实内容（推理/正文）到达
+    // 时由 takePlaceholderOpen() 自动收回——否则长推理回合会把面板一直敞着，
+    // 又变成"思考刷屏"。用户自己手动展开的不受影响（标记只在占位态为真）。
+    traceEl.open = true;
+    placeholderOpen = true;
+  }
+  traceTick();
   // 回令：服务端会在 turn_start 里原样带回，本 tab 据此不重复画自己的气泡。
   // crypto.randomUUID 只在安全上下文可用（本机 http OK，局域网 http 不一定），
   // 手写兜底保证任何环境都能生成足够唯一的 nonce。
