@@ -225,10 +225,8 @@ let stickBottom = true;
 // 就是上滑卡顿的主源。因此改判方向：任何向上滚动意图（wheel deltaY<0 或
 // touchmove 上划）直接 stickBottom=false，scroll 只负责「滚回底才恢复跟随」。
 let histLoading = false;
-let mainStickHoldUntil = 0;  // 上滚后冷静期：期间 scroll 不把跟随抢回来
 function onWheelUp(e) {
   if (e.deltaY < 0 && stickBottom) { stickBottom = false; updateBackBottom(); }
-  if (e.deltaY < 0) mainStickHoldUntil = Date.now() + 900;  // 与框内同一冷静期
 }
 chatEl.addEventListener("wheel", onWheelUp, { passive: true });
 let lastTouchY = null;
@@ -254,8 +252,8 @@ chatEl.addEventListener("scroll", () => {
     const away = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight;
     if (snapping) {
       if (away < 4) snapping = false;  // 平滑滚动到位，交还判定
-    } else if (away < 4 && Date.now() >= mainStickHoldUntil) {
-      stickBottom = true;  // 真正回到底部、且不在上滚冷静期内才恢复跟随
+    } else if (away < 4) {
+      stickBottom = true;  // 真正回到底部才恢复跟随（唯一恢复入口，不抢位置）
     }
     updateBackBottom();
     if (!histLoading && histHasMore && chatEl.scrollTop < 120 && currentSession) {
@@ -3280,33 +3278,33 @@ function pinInside(box) {
   box.scrollTop = target;
 }
 
-// 上滚意图 → 立刻退出跟随（与主页面 onWheelUp 同思路：靠方向判定，不靠阈值，
-// 否则流式期间上滚的头几帧仍满足阈值、每帧被拽回，产生拉扯感）
-function boxOnWheelUp(box) {
+// 上滚/下滑离开底部 → 退出跟随。语义修正：**跟随与否只看"用户是否在底部"**，
+// 不再用时间冷静期。此前用 900ms 冷静期，冷静期一过 scroll 回调就把"用户主动
+// 停在中间看内容"判成该跟随，把视图拽回底部（用户反馈"下滑看最新的，过几秒
+// 自动跳回上方"——其实是相反方向：停在中间被拽走）。
+function boxOnLeaveBottom(box) {
   boxStick.set(box, false);
-  box.__stickHoldUntil = Date.now() + 900;  // 上滚后 900ms 内不自动恢复跟随
 }
-// 滚回底部 → 恢复跟随。【关键】仅在"用户没有上滚意图"（超过 hold 窗口）时才
-// 恢复。早期版本只看 away<4 就恢复，而上滚一格时 away 往往仍 <4——scroll 一触发
-// 就恢复跟随，下一帧又拽到底，形成"上滑不动 + 每帧强制滚动掉帧"的死循环。
+// 用户自己滚回底部（<4px）→ 恢复跟随。这是唯一的恢复入口：不设时间、不抢位置。
 function boxOnScroll(box) {
-  if (Date.now() < (box.__stickHoldUntil || 0)) return;  // 上滚冷静期内不抢回
   const away = box.scrollHeight - box.scrollTop - box.clientHeight;
-  if (away < 4) boxStick.set(box, true);
+  boxStick.set(box, away < 4);
 }
 // 统一注册：框创建时调一次即可（弱表去重）
 function bindBoxScroll(box) {
   if (!box || box.__stickBound) return;
   box.__stickBound = true;
-  box.addEventListener("wheel", (e) => { if (e.deltaY < 0) boxOnWheelUp(box); }, { passive: true });
+  box.addEventListener("wheel", (e) => {
+    if (e.deltaY < 0) boxOnLeaveBottom(box);   // 上滚：立刻停跟随，不等 scroll
+  }, { passive: true });
   let lastY = null;
   box.addEventListener("touchstart", (e) => { lastY = e.touches[0].clientY; }, { passive: true });
   box.addEventListener("touchmove", (e) => {
-    if (lastY != null && e.touches[0].clientY > lastY) boxOnWheelUp(box);  // 手指下移=内容上划
+    if (lastY != null && e.touches[0].clientY > lastY) boxOnLeaveBottom(box);  // 手指下移=内容上划
     lastY = e.touches[0].clientY;
   }, { passive: true });
-  // scroll 高频触发，且流式期间每帧都有 DOM 写入——回调里读 scrollHeight 会强制
-  // 同步布局（掉帧源之一）。用 rAF 合并：一帧最多判定一次。
+  // scroll（含拖动滚动条、键盘、惯性滚动）：按位置判定跟随状态。用 rAF 合并
+  // 避免每帧读 scrollHeight 造成同步布局（掉帧源之一）。
   box.addEventListener("scroll", () => {
     if (box.__scrollRafQueued) return;
     box.__scrollRafQueued = true;
