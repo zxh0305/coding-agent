@@ -48,6 +48,9 @@
    *   metaText(elapsed, usage)
    *   compactCard(summary)
    *   artifactCard(m)          → 外置归档消息卡（可选）
+   *   pinBoxes(boxes)          → 过程窗/修改区/说明卡建成后调一次（可选）。
+   *     让回放路径与实时路径共用同一套"框底钉视口原位"（app.js 注入）。不注入
+   *     时（Node 测试）静默跳过，不影响结构。
    */
   function createRenderer(deps) {
     const doc = deps.doc;
@@ -179,6 +182,7 @@
         if (op.it && isEditItem(op.it)) editOps.push(op);
         else procOps.push(op);
       }
+      let procLine = null, editLine = null, noteLine = null;
       if (procOps.length) {
         const box = doc.createElement("div");
         box.className = "proc-line";
@@ -199,12 +203,14 @@
             box.appendChild(renderProcessItem(op.it, running));
           }
         }
+        procLine = box;
         frag.appendChild(box);
       }
       if (editOps.length) {
         const eb = doc.createElement("div");
         eb.className = "edit-box";
         for (const op of editOps) eb.appendChild(renderProcessItem(op.it, running));
+        editLine = eb;
         frag.appendChild(eb);
       }
       if (notes.length) {
@@ -218,8 +224,14 @@
           n.textContent = t;
           nb.appendChild(n);
         }
+        noteLine = nb;
         frag.appendChild(nb);
       }
+      // 【贴底】三个框（过程窗/修改区/说明卡）建好后交给 app.js 的同一套规则：
+      // 绑定框内跟随（bindBoxScroll）+ 记下框底基线。回放路径的框因此与实时
+      // 路径行为一致，不再有"渲染器建的窗不贴底"这一条分叉。
+      // 注入缺失（Node 测试）时静默跳过。
+      if (deps.pinBoxes) deps.pinBoxes([procLine, editLine, noteLine].filter(Boolean));
       return frag;
     }
 

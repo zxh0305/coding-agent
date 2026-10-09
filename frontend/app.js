@@ -1101,6 +1101,9 @@ const blocksRenderer = window.CodingAgentRenderBlocks.createRenderer({
   fmtElapsed: fmtElapsed,
   makeCopyBtn: makeCopyBtn,          // 答案气泡下方的 📋 复制原文按钮
   wrapWithActions: wrapWithActions,  // 气泡 + 动作条悬停组
+  // 回放路径的过程窗/修改区/说明卡也要贴底：渲染器建完框把节点交回来，
+  // 走与实时路径同一个 pinBoxes（内部 bindBoxScroll + 记框底基线）。
+  pinBoxes: (boxes) => { if (window.pinTraceBoxes) window.pinTraceBoxes(boxes); },
   // 历史回放错误卡的"重试上一条"按钮：复用与实时 error 事件相同的
   // retryLast() 路径（与 send() 同一条发送链路）。
   makeRetryButton: () => {
@@ -2638,6 +2641,17 @@ function traceOpenForThinking() {
   if (userToggledTrace || autoThinkOpen) return;
   autoThinkOpen = true;
   if (traceEl) traceEl.open = true;
+  resetPinMeters();   // 展开让过程窗底边跳位：钉底基线必须作废重对
+}
+
+// 过程窗/说明卡/修改区的"框底钉视口原位"基线清零。任何改变面板内布局的
+// 动作（展开/收起、插入工具行……）之后都要调：基线记的是上一次的框底位置，
+// 布局一跳它就成了错误参照，继续用会多推或少推一截。
+function resetPinMeters() {
+  if (procBox) pinMeter.delete(procBox);
+  if (editBox) pinMeter.delete(editBox);
+  if (noteBox) pinMeter.delete(noteBox);
+  if (thinkBox) pinMeter.delete(thinkBox);
 }
 function traceCloseAtEnd() {
   // 仅限 done/出错收尾路径调用（app.js:3533/3625 的 open=false + 清标志即本语义
@@ -2712,6 +2726,9 @@ function appendTrace(el) {
   // 页面级跟随用 scrollBottom（有 stickBottom 保护，上滑看历史时不打扰）。
   pinInside(toEdit ? editBox : procBox);
   scrollBottom();
+  // 插入条目改变了面板布局、外层也刚被同步滚过：钉底基线作废，重新对账——
+  // 否则下一次思考增量会拿插入之前的位置去算增量而多推一截。
+  resetPinMeters();
 }
 
 // 【显式排序】把 .trace 内的三栏按 proc → edit → note 的 DOM 顺序重排。
@@ -3312,6 +3329,54 @@ function pinInside(box) {
   box.scrollTop = target;
 }
 
+// 【框底钉在视口原位】框自身长高 dy 时，把外层聊天区同步往上推相同的 dy——
+// 结果：框的底边（也就是用户正在读的那一行）在屏幕上原地不动，新内容从框
+// 顶部涌入。这是"内容在窗内向上流动"的视觉，而不是"窗口往下爬"。
+//
+// 为什么不能只靠"框内贴底"两级滚动：外层页面的 scrollTop 是整数，亚像素的
+// 文字行增长被四舍五入吃掉；再加上外层是否跟随（stickBottom）还会被滚动事件
+// 重置。把"长高多少就下移多少"做成算术恒等式后，这种行为不再依赖任何滚动
+// 状态，思考时逐字流动、工具行插入时整条命令从底部滑入，两种节奏都贴底。
+//
+// 基线存在 WeakMap 里（键是框节点），不是框上的临时属性：
+//  - 实时路径（app.js）与回放路径（render_blocks.js）的框是同一种 DOM 节点，
+//    共用这一份实现与这一份状态，不再有两套口径；
+//  - 实时路径重建过程窗（新建 procBox 节点）时，旧框的基线随节点被回收，
+//    新框天然从零开始，不会拿着上一张卡的位置去算增量。
+// 调用方不需要自己记账：先 pinInside(box) 把框内滚到底，再调本函数即可；
+// 任何改变面板布局的动作（展开/收起、插入工具行）之前要先 resetPinMeters()，
+// 让基线在布局跳位后重新对账。
+const pinMeter = new WeakMap();   // box -> 上次已对账的框底视口坐标(y)
+
+function pinBoxBottomAtView(box) {
+  if (!box || !box.isConnected || !chatEl) return;
+  const y = box.getBoundingClientRect().bottom;   // 框底相对视口
+  const prev = pinMeter.get(box);
+  if (prev === undefined) { pinMeter.set(box, y); return; }   // 首次见到：只记基线
+  const dy = y - prev;                             // 本次真实长高（负值=变矮）
+  // 负值（内容变矮，如收起/清理）不补偿：往下拽会把页面弹回去，反而更糟。
+  if (dy > 0.5) {
+    // 还在底部附近（用户没上翻看历史）才下移页面。阈值远比 stickBottom 的
+    // 4px 宽：外层页面的 scrollTop 取整会让"贴底"时常驻十几像素的残差——
+    // 用 4px 判定会导致思考期间间歇性完全不动。
+    const away = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight;
+    if (away < 200) chatEl.scrollTop += Math.min(dy, 40);  // 单次上限：防异常跳变
+    // 下移后框底应回到原位（y）；写不进（已到页面底）时如实取实际值，
+    // 欠下的差额留到下一帧继续补，不会丢失。
+    pinMeter.set(box, box.getBoundingClientRect().bottom);
+  } else {
+    // 框底不在基线处（用户在看历史，或本就静止）：把基线重对齐到实测值，
+    // 下次仍只补真实增量。绝不能"记下未补的欠账"——没补的那段高度最终会被
+    // 压回，记账只会在之后把页面多推一截。
+    pinMeter.set(box, y);
+  }
+}
+// 渲染器路径（render_blocks.js 建的过程窗/说明卡/修改区）也要能用同一条规则：
+// 它没有 app.js 的闭包作用域，挂全局给它取。
+window.pinTraceBoxes = function (boxes) {
+  for (const b of boxes || []) { if (b) { pinInside(b); pinBoxBottomAtView(b); } }
+};
+
 // 上滚/下滑离开底部 → 退出跟随。语义修正：**跟随与否只看"用户是否在底部"**，
 // 不再用时间冷静期。此前用 900ms 冷静期，冷静期一过 scroll 回调就把"用户主动
 // 停在中间看内容"判成该跟随，把视图拽回底部（用户反馈"下滑看最新的，过几秒
@@ -3444,6 +3509,12 @@ function applyEvent(evt, seq) {
       thinkBox.append(head, thinkSeg);
     }
     queueStreamDelta("think", null, evt.delta);
+    // 【贴底右移】思考段长高多少，就把窗外层容器整体下移多少：即便窗内滚动
+    // 因任何原因没跟上（渲染器路径的窗尺寸变化错过一帧），用户此刻读到的那
+    // 一行也始终停在窗底部。基线由 pinBoxBottomAtView 自己记在 WeakMap 里。
+    // 放在 delta 分支（思考流打字的每一条事件）而非下方节流的帧刷新里：每段
+    // 思考的最终高度必须归零，拖后一帧就会在下一个工具行插入时欠账。
+    pinBoxBottomAtView(thinkBox);
   } else if (t === "answer_delta") {
     // 【方案A v2】不再因正文增量收起面板：代理式回合中间会吐正文段（过渡说明），
     // v1 在这里收起导致面板工作半途被藏住。最终回答在 done 时由 finalizeAnswer
@@ -3451,6 +3522,9 @@ function applyEvent(evt, seq) {
     // 阶段不会被流式文字推着滚屏（收尾收起 + 说明卡内小字流动，同旧不刷屏口径）。
     tracePhase = "正在撰写回答…";
     queueStreamDelta("answer", evt.mid, evt.delta);
+    // 【贴底右移】同思考流：说明卡长高多少就把外层下移多少，卡底（正在读的
+    // 那一行）钉在视口原位。说明卡不限高，卡内没有可滚的余量，全靠这一步。
+    if (noteBox) pinBoxBottomAtView(noteBox);
   } else if (t === "todo_update") {
     // 任务清单不再画进对话流：改为驱动右上角 📋 浮窗实时更新（后端同时已落库，
     // 重进会话走 loadTodos() 仍能看到）。
@@ -3533,6 +3607,7 @@ function applyEvent(evt, seq) {
     if (traceEl) {
       // 做完任务自动折叠：正文回归"只要答案"；点折叠条仍可回看全过程
       traceEl.open = false;
+      resetPinMeters();   // 收起面板：钉底基线随布局作废
       autoThinkOpen = false;  // 【方案A】思考期自动展开的标记随收尾清掉
       // 摘掉 running：渲染器路径的秒数计时器（render_blocks）见此标记即自停，
       // 快照卡与实时卡共用这一收尾；本 tab 的 metaTimer 已在上面 clearInterval。
@@ -3625,6 +3700,7 @@ function applyEvent(evt, seq) {
     retireLiveBubble();
     if (traceEl) {
       traceEl.open = false;  // 出错同样收起过程；点开可排查卡在哪一步
+      resetPinMeters();      // 同 done：收起后钉底基线作废
       autoThinkOpen = false;  // 【方案A】同 done：自动展开标记随收尾清掉
       traceEl.classList.remove("running");  // 摘标记：渲染器计时器据此自停（同 done 分支）
       traceEl.querySelector("summary").textContent =

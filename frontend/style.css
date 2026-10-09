@@ -611,7 +611,10 @@ body.side-resizing .sidebar { transition: none; }
 /* 回合定稿后思考窗塌缩成内容高：短思考不留大片空白，长思考仍限高滚动。
    流式中的窗保持固定高度——思考只在恒定小窗里流动，页面不往下刷。 */
 .trace:not(.running) .think-line {
-  height: auto; max-height: 120px;
+  /* 定稿后只需锁住上限：写 height:auto 会把流式期间"内容在窗内向上流动"的
+     滚动位置一并清掉——思考窗会缩回内容高、内容整体回弹到顶部。height 保持
+     流式期间算定的 120px 时，滚动位置保住，收起时停在末段（正在看的那行）。 */
+  max-height: 120px;
 }
 
 /* 过程性正文：中间轮次模型输出的说明文字（不是最终答案）。比正文小一号、
@@ -987,6 +990,7 @@ button.primary:hover { background: var(--accent-hover); }
 .ctx-dot {
   display: inline-block; width: 8px; height: 8px; border-radius: 50%;
   flex: 0 0 auto; margin-right: 6px;
+  align-self: center;   /* 行含 8px 点 + 12px 文字：不居中会按基线对齐而下沉 */
 }
 .ctx-row {
   display: flex; justify-content: space-between; font-size: 12px;
