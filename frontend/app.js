@@ -4179,6 +4179,8 @@ bind("attach-chip", "click", toggleAttachPop);
 bind("attach-close", "click", () => $("attach-pop").classList.add("hidden"));
 bind("docs-close", "click", closeDocsPanel);
 bind("docs-toggle", "click", toggleDocsList);
+bind("docs-copy", "click", copyCurrentDoc);
+bind("docs-download", "click", downloadCurrentDoc);
 // 浏览器栏：chip 点开/收起，✕ 关闭。与文档栏共用 --docs-w，二者互斥。
 bind("bell-chip", "click", toggleNotify);
 bind("edit-cancel", "click", cancelEdit);
@@ -5699,6 +5701,8 @@ function resetDocsPanel() {
   if (view) view.innerHTML = "";
   const countEl = $("docs-count");
   if (countEl) countEl.textContent = "0";
+  currentDoc = null;
+  syncDocActions();
 }
 
 // 拉取当前会话文档列表，刷新列表与计数。会话为空（新任务态）时清空。
@@ -5770,6 +5774,66 @@ function fmtDocTime(t) {
   return `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+// 当前打开的文档原文（供头部「复制 / 下载」使用）。切换文档或清空面板时重置。
+let currentDoc = null;
+
+// 头部两个动作按钮的可用态：没有打开文档时置灰。
+function syncDocActions() {
+  const on = !!(currentDoc && currentDoc.content);
+  for (const id of ["docs-copy", "docs-download"]) {
+    const b = $(id);
+    if (b) b.disabled = !on;
+  }
+}
+
+// 📋 复制当前文档：同时写 Markdown 原文（粘贴到聊天框/编辑器）与文件本体
+// （DownloadURL → Chrome/Edge 下可粘贴到 Finder/资源管理器变成 .md 文件；
+//  Safari/Firefox 不支持该类型，会退化为纯文本，属预期降级）。
+async function copyCurrentDoc() {
+  const doc = currentDoc;
+  if (!doc || !doc.content) return;
+  const btn = $("docs-copy");
+  let ok = false;
+  const blobUrl = URL.createObjectURL(new Blob([doc.content], { type: "text/markdown" }));
+  try {
+    if (navigator.clipboard && window.ClipboardItem) {
+      const item = new ClipboardItem({
+        "text/plain": new Blob([doc.content], { type: "text/plain" }),
+        "text/markdown": new Blob([doc.content], { type: "text/markdown" }),
+        "text/html": new Blob(
+          [`<a href="${blobUrl}">${doc.name}</a>`], { type: "text/html" }),
+      });
+      await navigator.clipboard.write([item]);
+      ok = true;
+    } else {
+      ok = await copyText(doc.content);
+    }
+  } catch (e) {
+    ok = await copyText(doc.content);
+  }
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+  if (btn) {
+    btn.textContent = ok ? "✅" : "❌";
+    setTimeout(() => { btn.textContent = "📋"; }, 1200);
+  }
+  toast(ok ? "已复制：可粘贴为文件，或粘贴为文本" : "复制失败：浏览器拒绝了剪贴板访问",
+    ok ? "success" : "error");
+}
+
+// ⬇ 下载当前文档：浏览器存成本地 .md 文件（不动后端）。
+function downloadCurrentDoc() {
+  const doc = currentDoc;
+  if (!doc || !doc.content) return;
+  const url = URL.createObjectURL(new Blob([doc.content], { type: "text/markdown" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = doc.name || "document.md";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
 // 打开一份文档：拉原文 → 渲染到右侧视图，并高亮列表项。
 async function openDoc(name) {
   if (!currentSession) return;
@@ -5777,9 +5841,13 @@ async function openDoc(name) {
   if (!view) return;
   try {
     const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}`
-      + `/docs/content?name=${encodeURIComponent(name)}`);
+      + `/docs?name=${encodeURIComponent(name)}`);
     view.replaceChildren(renderMarkdown(data.content || ""));
+    currentDoc = { name: data.name || name, content: data.content || "" };
+    syncDocActions();
   } catch (e) {
+    currentDoc = null;
+    syncDocActions();
     const err = document.createElement("div");
     err.className = "docs-empty";
     err.textContent = "文档打开失败：" + e.message;
