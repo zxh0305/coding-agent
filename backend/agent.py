@@ -181,7 +181,10 @@ MAX_TURN_REMINDERS = 3     # 每回合全部合成提醒的总预算（循环提
 
 WRAP_UP_INSTRUCTION = ("本轮工具调用轮数已达上限（{max_rounds}）。不要再调用任何工具——"
                        "请基于以上已获得的信息：①总结目前已完成或已修改的内容；"
-                       "②指出未完成的部分和下一步建议。直接输出总结。")
+                       "②指出未完成的部分和下一步建议。"
+                       "③若任务明显尚未完成，请在总结末尾用无序列表逐条列出【剩余步骤】，"
+                       "让用户能据此一句话让我继续（不要写\"如需继续请告知\"这类空话）。"
+                       "直接输出总结。")
 
 REPEAT_REMIND_TEXT = ("（系统提示：你已连续 {count} 次以完全相同的参数调用工具 {name}。"
                       "不要原样重试——基于已有结果换一个做法：调整参数、换工具、"
@@ -189,6 +192,24 @@ REPEAT_REMIND_TEXT = ("（系统提示：你已连续 {count} 次以完全相同
 
 BUDGET_REMIND_TEXT = ("（系统提示：本轮已进行到第 {round_no} 轮 / 上限 {max_rounds} 轮。"
                       "请开始收敛：优先完成核心改动，规划好剩余步骤，避免再做大范围探索。）")
+
+# 被拒调用原样重试的提醒（3b）：比 REPEAT_REMIND_TEXT 更早触发——不等连续 3 次，
+# 「上一轮刚被拒、这一轮又原样调」即刻提醒。实测模型会无视拒绝结果里的 hint 再调
+# 一次同一工具，白等一个权限确认超时（300s），这条提醒是拦它的第一道软闸。
+DENIED_REMIND_TEXT = ("（系统提示：你刚刚被拒绝的工具调用 {name} 又原样出现了一次。"
+                      "不要重复发起同一个被拒请求——换等价的安全做法，或直接向用户"
+                      "说明「需要你授权 X」并结束本轮等待回复。）")
+
+# 轮数上限：soft = 初始上限（到限先尝试续轮），到 soft 时有实质进展则每次续
+# ROUND_EXTEND_STEP 轮，最多续 MAX_ROUND_EXTENSIONS 次；硬顶 = soft 的兜底，
+# 到硬顶才真正进入收尾轮。见 _run 的主循环。
+ROUND_EXTEND_STEP = 20
+MAX_ROUND_EXTENSIONS = 2
+
+# 续轮提醒：soft 到限但任务在推进时注入，告知模型上限已延长、要抓紧收口。
+ROUND_EXTEND_REMIND_TEXT = ("（系统提示：第 {round_no} 轮仍在有效推进，轮数上限已从"
+                            "原值延长至 {new_limit} 轮。请继续完成剩余步骤，但注意"
+                            "抓紧收口、优先做核心改动，避免无谓的大范围探索。）")
 
 
 class Agent:
@@ -238,6 +259,9 @@ class Agent:
         self.context_window = int(context_window or 0)  # 压缩触发线的基准（providers 表解析链提供）
         self.history: list[dict] = []  # 不含 system 的完整对话历史，跨提问持续累积
         self.trace: list[dict] = []    # 最近一次提问的过程轨迹（轮次/工具调用），供前端展示
+        # 上一轮被权限拒绝的调用指纹（3b）：_run 每回合重置，这里给个默认值兜住
+        # 「未经 _run 直接调 _execute_tool_calls」的单测/子路径。
+        self._denied_sigs: set[str] = set()
         # 进行中回合的推理累积缓冲（按轮次分段，字符串）——trace 里的 reasoning
         # 条目要等整轮流结束才写入，进行中快照（app.py 的节流落库）靠它取到
         # 「已吐出的思考文本」。round_no → str；流结束时被 _consume_stream 聚合
@@ -595,6 +619,7 @@ class Agent:
         self._streak_sig = None
         self._streak_count = 0
         self._reminders_used = 0
+        self._denied_sigs: set[str] = set()  # 上一轮被权限拒绝的调用指纹（3b）
         self._budget_remind_rounds = {self.max_rounds - 10, self.max_rounds - 4}
         start = time.time()
         usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
@@ -610,7 +635,17 @@ class Agent:
                    "context_tokens": None,
                    "context": self.context_stats()}  # 还没发过请求时给个纯估算
 
-        for round_no in range(1, self.max_rounds + 1):
+        # 轮数上限的软/硬双限（1a）：soft_limit 到限时若上一轮有实质进展则续一段，
+        # 续满 extensions_left 次后不再续；hard_limit 是绝对硬顶，到顶必收尾。
+        # soft_limit 会随续轮增长，故用 while 而非 range；self.max_rounds 保持
+        # 构造时的原值不动（跨回合复用同一 Agent 时不受上一回合续轮影响）。
+        soft_limit = self.max_rounds
+        hard_limit = self.max_rounds + ROUND_EXTEND_STEP * MAX_ROUND_EXTENSIONS
+        extensions_left = MAX_ROUND_EXTENSIONS
+        round_no = 0
+        while round_no < hard_limit:
+            round_no += 1
+            self._round_had_progress = False  # 本轮是否发生实质进展（见下）
             if self.cancel_event.is_set():
                 # 工具结果刚入完历史就被叫停：历史以上一条 tool 消息结尾，依然合法
                 break
@@ -670,14 +705,39 @@ class Agent:
 
             # 执行工具：连续只读工具并行、写操作串行，结果按请求顺序回填
             # （分组调度规则与正确性论证见 _execute_tool_calls）
+            # denied_before：本轮执行【之前】就已被拒的调用指纹——只有"上一轮
+            # 被拒、这一轮又原样出现"才算重试；本轮刚被拒的那次不算（否则会在
+            # 被拒的同一轮就误报一次重试提醒）。
+            denied_before = set(self._denied_sigs)
             yield from self._execute_tool_calls(tool_calls)
 
             # 防失控提醒：不是砍停——检测到死循环苗头 / 轮数接近上限时注入合成
             # user 提醒，让模型下一轮自己纠偏（触发规则与预算见 _maybe_remind；
             # 提醒静默进历史，不发任何事件）。
-            self._maybe_remind(tool_calls, round_no)
+            self._maybe_remind(tool_calls, round_no, denied_before)
 
-        # 走到循环外只有两种情况：被用户停止，或跑满 max_rounds
+            # 软限续轮（1a）：跑到 soft_limit 时——本轮有实质进展（成功执行了非
+            # 只读工具）且还有续轮额度，就续 ROUND_EXTEND_STEP 轮并提醒模型收敛，
+            # 把"能做完的长任务"从硬砍变成续命；否则【立即 break 交收尾轮】，
+            # 绝不能继续跑到 hard_limit（那是"无进展也硬撑"的错误行为）。
+            # 续轮同时把新的预算提醒轮次并入 _budget_remind_rounds，让收敛提醒
+            # 覆盖到延长后的上限附近。hard_limit 只作绝对兜底（理论上 soft 到不了
+            # 它，因为每次续轮都在 soft 处 break-or-grow）。
+            if round_no >= soft_limit:
+                if extensions_left > 0 and self._round_had_progress:
+                    extensions_left -= 1
+                    soft_limit += ROUND_EXTEND_STEP
+                    self._budget_remind_rounds.update({soft_limit - 10, soft_limit - 4})
+                    self._inject_reminder(ROUND_EXTEND_REMIND_TEXT.format(
+                        round_no=round_no, new_limit=soft_limit),
+                        "round_extend", {"round": round_no, "new_limit": soft_limit},
+                        structural=True)
+                    log.info("第 %d 轮有实质进展，轮数上限续至 %d（剩余续轮 %d 次）",
+                             round_no, soft_limit, extensions_left)
+                else:
+                    break  # 到软限且无可续 → 交收尾轮（行为与旧版完全一致）
+
+        # 走到循环外只有两种情况：被用户停止，或跑满硬顶（含续轮后的 soft_limit）
         if self.cancel_event.is_set():
             log.info("生成被用户停止（未在流式阶段截住）")
             yield "done", {"answer": "（已手动停止）",
@@ -686,10 +746,11 @@ class Agent:
                            "context": metrics["context"],
                            "context_tokens": metrics["context_tokens"], "stopped": True}
             return
-        # 跑满 max_rounds：轮数上限的新语义是「触发收尾」而非「强制杀死」——
-        # 注入合成指令，以 tools=None 请求一轮真实总结，回合以模型自己的总结
-        # + done 收场（收尾轮与普通回答同一套完成后压缩判断，见 _wrap_up_round）。
-        yield from self._wrap_up_round(usage_total, metrics)
+        # 跑满上限：轮数上限的新语义是「触发收尾」而非「强制杀死」——注入合成
+        # 指令，以 tools=None 请求一轮真实总结，回合以模型自己的总结 + done 收场
+        # （收尾轮与普通回答同一套完成后压缩判断，见 _wrap_up_round）。
+        # 传入 soft_limit：续过轮时它就是本次实际的轮数上限，收尾文案/轮号据此对齐。
+        yield from self._wrap_up_round(usage_total, metrics, effective_max=soft_limit)
 
     # ------------------------------------------------------------------
     # 收尾轮与流的统一消费（主循环 / 收尾轮共用，防两份逻辑漂移）
@@ -800,9 +861,13 @@ class Agent:
             payload["stopped_reason"] = stopped_reason
         yield "done", payload
 
-    def _wrap_up_round(self, usage_total: dict, metrics: dict):
-        """收尾轮：跑满 max_rounds 后注入合成 user 指令，以 tools=None 请求一轮
+    def _wrap_up_round(self, usage_total: dict, metrics: dict,
+                       effective_max: int | None = None):
+        """收尾轮：跑满轮数上限后注入合成 user 指令，以 tools=None 请求一轮
         真实总结，让回合以模型自己的总结收场（替换旧的"强制停止"兜底文案）。
+
+        effective_max：本次实际跑到的轮数上限（1a 续轮后可能 > self.max_rounds）。
+        收尾文案的"上限"与收尾轮号都以它为准，避免续过轮却对外宣称"达上限 40"。
 
         1. 合成消息（_synthetic 标记）的生命周期不变式见模块头注释——这里只
            负责构造与追加，剥离（发给模型）/跳过（落库/提取）都在下游自动生效；
@@ -814,10 +879,11 @@ class Agent:
         4. 正常结束 → done 带 stopped_reason="max_rounds"；run() 对 done 的
            压缩判断一视同仁（未被停止就走 _maybe_compact），不另起路径。
         """
-        round_no = self.max_rounds + 1
+        limit = effective_max if effective_max is not None else self.max_rounds
+        round_no = limit + 1
         self.history.append({"role": "user", "_synthetic": True,
-                             "content": WRAP_UP_INSTRUCTION.format(max_rounds=self.max_rounds)})
-        log.warning("达到最大轮数 %d，进入收尾轮（禁工具总结）", self.max_rounds)
+                             "content": WRAP_UP_INSTRUCTION.format(max_rounds=limit)})
+        log.warning("达到最大轮数 %d，进入收尾轮（禁工具总结）", limit)
         self._log(f"── 第 {round_no} 轮（收尾）：请求总结 ──", "gray")
         self.trace.append({"type": "round", "round": round_no, "wrap_up": True})
         yield "round", {"round": round_no, "wrap_up": True}
@@ -853,36 +919,56 @@ class Agent:
             canonical = json.dumps([name, str(raw_arguments)], ensure_ascii=False)
         return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
 
-    def _inject_reminder(self, text: str, kind: str, detail: dict) -> bool:
-        """往历史里注入一条合成 user 提醒。受 MAX_TURN_REMINDERS 总预算约束，
+    def _inject_reminder(self, text: str, kind: str, detail: dict,
+                         structural: bool = False) -> bool:
+        """往历史里注入一条合成 user 提醒。默认受 MAX_TURN_REMINDERS 总预算约束，
         预算耗尽后一律放弃（提醒是提示性的，预算保证了它永远无法反过来绑架
-        回合）。返回是否真正注入。"""
-        if self._reminders_used >= MAX_TURN_REMINDERS:
+        回合）。返回是否真正注入。
+
+        structural=True：结构性提醒，不受总预算约束也不计数——用于"续轮"这类
+        同时也是循环控制的一部分的提醒（自身已被 MAX_ROUND_EXTENSIONS 封顶，
+        若再被提醒预算掐掉，会出现"上限已延长但模型不知道"的错位）。"""
+        if not structural and self._reminders_used >= MAX_TURN_REMINDERS:
             return False
-        self._reminders_used += 1
+        if not structural:
+            self._reminders_used += 1
         self.history.append({"role": "user", "_synthetic": True, "content": text})
         self.trace.append({"type": "system_reminder", "kind": kind, **detail})
         log.info("注入合成提醒（%s），本回合已用 %d/%d",
                  kind, self._reminders_used, MAX_TURN_REMINDERS)
         return True
 
-    def _maybe_remind(self, tool_calls: list[dict], round_no: int) -> None:
-        """工具结果入历史后检查两类提醒（静默进历史，不发任何事件——下一轮
+    def _maybe_remind(self, tool_calls: list[dict], round_no: int,
+                      denied_before: set | None = None) -> None:
+        """工具结果入历史后检查三类提醒（静默进历史，不发任何事件——下一轮
         请求模型自然看到）：
 
         1. 循环提醒：按【请求顺序】逐个更新重复指纹 streak（与 _execute_tool_calls
            的回填顺序一致，论证见其 docstring「回填顺序只认请求顺序」）。同一
            签名连续达到 REPEAT_STREAK_REMIND 次才提醒，且同一段连续重复内只提醒
            一次（== 阈值才触发，第 4、5 次不再触发）；签名变化即重置计数。
-        2. 轮数预算提醒：round_no 进入预算提醒轮数集合（max_rounds-10 / -4 各
+        2. 被拒重试提醒（3b）：这一轮出现的调用，若其指纹在【本轮执行前】就已被
+           权限拒绝过（denied_before，即上一轮被拒的调用），立即提醒——不等连续
+           3 次。命中即从集合移除，避免同一条被拒调用反复触发。注意用
+           denied_before 而非当前 _denied_sigs：后者含本轮刚被拒的调用，会把
+           "被拒的同一轮"也误判成重试。
+        3. 轮数预算提醒：round_no 进入预算提醒轮数集合（max_rounds-10 / -4 各
            一次）时提醒模型收敛。
 
-        两类提醒共享 _reminders_used 预算（见 _inject_reminder）。
+        各类提醒共享 _reminders_used 预算（见 _inject_reminder）。
         """
+        denied_before = denied_before or set()
         for call in tool_calls:
             fn = call.get("function") or {}
             name = fn.get("name", "")
             sig = self._tool_signature(name, fn.get("arguments"))
+            # 2. 被拒后原样重试：最高优先级，先判后销（一次即提醒）。
+            if sig in denied_before:
+                self._denied_sigs.discard(sig)
+                self._inject_reminder(DENIED_REMIND_TEXT.format(name=name),
+                                      "denied_retry", {"tool": name})
+                self._streak_sig, self._streak_count = sig, 1
+                continue
             if sig == self._streak_sig:
                 self._streak_count += 1
             else:
@@ -1547,6 +1633,11 @@ class Agent:
             it = items[idx]
             if it["verdict"].verb == DENY:
                 self._log(f"⛔ 权限拒绝: {it['name']} {it['verdict'].reason}", "yellow")
+                # 记下被拒指纹：下一轮 _maybe_remind 若又见到同一调用，立即提醒
+                # 模型别原样重试（3b，拦截白等一个权限确认超时）。
+                fn = it["call"].get("function") or {}
+                self._denied_sigs.add(self._tool_signature(
+                    fn.get("name", ""), fn.get("arguments")))
                 yield self._backfill_tool_result(it["call"], rejection_result(it["verdict"]))
                 idx += 1
                 continue
@@ -1559,10 +1650,15 @@ class Agent:
             group = [items[i]["call"] for i in range(idx, end)]
             for call, result in zip(group, self._run_tool_group(group)):
                 yield self._backfill_tool_result(call, result)
+                # 「实质进展」判定（续轮依据，见 _run 主循环）：本组只要有一个
+                # 非只读工具成功执行（结果无 error），就认为这一轮在推进任务。
+                # 只读侦察不算、失败/被拒不算——防"读来读去原地打转"骗续轮。
+                name = (call.get("function") or {}).get("name", "")
+                if not is_read_only(name) and '"error"' not in result:
+                    self._round_had_progress = True
                 # create_doc 成功：额外产出一条 doc_created 事件（走 app.py 的
                 # else 分支进 SSE 总线），前端据此自动弹出右侧文档面板。
                 # 失败（result 含 error）不推——没生成成功没什么可弹的。
-                name = (call.get("function") or {}).get("name", "")
                 # todo_write 成功：额外产出 todo_update 事件（清单已存 ctx.todos），
                 # 前端据此在过程面板上方渲染任务清单卡（进度一目了然）。
                 if name == "todo_write" and '"error"' not in result:

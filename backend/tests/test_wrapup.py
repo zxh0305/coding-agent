@@ -402,5 +402,120 @@ class TestReasoningTrace(WrapupTestBase):
         self.assertEqual([e for e in agent.trace if e["type"] == "reasoning"], [])
 
 
+# ---------------------------------------------------------------------------
+# 四、软限续轮（1a）：有实质进展才续，无进展即收尾
+# ---------------------------------------------------------------------------
+
+class TestRoundExtension(WrapupTestBase):
+
+    def test_progress_extends_limit_then_wraps_up(self):
+        """max_rounds=2 且每轮都在写文件（实质进展）：软限到 2 时续到 22、继续
+        跑到模型自己给出总结——不提前收尾。"""
+        summary = "全部改完，收工"
+        # 第 1、2 轮写文件（非只读、成功）→ 有进展；第 3 轮直接给总结。
+        llm = RecordingLLM([
+            tool_call_message(call("c1", "write_file", path="a.txt", content="A")),
+            tool_call_message(call("c2", "write_file", path="b.txt", content="B")),
+            asst(summary),
+        ])
+        agent = self.make_agent(llm=llm, max_rounds=2)
+        events = list(agent.run("写两个文件"))
+        rounds = [p for k, p in events if k == "round"]
+        # 第 2 轮触发续轮 → 上限变 22，第 3 轮仍在正常（非收尾）轮内跑出总结
+        self.assertEqual(len(rounds), 3)
+        self.assertFalse(any(p.get("wrap_up") for p in rounds))  # 没进收尾轮
+        done = events[-1][1]
+        self.assertEqual(done["answer"], summary)
+        self.assertNotIn("stopped_reason", done)  # 模型自然收尾，不是到限收尾
+        # 续轮提醒已注入历史
+        ext = [m for m in agent.history if m.get("_synthetic")
+               and "轮数上限已从原值延长" in m["content"]]
+        self.assertEqual(len(ext), 1)
+        self.assertIn("22", ext[0]["content"])
+
+    def test_no_progress_wraps_up_at_soft_limit(self):
+        """只读工具打转（无实质进展）：软限到即收尾，不续轮——与旧行为一致。"""
+        llm = RecordingLLM([
+            tool_call_message(call("c1", "read_file", path="a.txt")),
+            tool_call_message(call("c2", "read_file", path="b.txt")),
+            asst("兜底总结"),
+        ])
+        agent = self.make_agent(llm=llm, max_rounds=2)
+        events = list(agent.run("看看"))
+        rounds = [p for k, p in events if k == "round"]
+        self.assertTrue(rounds[-1].get("wrap_up"))  # 第 3 轮是收尾轮
+        self.assertEqual(events[-1][1]["stopped_reason"], "max_rounds")
+        # 没有续轮提醒
+        self.assertEqual([m for m in agent.history if m.get("_synthetic")
+                          and "轮数上限已从原值延长" in m["content"]], [])
+
+    def test_extension_capped_at_max_count(self):
+        """持续有进展也最多续 MAX_ROUND_EXTENSIONS 次，之后必进收尾轮。"""
+        from agent import MAX_ROUND_EXTENSIONS, ROUND_EXTEND_STEP
+        n = 2 + ROUND_EXTEND_STEP * MAX_ROUND_EXTENSIONS  # 软限 + 全部额度跑满
+        script = [tool_call_message(call(f"c{i}", "write_file", path=f"f{i}.txt", content=str(i)))
+                  for i in range(n)]
+        script.append(asst("最后兜底"))  # 收尾轮用（tools=None）
+        agent = self.make_agent(llm=RecordingLLM(script), max_rounds=2)
+        events = list(agent.run("无限写"))
+        rounds = [p for k, p in events if k == "round"]
+        # 续轮数 = MAX_ROUND_EXTENSIONS，收尾轮恰好一次
+        ext = [m for m in agent.history if m.get("_synthetic")
+               and "轮数上限已从原值延长" in m["content"]]
+        self.assertEqual(len(ext), MAX_ROUND_EXTENSIONS)
+        self.assertTrue(rounds[-1].get("wrap_up"))
+        self.assertEqual(events[-1][1]["stopped_reason"], "max_rounds")
+
+
+# ---------------------------------------------------------------------------
+# 五、被拒调用原样重试提醒（3b）
+# ---------------------------------------------------------------------------
+
+class _DenyAllGate:
+    """最小假闸门：check 一律返回 DENY（不走 ASK 流程，无需 open_requests /
+    wait_all / apply_decisions）。用来隔离验证 3b 的"被拒后原样重试"提醒。"""
+
+    def __init__(self, tool="read_file"):
+        self.tool = tool
+
+    def check(self, tool, args, overlay=None):
+        from permissions import DENY, Verdict
+        return Verdict(DENY, "测试：一律拒绝", ("test", tool))
+
+    def resolve(self, request_id, decision):
+        raise AssertionError("DENY 直通不应触发 resolve")
+
+
+class TestDeniedRetryReminder(WrapupTestBase):
+
+    def test_denied_then_retried_injects_reminder(self):
+        """同一调用第一次被拒，下一轮又原样出现 → 立即注入被拒重试提醒。"""
+        llm = RecordingLLM([
+            tool_call_message(call("c1", "read_file", path="x.txt")),  # 被拒
+            tool_call_message(call("c2", "read_file", path="x.txt")),  # 原样重试
+            asst("改道完成"),
+        ])
+        agent = self.make_agent(llm=llm, max_rounds=10)
+        agent.permissions = _DenyAllGate()
+        list(agent.run("读文件"))
+        denied = [m for m in agent.history if m.get("_synthetic")
+                  and "刚刚被拒绝的工具调用" in m["content"]]
+        self.assertEqual(len(denied), 1)
+        self.assertIn("read_file", denied[0]["content"])
+
+    def test_different_args_after_deny_no_reminder(self):
+        """被拒后换了参数再调 → 指纹不同，不算原样重试，不注入被拒提醒。"""
+        llm = RecordingLLM([
+            tool_call_message(call("c1", "read_file", path="x.txt")),  # 被拒
+            tool_call_message(call("c2", "read_file", path="y.txt")),  # 换参数（仍被拒）
+            asst("改道完成"),
+        ])
+        agent = self.make_agent(llm=llm, max_rounds=10)
+        agent.permissions = _DenyAllGate()
+        list(agent.run("读文件"))
+        self.assertEqual([m for m in agent.history if m.get("_synthetic")
+                          and "刚刚被拒绝的工具调用" in m["content"]], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
