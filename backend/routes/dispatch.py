@@ -20,8 +20,9 @@ from services.model_resolve import _active_window, _mask, _resolve_active
 
 from routes import busref
 
+# log 是 busref 的模块常量（不经注入），import 期取值安全；
+# 注入点（_session_state 等）一律在调用点写 busref.<名>，不可在此处取别名。
 log = busref.log
-_session_state = busref._session_state
 
 
 class DispatchMixin:
@@ -115,7 +116,7 @@ class DispatchMixin:
             archived = (self._query().get("archived") or ["0"])[0]
             rows = db.list_sessions(self.user["id"], archived=int(archived == "1"))
             for r in rows:  # state 是内存态，db 层不掺和，在这里现算后随列表带回
-                r["state"] = _session_state(r["id"])
+                r["state"] = busref._session_state(r["id"])
             # 预览行：每会话最后一条消息的一句话摘要（一条 SQL 批量取，不逐会话查）
             previews = db.last_message_previews([r["id"] for r in rows])
             for r in rows:

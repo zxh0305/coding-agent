@@ -336,15 +336,27 @@ function toast(text, type = "success") {
 let confirmingDelete = null;  // 正处于"确认删除"状态的任务 id（二次确认，防误触）
 let confirmingArchive = null; // 正处于"确认归档"状态的任务 id（行内「确认」按钮，点其他地方即消失）
 let sessionsCache = [];       // 最近一次拉取的任务列表，删除的乐观更新直接改它
+let sessionsLoadFailed = false;  // 最近一次列表拉取失败（要在列表区说出来，见 loadSessions）
+let sessionsLoadError = "";      // 失败原因：放进提示行的 title，正文只放短句
 let renamingSession = null;   // 正在重命名的任务 id（行内出现输入框）
 const collapsedGroups = new Set();  // 已折叠的项目组（存组名）
 
 async function loadSessions() {
   try {
     const list = await api("/api/sessions");
+    sessionsLoadFailed = false;
+    sessionsLoadError = "";
     sessionsCache = Array.isArray(list) ? list : [];
-    renderSessions(sessionsCache);
-  } catch (e) { /* 启动时后端未就绪不打扰 */ }
+  } catch (e) {
+    // 拉取失败必须显式说出来：接口 500 时列表区原先只剩"还没有任务，发一条消息
+    // 即创建"，用户读到的结论是"任务数据丢了"，而真因只在 backend 日志里
+    //（2026-10-09 GET /api/sessions 因注入点被 import 期取成 None 而 500，
+    // 就被当成"改了之后没数据了"）。这里保留上一次成功的缓存继续显示，
+    // 另在列表顶部顶一行可点击重试的提示。
+    sessionsLoadFailed = true;
+    sessionsLoadError = String((e && e.message) || "未知错误");
+  }
+  renderSessions(sessionsCache);   // 两条路径都重画：失败时也要把提示行画出来
 }
 
 // 列表状态轮询：state 是服务端内存态，只在"当前会话"的回合边界事件里刷新
@@ -526,10 +538,29 @@ function taskRow(s, list) {
   return li;
 }
 
+// 列表拉取失败时的一行提示：点一下立刻重试（比等 8 秒轮询快）。用 role/tabIndex
+// 让它键盘可达——这行是"列表为什么是空的"的唯一解释，读屏用户也得够得着。
+function listErrorRow() {
+  const li = document.createElement("li");
+  li.className = "task error";
+  li.setAttribute("role", "button");
+  li.tabIndex = 0;
+  li.textContent = "列表加载失败 · 点此重试";
+  li.title = sessionsLoadError;
+  const retry = () => loadSessions();
+  li.addEventListener("click", retry);
+  li.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); retry(); }
+  });
+  return li;
+}
+
 function renderSessions(list) {
   const ul = $("task-list");
   ul.innerHTML = "";
+  if (sessionsLoadFailed) ul.appendChild(listErrorRow());
   if (!list.length) {
+    if (sessionsLoadFailed) return;  // 失败导致的"空"不是真的空，别再说"还没有任务"
     const li = document.createElement("li");
     li.className = "task empty";
     li.textContent = "（还没有任务，发一条消息即创建）";

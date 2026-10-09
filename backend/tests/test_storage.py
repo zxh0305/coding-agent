@@ -634,5 +634,32 @@ class TestLastMessagePreviews(StorageTestBase):
         self.assertEqual(db.last_message_previews(["s1"]), {})
 
 
+    def test_long_messages_still_get_a_preview(self):
+        """超长消息必须有预览行（46bff9a 的 substr 截断让它们恒定为空）。
+
+        截断的是 JSON，不是正文：截在字符串中间 → json.loads 必失败 → 整条
+        消息被跳过。所以"越长的消息越没有预览"，而长回答恰恰是最想瞥一眼的。
+        """
+        long_text = "总结一下这次改动：" + "改了很多地方，" * 60  # 远超 300 字节
+        db.save_messages("s1", [{"role": "assistant", "content": long_text}], {})
+        prev = db.last_message_previews(["s1"])["s1"]
+        self.assertTrue(prev.startswith("总结一下这次改动："))
+        self.assertEqual(len(prev), 120)          # 裁剪在解析之后，按 120 字截
+
+        # 参数很长的 tool_calls 消息同理：JSON 超 300 字节也要降级出工具名
+        db.save_messages("s1", [{"role": "assistant", "content": None,
+                                 "tool_calls": [{"id": "c1", "type": "function",
+                                                 "function": {"name": "apply_patch",
+                                                              "arguments": "{\"patch\": \"" + "x" * 600 + "\"}"}}]}], {})
+        self.assertEqual(db.last_message_previews(["s1"])["s1"], "[调用工具 apply_patch]")
+
+        # 多部分 user 消息：只取文本部分，同样不受长度影响
+        db.save_messages("s1", [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,xx"}},
+            {"type": "text", "text": "这张图：" + "细节很多，" * 40},
+        ]}], {})
+        self.assertTrue(db.last_message_previews(["s1"])["s1"].startswith("你：这张图："))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

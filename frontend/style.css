@@ -295,6 +295,8 @@ body.side-resizing .sidebar { transition: none; }
 .task.active { background: var(--selected); }
 .task.empty { color: var(--text-3); font-size: 12px; cursor: default; }
 .task.empty:hover { background: none; }
+/* 列表拉取失败：与"空列表"必须长得不一样，否则用户会把接口故障读成"数据丢了" */
+.task.error { color: var(--warning-strong); font-size: 12px; cursor: pointer; }
 .t-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .t-time { font-size: 11px; color: var(--text-3); flex-shrink: 0; }
 /* 会话列表预览行：标题列转纵向，第二行放最后一条消息的摘要（两行各自省略） */

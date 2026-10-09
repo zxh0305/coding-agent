@@ -734,11 +734,16 @@ def list_sessions(user_id: int, archived: int = 0) -> list[dict]:
              "archived_at": r["archived_at"]} for r in rows]
 
 
-def last_message_previews(sids: list[str], chars: int = 300) -> dict[str, str]:
+def last_message_previews(sids: list[str]) -> dict[str, str]:
     """每会话最后一条消息的一句话摘要（会话列表预览行用）。
 
-    一次查询取全部会话：按 (session_id, ord) 取每会话 ord 最大的一条，
-    content 只取前 chars 字符（预览用不到完整正文；外置 stub 行本身就短）。
+    一次查询取全部会话：按 (session_id, ord) 取每会话 ord 最大的一条，content
+    必须【整条】读出来再解析——它是 {"role":…,"content":…} 的 JSON，按字符数
+    截断会截在字符串中间，json.loads 必失败，于是超过 300 字节的消息恒定拿不到
+    预览行（46bff9a 用 substr(content,1,300) 就踩了这条：实测 23 个会话里 17 个
+    没有预览，越长的消息越没有）。裁剪放在解析之后：正文取前 120 字。真实库上
+    所有会话的最后一条合计约 20KB，读全量没有 IO 压力。
+
     返回 {sid: "角色前缀 + 压平的文本"}；没有消息/正文解析失败的会话不在
     字典里（前端退化为不显示预览行）。role 为 user 时带"你："前缀区分立场，
     assistant 的 tool_calls 消息（content 为 null）降级为"[调用工具 x, y]"。
@@ -748,15 +753,15 @@ def last_message_previews(sids: list[str], chars: int = 300) -> dict[str, str]:
     placeholders = ",".join("?" * len(sids))
     with _conn() as conn:
         rows = conn.execute(
-            f"SELECT m.session_id AS sid, m.role AS role, substr(m.content, 1, ?) AS head "
+            f"SELECT m.session_id AS sid, m.role AS role, m.content AS content "
             f"FROM messages m JOIN (SELECT session_id, MAX(ord) AS ord FROM messages "
             f"WHERE session_id IN ({placeholders}) GROUP BY session_id) t "
             f"ON m.session_id = t.session_id AND m.ord = t.ord",
-            [chars, *sids]).fetchall()
+            sids).fetchall()
     out: dict[str, str] = {}
     for r in rows:
         try:
-            msg = json.loads(r["head"])
+            msg = json.loads(r["content"])
         except (json.JSONDecodeError, TypeError):
             continue
         content = msg.get("content")
