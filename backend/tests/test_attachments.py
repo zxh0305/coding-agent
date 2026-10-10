@@ -319,5 +319,106 @@ class TestWorkspacePlacement(AttachTestBase):
         self.assertTrue((ws / "keep.txt").exists())  # 工作区其它内容不受影响
 
 
+class TestChunkedUpload(AttachTestBase):
+    """大附件分块上传（staging_begin/put_chunk/commit/abort）。"""
+
+    def _upload(self, sid, name, blob, sha=""):
+        import math, hashlib
+        CH = db.ATTACH_CHUNK_BYTES
+        n = math.ceil(len(blob) / CH) if blob else 1
+        if not sha:
+            sha = hashlib.sha256(blob).hexdigest()
+        b = db.staging_begin(sid, name, len(blob), n, sha)
+        uid = b["upload_id"]
+        for i in range(n):
+            db.staging_put_chunk(sid, uid, i, blob[i * CH:(i + 1) * CH])
+        return uid
+
+    def test_roundtrip_multi_chunk(self):
+        """跨多块的文件：拼接后逐字节一致，暂存区落成后清空。"""
+        blob = bytes((i * 7) % 256 for i in range(db.ATTACH_CHUNK_BYTES * 3 + 123))
+        uid = self._upload("s1", "big.log", blob)
+        info = db.staging_commit("s1", uid)
+        self.assertEqual(info["bytes"], len(blob))
+        self.assertEqual(Path(info["path"]).read_bytes(), blob)
+        self.assertFalse((db._staging_root("s1") / uid).exists())
+
+    def test_single_chunk(self):
+        blob = b"hello\n"
+        info = db.staging_commit("s1", self._upload("s1", "a.txt", blob))
+        self.assertEqual(Path(info["path"]).read_bytes(), blob)
+
+    def test_sha_mismatch_rejected(self):
+        blob = b"x" * 1024
+        uid = self._upload("s1", "bad.txt", blob, sha="deadbeef")
+        with self.assertRaises(ValueError):
+            db.staging_commit("s1", uid)
+
+    def test_missing_chunk_rejected(self):
+        """少一块：commit 拒绝，不落成残缺文件。"""
+        import math
+        CH = db.ATTACH_CHUNK_BYTES
+        blob = b"a" * (CH * 2)
+        b = db.staging_begin("s1", "miss.txt", len(blob), 2, "")
+        db.staging_put_chunk("s1", b["upload_id"], 0, blob[:CH])  # 只写第一块
+        with self.assertRaises(ValueError):
+            db.staging_commit("s1", b["upload_id"])
+        self.assertEqual(db.list_attachments("s1"), [])
+
+    def test_next_chunk_index_tracks_contiguous(self):
+        """next_chunk_index = 已连续收到的下一块（供断点续传）。"""
+        CH = db.ATTACH_CHUNK_BYTES
+        b = db.staging_begin("s1", "p.txt", CH * 3, 3, "")
+        uid = b["upload_id"]
+        self.assertEqual(b["next_chunk_index"], 0)
+        self.assertEqual(db.staging_put_chunk("s1", uid, 0, b"a" * CH)["next_chunk_index"], 1)
+        # 跳着写第 2 块：第 1 块仍缺，进度不前进
+        self.assertEqual(db.staging_put_chunk("s1", uid, 2, b"c" * CH)["next_chunk_index"], 1)
+        self.assertEqual(db.staging_put_chunk("s1", uid, 1, b"b" * CH)["next_chunk_index"], 3)
+
+    def test_oversize_begin_rejected(self):
+        with self.assertRaises(ValueError):
+            db.staging_begin("s1", "huge.log", db.MAX_ATTACH_BYTES + 1, 1, "")
+
+    def test_chunk_too_large_rejected(self):
+        b = db.staging_begin("s1", "x.txt", db.ATTACH_CHUNK_BYTES * 2, 2, "")
+        with self.assertRaises(ValueError):
+            db.staging_put_chunk("s1", b["upload_id"], 0, b"z" * (db.ATTACH_CHUNK_BYTES + 1))
+
+    def test_abort_clears_staging(self):
+        b = db.staging_begin("s1", "x.txt", 1024, 1, "")
+        db.staging_abort("s1", b["upload_id"])
+        self.assertFalse((db._staging_root("s1") / b["upload_id"]).exists())
+        db.staging_abort("s1", "nonexistent")  # 幂等
+
+    def test_ttl_cleanup(self):
+        """超时未提交的暂存区被清理，未过期的保留。"""
+        import os, time
+        old = db.staging_begin("s1", "old.txt", 1024, 1, "")
+        keep = db.staging_begin("s1", "new.txt", 1024, 1, "")
+        meta = db._staging_root("s1") / old["upload_id"] / "meta.json"
+        old_t = time.time() - db.ATTACH_STAGING_TTL_SECONDS - 60
+        os.utime(meta, (old_t, old_t))
+        removed = db.cleanup_staging("s1")
+        self.assertEqual(removed, 1)
+        self.assertFalse((db._staging_root("s1") / old["upload_id"]).exists())
+        self.assertTrue((db._staging_root("s1") / keep["upload_id"]).exists())
+
+    def test_staging_not_listed_as_attachment(self):
+        """暂存区（.staging）不出现在附件列表里。"""
+        db.staging_begin("s1", "p.txt", 1024, 1, "")
+        self.assertEqual(db.list_attachments("s1"), [])
+
+    def test_invalid_upload_id_rejected(self):
+        with self.assertRaises(ValueError):
+            db.staging_put_chunk("s1", "../escape", 0, b"x")
+
+    def test_attachment_info(self):
+        db.save_attachment("s1", "a.txt", b"12345")
+        self.assertEqual(db.attachment_info("s1", "a.txt"), {"name": "a.txt", "bytes": 5})
+        with self.assertRaises(FileNotFoundError):
+            db.attachment_info("s1", "nope.txt")
+
+
 if __name__ == "__main__":
     unittest.main()
