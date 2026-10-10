@@ -53,6 +53,11 @@ class SessionRoutes:
         for _a in (body.get("attachments") or [])[:6]:
             _d = str(_a.get("data") or "")
             if not _d:
+                # 大附件走分块上传后已落盘，发送时只带 name（无 data）——
+                # 有 name 即视为有效附件，不能因"没有内联 data"判成空输入。
+                if str(_a.get("name") or "").strip():
+                    _has_att = True
+                    break
                 continue
             if _a.get("kind") == "image":
                 _has_att = True
@@ -365,6 +370,58 @@ class SessionRoutes:
         if info.get("kind") in ("archive", "binary"):
             return self._json(info)
         self._json(info)
+
+    # ---------- 大附件分块上传（begin / chunk / commit / abort） ----------
+    # 参照 ZCode 的三段式上传：每块都是独立的小 POST（远小于 MAX_BODY_BYTES），
+    # 于是"附件多大"与"请求体多大"解耦，单附件上限得以上到 100MB。详见 db.staging_*。
+
+    def _handle_attach_upload_begin(self, sid: str):
+        """开启一次分块上传：{name, size, total_chunks, sha256?} → {upload_id}。"""
+        body = self._body()
+        try:
+            info = db.staging_begin(
+                sid, body.get("name"), body.get("size"),
+                body.get("total_chunks"), body.get("sha256") or "")
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        self._json(info)
+
+    def _handle_attach_upload_chunk(self, sid: str):
+        """写入一个分块：{upload_id, chunk_index, data(base64)} → {next_chunk_index}。"""
+        body = self._body()
+        upload_id = str(body.get("upload_id") or "")
+        raw = str(body.get("data") or "")
+        if not raw:
+            return self._json({"error": "分块内容为空"}, 400)
+        try:
+            blob = base64.b64decode(raw)
+        except Exception:
+            return self._json({"error": "分块不是合法 base64"}, 400)
+        try:
+            info = db.staging_put_chunk(
+                sid, upload_id, body.get("chunk_index"), blob)
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        except FileNotFoundError:
+            return self._json({"error": "上传会话不存在或已过期，请重新上传"}, 404)
+        self._json(info)
+
+    def _handle_attach_upload_commit(self, sid: str):
+        """拼装 → 校验 → 落成正式附件：{upload_id} → {name, bytes}。"""
+        body = self._body()
+        try:
+            info = db.staging_commit(sid, str(body.get("upload_id") or ""))
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        except FileNotFoundError:
+            return self._json({"error": "上传会话不存在或已过期"}, 404)
+        self._json({"name": info["name"], "bytes": info["bytes"]})
+
+    def _handle_attach_upload_abort(self, sid: str):
+        """放弃一次上传（幂等）。"""
+        body = self._body()
+        db.staging_abort(sid, str(body.get("upload_id") or ""))
+        self._json({"ok": True})
 
     # ---------- 会话维护：重命名 / 已读 / 回退 / 压缩 / 删除收摊 ----------
 

@@ -316,6 +316,7 @@ def main():
     load_env_file(str(ENV_FILE))   # 读 .env（首库播种 / 默认供应商 / 默认工作区用）
     db.init_db()                   # 建表 + 播种（已初始化则跳过）
     db.cleanup_orphan_attachments()  # 兜底：清理无主会话的附件目录（防 kill -9 残留）
+    db.cleanup_staging()             # 兜底：清理超时未提交的分块上传暂存区
     orphan = db.cleanup_orphans()    # 兜底：清理无主行（历史遗留 / 旧版漏删）
     if any(orphan.values()):
         print(f"🧹 已清理孤儿行: {orphan}", flush=True)

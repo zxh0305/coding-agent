@@ -189,6 +189,18 @@ class DispatchMixin:
                 if db.session_owner(sid) != self.user["id"]:
                     return self._json({"error": "任务不存在或不属于当前用户"}, 404)
                 self._handle_session_submit(sid)
+            elif re.fullmatch(r"/api/sessions/[^/]+/attachments/(begin|chunk|commit|abort)", path):
+                # 大附件分块上传（begin/chunk/commit/abort）：三段式事务，见 db.staging_*
+                parts = path.split("/")
+                sid, action = parts[3], parts[5]
+                if not sid or db.session_owner(sid) != self.user["id"]:
+                    return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+                {
+                    "begin": self._handle_attach_upload_begin,
+                    "chunk": self._handle_attach_upload_chunk,
+                    "commit": self._handle_attach_upload_commit,
+                    "abort": self._handle_attach_upload_abort,
+                }[action](sid)
             elif re.fullmatch(r"/api/sessions/[^/]+/permission/[^/]+", path):
                 # 权限确认的决定回令：/api/sessions/<sid>/permission/<pid>
                 parts = path.split("/")

@@ -1290,9 +1290,10 @@ const attachDrafts = new Map();  // sid(或 __new__) -> attachments 数组快照
 
 function saveAttachDraft(sid) {
   const key = sid || DRAFT_NEW;
-  // 只存读好数据的附件：仍在读文件（data 为空）的占位不跨会话保留，
-  // 它的 FileReader 回调绑在旧列表上，带过去只会留下永远加载不出的空卡片。
-  const ready = attachments.filter(a => a.data);
+  // 只存"已就绪"的附件：小附件读好了 data、大附件已分块上传落盘（uploaded）。
+  // 仍在读文件/上传中的占位不跨会话保留——它们的 FileReader/上传回调绑在旧
+  // 列表上，带过去只会留下永远加载不出的空卡片。
+  const ready = attachments.filter(a => a.data || a.uploaded);
   if (ready.length) attachDrafts.set(key, ready);
   else attachDrafts.delete(key);  // 空托盘不留残留，避免下次误恢复
 }
@@ -1327,6 +1328,14 @@ function renderAttachTray() {
       icon.className = "att-file";
       icon.textContent = "📄 " + summarize(a.name, 14);
       card.appendChild(icon);
+      // 分块上传进度：未完成时叠一层进度条，用户能看到大文件传了多少。
+      if (a.pending && !a.uploaded) {
+        card.classList.add("uploading");
+        const bar = document.createElement("div");
+        bar.className = "att-progress";
+        bar.style.width = (a.progress || 0) + "%";
+        card.appendChild(bar);
+      }
     }
     const x = document.createElement("button");
     x.className = "att-del";
@@ -1351,18 +1360,104 @@ function renderAttachTray() {
   });
 }
 
+// 单附件上限（与后端 db.MAX_ATTACH_BYTES 对齐，100MB）。
+const MAX_ATTACH_BYTES = 100 * 1024 * 1024;
+// 分块大小（与后端 db.ATTACH_CHUNK_BYTES 对齐，384KiB）。
+const ATTACH_CHUNK_BYTES = 384 * 1024;
+// 超过此值走分块上传（避免把大文件 base64 内联进聊天请求体撑爆 body 上限）。
+const ATTACH_CHUNK_THRESHOLD = 2 * 1024 * 1024;
+
+function _b64FromBuffer(buf) {
+  // 分块转 base64：分块 ≤384KiB，逐段拼 String.fromCharCode 不会爆栈。
+  const bytes = new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(s);
+}
+
+async function _sha256Hex(buf) {
+  const h = await crypto.subtle.digest("SHA-256", buf);
+  return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// 大文件分块上传：begin → chunk×N → commit。上传在【选择文件时】进行，
+// 完成后 entry.uploaded = true，发送时只带 name（不带 data）。sid 为当前会话。
+async function uploadLargeAttachment(entry, file, sid) {
+  try {
+    const buf = await file.arrayBuffer();
+    const totalChunks = Math.max(1, Math.ceil(buf.byteLength / ATTACH_CHUNK_BYTES));
+    const sha256 = await _sha256Hex(buf);
+    const sidPath = encodeURIComponent(sid);
+    const begin = await api(`/api/sessions/${sidPath}/attachments/begin`, {
+      method: "POST",
+      body: JSON.stringify({ name: entry.name, size: buf.byteLength, total_chunks: totalChunks, sha256 }),
+    });
+    const uploadId = begin.upload_id;
+    let next = begin.next_chunk_index || 0;
+    for (let i = next; i < totalChunks; i++) {
+      if (!attachments.includes(entry)) {  // 中途被用户移除：中止上传，清暂存
+        await api(`/api/sessions/${sidPath}/attachments/abort`,
+                  { method: "POST", body: JSON.stringify({ upload_id: uploadId }) }).catch(() => {});
+        return;
+      }
+      const slice = buf.slice(i * ATTACH_CHUNK_BYTES, (i + 1) * ATTACH_CHUNK_BYTES);
+      await api(`/api/sessions/${sidPath}/attachments/chunk`, {
+        method: "POST",
+        body: JSON.stringify({ upload_id: uploadId, chunk_index: i, data: _b64FromBuffer(slice) }),
+      });
+      entry.progress = Math.round((i + 1) / totalChunks * 100);
+      renderAttachTray();
+    }
+    const done = await api(`/api/sessions/${sidPath}/attachments/commit`, {
+      method: "POST", body: JSON.stringify({ upload_id: uploadId }),
+    });
+    entry.uploaded = true;      // 已落盘：发送时只带 name
+    entry.data = "";            // 不再需要 base64 内联
+    entry.progress = 100;
+    entry.bytes = done.bytes;
+    renderAttachTray();
+  } catch (e) {
+    entry.error = e.message || "上传失败";
+    const i = attachments.indexOf(entry);
+    if (i >= 0) attachments.splice(i, 1);  // 上传失败：从托盘撤下，避免带个空附件发送
+    renderAttachTray();
+    toast(`附件「${entry.name}」上传失败：${entry.error}`, "error");
+  }
+}
+
 function addFileToAttachments(file) {
   if (!file) return;
   if (attachments.length >= MAX_ATTACH) { toast(`一次最多 ${MAX_ATTACH} 个附件`, "error"); return; }
   const isImage = file.type.startsWith("image/");
   if (isImage && file.size > 4 * 1024 * 1024) { toast(`图片超过 4MB`, "error"); return; }
-  if (!isImage && file.size > 5 * 1024 * 1024) { toast(`文件超过 5MB（附件限制）`, "error"); return; }
+  if (!isImage && file.size > MAX_ATTACH_BYTES) {
+    toast(`文件超过 ${Math.round(MAX_ATTACH_BYTES / 1024 / 1024)}MB（附件限制）`, "error");
+    return;
+  }
   if (isImage && !activeModelVision) {
     toast("当前模型未标注视觉能力，发送后将由 analyze_image 工具代为识别");
   }
+  // 大文件（非图片）走分块上传：需要一个已存在的会话。新任务的 sid 由服务端
+  // 在首条消息时创建，故此时无会话——提示用户先发一条或用现有会话。
+  if (!isImage && file.size > ATTACH_CHUNK_THRESHOLD) {
+    if (!currentSession) {
+      toast("大附件需要先在已有任务中上传（请先发送一条消息建立任务）", "error");
+      return;
+    }
+    const entry = { kind: "text", name: file.name || "clipboard.txt",
+                    mime: file.type || "text/plain", data: "", preview: "",
+                    progress: 0, uploaded: false, pending: true };
+    attachments.push(entry);
+    renderAttachTray();
+    uploadLargeAttachment(entry, file, currentSession);
+    return;
+  }
+  // 小文件：沿用原有 FileReader 内联路径（省一次往返）。
   // FileReader 是异步的：读取期间用户可能删除其他附件（数组前移/缩短），
   // 按读取开始时的下标回写会错位。这里先占一个真实位置，回写前核对
-  // （token 不匹配 = 列表变过，重新找位置；找不到说明该附件已被移除，丢弃）。
+  // （token 不匹配 = 列表变过；找不到说明该附件已被移除，丢弃）。
   const entry = isImage
     ? { kind: "image", name: file.name || `clipboard.${(file.type.split("/")[1] || "bin").replace("+xml", "")}`,
         mime: file.type, data: "", preview: "" }
@@ -3909,11 +4004,19 @@ function send() {
     runManualCompact();
     return;
   }
-  if (attachments.some(a => !a.data)) {  // 占位附件还在读文件：等下一拍
+  if (attachments.some(a => a.pending && !a.uploaded)) {  // 大附件还在分块上传：等完成
+    toast("附件还在上传中，请等进度走完再发送");
+    return;
+  }
+  if (attachments.some(a => !a.data && !a.uploaded)) {  // 小附件还在读文件：等下一拍
     toast("附件还在读取中，请稍候一秒再发送");
     return;
   }
-  const payloadAtts = attachments.map(a => ({ kind: a.kind, name: a.name, mime: a.mime, data: a.data }));
+  // 已分块上传的大附件：只带 name（不带 data），服务端已落盘；
+  // 小附件：沿用内联 data，由服务端落盘。
+  const payloadAtts = attachments.map(a => a.uploaded
+    ? { kind: a.kind, name: a.name, mime: a.mime, data: "" }
+    : { kind: a.kind, name: a.name, mime: a.mime, data: a.data });
   const outAtts = attachments.map(a => ({ kind: a.kind, name: a.name, preview: a.preview }));
   inputEl.value = "";
   attachments = [];              // 附件必须先清再存草稿：saveDraft 会把托盘快照

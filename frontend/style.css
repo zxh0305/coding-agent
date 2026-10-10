@@ -1422,6 +1422,12 @@ button.primary:hover { background: var(--accent-hover); }
   display: flex; align-items: center; justify-content: center;
 }
 .att-del:hover { background: var(--danger); }
+/* 分块上传进度：卡片底部一条随进度增长的高亮条（大附件上传时可见） */
+.att-card.uploading { overflow: hidden; }
+.att-progress {
+  position: absolute; left: 0; bottom: 0; height: 3px;
+  background: var(--accent); transition: width .15s linear;
+}
 
 /* 气泡里的附件图片/文件名：小缩略图（大图进灯箱看） */
 .msg-img {

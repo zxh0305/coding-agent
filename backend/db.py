@@ -970,11 +970,11 @@ def write_doc(sid: str, name: str, content: str) -> dict:
 # 后，消息里只带文件名与大小（几十 token），模型用 read_attachment 工具按需
 # 分页读取，单文件上限得以放宽到 5MB，模型还能覆盖全文。
 
-# 单个附件的大小上限（字节）。
-MAX_ATTACH_BYTES = 5 * 1024 * 1024
+# 单个附件的大小上限（字节）。大附件走分块上传（见 staging_begin），
+# 各分块请求体远小于 MAX_BODY_BYTES，故此处可放宽到 100MB 而不动 body 上限。
+MAX_ATTACH_BYTES = 100 * 1024 * 1024
 # 单会话全部附件的总量上限（字节）：防"反复上传把磁盘写满"的防呆阀。
-# 前端一次最多 6 个附件（MAX_ATTACH），正常使用碰不到这个数。
-MAX_ATTACH_TOTAL_BYTES = 100 * 1024 * 1024
+MAX_ATTACH_TOTAL_BYTES = 500 * 1024 * 1024
 
 
 def _attachments_dir() -> Path:
@@ -1064,6 +1064,170 @@ def _session_attach_bytes(sid: str) -> int:
         except OSError:
             continue
     return total
+
+
+# ---------------------------------------------------------------------------
+# 附件分块上传暂存区（大附件先分块落盘，commit 时才拼装成正式附件）
+# ---------------------------------------------------------------------------
+# 背景：附件原先 base64 内联进聊天请求体，单附件被 MAX_BODY_BYTES(12MB) 卡在 5MB。
+# 参照 ZCode 的三段式（begin/chunk/commit）上传：每块都是独立的小 POST，远小于
+# body 上限，于是"附件多大"与"请求体多大"解耦，单附件上限得以放宽到 100MB。
+#
+# 暂存区位置：<会话附件根>/.staging/<upload_id>/，与 _extracted 同域——都是
+# 派生产物，list_attachments 的 is_file() 天然过滤掉。commit 时按序拼接校验
+# sha256，再调 save_attachment 落成正式附件，工作区优先/会话隔离等既有机制全继承。
+
+# 账号名：分块大小（字节）。384KiB 可被 3 整除 → 除末块外 base64 无 padding。
+ATTACH_CHUNK_BYTES = 384 * 1024
+# 未提交的暂存区存活时间（秒）：超过即视为放弃，惰性清理。
+ATTACH_STAGING_TTL_SECONDS = 30 * 60
+
+
+def _staging_root(sid: str) -> Path:
+    """某会话的分块上传暂存根目录。"""
+    return _session_attach_root(sid) / ".staging"
+
+
+def staging_begin(sid: str, name: str, total_bytes: int, total_chunks: int,
+                  sha256: str = "") -> dict:
+    """开启一次分块上传：建暂存目录、写 meta.json、清理过期暂存区。
+
+    返回 {upload_id, next_chunk_index}。next_chunk_index 恒为 0（新上传），
+    但保留该字段是为了让前端与断点续传走同一套回执协议。
+    """
+    safe = _safe_attach_name(name)
+    total_bytes = int(total_bytes or 0)
+    if total_bytes <= 0:
+        raise ValueError("附件大小必须为正")
+    if total_bytes > MAX_ATTACH_BYTES:
+        raise ValueError(f"附件过大（{total_bytes} 字节），上限 {MAX_ATTACH_BYTES} 字节")
+    total_chunks = int(total_chunks or 0)
+    if total_chunks <= 0 or total_chunks > 4096:
+        raise ValueError("分块数不合法")
+    cleanup_staging(sid)  # 惰性清理过期暂存区
+    upload_id = uuid.uuid4().hex
+    d = _staging_root(sid) / upload_id
+    d.mkdir(parents=True, exist_ok=True)
+    meta = {"upload_id": upload_id, "name": safe, "total_bytes": total_bytes,
+            "total_chunks": total_chunks, "sha256": str(sha256 or ""),
+            "chunk_bytes": ATTACH_CHUNK_BYTES, "created": time.time()}
+    (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    log.info("分块上传开始 sid=%r name=%r size=%d chunks=%d", sid, safe, total_bytes, total_chunks)
+    return {"upload_id": upload_id, "next_chunk_index": 0}
+
+
+def _staging_dir(sid: str, upload_id: str) -> Path:
+    """定位一次上传的暂存目录，并做越界校验（upload_id 是不可信输入）。"""
+    if not upload_id or "/" in upload_id or "\\" in upload_id or ".." in upload_id:
+        raise ValueError("upload_id 不合法")
+    base = _staging_root(sid).resolve()
+    d = (base / upload_id).resolve()
+    if d == base or base not in d.parents:
+        raise ValueError("非法的暂存路径")
+    return d
+
+
+def staging_put_chunk(sid: str, upload_id: str, chunk_index: int, data: bytes) -> dict:
+    """写入一个分块；返回 {next_chunk_index}（已连续收到的下一块下标）。
+
+    幂等：同一 chunk_index 重传即覆盖（断点续传时前端可安全重发尾部块）。
+    """
+    d = _staging_dir(sid, upload_id)
+    meta_p = d / "meta.json"
+    if not meta_p.is_file():
+        raise FileNotFoundError("上传会话不存在或已过期")
+    meta = json.loads(meta_p.read_text(encoding="utf-8"))
+    idx = int(chunk_index)
+    if idx < 0 or idx >= int(meta["total_chunks"]):
+        raise ValueError("分块下标越界")
+    blob = data if isinstance(data, bytes) else bytes(data)
+    if len(blob) > ATTACH_CHUNK_BYTES:
+        raise ValueError(f"分块过大（{len(blob)} > {ATTACH_CHUNK_BYTES} 字节）")
+    (d / f"{idx:06d}.part").write_bytes(blob)
+    # 从 0 起找第一个缺失块，作为"已连续收到"的进度——前端据此展示/续传
+    nxt = 0
+    while (d / f"{nxt:06d}.part").is_file() and nxt < int(meta["total_chunks"]):
+        nxt += 1
+    return {"next_chunk_index": nxt}
+
+
+def staging_commit(sid: str, upload_id: str) -> dict:
+    """拼装全部分块 → 校验大小与 sha256 → 落成正式附件，返回 save_attachment 的结果。"""
+    d = _staging_dir(sid, upload_id)
+    meta_p = d / "meta.json"
+    if not meta_p.is_file():
+        raise FileNotFoundError("上传会话不存在或已过期")
+    meta = json.loads(meta_p.read_text(encoding="utf-8"))
+    total_chunks = int(meta["total_chunks"])
+    parts = [d / f"{i:06d}.part" for i in range(total_chunks)]
+    missing = [i for i, p in enumerate(parts) if not p.is_file()]
+    if missing:
+        raise ValueError(f"分块不完整，缺少 {len(missing)} 块（首个缺失 #{missing[0]}）")
+    blob = b"".join(p.read_bytes() for p in parts)
+    if len(blob) != int(meta["total_bytes"]):
+        raise ValueError(f"拼装大小不符（{len(blob)} != {meta['total_bytes']}）")
+    want = str(meta.get("sha256") or "")
+    if want:
+        got = hashlib.sha256(blob).hexdigest()
+        if got != want:
+            raise ValueError("sha256 校验失败（传输损坏，请重传）")
+    info = save_attachment(sid, meta["name"], blob)  # 超限/非法名在此抛错
+    shutil.rmtree(d, ignore_errors=True)  # 落成即清暂存
+    log.info("分块上传完成 sid=%r name=%r bytes=%d", sid, info["name"], info["bytes"])
+    return info
+
+
+def staging_abort(sid: str, upload_id: str) -> None:
+    """放弃一次上传，清掉暂存目录（幂等）。"""
+    try:
+        d = _staging_dir(sid, upload_id)
+    except ValueError:
+        return
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def cleanup_staging(sid: str | None = None) -> int:
+    """清理超时未提交的暂存区；sid 为 None 时扫所有会话。返回清理掉的目录数。"""
+    now = time.time()
+    roots: list[Path] = []
+    if sid:
+        roots.append(_staging_root(sid))
+    else:
+        base = _attachments_dir()
+        if base.is_dir():
+            for sd in base.iterdir():
+                if sd.is_dir():
+                    roots.append(sd / ".staging")
+    removed = 0
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for d in root.iterdir():
+            if not d.is_dir():
+                continue
+            try:
+                mtime = (d / "meta.json").stat().st_mtime if (d / "meta.json").is_file() \
+                    else d.stat().st_mtime
+            except OSError:
+                continue
+            if now - mtime > ATTACH_STAGING_TTL_SECONDS:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+    if removed:
+        log.info("清理过期附件暂存区 %d 个", removed)
+    return removed
+
+
+def attachment_info(sid: str, name: str) -> dict:
+    """查一份已落盘附件的元信息，返回 {name, bytes}；不存在抛 FileNotFoundError。
+
+    供"分块上传已落盘、发送时只带 name"的消息组装确认文件确实在（见
+    services/messages._build_user_message），避免凭空引用一个不存在的附件。
+    """
+    p = _attach_path(sid, _safe_attach_name(name))
+    if not p.is_file():
+        raise FileNotFoundError(f"附件不存在: {name}")
+    return {"name": p.name, "bytes": p.stat().st_size}
 
 
 def save_attachment(sid: str, name: str, data: bytes) -> dict:
