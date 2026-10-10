@@ -73,7 +73,13 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             # 早已发完，带不了 mid）。
             user_mid = uuid.uuid4().hex
             user_message["_mid"] = user_mid
-            db.save_messages(sid, [user_message], {})
+            # 必须传浅拷贝：save_messages 对超过 MAX_INLINE_BYTES 的消息会【就地】
+            # 替换成 _artifact 摘要桩（db.py 里 m.clear()+m.update(stub)）。带图片的
+            # 用户消息 base64 普遍超 64KB，若把原 dict 直接交过去，它会在这一瞬间
+            # 被掏空——随后 agent._run 提取 ctx.images 时 content 已是桩字符串，
+            # analyze_image 永远报"没有附带图片"。拷贝让替换只毁副本，原 dict 完整
+            # 进入 agent 历史；收尾整段落盘时本消息已按桩内容记过指纹，幂等跳过。
+            db.save_messages(sid, [dict(user_message)], {})
             # 截图推送注入（browser_tools → SSE）：回合线程里安全，publish 自带锁
             import browser_tools
             browser_tools.screenshot_pusher = _push_browser_screenshot

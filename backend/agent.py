@@ -609,7 +609,13 @@ class Agent:
         self._clear_old_tool_results()
         # 提取本轮附带的图片（OpenAI content 数组里的 image_url 部分），挂进工具上下文。
         # 主模型看不见像素；analyze_image 工具借"视觉模型"看图时用的就是这份数据。
-        content = (user_message or {}).get("content")
+        # 防御：调用方传来的 user_message 若已是 _artifact 摘要桩（如旧版本在回合
+        # 开始落库时被就地替换），先还原成完整消息再提取——桩的 content 是 JSON
+        # 字符串，直接提取会把图片静默丢成空列表（"收不到图片"事故，2026-10-10）。
+        um = user_message or {}
+        if um.get("_artifact"):
+            um = self._expand_artifact(um)
+        content = um.get("content")
         if isinstance(content, list):
             self.ctx.images = [p for p in content if p.get("type") == "image_url"]
         else:
