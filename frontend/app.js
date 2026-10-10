@@ -225,15 +225,41 @@ let stickBottom = true;
 // 就是上滑卡顿的主源。因此改判方向：任何向上滚动意图（wheel deltaY<0 或
 // touchmove 上划）直接 stickBottom=false，scroll 只负责「滚回底才恢复跟随」。
 let histLoading = false;
+// 【防误杀】wheel/touch 上滚是否会被内层滚动框"吃掉"。两种情况页面分毫未动：
+//  a) 目标框自己还能上滚（scrollTop>0）——滚动归框，事件虽冒泡但页面没滚；
+//  b) 框已到顶但 overscroll-behavior:contain 把链式滚动挡在框内——页面也不滚。
+// 此前只要在过程区上滚就 stickBottom=false，哪怕滚的只是思考窗内部、页面根本
+// 没动：页面级跟随从此静默死亡，之后所有轮次的说明卡都在视口下方流式增长，
+// 用户看到的就是"不贴底/贴顶"（2026-10-10 两次截图复盘的真正根因）。只有
+// 上滚真的会带动页面（框到顶且允许链式滚动，或目标本来就不在滚动框里）才算
+// "用户在看页面历史"，才解除页面跟随。
+function wheelSwallowedByBox(e) {
+  // 链式滚动语义：wheel 从最内层往外逐级消费。页面会动，当且仅当——
+  //  ① 祖先链（chatEl 以内）没有任何滚动框带 contain/none（有的话链在那里断掉）；
+  //  ② 且链上所有滚动框都已到顶（任何一个还有余量就先把这次滚动吃掉）。
+  // 所以不能在第一个滚动框就下结论：工具结果小框到顶≠页面会动，滚动可能
+  // 被外层思考窗接住。整链扫完再回答。
+  let sawRoom = false;
+  let el = e.target;
+  while (el && el !== chatEl && el.nodeType === 1) {
+    const cs = getComputedStyle(el);
+    if (cs.overflowY === "auto" || cs.overflowY === "scroll") {
+      if (cs.overscrollBehaviorY === "contain" || cs.overscrollBehaviorY === "none") return true;
+      if (el.scrollTop > 0) sawRoom = true;   // 该框能消费上滚（链在这里就断了，到不了页面）
+    }
+    el = el.parentElement;
+  }
+  return sawRoom;
+}
 function onWheelUp(e) {
-  if (e.deltaY < 0 && stickBottom) { stickBottom = false; updateBackBottom(); }
+  if (e.deltaY < 0 && stickBottom && !wheelSwallowedByBox(e)) { stickBottom = false; updateBackBottom(); }
 }
 chatEl.addEventListener("wheel", onWheelUp, { passive: true });
 let lastTouchY = null;
 chatEl.addEventListener("touchstart", e => { lastTouchY = e.touches[0].clientY; }, { passive: true });
 chatEl.addEventListener("touchmove", e => {
-  if (lastTouchY != null && e.touches[0].clientY > lastTouchY && stickBottom) {
-    stickBottom = false; updateBackBottom();  // 手指下移 = 内容上划看历史
+  if (lastTouchY != null && e.touches[0].clientY > lastTouchY && stickBottom && !wheelSwallowedByBox(e)) {
+    stickBottom = false; updateBackBottom();  // 手指下移 = 内容上划看历史（仅当真的在滚页面）
   }
   lastTouchY = e.touches[0].clientY;
 }, { passive: true });
@@ -274,8 +300,10 @@ function scrollBottom(force = false) {
 function updateBackBottom() {
   const btn = $("back-bottom");
   if (!btn) return;
-  const away = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight;
-  btn.classList.toggle("hidden", stickBottom || away < chatEl.clientHeight * 0.25);
+  const dist = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight;
+  // 显示条件：不在跟随态且确实离底（1/4 屏阈值原本会吞掉"离底不远"的盲区——
+  // 页面跟随被误杀后冻结在半空，连召回按钮都不出现，用户彻底没有回底入口）。
+  btn.classList.toggle("hidden", stickBottom || dist < 4);
 }
 
 function bubble(className, text) {
@@ -3422,6 +3450,10 @@ function flushStreamBuffers() {
     pinInside(thinkBox || procBox, true);
     scrollBottom();  // 同上：页面级跟随（有 stickBottom 保护）
   }
+  // 【召回盲区】页面不在跟随态时，流式增长只改变 scrollHeight、不触发 chatEl
+  // 的 scroll 事件——updateBackBottom 不会被调用，按钮状态冻结在旧值。非跟随
+  // 时每次帧刷同步一次，"离底即出现"不滞后；跟随态按钮恒隐藏，不白读几何。
+  if (!stickBottom) updateBackBottom();
 }
 
 // 把内容区固定在一个框内滚动贴底（近底才拽）：思考窗、说明卡、正文流共用。
