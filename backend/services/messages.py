@@ -42,7 +42,24 @@ def _build_user_message(body: dict, sid: str) -> tuple[str, dict | None]:
             mime = att.get("mime") if str(att.get("mime", "")).startswith("image/") else "image/png"
             parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}})
             names.append(name)
-        elif not data:
+        elif data:
+            # 小附件（<2MB 未走分块上传）仍内联 base64 随请求体到达：解码后
+            # 落盘到会话附件区，消息里只注入引用说明。5e33148 曾把本分支误删
+            # （原 else 改成了 elif not data），带 data 的小文件两个分支都不
+            # 命中、被静默丢弃——"只发附件不打字"就会报「输入不能为空」。
+            try:
+                blob = base64.b64decode(data)
+            except Exception:
+                continue
+            if not blob:
+                continue
+            info = db.save_attachment(sid, name, blob)  # 落盘；超限抛 ValueError
+            file_notes.append(
+                f"### 附件文件：{info['name']}（已存入附件区，共 {info['bytes']} 字节）\n"
+                f"请用 read_attachment 工具读取内容（支持 offset/limit 分页），"
+                f"不要假设已经看到全文。")
+            names.append(info["name"])
+        else:
             # 大附件走分块上传后已落盘（发送时只带 name、不带 data）：此处
             # 不再落盘，只确认文件确实存在，然后照常注入引用说明。
             try:
