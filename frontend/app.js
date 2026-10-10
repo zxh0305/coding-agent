@@ -3417,7 +3417,9 @@ function flushStreamBuffers() {
     }
     pendingThink = "";
     // 【贴底】思考窗同口径：跟随态钉底，用户上滚即停止跟随。
-    pinInside(thinkBox || procBox);
+    // 【贴底·强制】思考是直播（trace-convergence 定稿口径）：流式期间无条件
+    // 钉在窗底——"停在中段看着像卡住"比打断翻历史更伤；要回看等这段流完再翻。
+    pinInside(thinkBox || procBox, true);
     scrollBottom();  // 同上：页面级跟随（有 stickBottom 保护）
   }
 }
@@ -3444,14 +3446,15 @@ function boxIsSticky(box) {
 }
 
 // 强制贴底：仅当该框处于"跟随"态才拽（用户上滚后不打扰）
-function pinInside(box) {
+function pinInside(box, force = false) {
   if (!box) return;
-  if (!boxIsSticky(box)) return;
+  if (!force && !boxIsSticky(box)) return;
   // 【防掉帧】只有真的不在底部时才写 scrollTop。rAF 每帧调用本函数，若无条件
   // 赋值会每帧触发一次同步布局（读 scrollHeight + 写 scrollTop），流式期间
   // 叠加在 DOM 写入上就是明显卡顿。差值 <1px 直接跳过。
   const target = box.scrollHeight - box.clientHeight;
   if (Math.abs(box.scrollTop - target) < 1) return;
+  box.__programmaticScroll = true;   // 下一帧 scroll 回调豁免：这是我们自己写的贴底
   box.scrollTop = target;
 }
 
@@ -3519,18 +3522,28 @@ function boxOnScroll(box) {
 function bindBoxScroll(box) {
   if (!box || box.__stickBound) return;
   box.__stickBound = true;
+  // 【防误伤】框不可滚（内容还没超出限高）时，框上的滚轮/触摸实际滚的是外层
+  // 页面——此时把框判成"用户在看历史"是冤案：等框长到限高开始内滚，贴底早已
+  // 被解绑，从此永远停在旧内容上（2026-10-10 用户截图：说明卡流式中不贴底的
+  // 根因）。所以"离开底部"只在框真的可滚时才成立。
+  const boxScrollable = () => box.scrollHeight > box.clientHeight + 1;
   box.addEventListener("wheel", (e) => {
-    if (e.deltaY < 0) boxOnLeaveBottom(box);   // 上滚：立刻停跟随，不等 scroll
+    if (e.deltaY < 0 && boxScrollable()) boxOnLeaveBottom(box);   // 上滚：立刻停跟随，不等 scroll
   }, { passive: true });
   let lastY = null;
   box.addEventListener("touchstart", (e) => { lastY = e.touches[0].clientY; }, { passive: true });
   box.addEventListener("touchmove", (e) => {
-    if (lastY != null && e.touches[0].clientY > lastY) boxOnLeaveBottom(box);  // 手指下移=内容上划
+    if (lastY != null && e.touches[0].clientY > lastY && boxScrollable()) boxOnLeaveBottom(box);  // 手指下移=内容上划
     lastY = e.touches[0].clientY;
   }, { passive: true });
   // scroll（含拖动滚动条、键盘、惯性滚动）：按位置判定跟随状态。用 rAF 合并
   // 避免每帧读 scrollHeight 造成同步布局（掉帧源之一）。
+  // 【防自噬】pinInside 写 scrollTop 也会触发 scroll 事件——那帧 rAF 里读到的
+  // away 可能仍是旧值（布局未含刚写入的滚动量）。不拦的话，程序自己的贴底写入
+  // 会被误判成"用户滚离底部"，把跟随态掐掉，下一帧又不贴 → 拉扯。挂在框上的
+  // 一次性标记：写入后的第一帧豁免判定（竖向轴；wheel 横滚不产生竖向 scroll）。
   box.addEventListener("scroll", () => {
+    if (box.__programmaticScroll) { box.__programmaticScroll = false; return; }
     if (box.__scrollRafQueued) return;
     box.__scrollRafQueued = true;
     requestAnimationFrame(() => { box.__scrollRafQueued = false; boxOnScroll(box); });
