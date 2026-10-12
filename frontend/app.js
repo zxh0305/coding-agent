@@ -3379,7 +3379,7 @@ function resetStatBar() {
 
 // 回放/切会话回填：从最近一条 assistant 历史的 _stats 还原统计（无事件流时用）
 function refreshStatBar(history) {
-  statUsage = null; statTiming = null;
+  let found = false;
   if (Array.isArray(history)) {
     for (let i = history.length - 1; i >= 0; i--) {
       const s = history[i] && history[i]._stats;
@@ -3394,8 +3394,17 @@ function refreshStatBar(history) {
                        ttft_avg_s: s.ttft_avg_s, tps: s.tps,
                        cache_hit_rate: s.cache_hit_rate, rounds: s.rounds };
       }
+      found = true;
       break;
     }
+  }
+  // 找不到带 _stats 的 assistant（旧回合/该会话从未落 timing）时，【不要清空】
+  // 已有数据：refreshCtx 可能已用 /api/context 填好段3。此前无条件清零会把它
+  // 刚设好的内容覆盖掉，导致"刷新/切会话后状态条整条消失"（真实踩过的坑）。
+  if (!found) {
+    // 已有数据就保留；完全空时才按无数据处理（updateStatBar 会自行隐藏）
+    if (!statUsage && !statTiming) { updateStatBar(); return; }
+    return;
   }
   updateStatBar();
 }
