@@ -215,10 +215,10 @@ function makeCopyBtn(rawText) {
   return btn;
 }
 
-// ---------- 贴底滚动（stick-to-bottom） ----------
-// 流式输出时每帧都强制拉底的话，用户往上滑看历史会被拽回来（"卡卡的、
-// 优先流式输出"的体感就来自这里）。规则：只有用户本来就在底部附近（80px）
-// 才跟随滚动；往上滑了就不打扰，滚回底部或用户自己发消息时恢复跟随。
+// ---------- 贴底滚动（stick-to-bottom，全局统一规则） ----------
+// 页面与三个内滚框（过程窗/修改区/说明卡）同一套：默认自动贴底；上滑即取消
+// 跟随（不打扰看历史）；滚回底部或自己发消息时恢复。不存在任何 force 旁路——
+// 任何"无条件强拽"都会压过上滚让位（0ef26da 引入、496da9d 再修的教训）。
 let stickBottom = true;
 // 上滑瞬间立刻解除跟随：光靠 scroll 事件里的「距底<80px」判定，流式期间用户
 // 往上滑的头几帧仍满足阈值，每帧 flush 都会把 scrollTop 拽回底部——拉扯感
@@ -309,7 +309,7 @@ function updateBackBottom() {
 function bubble(className, text) {
   const div = buildBubble(className, text);
   chatEl.appendChild(div);
-  scrollBottom(true);  // 出现的新消息（错误/提示）永远贴底
+  scrollBottom();  // 全局统一：跟随态才贴底；用户在看历史时靠 ↓ 按钮召回
   return div;
 }
 
@@ -1693,7 +1693,9 @@ function buildUserBubble(text, atts) {
 
 function userBubble(text, atts, mid) {
   chatEl.appendChild(railTag(buildUserBubble(text, atts), mid, "user"));
-  scrollBottom(true);  // 用户自己的消息永远贴底（同时恢复跟随）
+  // 自己发消息=明确要看底部：显式恢复跟随（全局统一规则的合法恢复入口之一）
+  stickBottom = true;
+  scrollBottom();
 }
 
 // ---------- 回退编辑（ZCode editUserQuery rewind 语义） ----------
@@ -2872,14 +2874,20 @@ function appendTrace(el) {
   // 搜索/截图…）进过程监视窗内滚。结果行跟随其调用行的归属（result 行的
   // dataset.editBy 在 toolResultLine 里按配对设置）。
   const toEdit = el.classList.contains("card") || (el.dataset && el.dataset.editBy === "1");
-  (toEdit ? editBoxEl() : procBoxEl()).appendChild(el);
+  const box = toEdit ? editBoxEl() : procBoxEl();
+  const bottomBefore = box.getBoundingClientRect().bottom;
+  box.appendChild(el);
   if (toEdit) syncEditBox();  // 首条修改到达即让修改区显形
   orderTraceSections();       // 显式 DOM 重排，不依赖 CSS order
   traceTick();
-  // 框内【强制】贴底：新工具行要立刻可见（近底阈值会让框停在旧内容上）。
-  // 页面级跟随用 scrollBottom（有 stickBottom 保护，上滑看历史时不打扰）。
-  pinInside(toEdit ? editBox : procBox);
-  scrollBottom();
+  // 框内贴底（全局统一规则）：新工具行立刻可见；用户上滚查看时让位。
+  pinInside(box);
+  // 页面跟随：跟随时把本行撑高的 dy 补给外层（框底钉在视口原位），非跟随不动。
+  // 不再直写 scrollBottom——绝对跳底与基线补偿两套账互抢 scrollTop。
+  if (stickBottom && boxIsSticky(box)) {
+    const dy = box.getBoundingClientRect().bottom - bottomBefore;
+    if (dy > 0.5) chatEl.scrollTop += Math.min(dy, 40);  // 单次上限：防异常跳变
+  }
   // 插入条目改变了面板布局、外层也刚被同步滚过：钉底基线作废，重新对账——
   // 否则下一次思考增量会拿插入之前的位置去算增量而多推一截。
   resetPinMeters();
@@ -3269,7 +3277,9 @@ function showPermissionCard(evt) {
   traceEl.appendChild(card);
   card.style.order = "3";
   permissionCards.set(evt.id, card);
-  scrollBottom(true);  // 确认卡是必须看到的交互：强制贴底
+  // 必须操作的交互卡：显式恢复跟随并贴底（用户在等它，等同自己发消息的恢复入口）
+  stickBottom = true;
+  scrollBottom();
 }
 
 // ⏱ 耗时 + token 统计行（跟随当前回答气泡）
@@ -3325,7 +3335,7 @@ function ensureLiveMsg(mid) {
   liveBubble = b.el;  // 兼容既有的"当前气泡"语义（retire/done 收尾用）
   // 不再 scrollBottom：流式正文住在说明卡里（220px 上限内滚），flushStreamBuffers
   // 每帧做卡内贴底；页面级滚动只留给最终答案（finalizeAnswer）与确认卡。
-  scrollInside(noteBox);
+  pinInside(noteBox);  // 统一框内贴底（scrollInside 已铲除并入）
   return b;
 }
 
@@ -3432,12 +3442,10 @@ function flushStreamBuffers() {
     pendingDeltas.clear();
     // 正文/说明流住在说明卡（.note-box）里：卡限高内滚，页面不被流式文字撑长
     // （那正是"刷屏"的观感来源；实测模型把逐轮推理都发进这个流）。
-    // 【贴底】走 pinInside：跟随态才拽，用户上滚看历史时不打扰。
+    // 【贴底】卡内走 pinInside、页面走 pinBoxBottomAtView（applyEvent 增量分支）：
+    // 两者都只认全局统一规则——跟随态才贴底，上滑即让位。此处不再直写
+    // scrollBottom：绝对跳底会跳过中间内容，还与基线补偿互抢 scrollTop。
     pinInside(noteBox);
-    // 【页面跟随】过程区在长高（卡变高/新工具行插入），页面必须跟着往下走，
-    // 否则最新内容停在输入框下方看不见（用户反馈"不会自动到底部"）。
-    // scrollBottom 内部有 stickBottom 保护：用户上滑看历史时不会被打扰。
-    scrollBottom();
   }
   if (pendingThink) {
     if (thinkSeg) {
@@ -3449,7 +3457,7 @@ function flushStreamBuffers() {
     // 跟随"，用户上翻看历史时被每帧拉回窗底（2026-10-12 用户反馈）。
     // 直播口径仍在：无人为上滚时每帧钉底，流式中途不会停在半空。
     pinInside(thinkBox || procBox);
-    scrollBottom();  // 同上：页面级跟随（有 stickBottom 保护）
+    // 页面跟随由 pinBoxBottomAtView（think delta 分支）按同一规则负责，不直写。
   }
   // 【召回盲区】页面不在跟随态时，流式增长只改变 scrollHeight、不触发 chatEl
   // 的 scroll 事件——updateBackBottom 不会被调用，按钮状态冻结在旧值。非跟随
@@ -3457,14 +3465,10 @@ function flushStreamBuffers() {
   if (!stickBottom) updateBackBottom();
 }
 
-// 把内容区固定在一个框内滚动贴底（近底才拽）：思考窗、说明卡、正文流共用。
-// 思考/说明两窗高度恒定、只在窗内滚动，是"页面不随过程刷屏"的关键——它们
-// 一律不走 scrollBottom（外层页面不动），只有最终答案（真正的输出）才推页面。
-function scrollInside(box) {
-  if (!box) return;
-  const near = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
-  if (near) box.scrollTop = box.scrollHeight;
-}
+// 【已铲除】旧 scrollInside 是第三套贴底判定（48px 邻近直写、不认任何跟随态）：
+// 它的写入触发 scroll 事件，叠在 pinInside 写入回声之后被 rAF 拿去判定，彼刻布局
+// 尚未含本次写入 → away 读到旧值 → 跟随态被误掐 → 说明卡从此停在顶部（"贴顶"
+// 的根因之一）。并入 pinInside 统一规则后已无调用方。
 
 // 【框内贴底】过程窗/修改区/说明卡三个框与主页面同一套规则：内容增长时自动
 // 贴底；用户一旦手动往上滚就停止跟随（不打扰看历史）；滚回底部自动恢复。
@@ -3487,7 +3491,12 @@ function pinInside(box, force = false) {
   // 叠加在 DOM 写入上就是明显卡顿。差值 <1px 直接跳过。
   const target = box.scrollHeight - box.clientHeight;
   if (Math.abs(box.scrollTop - target) < 1) return;
-  box.__programmaticScroll = true;   // 下一帧 scroll 回调豁免：这是我们自己写的贴底
+  // 写入回声豁免改用「目标位置比对」而非一次性标记：一次贴底写入会触发多个
+  // scroll 事件，一次性标记只消费第一个，漏网的回声在下一帧 rAF 判定时读到的
+  // 布局可能还没含本次写入——旧值 away>4 → 误判「用户滚离」→ 跟随态被掐掉、
+  // 框从此停在旧内容上（说明卡恒贴顶的根因）。凡停在写入目标处（±2px）的
+  // scroll 都是我们自己的回声，一律跳过判定；用户拖动滚动条位置必然不同。
+  box.__lastPinTarget = target;
   box.scrollTop = target;
 }
 
@@ -3518,11 +3527,11 @@ function pinBoxBottomAtView(box) {
   const dy = y - prev;                             // 本次真实长高（负值=变矮）
   // 负值（内容变矮，如收起/清理）不补偿：往下拽会把页面弹回去，反而更糟。
   if (dy > 0.5) {
-    // 还在底部附近（用户没上翻看历史）才下移页面。阈值远比 stickBottom 的
-    // 4px 宽：外层页面的 scrollTop 取整会让"贴底"时常驻十几像素的残差——
-    // 用 4px 判定会导致思考期间间歇性完全不动。
-    const away = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight;
-    if (away < 200) chatEl.scrollTop += Math.min(dy, 40);  // 单次上限：防异常跳变
+    // 页面跟随与否只认全局唯一的 stickBottom + 该框自己的跟随态（boxStick）。
+    // 旧实现自设「离底<200px 就推」——用户上滑翻历史时只要剩不到一屏，每帧
+    // 仍被推回底部，是"全局上滑仍被强制贴底"的元凶；跟随态下无 4px 死区问题，
+    // 因为 stickBottom 一旦为 true 就由本函数持续补偿。
+    if (stickBottom && boxIsSticky(box)) chatEl.scrollTop += Math.min(dy, 40);  // 单次上限：防异常跳变
     // 下移后框底应回到原位（y）；写不进（已到页面底）时如实取实际值，
     // 欠下的差额留到下一帧继续补，不会丢失。
     pinMeter.set(box, box.getBoundingClientRect().bottom);
@@ -3576,10 +3585,14 @@ function bindBoxScroll(box) {
   // 会被误判成"用户滚离底部"，把跟随态掐掉，下一帧又不贴 → 拉扯。挂在框上的
   // 一次性标记：写入后的第一帧豁免判定（竖向轴；wheel 横滚不产生竖向 scroll）。
   box.addEventListener("scroll", () => {
-    if (box.__programmaticScroll) { box.__programmaticScroll = false; return; }
     if (box.__scrollRafQueued) return;
     box.__scrollRafQueued = true;
-    requestAnimationFrame(() => { box.__scrollRafQueued = false; boxOnScroll(box); });
+    requestAnimationFrame(() => {
+      box.__scrollRafQueued = false;
+      // 自己写入的回声（位置=写入目标）不参与跟随判定，见 pinInside 注释
+      if (box.__lastPinTarget != null && Math.abs(box.scrollTop - box.__lastPinTarget) < 2) return;
+      boxOnScroll(box);
+    });
   }, { passive: true });
 }
 
