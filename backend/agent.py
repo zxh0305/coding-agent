@@ -825,7 +825,7 @@ class Agent:
                 hit = payload.get("prompt_cache_hit_tokens")
                 miss = payload.get("prompt_cache_miss_tokens")
                 if hit is not None and (hit + (miss or 0)) > 0:
-                    metrics["cache_hit_rate"] = round(hit / (hit + miss) * 100, 1)
+                    metrics["cache_hit_rate"] = round(hit / (hit + (miss or 0)) * 100, 1)
                 last_prompt = payload.get("prompt_tokens") or 0
                 metrics["context_tokens"] = max(metrics["context_tokens"] or 0, last_prompt)
                 metrics["context"] = self.context_stats(prompt_tokens=last_prompt)
