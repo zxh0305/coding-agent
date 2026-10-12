@@ -2903,12 +2903,22 @@ function appendTrace(el) {
 // 反例（用户截图）。直接在 DOM 上重排，与容器是否 flex、元素从哪条路径来都无关。
 function orderTraceSections() {
   if (!traceEl) return;
-  const order = [procBox, editBox, noteBox];
-  const anchor = traceEl.querySelector("summary");
-  for (const el of order) {
-    if (el && el.parentElement === traceEl) traceEl.appendChild(el);
+  // 【只挪错位的】appendChild 对已挂载节点是「先摘下再插回」：框脱离文档一瞬
+  // scrollTop 清零并触发 scroll 回调——回调读到清零后的位置，把跟随态误判成
+  // 「用户滚离」；此后 pinInside 每帧跳过，框定格在顶部。procBox 会被
+  // appendTrace 随后的 pinInside 拉回（回声比对位置相等，态保住），而 noteBox
+  // 不在那份贴底名单里、无人拉回——这就是「说明卡恒贴顶、思考框没事」的
+  // 不对称根因。顺序已正确时一个节点都不得移动。
+  let prev = traceEl.querySelector("summary");
+  for (const el of [procBox, editBox, noteBox]) {
+    if (!el || el.parentElement !== traceEl) continue;
+    if (el.previousElementSibling !== prev) {
+      traceEl.appendChild(el);               // 真错位（快照接管/新建兜底）才挪
+      if (boxIsSticky(el)) pinInside(el);    // 挪完位置清零了：按跟随态立即拉回
+    }
+    prev = el;
   }
-  // 权限确认卡等其它子项天然排在末尾（appendChild 依次后移），顺序保持 proc→edit→note→其它
+  // 权限确认卡等其它子项天然排在末尾，顺序保持 proc→edit→note→其它
 }
 
 // 【修改区】.edit-box：写文件/改代码（apply_patch / write_file）的操作单独成区，
@@ -3603,11 +3613,10 @@ function pinInside(box, force = false) {
   // 叠加在 DOM 写入上就是明显卡顿。差值 <1px 直接跳过。
   const target = box.scrollHeight - box.clientHeight;
   if (Math.abs(box.scrollTop - target) < 1) return;
-  // 写入回声豁免改用「目标位置比对」而非一次性标记：一次贴底写入会触发多个
-  // scroll 事件，一次性标记只消费第一个，漏网的回声在下一帧 rAF 判定时读到的
-  // 布局可能还没含本次写入——旧值 away>4 → 误判「用户滚离」→ 跟随态被掐掉、
-  // 框从此停在旧内容上（说明卡恒贴顶的根因）。凡停在写入目标处（±2px）的
-  // scroll 都是我们自己的回声，一律跳过判定；用户拖动滚动条位置必然不同。
+  // 写入回声豁免用「目标位置比对」：凡停在写入目标处（±2px）的 scroll 都是
+  // 我们自己的回声，不参与跟随判定；用户拖动滚动条位置必然不同。这只解决
+  // 「贴底写入自身」的回声；另一类写入来源是 orderTraceSections 挪动节点导致
+  // 的 scrollTop 清零——那个在源头修（只挪错位的框），不在这里兜。
   box.__lastPinTarget = target;
   box.scrollTop = target;
 }
