@@ -50,6 +50,17 @@ class FakeLLM:
         yield "message", msg
 
 
+class HitOnlyLLM(FakeLLM):
+    """只返回 cache_read 不返回 cache_creation 的网关（maiya 生产实测行为）。
+    曾导致 agent.py 里 hit + miss = int + NoneType，崩掉整个回合
+    （2026-10-12 线上事故：TypeError in _consume_stream）。"""
+
+    def chat_stream(self, messages, tools=None, cancel=None):
+        yield "usage", {"prompt_tokens": 1000, "completion_tokens": 8,
+                        "prompt_cache_hit_tokens": 1024}  # 无 miss 键
+        yield "message", {"role": "assistant", "content": "done"}
+
+
 def collect(gen):
     """把 agent.run() 的 (kind, payload) 生成器收成列表。"""
     return list(gen)
@@ -129,6 +140,20 @@ class TestTimingChain(HarnessTimingBase):
         # 所有 trace 条目都应带 ts
         missing = [e for e in ag.trace if "ts" not in e]
         self.assertEqual(missing, [], f"有 trace 条目缺 ts: {missing[:3]}")
+
+
+class TestCacheHitOnly(HarnessTimingBase):
+    def test_cache_hit_only_no_crash(self):
+        """回归：网关只返回 cache_hit 不返回 miss（2026-10-12 线上 TypeError，
+        崩掉两个回合）。整个回合必须能跑完、done 带正常 timing。"""
+        llm = HitOnlyLLM([[("text", "好")]])
+        ag = Agent(llm=llm, verbose=False, workspace=str(self.ws),
+                   session_id="s1")
+        events = collect(ag.run("测一下"))
+        kinds = [k for k, _ in events]
+        self.assertIn("done", kinds)  # 没崩、正常收尾
+        done = [p for k, p in events if k == "done"][-1]
+        self.assertIn("timing", done)
 
 
 if __name__ == "__main__":
