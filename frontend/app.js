@@ -3444,10 +3444,11 @@ function flushStreamBuffers() {
       thinkSeg.textContent += pendingThink;
     }
     pendingThink = "";
-    // 【贴底】思考窗同口径：跟随态钉底，用户上滚即停止跟随。
-    // 【贴底·强制】思考是直播（trace-convergence 定稿口径）：流式期间无条件
-    // 钉在窗底——"停在中段看着像卡住"比打断翻历史更伤；要回看等这段流完再翻。
-    pinInside(thinkBox || procBox, true);
+    // 【贴底】思考窗同口径：跟随态才钉底，用户上滚即停止跟随、滚回底部自动
+    // 恢复直播贴底。不给 force=true：无条件强拽会压过 boxStick 的"上滚停止
+    // 跟随"，用户上翻看历史时被每帧拉回窗底（2026-10-12 用户反馈）。
+    // 直播口径仍在：无人为上滚时每帧钉底，流式中途不会停在半空。
+    pinInside(thinkBox || procBox);
     scrollBottom();  // 同上：页面级跟随（有 stickBottom 保护）
   }
   // 【召回盲区】页面不在跟随态时，流式增长只改变 scrollHeight、不触发 chatEl
