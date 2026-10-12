@@ -626,6 +626,15 @@ class AnthropicMessagesClient:
                     if t == "message_start":
                         u = (data.get("message") or {}).get("usage") or {}
                         usage["prompt_tokens"] = u.get("input_tokens", 0)
+                        # Anthropic 的缓存用量：cache_read=命中（读已缓存前缀），
+                        # cache_creation=本次新写入的。转成统一字段名（与 OpenAI
+                        # 适配器的 prompt_cache_hit/miss_tokens 对齐），否则 agent
+                        # 层的缓存命中率永远拿不到值（探测脚本直连明明有 1024）。
+                        if u.get("cache_read_input_tokens"):
+                            usage["prompt_cache_hit_tokens"] = u["cache_read_input_tokens"]
+                        if u.get("cache_creation_input_tokens"):
+                            # 新写入的部分视作未命中（本回合首次发送的前缀）
+                            usage["prompt_cache_miss_tokens"] = u["cache_creation_input_tokens"]
                     elif t == "content_block_start":
                         block = data.get("content_block") or {}
                         blocks[data.get("index", 0)] = {"type": block.get("type", "text"), "text": "",
@@ -659,6 +668,11 @@ class AnthropicMessagesClient:
                         # prompt_tokens 恒 0，上下文徽章永远没数字（真实踩过）
                         if du.get("input_tokens"):
                             usage["prompt_tokens"] = du["input_tokens"]
+                        # 缓存字段同样可能延到这里才给（与 input_tokens 同理）
+                        if du.get("cache_read_input_tokens"):
+                            usage["prompt_cache_hit_tokens"] = du["cache_read_input_tokens"]
+                        if du.get("cache_creation_input_tokens"):
+                            usage["prompt_cache_miss_tokens"] = du["cache_creation_input_tokens"]
                     elif t == "error":
                         raise RuntimeError(f"Anthropic API 错误：{(data.get('error') or {}).get('message', data)}")
                     elif t == "message_stop":
