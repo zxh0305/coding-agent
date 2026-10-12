@@ -44,6 +44,33 @@ def load_env():
 PREFIX = ("你是一个严谨的工程助手。以下是一段用于测试 prompt cache 的稳定前缀，" * 60)
 
 
+def load_providers():
+    """从数据库读供应商列表（脚本实际用的就是库里配置的中转，不是 .env）。
+
+    返回 [{id, name, base_url, api_format, api_key}]；读不到返回 []。
+    """
+    import sqlite3
+    db_path = Path(__file__).resolve().parent.parent / "data" / "agent_data.db"
+    if not db_path.exists():
+        return []
+    try:
+        con = sqlite3.connect(str(db_path))
+        con.row_factory = sqlite3.Row
+        cols = {r[1] for r in con.execute("PRAGMA table_info(providers)")}
+        keycol = "api_key" if "api_key" in cols else ("key" if "key" in cols else None)
+        rows = con.execute(
+            f"SELECT id, name, base_url, api_format{',' + keycol if keycol else ''} "
+            "FROM providers"
+        ).fetchall()
+        return [{
+            "id": r["id"], "name": r["name"], "base_url": r["base_url"],
+            "api_format": r["api_format"],
+            "api_key": r[keycol] if keycol else "",
+        } for r in rows]
+    except Exception:
+        return []
+
+
 def build_body(model, use_cache):
     """构造一次请求体：system 前缀带 cache_control 断点（对齐 llm_client 的做法）。"""
     system = [{"type": "text", "text": PREFIX}]
@@ -58,17 +85,44 @@ def build_body(model, use_cache):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="探测供应商是否透传 prompt cache")
     ap.add_argument("--tries", type=int, default=2, help="总请求次数（默认 2）")
     ap.add_argument("--no-cache", action="store_true", help="对照组：不打 cache_control")
+    ap.add_argument("--provider", help="供应商 id 或名称子串（从数据库读；不传则用 .env）")
+    ap.add_argument("--model", help="模型名（覆盖 .env/默认；查特定模型是否透传缓存时用）")
+    ap.add_argument("--list", action="store_true", help="列出数据库里可选的供应商后退出")
     args = ap.parse_args()
 
-    env = load_env()
-    base = env.get("LLM_BASE_URL") or env.get("OPENAI_BASE_URL")
-    key = env.get("LLM_API_KEY") or env.get("OPENAI_API_KEY")
-    model = env.get("LLM_MODEL") or env.get("OPENAI_MODEL")
+    providers = load_providers()
+    if args.list:
+        if not providers:
+            print("（读不到数据库供应商；请用 .env 的 LLM_BASE_URL 方式）")
+        for p in providers:
+            print(f"  {p['id']:<8} {p['name']:<16} [{p['api_format']}] {p['base_url']}")
+        return 0
+
+    if args.provider:
+        # 按 id 或名称子串匹配库里的供应商
+        hit = [p for p in providers
+               if p["id"] == args.provider or args.provider in p["name"]]
+        if not hit:
+            print(f"✗ 库里没找到供应商「{args.provider}」；用 --list 看可选列表")
+            return 2
+        p = hit[0]
+        base, key, fmt = p["base_url"], p["api_key"], p["api_format"]
+        # 模型名：库里没有就退回 .env 的 LLM_MODEL
+        env0 = load_env()
+        model = args.model or env0.get("LLM_MODEL") or "deepseek-v4-pro"
+        print(f"（供应商来自数据库：{p['name']}，模型 {model}）")
+        env = {"LLM_API_FORMAT": fmt}
+    else:
+        env = load_env()
+        base = env.get("LLM_BASE_URL") or env.get("OPENAI_BASE_URL")
+        key = env.get("LLM_API_KEY") or env.get("OPENAI_API_KEY")
+        model = args.model or env.get("LLM_MODEL") or env.get("OPENAI_MODEL")
     if not (base and key and model):
-        print("✗ .env 里缺 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL，无法探测")
+        print("✗ 缺 base/key/model：用 --provider <id|名称> 指定库里的供应商，")
+        print("  或在 .env 里补 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL")
         return 2
 
     import urllib.request
