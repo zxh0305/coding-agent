@@ -1010,6 +1010,10 @@ async function doSwitchSession(id) {
   histOldestOrd = null;
   histHasMore = false;
   historyMids = new Set();        // 补发去重基准随任务重建
+  // 上下文占用与历史并行拉取、不 await：否则状态条段3 要排在 loadHistoryPage、
+  // loadSessions、loadConfig 一串 await 之后，比对话框内容慢半拍才出现。
+  // 它自带 currentSession 快照守卫，切走后回来会自行丢弃结果。
+  refreshCtx();
   await loadHistoryPage();        // 时间线先行：补发定性（finishBoot）要拿它比对
   loadTodos();                    // 本会话的任务清单（若有）：驱动右上角 📋 入口
   openEvents(id);                 // 再接事件流：断线/刷新期间的回合靠 since 补发接上
@@ -1027,7 +1031,6 @@ async function doSwitchSession(id) {
       if (!archived) setComposerArchived(false);
     }).catch(() => {});  // 确认失败维持加锁态：只读比可写安全
   }
-  await refreshCtx();
   await loadConfig(id);  // 模型随任务走：切换后工具栏标签跟着换成该任务的模型
   loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换（内部顺带拉权限模式）
   closeGitPop();    // 工作区变了，旧的提交列表不再对应当前项目
@@ -2413,8 +2416,10 @@ function updateCtxChip() {
 
 async function refreshCtx() {
   if (!currentSession) { usageNow = null; updateCtxChip(); return; }
+  const sid = currentSession;   // 快照：await 期间若用户又切了会话，回来时丢弃本次结果
   try {
-    const c = await api(`/api/context?session_id=${encodeURIComponent(currentSession)}`);
+    const c = await api(`/api/context?session_id=${encodeURIComponent(sid)}`);
+    if (currentSession !== sid) return;  // 已切走：不覆盖新会话的数据
     contextWindow = c.window || contextWindow;
     usageNow = { prompt_tokens: c.tokens, context_tokens: c.tokens,
                  context: c.breakdown, cache_hit_rate: c.cache_hit_rate };
