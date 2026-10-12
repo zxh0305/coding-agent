@@ -1096,6 +1096,10 @@ async function loadHistoryPage() {
       }
     }
     const btn = $("load-older");
+    // 首次渲染 = chatEl 里还没有任何历史气泡节点（翻页时已存在）。
+    // 不能用 btn 是否存在判断：首次加载时若历史 >100 条，load-older 按钮已经
+    // 存在，会被误判成翻页而跳过回填（真实踩过的坑）。
+    const firstRender = !chatEl.querySelector(".bubble");
     if (btn) {
       // 向上翻页：更早的消息插在"加载更早"按钮之后、现有历史之前；
       // 补偿滚动位置，用户视线的消息不跳动
@@ -1112,13 +1116,10 @@ async function loadHistoryPage() {
       const anchor = running && lastUser ? lastUser : null;
       if (anchor) anchor.scrollIntoView({ block: "start" });
       else chatEl.scrollTop = chatEl.scrollHeight;
-      // 首次加载（无 load-older 按钮 = 首次渲染）时回填状态条统计：刷新页面/
-      // 切会话后没有事件流，只能从最近一条带 _stats 的 assistant 还原。
-      // 翻页分支不回填，避免用旧回合覆盖当前显示。※ 此前条件写成
-      // `histOldestOrd === data.messages[0].ord`（翻页状态量 vs 服务端最旧 ord，
-      // 语义不同、几乎永不相等），导致刷新后状态条永远空——真实踩过的坑。
-      refreshStatBar(data.messages);
     }
+    // 首次渲染时回填状态条统计：刷新页面/切会话后没有事件流，只能从最近一条
+    // 带 _stats 的 assistant 还原。翻页时不回填，避免用旧回合覆盖当前显示。
+    if (firstRender) refreshStatBar(data.messages);
     updateLoadOlder();
     scheduleRail();  // 历史装载完毕：导航条按新消息重建
   } catch (e) {
@@ -2418,6 +2419,13 @@ async function refreshCtx() {
     usageNow = { prompt_tokens: c.tokens, context_tokens: c.tokens,
                  context: c.breakdown, cache_hit_rate: c.cache_hit_rate };
     updateCtxChip();
+    // 状态条段3 的上下文占用也随之刷新：/api/context 一定可用，是段3 最可靠的
+    // 数据源（历史 _stats 可能因旧数据/压缩缺失）。合并而非覆盖，避免把
+    // refreshStatBar 已回填的 tokens/轮数冲掉。
+    statUsage = { ...(statUsage || {}), context_tokens: c.tokens,
+                  prompt_tokens: (statUsage && statUsage.prompt_tokens) || c.tokens,
+                  context: c.breakdown, cache_hit_rate: c.cache_hit_rate };
+    updateStatBar();
   } catch (e) { /* 忽略 */ }
 }
 
