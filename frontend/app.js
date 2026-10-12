@@ -2424,12 +2424,13 @@ async function refreshCtx() {
     usageNow = { prompt_tokens: c.tokens, context_tokens: c.tokens,
                  context: c.breakdown, cache_hit_rate: c.cache_hit_rate };
     updateCtxChip();
-    // 状态条段3 的上下文占用也随之刷新：/api/context 一定可用，是段3 最可靠的
-    // 数据源（历史 _stats 可能因旧数据/压缩缺失）。合并而非覆盖，避免把
-    // refreshStatBar 已回填的 tokens/轮数冲掉。
-    statUsage = { ...(statUsage || {}), context_tokens: c.tokens,
-                  prompt_tokens: (statUsage && statUsage.prompt_tokens) || c.tokens,
-                  context: c.breakdown, cache_hit_rate: c.cache_hit_rate };
+    // 段3（上下文占用）的数据源：/api/context 一定可用，是它最可靠来源
+    // （历史 _stats 可能因旧数据/压缩缺失）。注意【不能】塞进 prompt_tokens——
+    // 那是 Token 卡"本回合消耗"的字段，把上下文容量灌进去会让 Token 卡
+    // 误报"本回合消耗 = 上下文大小"（真实踩过的坑：11万 tok 却输出 0，自相矛盾）。
+    // 用独立字段 ctx_tokens 专供段3，与累计消耗彻底分家。
+    statUsage = { ...(statUsage || {}), ctx_tokens: c.tokens,
+                  context: c.breakdown, cache_hit_rate: (statUsage && statUsage.cache_hit_rate) || c.cache_hit_rate };
     updateStatBar();
   } catch (e) { /* 忽略 */ }
 }
@@ -3353,16 +3354,18 @@ function updateStatBar() {
   if (tps) p1.push(`${Math.round(tps)} tok/s`);
   $("stat-run-label").textContent = p1.length ? p1.join(" · ") : "—";
 
-  // 段2：总量 · 缓存命中率
-  const total = u ? (u.prompt_tokens || 0) + (u.completion_tokens || 0) : 0;
+  // 段2：本回合累计消耗（只用真实 turn 数据：prompt/completion_tokens）。
+  // 上下文容量（ctx_tokens）绝不参与——那是段3 的口径，混进来会误报消耗量。
+  const turns = u ? (u.prompt_tokens || 0) + (u.completion_tokens || 0) : 0;
   const rate = t ? t.cache_hit_rate : (u && u.cache_hit_rate);
   const p2 = [];
-  if (total) p2.push(fmtWan(total) + " tok");
+  if (turns) p2.push(fmtWan(turns) + " tok");
   if (rate != null) p2.push(`缓存命中 ${rate}%`);
   $("stat-tok-label").textContent = p2.length ? p2.join(" · ") : "—";
 
-  // 段3：上下文占用 %
-  const ctxTok = u ? (u.context_tokens ?? u.prompt_tokens ?? 0) : 0;
+  // 段3：上下文占用 %（优先 ctx_tokens = /api/context 的上下文容量；
+  // 回落到 _stats.usage 里的 context_tokens）
+  const ctxTok = (u && (u.ctx_tokens || u.context_tokens)) || 0;
   $("stat-ctx-label").textContent = ctxTok
     ? `${Math.min(100, (ctxTok / (contextWindow || 1)) * 100).toFixed(0)}%` : "—";
 
@@ -3427,8 +3430,16 @@ function renderTokPop() {
   const miss = hasCache ? (u.prompt_cache_miss_tokens || 0) : 0;
   const out = u ? (u.completion_tokens || 0) : 0;
   const prompt = u ? (u.prompt_tokens || 0) : 0;
+  const ctxTok = (u && (u.ctx_tokens || u.context_tokens)) || 0;
   const total = prompt + out;
-  $("tok-total").textContent = total ? fmtWan(total) + " tok" : "—";
+  // 有没有【本回合真实消耗】数据：回填旧会话时只有 /api/context 的上下文容量
+  // （02 series），没有 turn 消耗。此时标题与总量都该按"上下文占用"口径说，
+  // 否则会出现「本回合消耗 11万 tok 但输出 0」的自相矛盾（真实踩过的坑）。
+  const hasTurn = total > 0;
+  const title = $("tok-title");
+  if (title) title.textContent = hasTurn ? "本回合 Token 消耗" : "当前上下文占用";
+  const head = hasTurn ? total : ctxTok;
+  $("tok-total").textContent = head ? fmtWan(head) + " tok" : "—";
   const rate = t ? t.cache_hit_rate
     : (hit + miss > 0 ? Math.round(hit / (hit + miss) * 100) : null);
   $("tok-rate").textContent = rate != null ? rate + "%"
@@ -3436,6 +3447,11 @@ function renderTokPop() {
   $("tok-hit").textContent = hasCache ? hit.toLocaleString() + " tok" : "—";
   $("tok-miss").textContent = hasCache ? miss.toLocaleString() + " tok" : "—";
   $("tok-out").textContent = out ? out.toLocaleString() + " tok" : "0 tok";
+  // 口径说明随数据来源切换
+  const hint = $("tok-hint");
+  if (hint) hint.textContent = hasTurn
+    ? "这是【本回合按量计费的总量】，不是上下文大小：工具循环每轮都重发全部历史，所以多轮回合的总量 ≈ 单轮大小 × 轮数，远大于当前上下文（见左侧 %）。"
+    : "这是【当前上下文占用】（最近一次请求的输入大小），不是某回合的用量。往会话里发一条并答完，这里才会显示那次回合的实际消耗。";
 }
 
 // 浮卡定位：贴在被点的那一段上方（与 ctx-pop 同一套视觉）
