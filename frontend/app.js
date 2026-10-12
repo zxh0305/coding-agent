@@ -1112,12 +1112,15 @@ async function loadHistoryPage() {
       const anchor = running && lastUser ? lastUser : null;
       if (anchor) anchor.scrollIntoView({ block: "start" });
       else chatEl.scrollTop = chatEl.scrollHeight;
+      // 首次加载（无 load-older 按钮 = 首次渲染）时回填状态条统计：刷新页面/
+      // 切会话后没有事件流，只能从最近一条带 _stats 的 assistant 还原。
+      // 翻页分支不回填，避免用旧回合覆盖当前显示。※ 此前条件写成
+      // `histOldestOrd === data.messages[0].ord`（翻页状态量 vs 服务端最旧 ord，
+      // 语义不同、几乎永不相等），导致刷新后状态条永远空——真实踩过的坑。
+      refreshStatBar(data.messages);
     }
     updateLoadOlder();
     scheduleRail();  // 历史装载完毕：导航条按新消息重建
-    // 首次加载（非向上翻页）时回填状态条统计——刷新页面/切会话后没有事件流，
-    // 只能从最近一条 assistant 的 _stats 还原（翻页时不回填，避免用旧回合覆盖当前）
-    if (histOldestOrd === data.messages[0].ord) refreshStatBar(data.messages);
   } catch (e) {
     // 历史拉取失败不能静默：以前这里是空 catch，任何渲染/接口异常都被吞掉，
     // 表现成"点进会话一片空白且控制台无痕"，排查代价极高。现在至少留痕 + 给
@@ -3368,7 +3371,11 @@ function refreshStatBar(history) {
     for (let i = history.length - 1; i >= 0; i--) {
       const s = history[i] && history[i]._stats;
       if (!s) continue;
-      if (s.usage) statUsage = s.usage;
+      // context_tokens 在 _stats 顶层（不在 usage 里），段3 的上下文占用 %
+      // 依赖它——不回填的话刷新后段3会显示「—」。这里补进 statUsage。
+      if (s.usage) statUsage = { ...s.usage,
+                                 context_tokens: s.context_tokens ?? s.usage.context_tokens };
+      else if (s.context_tokens != null) statUsage = { context_tokens: s.context_tokens };
       if (s.llm_total_s != null || s.tool_total_s != null) {
         statTiming = { llm_total_s: s.llm_total_s, tool_total_s: s.tool_total_s,
                        ttft_avg_s: s.ttft_avg_s, tps: s.tps,
