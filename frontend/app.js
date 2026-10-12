@@ -2392,8 +2392,10 @@ function ctxUsagePct() {
 }
 
 function updateCtxChip() {
-  const chip = $("ctx-chip"), label = $("ctx-ring-label"), arc = chip?.querySelector(".ctx-ring-arc");
-  if (!chip || !label || !arc) return;
+  // 顶部 ctx-chip 已移除（上下文只在状态条第三段展示）：保留函数以便旧引用
+  // 安全空转，避免逐个拔除调用点引入回归。
+  const chip = $("ctx-chip");
+  if (!chip) return;
   if (!usageNow) { label.textContent = "—"; arc.style.strokeDasharray = "0 100"; chip.classList.remove("warn"); return; }
   // context_tokens = 最近一次真实请求的 prompt_tokens（模型当前上下文大小）；
   // prompt_tokens 是回合内多轮请求的累加值（历史被重复计数），只作兼容回退。
@@ -2419,13 +2421,19 @@ async function refreshCtx() {
 let ctxPinned = false;   // 点击钉住：钉住时 hover 移出不收起，再点一次（或点外部）才关
 let ctxHoverTimer = null;
 
-function showCtxPop() {
+function showCtxPop(anchor) {
+  // anchor：定位锚点元素（默认顶部 ctx-chip；状态条第三段调用时传该段，
+  // 否则浮卡会飘到页顶之外，表现为"点了没反应"）
   const pop = $("ctx-pop");
   renderCtxPop();
-  const rect = $("ctx-chip").getBoundingClientRect();
+  const el = anchor || $("ctx-chip") || $("stat-seg-ctx");
+  const rect = el.getBoundingClientRect();
   pop.style.left = Math.max(8, rect.left) + "px";
   pop.style.bottom = (innerHeight - rect.top + 8) + "px";
   pop.classList.remove("hidden");
+  // 与另两张卡互斥
+  $("stat-pop")?.classList.add("hidden");
+  $("tok-pop")?.classList.add("hidden");
 }
 
 function hideCtxPop() {
@@ -3866,6 +3874,7 @@ function applyEvent(evt, seq) {
   } else if (t === "usage") {
     usageNow = evt;   // 供上下文气泡与统计行使用
     statUsage = evt;
+    if (evt.timing) statTiming = evt.timing;  // 进行中的计时快照（done 时会用更全的覆盖）
     updateCtxChip();
     updateStatBar();
     if (metaEl) metaEl.textContent = metaText(evt.elapsed_s, usageNow);
@@ -4506,12 +4515,10 @@ bind("m-skip", "click", () => {
 bind("m-up", "click", () => mParent && navTo(mParent));
 bind("m-home", "click", () => navTo(mHome || undefined));
 bind("m-choose", "click", chooseWorkspace);
-bind("ctx-chip", "click", toggleCtxPop);
 // harness 状态条：点段弹对应详情卡（互斥，点另一段切走）
 bind("stat-seg-run", "click", () => showStatPop("stat-pop", "stat-seg-run"));
 bind("stat-seg-tok", "click", () => showStatPop("tok-pop", "stat-seg-tok"));
-bind("stat-seg-ctx", "click", () => { showCtxPop(); $("stat-pop")?.classList.add("hidden"); $("tok-pop")?.classList.add("hidden"); });
-bindCtxHover();   // 环形徽章悬浮预览（200ms 延时），点击钉住见 toggleCtxPop
+bind("stat-seg-ctx", "click", () => showCtxPop($("stat-seg-ctx")));
 bind("perm-chip", "click", togglePermPop);
 bind("user-btn", "click", toggleUserPop);
 bind("pop-logout", "click", logoutNow);
@@ -4562,7 +4569,7 @@ document.addEventListener("click", (e) => {
     renderSessions(sessionsCache);
   }
   // 点弹窗外空白处关闭浮动层
-  for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["stat-pop", "stat-seg-run"], ["tok-pop", "stat-seg-tok"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"], ["perm-pop", "perm-chip"], ["todo-pop", "todo-chip"]]) {
+  for (const [pop, btn] of [["ctx-pop", "stat-seg-ctx"], ["stat-pop", "stat-seg-run"], ["tok-pop", "stat-seg-tok"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"], ["perm-pop", "perm-chip"], ["todo-pop", "todo-chip"]]) {
     const el = $(pop);
     // git 的分支二级面板挂在外层（不在 git-pop 内）：点它不算点空白，否则
     // git 浮窗被关掉而分支面板还留着（真实踩过的坑）

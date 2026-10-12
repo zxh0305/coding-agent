@@ -832,12 +832,16 @@ class Agent:
                 miss = payload.get("prompt_cache_miss_tokens")
                 r_hit_rate = (round(hit / (hit + (miss or 0)) * 100, 1)
                               if hit is not None and (hit + (miss or 0)) > 0 else None)
+                # 进行中的计时快照：本轮的 _timing 要等 message 才到，故此处用
+                # 【已完成轮次】的累计值，让前端在回合进行中就能看到模型/工具用时、
+                # TTFT、TPS（否则会话统计卡在整个回合里全是「—」，直到 done 才填上）。
                 yield "usage", {**usage_total, "elapsed_s": round(time.time() - metrics["start"], 1),
                                 "cache_hit_rate": metrics["cache_hit_rate"],
                                 "round": round_no,
                                 "round_cache_hit_rate": r_hit_rate,
                                 "context": metrics["context"],
-                                "context_tokens": metrics["context_tokens"]}
+                                "context_tokens": metrics["context_tokens"],
+                                "timing": self._timing_summary(usage_total, metrics)}
             else:
                 assistant_msg = payload
         # 本轮推理文本收尾后整段入 trace（放流结束而非每个 delta 追加：一条条目
