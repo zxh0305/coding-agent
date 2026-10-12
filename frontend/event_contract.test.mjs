@@ -21,8 +21,9 @@
  *   tool_call   {name, arguments}                       arguments 是 JSON 字符串
  *   tool_result {name, result}
  *   permission_request {id, tool, input, reason}        input 可能是对象
- *   usage       {...}
- *   done        {answer, mid, elapsed_s, usage, stopped?, stopped_reason?}
+ *   usage       {...prompt_tokens, completion_tokens, round?, round_cache_hit_rate?, context_tokens?}
+ *   done        {answer, mid, elapsed_s, usage, timing?, stopped?, stopped_reason?}
+ *                                                        timing = {llm_total_s, tool_total_s, ttft_avg_s, tps, cache_hit_rate, rounds}
  *   compacted   {summary, prompt_tokens, context}
  *   turn_end    {user_mid}                              mid 在此才回填
  */
@@ -199,4 +200,31 @@ test("契约：权限流程的真实事件序（无 tool_call，只有 permissio
     tTools.map((t) => `${t.name}:${t.status}`),
     pTools.map((t) => `${t.name}:${t.status}`),
   );
+});
+
+test("契约：usage 带轮级计时字段（round / round_cache_hit_rate），前端状态条据此显示", () => {
+  // 后端 _consume_stream 的 usage 事件新增（2026-10）：round 为当前轮号，
+  // round_cache_hit_rate 为本轮缓存命中率（缺省 null，表示该轮无缓存字段）。
+  const events = [
+    { type: "turn_start", input: "x", atts: [] },
+    { type: "usage", prompt_tokens: 1000, completion_tokens: 50, round: 3,
+      round_cache_hit_rate: 91.2, cache_hit_rate: 88, context_tokens: 1000 },
+  ];
+  const blocks = blocksFromEvents(events);
+  // usage 仍不单独产块（协议不变），字段由事件流旁路给状态条使用
+  assert.ok(!blocks.some((b) => b.kind === "meta"));
+});
+
+test("契约：done 带 timing 汇总（模型用时/工具用时/TTFT/TPS），前端浮卡据此显示", () => {
+  const events = [
+    { type: "turn_start", input: "x", atts: [] },
+    { type: "done", mid: "seg1", answer: "好了", elapsed_s: 12.5,
+      usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+      timing: { llm_total_s: 9.8, tool_total_s: 0.6, ttft_avg_s: 1.7,
+                tps: 206.1, cache_hit_rate: 91, rounds: 3 } },
+  ];
+  const meta = blocksFromEvents(events).find((b) => b.kind === "meta");
+  assert.ok(meta, "done 应产 meta 块");
+  // timing 是给状态条/浮卡的旁路字段，不改 meta 块的既有结构
+  assert.equal(meta.elapsed, 12.5);
 });

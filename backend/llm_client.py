@@ -332,6 +332,7 @@ class OpenAIChatClient:
         calls: dict[int, dict] = {}  # tool_calls 的 index -> 累积中的调用
         usage: dict | None = None
         start = time.time()
+        ttft: float | None = None  # 首个内容增量（正文或推理）到达时刻 - 请求开始，即首 token 延迟
         with resp:
             try:
                 for raw in resp:  # 逐行读 SSE
@@ -365,6 +366,11 @@ class OpenAIChatClient:
                     if not choices:
                         continue
                     delta = choices[0].get("delta") or {}
+                    # 首 token 延迟：首个带内容的增量（推理或正文）到达即定格。
+                    # 思考模型先出 reasoning，所以这里对两类增量都算首 token——
+                    # 它衡量的是"用户多久看到第一个字"，与内容归属无关。
+                    if ttft is None and (delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning")):
+                        ttft = time.time() - start
                     reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                     if reasoning:
                         # 思考模型的推理过程先于正文流出。不透传的话，整个思考阶段
@@ -413,7 +419,15 @@ class OpenAIChatClient:
                 }
                 for index, acc in sorted(calls.items())
             ]
-        log.debug("API 流式往返 %.2fs", time.time() - start)
+        elapsed = time.time() - start
+        log.debug("API 流式往返 %.2fs", elapsed)
+        # 计时元数据随 message 带出（下划线前缀 = 内部字段，不进模型历史，
+        # 与 agent._messages_for_model 剥离下划线字段的约定一致）。agent 用它做
+        # 轮级 TTFT / 生成耗时 / TPS 统计与 SSE usage 事件。
+        message["_timing"] = {
+            "ttft_s": round(ttft, 3) if ttft is not None else None,
+            "gen_s": round(elapsed, 3),  # 从请求发出到流结束（含思考与工具分片）
+        }
         yield "message", message
 
 
@@ -592,6 +606,8 @@ class AnthropicMessagesClient:
 
         blocks: dict[int, dict] = {}  # content block 下标 -> 累积中的内容
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        start = time.time()
+        ttft: float | None = None  # 首个内容 delta（text 或 thinking）到达 - 请求开始
         # cancel 在这里传给 _post：_arm_cancel_watchdog 之前的空窗，重试等待
         # 期间也能响应停止请求
         resp = self._post(body, cancel=cancel)
@@ -622,11 +638,15 @@ class AnthropicMessagesClient:
                         if d.get("type") == "text_delta":
                             blk["type"] = "text"
                             blk["text"] += d.get("text", "")
+                            if ttft is None and d.get("text"):
+                                ttft = time.time() - start
                             yield "delta", d.get("text", "")
                         elif d.get("type") == "thinking_delta":
                             # 思考块的 delta 只透传给前端实时显示；不并入 text，
                             # 最终 message（进历史的内容）不带思考过程
                             blk["type"] = "thinking"
+                            if ttft is None and d.get("thinking"):
+                                ttft = time.time() - start
                             yield "reasoning_delta", d.get("thinking", "")
                         elif d.get("type") == "input_json_delta":  # 工具参数也是分片到达的
                             blk["type"] = "tool_use"
@@ -663,6 +683,11 @@ class AnthropicMessagesClient:
         message["content"] = message["content"] or None
         if tool_calls:
             message["tool_calls"] = tool_calls
+        # 与 OpenAIChatClient.chat_stream 同口径的计时元数据（下划线内部字段）
+        message["_timing"] = {
+            "ttft_s": round(ttft, 3) if ttft is not None else None,
+            "gen_s": round(time.time() - start, 3),
+        }
         yield "message", message
 
 

@@ -657,7 +657,11 @@ class Agent:
         # 都重发全部历史，会被重复计数），拿它当"上下文容量"会系统性偏大。
         metrics = {"start": start, "cache_hit_rate": None,
                    "context_tokens": None,
+                   "llm_total_s": 0.0,  # 各轮模型生成耗时之和（会话统计浮卡）
+                   "tool_total_s": 0.0,  # 各工具执行耗时之和
                    "context": self.context_stats()}  # 还没发过请求时给个纯估算
+        self._round_timings: list[dict] = []  # 逐轮 {round, gen_s, ttft_s}（本回合内累积）
+        self._tool_total_s = 0.0  # 各工具执行耗时之和（_backfill_tool_result 累加，回合起点重置防跨回合串味）
 
         # 轮数上限的软/硬双限（1a）：soft_limit 到限时若上一轮有实质进展则续一段，
         # 续满 extensions_left 次后不再续；hard_limit 是绝对硬顶，到顶必收尾。
@@ -674,7 +678,7 @@ class Agent:
                 # 工具结果刚入完历史就被叫停：历史以上一条 tool 消息结尾，依然合法
                 break
             self._log(f"── 第 {round_no} 轮：请求 LLM ──", "gray")
-            self.trace.append({"type": "round", "round": round_no})
+            self._trace({"type": "round", "round": round_no})
             yield "round", {"round": round_no}
 
             # 每轮都重发【系统提示 + 完整历史】—— 这就是 LLM 的全部"记忆"。
@@ -719,12 +723,12 @@ class Agent:
             # 与实时观感割裂）。落 trace 而非只在内存：回放靠 trace 重建过程。
             _ptext = (assistant_msg.get("content") or "").strip()
             if _ptext:
-                self.trace.append({"type": "process_text", "round": round_no, "text": _ptext})
+                self._trace({"type": "process_text", "round": round_no, "text": _ptext})
             self.history.append(assistant_msg)
             for call in tool_calls:
                 self._log(f"🤖 LLM 请求调用: {call['function']['name']}({call['function']['arguments']})", "cyan")
                 arguments = call["function"].get("arguments") or "{}"
-                self.trace.append({"type": "tool_call", "name": call["function"]["name"], "arguments": arguments})
+                self._trace({"type": "tool_call", "name": call["function"]["name"], "arguments": arguments})
                 yield "tool_call", {"name": call["function"]["name"], "arguments": arguments}
 
             # 执行工具：连续只读工具并行、写操作串行，结果按请求顺序回填
@@ -797,6 +801,7 @@ class Agent:
         """
         assistant_msg = None
         reasoning_parts: list[str] = []
+        round_wait = time.monotonic()  # 本轮请求发出到流结束的墙钟（含思考+工具分片）
         for kind, payload in self.llm.chat_stream(messages=messages, tools=tools,
                                                   cancel=self.cancel_event):
             if kind == "delta":
@@ -820,8 +825,17 @@ class Agent:
                 last_prompt = payload.get("prompt_tokens") or 0
                 metrics["context_tokens"] = max(metrics["context_tokens"] or 0, last_prompt)
                 metrics["context"] = self.context_stats(prompt_tokens=last_prompt)
+                # 轮级计时：本轮的缓存命中/未命中、TTFT、生成耗时、TPS。TTFT 与
+                # gen_s 由 llm_client 随最终 message 带出（此处 usage chunk 先到，
+                # 故先从 payload 取能在流中早期拿到；缺则回退 metrics 里上一轮值）。
+                hit = payload.get("prompt_cache_hit_tokens")
+                miss = payload.get("prompt_cache_miss_tokens")
+                r_hit_rate = (round(hit / (hit + (miss or 0)) * 100, 1)
+                              if hit is not None and (hit + (miss or 0)) > 0 else None)
                 yield "usage", {**usage_total, "elapsed_s": round(time.time() - metrics["start"], 1),
                                 "cache_hit_rate": metrics["cache_hit_rate"],
+                                "round": round_no,
+                                "round_cache_hit_rate": r_hit_rate,
                                 "context": metrics["context"],
                                 "context_tokens": metrics["context_tokens"]}
             else:
@@ -830,10 +844,53 @@ class Agent:
         # 一个轮次，回放时渲染成一个思考块）。空串不入，避免无思考模型多出空块。
         text = "".join(reasoning_parts)
         if text:
-            self.trace.append({"type": "reasoning", "round": round_no, "text": text})
+            self._trace({"type": "reasoning", "round": round_no, "text": text})
         # 本轮推理已固化进 trace：从 live 缓冲摘除，避免快照双份携带
         self.reasoning_live.pop(round_no, None)
+        # ── 轮级计时收尾：把 llm_client 带出的 _timing 累计进 metrics ──
+        # gen_s = 请求发出到流结束（模型"占着"这一轮的墙钟，含思考与工具分片生成）；
+        # 用它做 TPS 分母、也作为 llm_total_s 的分项。tool_total_s 由
+        # _backfill_tool_result 累计。二者共同支撑会话统计浮卡。
+        timing = (assistant_msg or {}).pop("_timing", None) or {}
+        gen_s = timing.get("gen_s")
+        if gen_s is None:  # 兜底：客户端未带 _timing 时用本地墙钟
+            gen_s = round(time.monotonic() - round_wait, 3)
+        ttft = timing.get("ttft_s")
+        self._round_timings.append({"round": round_no, "gen_s": gen_s, "ttft_s": ttft})
+        metrics["llm_total_s"] = round(metrics.get("llm_total_s", 0.0) + gen_s, 3)
+        if ttft is not None:
+            metrics.setdefault("ttft_samples", []).append(ttft)
         return assistant_msg
+
+    def _timing_summary(self, usage_total: dict, metrics: dict) -> dict:
+        """回合级计时汇总（会话统计浮卡的数据源）。
+
+        - llm_total_s：各轮"请求发出→流结束"的生成耗时之和
+        - tool_total_s：各工具执行耗时之和（_backfill_tool_result 累加）
+        - ttft_avg_s：各轮首 token 延迟的均值（无采样则 None）
+        - tps：输出速度 = 输出 tokens / 实际生成秒（gen_s 之和 − 首轮 TTFT 等待部分，
+          因为首 token 之前那段是"等待"不是"生成"）。两者都 ≤0 时给 None 防除零。
+        - cache_hit_rate：回合累计口径（累计命中 / (累计命中+累计未命中)），
+          与前端状态条一致；区别于"最后一次请求"的单点口径。
+        """
+        llm_s = round(metrics.get("llm_total_s", 0.0), 3)
+        samples = metrics.get("ttft_samples") or []
+        ttft_avg = round(sum(samples) / len(samples), 3) if samples else None
+        out_tok = usage_total.get("completion_tokens") or 0
+        # 生成净耗时：去掉首轮首 token 之前的等待（ttft 已含在 gen_s 里）
+        gen_net = llm_s - (samples[0] if samples else 0.0)
+        tps = round(out_tok / gen_net, 1) if out_tok > 0 and gen_net > 0.05 else None
+        hit = usage_total.get("prompt_cache_hit_tokens") or 0
+        miss = usage_total.get("prompt_cache_miss_tokens") or 0
+        cum_rate = round(hit / (hit + miss) * 100, 1) if (hit + miss) > 0 else None
+        return {
+            "llm_total_s": llm_s,
+            "tool_total_s": round(getattr(self, "_tool_total_s", 0.0), 3),
+            "ttft_avg_s": ttft_avg,
+            "tps": tps,
+            "cache_hit_rate": cum_rate if cum_rate is not None else metrics.get("cache_hit_rate"),
+            "rounds": len(getattr(self, "_round_timings", [])),
+        }
 
     def _tail_stopped(self, assistant_msg, usage_total: dict, metrics: dict):
         """「用户中途停止」收尾：已生成的半截文字直接作为回答。
@@ -843,16 +900,19 @@ class Agent:
         partial = (assistant_msg or {}).get("content") or ""
         answer = (partial + "\n\n（已手动停止）").strip()
         elapsed = round(time.time() - metrics["start"], 1)
+        timing = self._timing_summary(usage_total, metrics)
         self.history.append({"role": "assistant", "content": answer,
                              "_stats": {"elapsed_s": elapsed, "usage": dict(usage_total),
-                                        "cache_hit_rate": metrics["cache_hit_rate"],
+                                        "cache_hit_rate": timing["cache_hit_rate"],
                                         "context_tokens": metrics["context_tokens"],
+                                        **timing,
                                         "provider_id": self.model_tag[0], "model": self.model_tag[1],
                                         "stopped": True}})
         log.info("耗时 %.1fs · 用户中途停止", elapsed)
         yield "done", {"answer": answer, "elapsed_s": elapsed, "usage": usage_total,
-                       "cache_hit_rate": metrics["cache_hit_rate"],
+                       "cache_hit_rate": timing["cache_hit_rate"],
                        "context": metrics["context"],
+                       "timing": timing,
                        "context_tokens": metrics["context_tokens"], "stopped": True}
 
     def _tail_answer(self, assistant_msg, usage_total: dict, metrics: dict,
@@ -871,15 +931,19 @@ class Agent:
             answer = "（本轮没有产出文字回答；推理过程见执行过程）"
             log.warning("本轮 LLM 未返回正文内容，已用占位说明收尾")
         elapsed = round(time.time() - metrics["start"], 1)
+        timing = self._timing_summary(usage_total, metrics)
         self.history.append({"role": "assistant", "content": answer,
                              "_stats": {"elapsed_s": elapsed, "usage": dict(usage_total),
-                                        "cache_hit_rate": metrics["cache_hit_rate"],
+                                        "cache_hit_rate": timing["cache_hit_rate"],
                                         "context_tokens": metrics["context_tokens"],
+                                        **timing,
                                         "provider_id": self.model_tag[0], "model": self.model_tag[1]}})
-        log.info("耗时 %.1fs · tokens 输入 %d / 输出 %d",
-                 elapsed, usage_total["prompt_tokens"], usage_total["completion_tokens"])
+        log.info("耗时 %.1fs · tokens 输入 %d / 输出 %d · LLM %.1fs / 工具 %.1fs / %.1f tok/s",
+                 elapsed, usage_total["prompt_tokens"], usage_total["completion_tokens"],
+                 timing["llm_total_s"], timing["tool_total_s"], timing["tps"] or 0.0)
         payload = {"answer": answer, "elapsed_s": elapsed, "usage": usage_total,
-                   "cache_hit_rate": metrics["cache_hit_rate"], "context": metrics["context"],
+                   "cache_hit_rate": timing["cache_hit_rate"], "context": metrics["context"],
+                   "timing": timing,
                    "context_tokens": metrics["context_tokens"]}
         if stopped_reason:
             payload["stopped_reason"] = stopped_reason
@@ -909,7 +973,7 @@ class Agent:
                              "content": WRAP_UP_INSTRUCTION.format(max_rounds=limit)})
         log.warning("达到最大轮数 %d，进入收尾轮（禁工具总结）", limit)
         self._log(f"── 第 {round_no} 轮（收尾）：请求总结 ──", "gray")
-        self.trace.append({"type": "round", "round": round_no, "wrap_up": True})
+        self._trace({"type": "round", "round": round_no, "wrap_up": True})
         yield "round", {"round": round_no, "wrap_up": True}
         messages = [{"role": "system", "content": self._system_content()},
                     *self._messages_for_model()]
@@ -957,7 +1021,7 @@ class Agent:
         if not structural:
             self._reminders_used += 1
         self.history.append({"role": "user", "_synthetic": True, "content": text})
-        self.trace.append({"type": "system_reminder", "kind": kind, **detail})
+        self._trace({"type": "system_reminder", "kind": kind, **detail})
         log.info("注入合成提醒（%s），本回合已用 %d/%d",
                  kind, self._reminders_used, MAX_TURN_REMINDERS)
         return True
@@ -1166,19 +1230,19 @@ class Agent:
                 if trace_budget > 0:
                     trace_budget -= 1
                     if kind == "round":
-                        self.trace.append({"type": "sub_round", "parent": sub_id,
+                        self._trace({"type": "sub_round", "parent": sub_id,
                                            "round": payload.get("round")})
                     elif kind == "tool_call":
-                        self.trace.append({"type": "sub_tool_call", "parent": sub_id,
+                        self._trace({"type": "sub_tool_call", "parent": sub_id,
                                            "name": payload.get("name"),
                                            "arguments": payload.get("arguments")})
                     else:
-                        self.trace.append({"type": "sub_tool_result", "parent": sub_id,
+                        self._trace({"type": "sub_tool_result", "parent": sub_id,
                                            "name": payload.get("name"),
                                            "result": payload.get("result")})
                 elif trace_budget == 0:
                     trace_budget = -1
-                    self.trace.append({"type": "sub_truncated", "parent": sub_id,
+                    self._trace({"type": "sub_truncated", "parent": sub_id,
                                        "text": "…[子代理过程条目过多，已省略]"})
         # 停止判定必须在结论判定之前：被掐断的子代理走「手动停止」收尾，done
         # 里仍带着半截回答——那是残缺的中间产物，不是结论，回收它并继续跑
@@ -1799,8 +1863,18 @@ class Agent:
         self.history.append(tool_msg)
         self._log(f"🔧 工具返回: {result}", "yellow")
         name = (call.get("function") or {}).get("name", "")
-        self.trace.append({"type": "tool_result", "name": name, "result": result})
-        return ("tool_result", {"name": name, "result": result})
+        dur_s = call.get("_dur_s")  # 由 _run_tool 记录；权限拒绝路径没有（无执行）
+        if dur_s is not None:
+            # 累计进回合工具耗时（_run 回合起点重置，收尾写进 _stats）
+            self._tool_total_s = round(getattr(self, "_tool_total_s", 0.0) + dur_s, 3)
+        entry = {"type": "tool_result", "name": name, "result": result}
+        if dur_s is not None:
+            entry["dur_s"] = dur_s
+        self._trace(entry)
+        event = {"name": name, "result": result}
+        if dur_s is not None:
+            event["dur_s"] = dur_s
+        return ("tool_result", event)
 
     def _run_tool_group(self, group: list[dict]) -> list[str]:
         """执行一组 tool_calls，返回与 group 下标一一对应的结果列表。
@@ -1846,14 +1920,23 @@ class Agent:
         """
         name = (call.get("function") or {}).get("name", "")
         raw_args = (call.get("function") or {}).get("arguments") or "{}"
+        # 计时起点放在最前：白名单闸/钩子否决/参数解析失败等早返回路径也计入，
+        # 这样前端看到的每个调用都有耗时（哪怕是毫秒级的拒绝）。
+        tool_start = time.monotonic()
 
         # 白名单前置闸（子代理防幻觉调用）：schema 已过滤，模型正常情况下看
         # 不到名单外的工具；这里仍拦一道，把"幻觉出的调用"变成可读的错误信封
         # 而不是执行到注册表里（execute_tool 按全量表查找，白名单限制会失守）。
+        def _stamp(res: str) -> str:
+            """把本次调用耗时挂回 call（不抛、不进历史），返回原结果。"""
+            call["_dur_s"] = round((call.get("_dur_s") or 0.0)
+                                   + (time.monotonic() - tool_start), 3)
+            return res
+
         if self.allowed_tools is not None and name not in self.allowed_tools:
-            return error_result(f"本代理无权使用工具 {name}",
-                                "只能使用任务说明给出的只读侦察工具；需要写操作请写进结论，"
-                                "由主代理决定执行")
+            return _stamp(error_result(f"本代理无权使用工具 {name}",
+                                       "只能使用任务说明给出的只读侦察工具；需要写操作请写进结论，"
+                                       "由主代理决定执行"))
 
         # ── pre 钩子：返回拒绝原因字符串即否决 ─────────────────────────
         for hook in self.pre_tool_hooks:
@@ -1863,8 +1946,8 @@ class Agent:
                 log.exception("pre_tool_hook 执行失败（忽略）")
                 continue
             if isinstance(reason, str) and reason:
-                return error_result(f"工具调用被拦截: {reason}",
-                                    "本次调用未执行。调整方式后重试，或改用其它工具。")
+                return _stamp(error_result(f"工具调用被拦截: {reason}",
+                                           "本次调用未执行。调整方式后重试，或改用其它工具。"))
 
         def args_error(reason: str) -> str:
             payload = {"ok": False, "error": reason,
@@ -1902,7 +1985,9 @@ class Agent:
                     result = rewritten
         if '"error"' in result:
             log.warning("工具 %s 执行出错: %s", name, result)
-        return result
+        # 耗时挂回 call 对象（每轮 call 是新解析出的临时 dict，不进模型历史、
+        # 不落库），供 _backfill_tool_result 写进 trace 与前端事件。
+        return _stamp(result)
 
     def _record_recent_read(self, name: str, arguments: dict, result: str) -> None:
         """内置 post 钩子：记录 read_file 的成功读取（供压缩后重注入 recent_reads）。
@@ -1922,6 +2007,15 @@ class Agent:
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
         return None
+
+    def _trace(self, entry: dict) -> None:
+        """唯一 trace 写入口：统一补时间戳 ts（epoch 秒）。
+
+        回放/前端据此可重建耗时瀑布（每轮何时开始、工具各花多久）。旧 trace
+        条目没有 ts，前端需按缺省容错处理（不显示时间轴即可）。
+        """
+        entry.setdefault("ts", round(time.time(), 3))
+        self.trace.append(entry)
 
     def _log(self, text: str, color: str) -> None:
         log.info(text)  # 同步写进 agent.log（无颜色），终端仍走彩色 print

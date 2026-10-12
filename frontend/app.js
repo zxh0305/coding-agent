@@ -707,6 +707,7 @@ async function newTask(presetProject = null) {
   setSessionTodos([]); // 新任务态：还没有清单，入口隐藏
   usageNow = null;
   updateCtxChip();
+  resetStatBar();      // 新任务态：上一会话的统计数字清零并隐藏状态条
   if (presetProject) {
     // 直接绑定项目的新任务：工具栏立刻显示项目名（绑定发生在首条消息建会话时）
     wsCustom = true;
@@ -1114,6 +1115,9 @@ async function loadHistoryPage() {
     }
     updateLoadOlder();
     scheduleRail();  // 历史装载完毕：导航条按新消息重建
+    // 首次加载（非向上翻页）时回填状态条统计——刷新页面/切会话后没有事件流，
+    // 只能从最近一条 assistant 的 _stats 还原（翻页时不回填，避免用旧回合覆盖当前）
+    if (histOldestOrd === data.messages[0].ord) refreshStatBar(data.messages);
   } catch (e) {
     // 历史拉取失败不能静默：以前这里是空 catch，任何渲染/接口异常都被吞掉，
     // 表现成"点进会话一片空白且控制台无痕"，排查代价极高。现在至少留痕 + 给
@@ -2500,10 +2504,10 @@ function renderCtxPop() {
     row.append(dot, name, val);
     bd.appendChild(row);
   }
-  // 缓存命中率只在 >78% 时显示（ZCode 同规则）：低命中率展示出来只会
-  // 分散注意力——它要么还没稳定（前几轮），要么说明这个供应商不缓存。
+  // 缓存命中率始终显示（此前 >78% 才显示，导致恒 0 命中时反而看不见——
+  // 而这恰是"供应商没透传缓存"的关键信号，必须可见）。
   const hit = usageNow && usageNow.cache_hit_rate;
-  $("ctx-cache").textContent = hit != null && hit > 78 ? hit + "%" : "—";
+  $("ctx-cache").textContent = hit != null ? hit + "%" : "—";
 }
 
 // ---------- 常驻事件流（SSE 断线重连） ----------
@@ -3286,6 +3290,114 @@ function showPermissionCard(evt) {
 // 两个口径必须分开标注：↑↓ 是本回合多次请求的【累计账单】（工具循环每轮都
 // 重发全部历史，历史被重复计数）；「上下文」是模型当前真实占用（最后一次
 // 请求的 prompt_tokens，即徽章口径）。单次请求的回合两者相等，不重复标注。
+// ---------- harness 式状态条（输入框下方） ----------
+// 数据源：usage 事件（逐轮）与 done 事件（回合权威汇总 timing）。两者都在时
+// 优先用 done 的 timing（口径完整：含 tool_total_s / ttft_avg / tps）。
+let statTiming = null;   // 最近一次 done 的 timing（权威）
+let statUsage = null;    // 最近一次 usage（含累计 tokens / 轮数）
+
+function fmtDur(s) {
+  if (s == null) return "—";
+  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)} 秒`;
+  return `${Math.floor(s / 60)} 分 ${Math.round(s % 60)} 秒`;
+}
+
+function updateStatBar() {
+  const bar = $("stat-bar");
+  if (!bar) return;
+  const u = statUsage, t = statTiming;
+  if (!u && !t) { bar.classList.add("hidden"); return; }
+  bar.classList.remove("hidden");
+
+  // 段1：轮数 · 步数 · tok/s
+  const rounds = (u && u.round) || (t && t.rounds) || 0;
+  const steps = liveTracker.state() ? liveTracker.state().steps : 0;
+  const tps = (t && t.tps) || null;
+  const p1 = [];
+  if (rounds) p1.push(`${rounds} 轮`);
+  if (steps) p1.push(`${steps} 步`);
+  if (tps) p1.push(`${Math.round(tps)} tok/s`);
+  $("stat-run-label").textContent = p1.length ? p1.join(" · ") : "—";
+
+  // 段2：总量 · 缓存命中率
+  const total = u ? (u.prompt_tokens || 0) + (u.completion_tokens || 0) : 0;
+  const rate = t ? t.cache_hit_rate : (u && u.cache_hit_rate);
+  const p2 = [];
+  if (total) p2.push(fmtWan(total) + " tok");
+  if (rate != null) p2.push(`缓存命中 ${rate}%`);
+  $("stat-tok-label").textContent = p2.length ? p2.join(" · ") : "—";
+
+  // 段3：上下文占用 %
+  const ctxTok = u ? (u.context_tokens ?? u.prompt_tokens ?? 0) : 0;
+  $("stat-ctx-label").textContent = ctxTok
+    ? `${Math.min(100, (ctxTok / (contextWindow || 1)) * 100).toFixed(0)}%` : "—";
+
+  renderStatPop();
+  renderTokPop();
+}
+
+function resetStatBar() {
+  statUsage = null; statTiming = null;
+  $("stat-pop")?.classList.add("hidden");
+  $("tok-pop")?.classList.add("hidden");
+  updateStatBar();  // 无数据 → 自动隐藏状态条
+}
+
+// 回放/切会话回填：从最近一条 assistant 历史的 _stats 还原统计（无事件流时用）
+function refreshStatBar(history) {
+  statUsage = null; statTiming = null;
+  if (Array.isArray(history)) {
+    for (let i = history.length - 1; i >= 0; i--) {
+      const s = history[i] && history[i]._stats;
+      if (!s) continue;
+      if (s.usage) statUsage = s.usage;
+      if (s.llm_total_s != null || s.tool_total_s != null) {
+        statTiming = { llm_total_s: s.llm_total_s, tool_total_s: s.tool_total_s,
+                       ttft_avg_s: s.ttft_avg_s, tps: s.tps,
+                       cache_hit_rate: s.cache_hit_rate, rounds: s.rounds };
+      }
+      break;
+    }
+  }
+  updateStatBar();
+}
+
+function renderStatPop() {
+  const t = statTiming;
+  $("stat-model").textContent = (currentSession && $("model-label")?.textContent) || "";
+  $("stat-llm").textContent = t ? fmtDur(t.llm_total_s) : "—";
+  $("stat-tool").textContent = t ? fmtDur(t.tool_total_s) : "—";
+  $("stat-ttft").textContent = t && t.ttft_avg_s != null ? `${t.ttft_avg_s.toFixed(1)} 秒` : "—";
+  $("stat-tps").textContent = t && t.tps != null ? `${Math.round(t.tps)} tok/s` : "—";
+}
+
+function renderTokPop() {
+  const u = statUsage, t = statTiming;
+  const hit = u ? (u.prompt_cache_hit_tokens || 0) : 0;
+  const miss = u ? (u.prompt_cache_miss_tokens || 0) : 0;
+  const out = u ? (u.completion_tokens || 0) : 0;
+  const total = (u ? (u.prompt_tokens || 0) + out : 0);
+  $("tok-total").textContent = total ? fmtWan(total) + " tok" : "—";
+  const rate = t ? t.cache_hit_rate
+    : (hit + miss > 0 ? Math.round(hit / (hit + miss) * 100) : null);
+  $("tok-rate").textContent = rate != null ? rate + "%" : "—";
+  $("tok-miss").textContent = miss ? miss.toLocaleString() + " tok" : "0 tok";
+  $("tok-hit").textContent = hit ? hit.toLocaleString() + " tok" : "0 tok";
+  $("tok-out").textContent = out ? out.toLocaleString() + " tok" : "0 tok";
+}
+
+// 浮卡定位：贴在被点的那一段上方（与 ctx-pop 同一套视觉）
+function showStatPop(popId, segId) {
+  const pop = $(popId), seg = $(segId);
+  if (!pop || !seg) return;
+  const rect = seg.getBoundingClientRect();
+  pop.style.left = Math.max(8, rect.left) + "px";
+  pop.style.bottom = (innerHeight - rect.top + 8) + "px";
+  pop.classList.remove("hidden");
+  const other = popId === "stat-pop" ? "tok-pop" : "stat-pop";
+  $(other)?.classList.add("hidden");
+}
+
 function metaText(elapsed, u) {
   let t = `⏱ ${elapsed}s`;
   if (u && u.total_tokens) {
@@ -3744,7 +3856,9 @@ function applyEvent(evt, seq) {
     showPermissionCard(evt);
   } else if (t === "usage") {
     usageNow = evt;   // 供上下文气泡与统计行使用
+    statUsage = evt;
     updateCtxChip();
+    updateStatBar();
     if (metaEl) metaEl.textContent = metaText(evt.elapsed_s, usageNow);
   } else if (t === "done") {
     pendingDeltas = new Map(); pendingThink = "";  // 完整回答直接覆盖，丢弃未刷的增量，防止 rAF 晚到追加旧文本
@@ -3788,6 +3902,9 @@ function applyEvent(evt, seq) {
       (traceEl || chatEl).appendChild(metaEl);
     }
     metaEl.textContent = metaText(evt.elapsed_s, evt.usage);
+    if (evt.usage) { statUsage = evt.usage; }
+    if (evt.timing) { statTiming = evt.timing; }  // 回合权威汇总（模型/工具用时、TTFT、TPS）
+    updateStatBar();
     if (evt.mid) historyMids.add(evt.mid);  // 已在屏上：防后续补发重复渲染
     if (traceEl) {
       // 做完任务自动折叠：正文回归"只要答案"；点折叠条仍可回看全过程
@@ -3981,6 +4098,7 @@ function resetStreamState() {
   pendingDeltas = new Map(); pendingThink = "";
   curMid = null; usageNow = null;
   qStart = 0;  // 计时起点随会话一起作废：否则切回来的新回合会接着上一个会话的时间数
+  resetStatBar();  // 统计数字随会话作废（随后由回放/refreshCtx 回填）
   // 回退编辑态随会话一起作废：换任务后 banner 还挂着会把新消息发进错误的语境
   editTarget = null;
   const eb = $("edit-banner");
@@ -4380,6 +4498,10 @@ bind("m-up", "click", () => mParent && navTo(mParent));
 bind("m-home", "click", () => navTo(mHome || undefined));
 bind("m-choose", "click", chooseWorkspace);
 bind("ctx-chip", "click", toggleCtxPop);
+// harness 状态条：点段弹对应详情卡（互斥，点另一段切走）
+bind("stat-seg-run", "click", () => showStatPop("stat-pop", "stat-seg-run"));
+bind("stat-seg-tok", "click", () => showStatPop("tok-pop", "stat-seg-tok"));
+bind("stat-seg-ctx", "click", () => { showCtxPop(); $("stat-pop")?.classList.add("hidden"); $("tok-pop")?.classList.add("hidden"); });
 bindCtxHover();   // 环形徽章悬浮预览（200ms 延时），点击钉住见 toggleCtxPop
 bind("perm-chip", "click", togglePermPop);
 bind("user-btn", "click", toggleUserPop);
@@ -4431,7 +4553,7 @@ document.addEventListener("click", (e) => {
     renderSessions(sessionsCache);
   }
   // 点弹窗外空白处关闭浮动层
-  for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"], ["perm-pop", "perm-chip"], ["todo-pop", "todo-chip"]]) {
+  for (const [pop, btn] of [["ctx-pop", "ctx-chip"], ["stat-pop", "stat-seg-run"], ["tok-pop", "stat-seg-tok"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"], ["perm-pop", "perm-chip"], ["todo-pop", "todo-chip"]]) {
     const el = $(pop);
     // git 的分支二级面板挂在外层（不在 git-pop 内）：点它不算点空白，否则
     // git 浮窗被关掉而分支面板还留着（真实踩过的坑）

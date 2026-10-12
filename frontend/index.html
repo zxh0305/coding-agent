@@ -133,6 +133,14 @@
           <span class="grow"></span>
           <button id="send" class="primary send-btn">发送</button>
         </div>
+
+        <!-- harness 式状态条：进行中显示，空闲/无数据隐藏。
+             三段可点，各自弹出详情卡；数据源 = usage / done 事件。 -->
+        <div id="stat-bar" class="stat-bar hidden">
+          <button class="stat-seg" id="stat-seg-run" title="查看会话统计"><span class="stat-ico">⏱</span><span id="stat-run-label">—</span></button>
+          <button class="stat-seg" id="stat-seg-tok" title="查看 Token 用量"><span class="stat-ico">🗜</span><span id="stat-tok-label">—</span></button>
+          <button class="stat-seg" id="stat-seg-ctx" title="查看上下文容量"><span class="stat-ico">◔</span><span id="stat-ctx-label">—</span></button>
+        </div>
       </div>
     </main>
 
@@ -196,6 +204,26 @@
     <div id="ctx-breakdown"></div>
     <div class="ctx-foot"><span>平均缓存命中率</span><b id="ctx-cache">—</b></div>
     <div class="ctx-hint">口径：徽章与分段条是模型当前真实占用（最后一次请求的输入，含缓存命中）；回答统计行的 ↑↓ 是本回合累计消耗——工具循环每轮重发全部历史，两者本就不同。</div>
+  </div>
+
+  <!-- 会话统计卡（harness 式可观测）：模型/工具用时、TTFT、输出速度 -->
+  <div id="stat-pop" class="ctx-pop hidden">
+    <div class="ctx-head"><b>会话统计</b><span id="stat-model" class="mono"></span></div>
+    <div class="ctx-row"><span>模型用时</span><b id="stat-llm">—</b></div>
+    <div class="ctx-row"><span>工具调用用时</span><b id="stat-tool">—</b></div>
+    <div class="ctx-row"><span>首 token 平均（TTFT）</span><b id="stat-ttft">—</b></div>
+    <div class="ctx-row"><span>输出速度（TPS）</span><b id="stat-tps">—</b></div>
+    <div class="ctx-hint">口径：模型用时 = 各轮"请求发出→流结束"之和（含思考）；工具用时 = 各工具执行之和；TPS = 输出 tokens / 实际生成秒（已扣首 token 等待）。</div>
+  </div>
+
+  <!-- Token 用量卡（harness 式可观测）：总量与缓存命中构成 -->
+  <div id="tok-pop" class="ctx-pop hidden">
+    <div class="ctx-head"><b>Token 用量</b><span id="tok-total" class="mono"></span></div>
+    <div class="ctx-row"><span>缓存命中</span><b id="tok-rate">—</b></div>
+    <div class="ctx-row"><span>未缓存输入</span><b id="tok-miss">—</b></div>
+    <div class="ctx-row"><span>缓存读取</span><b id="tok-hit">—</b></div>
+    <div class="ctx-row"><span>输出</span><b id="tok-out">—</b></div>
+    <div class="ctx-hint">口径：本回合累计。工具循环每轮重发全部历史，故输入总量远大于当前上下文占用。</div>
   </div>
 
   <!-- 管理模型弹窗：供应商列表 + 编辑器（Base URL / Key / 模型列表 / 测试链接） -->

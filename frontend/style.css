@@ -1010,6 +1010,23 @@ button.primary:hover { background: var(--accent-hover); }
   margin-top: 6px;
 }
 
+/* ---------- harness 式状态条（输入框下方） ---------- */
+/* 一行三段：⏱ 轮·步·tok/s ｜ 🗜 总量·缓存命中 ｜ ◔ 上下文%。点段弹详情卡。
+   hover 才显色，常态低对比——"看一眼就够"的辅助信息，不抢输入框。 */
+.stat-bar {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  padding: 2px 4px 0; font-size: 12px;
+  color: var(--text-3, var(--text-2));
+}
+.stat-seg {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: none; border: 0; cursor: pointer;
+  padding: 3px 8px; border-radius: 8px;
+  color: inherit; font: inherit; white-space: nowrap;
+}
+.stat-seg:hover { background: var(--hover); color: var(--text-1, inherit); }
+.stat-seg .stat-ico { opacity: .8; }
+
 /* 权限模式气泡（复用 ctx-pop 定位）：三行选项 */
 .perm-row {
   display: flex; flex-direction: column; gap: 2px;
