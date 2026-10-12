@@ -230,13 +230,13 @@ class TestDeleteAndCleanup(AttachTestBase):
 
 
 class TestWorkspacePlacement(AttachTestBase):
-    """附件落工作区 + 绑定工作区后迁移。
+    """附件落盘位置（2026-10-12 起：恒落数据区）。
 
-    为什么改：附件原先一律落 data/attachments/，在 agent 工作区之外——
-    run_bash 的 cwd 锁在工作区、read_file 有越界校验，压缩包类附件因此
-    完全没法用。改为落工作区后，附件是普通文件，一切文件能力自然可用。
-    2026-09-29 起再深一层：工作区内也按 <sid> 分目录（.coding-agent/
-    attachments/<sid>/），否则同一工作区的多个会话共用一份附件。
+    为什么改回去：2026-09-29 曾把附件挪进工作区（.coding-agent/attachments/）
+    换"文件工具天然可达"，但没被 .gitignore 覆盖的绑定工作区会因此出现 git
+    变动（用户实测踩过）。现在恒落数据区 attachments/<sid>/，会话隔离不变，
+    文件能力由沙箱桥接前缀（attachments/，见 code_tools._resolve）补上；
+    工作区里旧布局的遗留文件由 migrate_legacy_workspace_files 收回。
     """
 
     def _mk_ws(self, name="proj"):
@@ -244,78 +244,88 @@ class TestWorkspacePlacement(AttachTestBase):
         ws.mkdir()
         return ws
 
-    def test_falls_back_to_data_without_workspace(self):
-        """未绑定工作区时仍落 data/attachments，附件不丢。"""
-        info = db.save_attachment("s1", "a.txt", b"x")
-        self.assertIn("attachments", info["path"])
-        self.assertNotIn("proj", info["path"])
-
-    def test_lands_in_workspace_when_bound(self):
-        """已绑定工作区：附件直接落工作区 .coding-agent/attachments/。"""
+    def test_lands_in_data_even_when_workspace_bound(self):
+        """绑定了工作区也落数据区：附件永不进用户工作区（git 变动区干净）。"""
         ws = self._mk_ws()
         db.set_session_workspace("s1", str(ws))
         info = db.save_attachment("s1", "a.txt", b"x")
-        self.assertTrue((ws / db.ATTACH_DIR_NAME / "s1" / "a.txt").exists())
+        self.assertTrue((db._attachments_dir() / "s1" / "a.txt").exists())
+        self.assertNotIn(str(ws), info["path"])
+        self.assertFalse((ws / ".coding-agent").exists())  # 工作区纹丝不动
         self.assertEqual(db.read_attachment_text("s1", "a.txt")["content"], "x")
 
-    def test_sessions_in_same_workspace_are_isolated(self):
-        """同一工作区绑定两个会话：附件互相不可见（按会话隔离）。"""
-        ws = self._mk_ws()
-        db.set_session_workspace("s1", str(ws))
-        db.set_session_workspace("s2", str(ws))
+    def test_sessions_isolated_by_sid(self):
+        """会话隔离：<sid> 子目录各管各的，删除互不误伤。"""
         db.save_attachment("s1", "only-s1.txt", b"1")
         db.save_attachment("s2", "only-s2.txt", b"2")
         self.assertEqual([a["name"] for a in db.list_attachments("s1")], ["only-s1.txt"])
         self.assertEqual([a["name"] for a in db.list_attachments("s2")], ["only-s2.txt"])
-        # s1 删除后，s2 的附件与目录结构不受影响
         db.delete_session("s1")
-        self.assertFalse((ws / db.ATTACH_DIR_NAME / "s1").exists())
-        self.assertTrue((ws / db.ATTACH_DIR_NAME / "s2" / "only-s2.txt").exists())
+        self.assertFalse((db._attachments_dir() / "s1").exists())
         self.assertEqual(db.read_attachment_text("s2", "only-s2.txt")["content"], "2")
 
-    def test_migrate_moves_preexisting(self):
-        """先上传（落 data/）后绑定工作区 → 迁移到工作区 <sid>/ 子目录。"""
-        db.save_attachment("s1", "a.txt", b"hello")
+    def test_migrate_pulls_attachments_back_to_data(self):
+        """旧布局（工作区 .coding-agent/attachments/<sid>/）整袋收回数据区。"""
         ws = self._mk_ws()
+        legacy = ws / db.ATTACH_DIR_NAME / "s1"
+        legacy.mkdir(parents=True)
+        (legacy / "a.txt").write_bytes(b"legacy")
         db.set_session_workspace("s1", str(ws))
-        moved = db.migrate_attachments_to_workspace("s1")
+        moved = db.migrate_legacy_workspace_files("s1")
         self.assertEqual(moved, 1)
-        self.assertTrue((ws / db.ATTACH_DIR_NAME / "s1" / "a.txt").exists())
-        self.assertEqual(db.read_attachment_text("s1", "a.txt")["content"], "hello")
-
-    def test_migrate_does_not_overwrite_workspace_copy(self):
-        """工作区已有同名附件时不覆盖（保留用户后来上传的那份）。"""
-        ws = self._mk_ws()
-        db.set_session_workspace("s1", str(ws))
-        db.save_attachment("s1", "a.txt", b"new-in-ws")
-        # 手工在 data/ 放一份同名的旧文件，模拟"迁移前遗留"
-        old = db._attachments_dir() / "s1"
-        old.mkdir(parents=True, exist_ok=True)
-        (old / "a.txt").write_bytes(b"stale")
-        db.migrate_attachments_to_workspace("s1")
-        self.assertEqual((ws / db.ATTACH_DIR_NAME / "s1" / "a.txt").read_bytes(), b"new-in-ws")
+        self.assertTrue((db._attachments_dir() / "s1" / "a.txt").exists())
+        self.assertFalse(legacy.exists())
+        self.assertEqual(db.read_attachment_text("s1", "a.txt")["content"], "legacy")
 
     def test_migrate_adopts_legacy_flat_files(self):
-        """旧布局（.coding-agent/attachments/ 平铺无 <sid> 层）归给触发迁移的会话。"""
+        """更旧的平铺布局（.coding-agent/attachments/ 无 <sid> 层）归给触发迁移的会话。"""
         ws = self._mk_ws()
         legacy = ws / db.ATTACH_DIR_NAME
         legacy.mkdir(parents=True)
         (legacy / "old.txt").write_bytes(b"legacy")
         db.set_session_workspace("s1", str(ws))
-        moved = db.migrate_attachments_to_workspace("s1")
+        moved = db.migrate_legacy_workspace_files("s1")
         self.assertEqual(moved, 1)
-        self.assertTrue((legacy / "s1" / "old.txt").exists())
-        self.assertFalse((legacy / "old.txt").exists())
+        self.assertTrue((db._attachments_dir() / "s1" / "old.txt").exists())
+        self.assertFalse((ws / db.ATTACH_DIR_NAME).exists())  # 空壳连根收掉
         self.assertEqual(db.read_attachment_text("s1", "old.txt")["content"], "legacy")
 
-    def test_delete_session_cleans_workspace_attach_dir(self):
-        """删除会话时清掉工作区里本会话的附件子目录，但不动工作区其它内容。"""
+    def test_migrate_moves_memory_dir_to_data(self):
+        """旧记忆目录（<ws>/.agent-memory/）整目录收进数据区，工作区清空壳。"""
+        ws = self._mk_ws()
+        mem = ws / ".agent-memory"
+        mem.mkdir()
+        (mem / "user-pref.md").write_text("---\nname: user-pref\n---\n正文", encoding="utf-8")
+        (mem / "MEMORY.md").write_text("- [user-pref](user-pref.md) — 偏好", encoding="utf-8")
+        db.set_session_workspace("s1", str(ws))
+        moved = db.migrate_legacy_workspace_files("s1")
+        self.assertEqual(moved, 2)
+        bucket = db.DB_PATH.parent / "memory"
+        # 记忆按工作区 token 分桶
+        self.assertEqual(len(list(bucket.iterdir())), 1)
+        self.assertTrue((next(bucket.iterdir()) / "user-pref.md").exists())
+        self.assertTrue((next(bucket.iterdir()) / "MEMORY.md").exists())
+        self.assertFalse(mem.exists())  # 工作区里的记忆目录已收走
+
+    def test_migrate_does_not_overwrite_existing(self):
+        """数据区已有同名文件时不覆盖（保留已在数据区的那份）。"""
+        ws = self._mk_ws()
+        db.save_attachment("s1", "a.txt", b"in-data")
+        legacy = ws / db.ATTACH_DIR_NAME / "s1"
+        legacy.mkdir(parents=True)
+        (legacy / "a.txt").write_bytes(b"in-ws")
+        db.set_session_workspace("s1", str(ws))
+        db.migrate_legacy_workspace_files("s1")
+        self.assertEqual((db._attachments_dir() / "s1" / "a.txt").read_bytes(), b"in-data")
+
+    def test_delete_session_never_touches_workspace(self):
+        """删除会话只清数据区，绝不动工作区（哪怕工作区里有同名目录）。"""
         ws = self._mk_ws()
         db.set_session_workspace("s1", str(ws))
         db.save_attachment("s1", "a.txt", b"x")
         (ws / "keep.txt").write_text("用户自己的文件")
         db.delete_session("s1")
-        self.assertFalse((ws / db.ATTACH_DIR_NAME).exists())
+        self.assertFalse((db._attachments_dir() / "s1").exists())
         self.assertTrue((ws / "keep.txt").exists())  # 工作区其它内容不受影响
 
 

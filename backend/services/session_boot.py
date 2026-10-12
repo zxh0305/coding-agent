@@ -75,7 +75,7 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
                           artifact_reader=db.read_artifact,  # 外置大消息的还原器（模型视图用）
                           # 工具结果落盘 sink（结果落盘轻引用）：全文进 data/tool_results/<sid>/
                           result_sink=lambda content, _sid=sid: db.write_tool_result(_sid, content),
-                          permission_gate=_build_permission_gate(workspace),
+                          permission_gate=_build_permission_gate(workspace, sid),
                           session_id=sid,  # 文档工具据此确定文档归属
                           model_tag=(prov["id"], model))  # 随 _stats 落库，用量页按它聚合
             # 落盘工具结果的读侧（read_tool_result 工具用，与 result_sink 同一套目录）

@@ -92,6 +92,7 @@ from pathlib import Path
 
 import db
 from agent import Agent
+import code_tools
 from code_tools import prepare_workspace
 from config import BACKEND_DIR, ENV_FILE, FRONTEND_DIR, PROJECT_DIR
 from events import SessionEvents
@@ -198,7 +199,7 @@ def _session_state(sid: str) -> str:
 PERMISSION_ASK_TIMEOUT = 300
 
 
-def _build_permission_gate(workspace: Path) -> PermissionGate:
+def _build_permission_gate(workspace: Path, sid: str | None = None) -> PermissionGate:
     """构造一个会话的权限闸门（permissions.py）。用户规则按工作区隔离：存
     settings 表，key = "permissions:<workspace_path>"，值是 JSON 数组、可直接
     手编（后续可挂管理面板），例如：
@@ -207,13 +208,26 @@ def _build_permission_gate(workspace: Path) -> PermissionGate:
     key = "perm_mode:<workspace_path>"，加载器每次判定现读——前端切换模式
     下一轮工具调用立即生效，无需重建会话。
     加载器以闭包注入而非让闸门直接 import db：闸门保持存储无关（CLI/单测
-    不引库也能跑），每次判定现读——手编规则下一轮工具调用立即生效。"""
+    不引库也能跑），每次判定现读——手编规则下一轮工具调用立即生效。
+    sid 非空时注入桥接根加载器（attachments/、.agent-memory/ 前缀的放行表，
+    与 Agent.ctx.bridge_roots 同源）——写工具对桥接区内的写入放行，与执行
+    层同一套校验。"""
     return PermissionGate(
         workspace=workspace,
         user_rules_loader=lambda w=str(workspace): db.get_setting(f"permissions:{w}", []),
         mode_loader=lambda: db.get_setting(f"perm_mode:{workspace}", "confirm"),
         ask_timeout=PERMISSION_ASK_TIMEOUT,
+        bridge_roots_loader=(lambda s=sid: _bridge_roots_for(s)) if sid else None,
     )
+
+
+def _bridge_roots_for(sid: str) -> dict:
+    """闸门与 Agent 共用的桥接根解析（前缀 → 物理绝对路径，物理位置在数据区）。"""
+    roots = {}
+    if sid:
+        roots[code_tools.BRIDGE_ATTACH] = db.session_attachments_dir(sid).resolve()
+        roots[code_tools.BRIDGE_MEMORY] = memory_dir(db.get_session_workspace(sid)).resolve()
+    return roots
 
 
 def _spawn_memory_extraction(sid: str, agent: Agent) -> None:
@@ -315,6 +329,9 @@ def _lan_ips() -> list[str]:
 def main():
     load_env_file(str(ENV_FILE))   # 读 .env（首库播种 / 默认供应商 / 默认工作区用）
     db.init_db()                   # 建表 + 播种（已初始化则跳过）
+    n_legacy = db.migrate_legacy_workspace_files_all()
+    if n_legacy:
+        print(f"🧹 已把工作区里的遗留附件/记忆收回数据区（{n_legacy} 个文件）", flush=True)
     db.cleanup_orphan_attachments()  # 兜底：清理无主会话的附件目录（防 kill -9 残留）
     db.cleanup_staging()             # 兜底：清理超时未提交的分块上传暂存区
     orphan = db.cleanup_orphans()    # 兜底：清理无主行（历史遗留 / 旧版漏删）

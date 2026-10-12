@@ -8,7 +8,8 @@ Coding 工具集
 安全边界（初学阶段在本机直接干活的最低保障）：
 1. 路径越界保护：所有文件操作被限制在工作区内，`../..` 逃逸直接报错；
    权限层（permissions.py）在调度前复用同一检查，把越界从「执行时报错」
-   提前为「带原因的权限拒绝」；
+   提前为「带原因的权限拒绝」；另有 attachments/ 与 .agent-memory/ 两个
+   桥接前缀放行到数据区（_bridge_roots 注入，见 BRIDGE_ATTACH/BRIDGE_MEMORY）；
 2. 权限闸门：高危命令不再在本模块静默拦截——命令拆解、allow/deny/ask
    三态判定与用户确认全部收编进 permissions.py（拆段匹配能看清 `ls;rm -rf /`
    这类复合命令，也不会再误伤引号里的字符串）；
@@ -121,17 +122,44 @@ def _ws(ctx) -> Path:
     return prepare_workspace(getattr(ctx, "workspace", None) if ctx is not None else None)
 
 
-def _resolve(path: str, ws: Path) -> Path:
+# 沙箱内的两个桥接前缀：附件区与会话记忆区。【物理上】它们落在本项目的数据区
+# （data/attachments、data/memory/<工作区token>，见 db.py / memory.py）——落在
+# 数据区是为了不再污染绑定工作区的 git 变动（用户实测踩过）；【逻辑上】模型
+# 仍用 attachments/… 与 .agent-memory/… 这两个相对前缀访问它们。前缀名不变，
+# 因为 system 里的记忆契约写的是 .agent-memory/，且历史会话的轨迹里也是它。
+BRIDGE_ATTACH = "attachments"       # 本会话附件区根（read_file/apply_patch/list_dir/grep 可达）
+BRIDGE_MEMORY = ".agent-memory"     # 本会话记忆区根（读写均放行；轮末提取也写这里）
+
+
+def _bridge_roots(ctx) -> dict[str, Path]:
+    """本会话的两个桥接根目录（前缀 → 物理绝对路径）。
+
+    由 ToolContext 注入（app.py 构造 Agent 时装配），解析失败（会话未知等）
+    返回空表——前缀按普通相对路径处理，自然落到越界报错，绝不静默放大权限。
+    """
+    roots = getattr(ctx, "bridge_roots", None)
+    return roots() if callable(roots) else {}
+
+
+def _resolve(path: str, ws: Path, bridge: dict[str, Path] | None = None) -> Path:
     """把（相对工作区的）路径解析成绝对路径，并拦截越界访问。
 
     这是本模块最重要的一道防线：resolve() 消解掉 ../ 和符号链接之后，
-    再校验目标必须仍在工作区之内。ws 是【本次调用】的工作区，由 ctx 注入。
+    再校验目标必须仍在放行根之内。ws 是【本次调用】的工作区，由 ctx 注入。
 
-    附件现在直接落进工作区的 .coding-agent/attachments/（见 db._session_attach_root），
-    所以它们是工作区内的普通文件——无需任何特殊放行，越界校验保持最严。
+    桥接前缀（attachments/、.agent-memory/）按字面前缀匹配——不是路径包含
+    判断，"..%2e" 之类的花活拼不出这个字面前缀；且后续还要过根内包含校验，
+    双闸都在。桥接根之外的一切照旧只认工作区，最严边界不放松。
     """
     if not path or not isinstance(path, str):
         raise ValueError("path 不能为空")
+    norm = path.replace("\\\\", "/").lstrip("/")
+    for prefix, root in (bridge or {}).items():
+        if norm == prefix or norm.startswith(prefix + "/"):
+            target = (root / norm[len(prefix):].lstrip("/")).resolve()
+            if target == root or root in target.parents:
+                return target
+            raise ValueError(f"路径越界：{path} 超出 {prefix}/ 桥接区")
     target = (ws / path).resolve()
     if target != ws and ws not in target.parents:
         raise ValueError(f"路径越界：{path} 位于工作区之外，Agent 只能访问工作区内的文件")
@@ -163,7 +191,7 @@ def read_file(path: str, offset: int = 1, limit: int = 0, ctx=None) -> str:
     offset/limit 读后续段——截断提示不是客套话：模型看不到的部分如果被
     当成"整个文件"，apply_patch 的锚定与 write_file 的整文件覆盖都会误伤。
     """
-    p = _resolve(path, _ws(ctx))
+    p = _resolve(path, _ws(ctx), _bridge_roots(ctx))
     if not p.exists():
         return _err(f"文件不存在: {path}", "先 list_dir 查看工作区的真实目录结构，确认路径拼写")
     if p.is_dir():
@@ -206,7 +234,7 @@ def read_file(path: str, offset: int = 1, limit: int = 0, ctx=None) -> str:
 
 def write_file(path: str, content: str, ctx=None) -> str:
     """新建文件，或整文件覆盖。修改已有文件的局部内容请优先用 apply_patch。"""
-    p = _resolve(path, _ws(ctx))
+    p = _resolve(path, _ws(ctx), _bridge_roots(ctx))
     if p.is_dir():
         return _err(f"{path} 是目录，不能当作文件写入",
                     "换一个文件路径；若想看该目录里已有什么，用 list_dir")
@@ -290,7 +318,7 @@ def apply_patch(path: str, search: str, replace: str, ctx=None) -> str:
        strip 后仍必须命中，且 search 的 strip 版在全文唯一——多义一律拒绝，
        宁失败不错改。救援命中的返回里带 note，模型能知道实际替换位置。
     """
-    p = _resolve(path, _ws(ctx))
+    p = _resolve(path, _ws(ctx), _bridge_roots(ctx))
     if not p.exists():
         return _err(f"文件不存在: {path}", "先 list_dir 查看工作区的真实目录结构，确认路径拼写")
     text = p.read_text(encoding="utf-8", errors="replace")
@@ -360,7 +388,7 @@ def apply_patch(path: str, search: str, replace: str, ctx=None) -> str:
 
 
 def list_dir(path: str = ".", ctx=None) -> str:
-    p = _resolve(path, _ws(ctx))
+    p = _resolve(path, _ws(ctx), _bridge_roots(ctx))
     if not p.is_dir():
         return _err(f"{path} 不是目录",
                     "想看的是文件内容的话用 read_file；确认路径是否写对可先 list_dir 根目录")
@@ -381,7 +409,7 @@ def grep(pattern: str, path: str = ".", ctx=None) -> str:
     except re.error as e:
         return _err(f"正则表达式不合法: {e}", "简化正则再试，或把特殊字符加 \\ 转义")
     ws = _ws(ctx)
-    root = _resolve(path, ws)
+    root = _resolve(path, ws, _bridge_roots(ctx))
     if root.is_file():
         files = [root]  # os.walk 对文件路径一次都不迭代，直接传会静默返回 0 匹配
     else:
@@ -400,8 +428,12 @@ def grep(pattern: str, path: str = ".", ctx=None) -> str:
             with open(fp, encoding="utf-8", errors="replace") as f:
                 for lineno, line in enumerate(f, 1):
                     if rx.search(line):
+                        try:
+                            rel = str(fp.relative_to(ws))
+                        except ValueError:
+                            rel = f"{path}/{fp.relative_to(root)}"
                         matches.append({
-                            "file": str(fp.relative_to(ws)),
+                            "file": rel,
                             "line": lineno,
                             "text": format_numbered_lines([line.rstrip("\n")], lineno),
                         })

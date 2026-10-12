@@ -24,6 +24,7 @@ read_file 打开对应文件——索引常驻 system 的开销可控，正文�
     （CLI 没有回合收尾时机，后续要挂的话调 run_extraction_async 即可，同一个钩子）。
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -37,11 +38,22 @@ log = logging.getLogger("memory")
 # 常量
 # ---------------------------------------------------------------------------
 
-MEMORY_DIR_NAME = ".agent-memory"   # 记忆目录：固定在工作区内，复用工具沙箱
+# 记忆目录不再落在工作区（<ws>/.agent-memory/）：那会让没被 .gitignore 覆盖的
+# 绑定目录出现 git 变动（用户实测踩过）。数据归数据——统一落本项目的数据区，
+# 按工作区路径哈希分桶，不同项目互不串味；文件工具经沙箱的 .agent-memory/
+# 前缀桥接读写（见 code_tools._resolve）。MEMORY_DIR_NAME 保留为桥接前缀名。
+MEMORY_DIR_NAME = ".agent-memory"   # agent 视角的前缀名（桥接），也是历史遗留目录名
 INDEX_NAME = "MEMORY.md"            # 索引文件：记忆目录内，无 frontmatter
 
-# workspace 为空时的兜底记忆目录（backend 同级的 data/memories/default/）
+# workspace 为空时的兜底记忆目录（数据区下不分桶）
 _FALLBACK_MEM_DIR = Path(__file__).resolve().parent.parent / "data" / "memories" / "default"
+
+
+def _legacy_mem_dir(workspace) -> Path | None:
+    """2026-10-12 之前的旧布局：<workspace>/.agent-memory/。仅迁移用。"""
+    if not workspace:
+        return None
+    return Path(workspace).expanduser() / MEMORY_DIR_NAME
 
 # 记忆文件名白名单：小写字母/数字开头，只允许小写字母、数字、短横线。
 # 正则天然拒绝路径分隔符与 ".."，是防路径逃逸的第一道闸。
@@ -60,6 +72,7 @@ INDEX_HEADING = "用户记忆索引（跨会话持久）"
 
 # 使用契约（原样注入 system）。写明类型语义、禁区、更新纪律，让模型在回合内
 # 自己完成"写正文 + 更新索引"；轮末提取只是兜底，捕获模型没落盘的信息。
+# 模型始终用 .agent-memory/ 前缀读写（沙箱桥接），存储位置的变化对模型透明。
 MEMORY_CONTRACT = (
     "你有持久记忆目录 .agent-memory/，每条记忆是一个 md 文件。判断需要记住新信息时，"
     "直接用 write_file 写入，然后同步更新 MEMORY.md 索引加一行。类型语义："
@@ -75,13 +88,28 @@ MEMORY_CONTRACT = (
 # 路径与文件名
 # ---------------------------------------------------------------------------
 
+def workspace_token(workspace) -> str:
+    """工作区 → 12 位十六进制 token（路径哈希）。同一路径恒定同一桶；
+    路径移动/重命名视为新桶（记忆按位置分桶，不跟随目录搬家）。"""
+    return hashlib.sha256(str(Path(workspace).expanduser().resolve()).encode("utf-8")
+                          ).hexdigest()[:12]
+
+
 def memory_dir(workspace=None) -> Path:
-    """记忆目录：<workspace>/.agent-memory/。workspace 为空时退到
-    data/memories/default/。只解析路径不创建——目录惰性创建（首次写入时），
-    纯读路径（注入/清单扫描）绝不产生副作用。"""
-    if workspace:
-        return Path(workspace) / MEMORY_DIR_NAME
-    return _FALLBACK_MEM_DIR
+    """记忆目录：数据区 data/memory/<工作区token>/（2026-10-12 起不再落
+    <workspace>/.agent-memory/——那会污染绑定工作区的 git 变动区）。
+
+    workspace 为空时退到 data/memories/default/。只解析路径不创建——目录
+    惰性创建（首次写入时），纯读路径（注入/清单扫描）绝不产生副作用。
+
+    agent 读写记忆仍走文件工具，用 .agent-memory/ 相对前缀（沙箱桥接，
+    见 code_tools._resolve），模型感知不到存储位置的变化。"""
+    if not workspace:
+        return _FALLBACK_MEM_DIR
+    # 跟随库文件所在目录（= 数据区）：测试重定向 db.DB_PATH 时记忆目录随行，
+    # 不污染项目根的 data/。
+    import db  # 局部导入：db 不反向依赖本模块，此处只为取 DB_PATH
+    return db.DB_PATH.parent / "memory" / workspace_token(workspace)
 
 
 def valid_memory_filename(name) -> bool:

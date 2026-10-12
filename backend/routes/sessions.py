@@ -90,9 +90,9 @@ class SessionRoutes:
                 return self._json({"error": "已存在的任务不支持随消息改绑目录，请用 /api/workspace"}, 400)
         if ws_target is not None:
             db.set_session_workspace(sid, str(ws_target))
-            # 附件此前只能落 data/attachments（上传发生在绑定工作区之前），
-            # 现在有了工作区，把它们搬过去——之后 agent 的文件工具才够得到。
-            db.migrate_attachments_to_workspace(sid)
+            # 绑定工作区时顺带兜底：把这个工作区里旧布局遗留的附件/记忆收回到
+            # 数据区（2026-10-12 前的版本曾把它们落进工作区，会污染 git 变动区）。
+            db.migrate_legacy_workspace_files(sid)
             with busref._lock:
                 busref._agents.pop(sid, None)  # 丢弃无目录时构建的占位实例，下一回合按绑定目录重建
             agent = get_session(sid, self.user["id"])[1]

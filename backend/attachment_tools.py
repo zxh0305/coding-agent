@@ -5,7 +5,8 @@
 让 agent 能读取用户上传的附件内容。与 code_tools 分开是因为职责不同：
 code_tools 操作的是【用户工作区文件】（用户的项目代码，受工作区边界约束），
 本模块操作的是【会话附件】（用户上传给这次对话的文件，按会话隔离存在
-data/attachments/<sid>/，不进用户工作区）。
+data/attachments/<sid>/，不进用户工作区；文件工具经 attachments/ 桥接
+前缀访问，见 code_tools._resolve）。
 
 为什么要有这个工具：附件改成"引用式"存储后，消息里只带文件名与大小，
 正文不在上下文里——模型必须主动调用本工具去读，才能看到文件内容。
@@ -97,15 +98,17 @@ def _archive_read_result(info: dict, sid: str) -> dict:
         lines.append(f"  …还有 {info['file_count'] - 30} 个成员")
     lines.append("")
     lines.append("下一步：用 extract_attachment 解压后，再用 read_file / run_bash 读取"
-                 "解压出的文件（解压目录会出现在工作区 .coding-agent/attachments/ 下）。")
+                 "解压出的文件（解压目录会出现在附件区 _extracted/ 下，read_file "
+                 "用 attachments/ 前缀访问）。")
     return {**info, "result": "\n".join(lines)}
 
 
 def extract_attachment(name: str, ctx=None) -> str:
     """解压当前会话中的一个压缩包附件，返回解压目录与文件清单。
 
-    解压后的文件落在工作区 .coding-agent/attachments/_extracted/<附件名>/ 下
-    （附件本身也在工作区内），之后可用 read_file 读取、用 grep/run_bash 分析。
+    解压后的文件落在附件区 _extracted/<附件名>/ 下（物理在数据区；解压结果
+    会给出可直接使用的绝对路径，文件工具也能用 attachments/ 前缀访问），
+    之后可用 read_file 读取、用 grep/run_bash 分析。
     带输出总量与成员数上限，防压缩炸弹。
     """
     sid = getattr(ctx, "session_id", None) if ctx is not None else None
@@ -136,14 +139,16 @@ def extract_attachment(name: str, ctx=None) -> str:
     if skipped:
         lines.append("")
         lines.append(f"（{len(skipped)} 个成员被跳过：{skipped[0].get('skipped')}）")
-    # 解压目录在工作区内：给 agent 可直接使用的相对路径
+    # 解压目录在附件区（数据区）：给 agent 可直接使用的绝对路径与桥接前缀路径
     rel = result.get("rel_dir")
     if rel:
-        dir_rel = f"{db.ATTACH_DIR_NAME}/{rel}"
+        prefix_rel = f"{db.ATTACH_DIR_NAME}/{rel}"
         lines.append("")
-        lines.append(f"解压目录（工作区内）：{dir_rel}")
+        lines.append(f"解压目录（附件区）：{prefix_rel}")
+        if result.get("abs_dir"):
+            lines.append(f"绝对路径（run_bash / grep 命令里直接用）：{result['abs_dir']}")
         if files:
-            lines.append(f"例：read_file {{\"path\": \"{dir_rel}/{files[0]['name']}\"}}")
+            lines.append(f"例：read_file {{\"path\": \"{prefix_rel}/{files[0]['name']}\"}}")
     return _ok({**result, "result": "\n".join(lines)})
 
 
@@ -189,8 +194,9 @@ ATTACH_TOOL_SCHEMAS = [
             "description": "解压当前会话中的一个压缩包附件（.tar.gz/.zip/.gz 等），"
                            "返回解压目录与文件清单。什么时候用：read_attachment 提示"
                            "某个附件是压缩包时（运维日志包很常见）。解压后文件出现在"
-                           "工作区 .coding-agent/attachments/ 下，可用 read_file 读取、"
-                           "用 grep/run_bash 分析。带输出总量与成员数上限，防压缩炸弹。"
+                           "附件区 _extracted/ 下（结果里给出可直接使用的绝对路径），"
+                           "可用 read_file（attachments/ 前缀）读取、用 grep/run_bash 分析。"
+                           "带输出总量与成员数上限，防压缩炸弹。"
                            "示例：{\\\"name\\\": \\\"logs.tar.gz\\\"}。",
             "parameters": {
                 "type": "object",

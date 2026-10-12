@@ -339,10 +339,14 @@ def _allowlist_hit(segment: list[str], workspace: Path,
     return False
 
 
-def _builtin_verdict(tool: str, arguments: dict, workspace: Path) -> Verdict:
+def _builtin_verdict(tool: str, arguments: dict, workspace: Path,
+                     bridge: dict | None = None) -> Verdict:
     if tool in _WRITE_TOOLS:
         try:
-            _resolve(str(arguments.get("path") or ""), workspace)
+            # bridge：沙箱桥接根（attachments/、.agent-memory/ → 数据区），与
+            # 执行层 code_tools._resolve 同一份表、同一套校验——权限层不会比
+            # 执行层更严或更松。
+            _resolve(str(arguments.get("path") or ""), workspace, bridge)
         except ValueError as e:
             # 越界（或路径非法）：带上 _resolve 给出的具体原因拒绝。
             # 不静默：模型必须知道"为什么被拒"才能换工作区内的路径重试。
@@ -413,7 +417,11 @@ class PermissionGate:
 
     def __init__(self, workspace: Path, user_rules_loader=None,
                  ask_timeout: float = DEFAULT_ASK_TIMEOUT,
-                 mode_loader=None, mode: str = "confirm"):
+                 mode_loader=None, mode: str = "confirm",
+                 bridge_roots_loader=None):
+        # bridge_roots_loader：fn() -> {前缀: 绝对路径}，与 Agent.ctx.bridge_roots
+        # 同源（session_boot 构造闸门时传入）。None（CLI/单测）= 无桥接。
+        self.bridge_roots_loader = bridge_roots_loader
         # resolve 与 code_tools._resolve 的比较口径对齐：macOS 的 /tmp、
         # /var 等是符号链接，调用方若传入未解析路径，越界判断会把工作区内
         # 的目标误判成区外（smoke test 真实踩过）。resolve 非严格模式，路径
@@ -505,7 +513,14 @@ class PermissionGate:
                     matched.append((ALLOW, f"{r.reason}（本会话已允许）", r.key))
                     continue
             matched.append((verb, r.reason, r.key))
-        base = _builtin_verdict(tool, arguments, self.workspace)
+        try:
+            bridge = dict(self.bridge_roots_loader()) if self.bridge_roots_loader else {}
+        except Exception as e:
+            # 桥接根解析失败（会话未知等）不放大权限：按无桥接继续——前缀会
+            # 落到越界拒绝，与执行层的空表行为一致。
+            log.warning("桥接根解析失败，按无桥接判定：%s", e)
+            bridge = {}
+        base = _builtin_verdict(tool, arguments, self.workspace, bridge)
         if base.verb == ASK:
             # 工具级 ask（解析失败）同样可被本轮决定 / 会话记忆吸收——
             # 不吸收的话，恢复后的重新判定会原样再问一次，回合永远走不出等待

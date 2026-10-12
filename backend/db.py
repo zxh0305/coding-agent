@@ -799,8 +799,8 @@ def session_archived(sid: str) -> int:
 
 def delete_session(sid: str) -> None:
     """删除任务：消息行、统计行、外置正文文件一起清理。"""
-    # 工作区路径必须在删 sessions 行之前取——删了就查不到了（附件现在
-    # 可能落在工作区里，清理它需要这个路径）。
+    # 工作区路径必须在删 sessions 行之前取——删了就查不到了（记忆提取的
+    # 兜底文件读取可能需要它，附件清理已不需要：附件恒在数据区）。
     ws = get_session_workspace(sid)
     with _conn() as conn:
         conn.execute("DELETE FROM messages WHERE session_id=?", (sid,))
@@ -820,24 +820,10 @@ def delete_session(sid: str) -> None:
     shutil.rmtree(DB_PATH.parent / "browser-shots" / sid, ignore_errors=True)
     # tool_results/<sid>/ 同理：落盘的工具结果全文随会话一起消失
     shutil.rmtree(_tool_results_dir() / sid, ignore_errors=True)
-    # 附件现在可能落在工作区 .coding-agent/attachments/<sid>/（见
-    # _session_attach_root）：只清本会话那个子目录，绝不碰用户工作区的
-    # 其它内容、也不动同工作区其它会话的附件。
-    if ws:
-        try:
-            sub = Path(ws).expanduser() / ATTACH_DIR_NAME / sid
-            if sub.is_dir():
-                shutil.rmtree(sub, ignore_errors=True)
-            # attachments/<sid>/ 消失后，attachments/ 空了就连 .coding-agent/
-            # 一起收掉空壳；不空说明还有别的会话的附件，留着。
-            root = Path(ws).expanduser() / ATTACH_DIR_NAME
-            if root.is_dir() and not any(root.iterdir()):
-                root.rmdir()
-                parent = root.parent
-                if parent.is_dir() and not any(parent.iterdir()):
-                    parent.rmdir()
-        except OSError:
-            pass
+    # 附件恒落数据区 attachments/<sid>/（见 _session_attach_root），上面的
+    # rmtree 已覆盖；工作区里若残留 2026-10-12 之前旧布局的附件目录，交给
+    # 启动迁移（migrate_legacy_workspace_files）收走，删除会话不再碰工作区。
+    _ = ws  # 保留读取：记忆迁移兜底与未来扩展仍需会话工作区
 
 
 # ---------------------------------------------------------------------------
@@ -962,8 +948,10 @@ def write_doc(sid: str, name: str, content: str) -> dict:
 # ---------------------------------------------------------------------------
 # 与 docs/ 完全平行：路径与 artifacts/docs 同址（DB_PATH.parent/attachments），
 # 同样跟随库文件走、便于测试重定向；每会话一个子目录 attachments/<sid>/<name>。
-# attachments/ 落在 data/ 下，已被 .gitignore 忽略，不会进版本库，也不污染
-# 用户的工作区（用户的 WORKSPACE_DIR 是另一回事）。
+# attachments/ 落在 data/ 下，已被 .gitignore 忽略，不会进版本库。
+# 2026-10-12 起恒落数据区：曾经"优先落 <ws>/.coding-agent/attachments/"的布局
+# 会让没被 .gitignore 覆盖的绑定工作区出现 git 变动（用户实测踩过），已废弃；
+# agent 经文件工具的 attachments/ 前缀桥接访问（见 code_tools._resolve）。
 #
 # 为什么是"引用式"：早期附件把全文 base64 解码后直接注入消息正文，300KB 中文
 # 就约 10 万 token，且随会话历史每轮重复携带——上限只能卡死在 300KB。改为落盘
@@ -982,29 +970,23 @@ def _attachments_dir() -> Path:
     return DB_PATH.parent / "attachments"
 
 
-# 工作区内的附件子目录名：附件直接落进用户工作区，agent 无需桥接即可
-# 用 read_file / run_bash / grep 直接访问（压缩包解压后就能分析）。
+# 附件子目录的桥接前缀名：agent 视角仍叫 .coding-agent/attachments（历史轨迹
+# 与提示词里出现过这个名字），物理位置在数据区 attachments/ 下。
 ATTACH_DIR_NAME = ".coding-agent/attachments"
 
 
 def _session_attach_root(sid: str) -> Path:
-    """某会话附件存放的根目录：优先落进会话工作区，无工作区则回退 data/attachments。
+    """某会话附件存放的根目录：恒落数据区 attachments/<sid>/（跟随库文件所在
+    目录，测试重定向 DB_PATH 时随行）。
 
-    为什么落工作区：附件在 data/ 下时，agent 的文件工具够不到（run_bash 的 cwd
-    锁在工作区、read_file 有越界校验），压缩包类附件因此没法用。落进工作区后，
-    附件变成"普通文件"，一切文件能力自然可用——这是 ZCode 的做法（附件即
-    workspace path）。工作区未绑定时仍回退 data/attachments，保证不丢附件。
+    为什么不再落进会话工作区（2026-10-12 撤销 2026-09-29 的布局）：附件进
+    工作区曾换来"文件工具天然可达"，但没被 .gitignore 覆盖的绑定工作区会因此
+    出现 git 变动——附件属于会话数据，不该出现在用户项目的变动区。现在由
+    code_tools._resolve 的 attachments/ 桥接前缀放行，文件能力不缩水。
 
-    为什么再多一层 <sid> 子目录（2026-09-29）：同一个工作区会被多个会话绑定，
-    早期实现落 <ws>/.coding-agent/attachments/ 本身，导致同工作区切换会话时
-    "附件不变"——物理上是同一目录。加上 <sid> 一层后才真正按会话隔离，且
-    删除会话时 rmtree <sid>/ 不会误伤其它会话的附件。
+    <sid> 子目录保留（2026-09-29 引入）：按会话隔离，同工作区切换会话附件
+    互不可见；删除会话时 rmtree <sid>/ 不会误伤其它会话的附件。
     """
-    ws = get_session_workspace(sid)
-    if ws:
-        base = Path(ws).expanduser()
-        if base.is_dir():
-            return base / ATTACH_DIR_NAME / sid
     return _attachments_dir() / sid
 
 
@@ -1014,7 +996,7 @@ def attachments_root() -> Path:
 
 
 def session_attachments_dir(sid: str) -> Path:
-    """某会话的附件目录（工作区优先；不存在也返回路径，由调用方决定是否创建）。"""
+    """某会话的附件目录（恒在数据区；不存在也返回路径，由调用方决定是否创建）。"""
     return _session_attach_root(sid)
 
 
@@ -1348,9 +1330,9 @@ def read_attachment_text(sid: str, name: str, offset: int = 0,
 def extract_attachment(sid: str, name: str) -> dict:
     """把一个归档附件解压到附件区根下的 _extracted/<附件名>/。
 
-    返回 {ok, kind, members, file_count, total_bytes, extracted_dir, rel_dir}。
+    返回 {ok, kind, members, file_count, total_bytes, extracted_dir, rel_dir, abs_dir}。
     失败返回 {ok: False, error}。rel_dir 是解压目录相对【附件区根】的路径，
-    供 agent 通过桥接路径访问（见 code_tools 的附件桥接）。
+    供 agent 经 attachments/ 前缀桥接访问；abs_dir 是绝对路径（run_bash/grep 用）。
     """
     import archive_tools
 
@@ -1366,17 +1348,15 @@ def extract_attachment(sid: str, name: str) -> dict:
     return result
 
 
-def migrate_attachments_to_workspace(sid: str) -> int:
-    """把会话此前落在 data/attachments/<sid>/ 的附件迁移到工作区附件目录。
+def migrate_legacy_workspace_files(sid: str) -> int:
+    """把 2026-10-12 之前落在【工作区】里的附件与会话记忆收回到数据区。
 
-    为什么需要：上传发生在会话绑定工作区之前（见 app.py 的请求顺序），那时
-    只能落 data/。工作区绑定后调用本函数搬过去，之后 agent 就能用文件工具
-    直接访问。同名文件以工作区已有者为准（不覆盖用户后来上传的），迁移后
-    清理空的旧目录。返回迁移的文件数。
-
-    顺带兜底一次旧布局迁移：把 <ws>/.coding-agent/attachments/ 里平铺的
-    遗留文件（加 <sid> 层之前的）搬进本会话的 <sid>/ 子目录——同一工作区
-    的旧附件无法精确归属，约定归给第一个触发迁移的会话。
+    布局改动后需要兜底的旧文件有两类：
+    a) <ws>/.coding-agent/attachments/<sid>/（或更早的平铺 .coding-agent/
+       attachments/）——本会话的搬回 data/attachments/<sid>/；
+    b) <ws>/.agent-memory/ 里的 .md 记忆——搬进 data/memory/<工作区token>/。
+    平铺的旧附件无法精确归属，约定归给【触发迁移的会话】（绑定该工作区的
+    第一个会话）。同名以目标已有者为准，迁移后收掉旧目录空壳。返回迁移数。
     """
     ws = get_session_workspace(sid)
     if not ws:
@@ -1384,35 +1364,84 @@ def migrate_attachments_to_workspace(sid: str) -> int:
     base = Path(ws).expanduser()
     if not base.is_dir():
         return 0
-    new_dir = base / ATTACH_DIR_NAME / sid
-    new_dir.mkdir(parents=True, exist_ok=True)
     moved = 0
-    # 两个旧布局：a) data/attachments/<sid>/（本会话未绑工作区前落下的）；
-    # b) <ws>/.coding-agent/attachments/ 直接平铺（2026-09-29 加 <sid> 层之前
-    # 的布局）——b 里无法精确归属到某个会话，约定归给【触发迁移的会话】，
-    # 也就是"绑定/切换到该工作区的第一个会话"。
-    for old_dir in (_attachments_dir() / sid, base / ATTACH_DIR_NAME):
-        if old_dir == new_dir or not old_dir.is_dir():
+    # 附件：两个旧布局（带 <sid> 层的 / 平铺的）都从工作区搬回数据区
+    attach_new = _attachments_dir() / sid
+    for old_dir in (base / ATTACH_DIR_NAME / sid, base / ATTACH_DIR_NAME):
+        if not old_dir.is_dir() or old_dir == attach_new:
             continue
         for p in list(old_dir.iterdir()):
             if not p.is_file() or p.name.endswith(".tmp"):
                 continue
-            target = new_dir / p.name
+            target = attach_new / p.name
             if target.exists():
                 continue  # 目标已有同名：保留已有的那份
             try:
+                attach_new.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(p), str(target))
                 moved += 1
             except OSError as e:
                 log.warning("附件迁移失败 sid=%r name=%r: %s", sid, p.name, e)
-        # 旧目录只剩空壳时清掉
-        try:
-            if old_dir.is_dir() and not any(old_dir.iterdir()):
-                old_dir.rmdir()
-        except OSError:
-            pass
+        _rmdir_if_empty_chain(old_dir, stop=base)
+    # 记忆：<ws>/.agent-memory/ 整目录收进数据区分桶（含 MEMORY.md 索引）
+    try:
+        from memory import _legacy_mem_dir, workspace_token
+        legacy_mem = _legacy_mem_dir(ws)
+        if legacy_mem and legacy_mem.is_dir():
+            # 跟随库文件所在目录（= 数据区），测试重定向 DB_PATH 时随行
+            new_mem = DB_PATH.parent / "memory" / workspace_token(ws)
+            new_mem.mkdir(parents=True, exist_ok=True)
+            for p in list(legacy_mem.iterdir()):
+                if not p.is_file() or not p.name.endswith(".md"):
+                    continue
+                target = new_mem / p.name
+                if target.exists():
+                    continue
+                try:
+                    shutil.move(str(p), str(target))
+                    moved += 1
+                except OSError as e:
+                    log.warning("记忆迁移失败 name=%r: %s", p.name, e)
+            _rmdir_if_empty_chain(legacy_mem, stop=base)
+    except OSError as e:
+        log.warning("记忆目录迁移跳过（sid=%r）：%s", sid, e)
     if moved:
-        log.info("附件迁移到工作区：sid=%r %d 个", sid, moved)
+        log.info("工作区遗留文件已收回数据区：sid=%r %d 个", sid, moved)
+    return moved
+
+
+def _rmdir_if_empty_chain(d: Path, stop: Path) -> None:
+    """目录空则删除，并向上收空壳（不越过 stop——绝不碰用户工作区其它内容）。"""
+    try:
+        while d.is_dir() and d != stop and not any(d.iterdir()):
+            d.rmdir()
+            d = d.parent
+    except OSError:
+        pass
+
+
+def _all_session_workspaces() -> list[str]:
+    """库中登记过的全部会话工作区路径（去重、去空）。"""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT workspace FROM sessions WHERE workspace IS NOT NULL AND workspace != ''"
+        ).fetchall()
+    return [r["workspace"] for r in rows]
+
+
+def migrate_legacy_workspace_files_all() -> int:
+    """启动版迁移：对库中登记过的每个工作区跑一次 migrate_legacy_workspace_files。
+
+    需要一个会话身份来归属"平铺旧附件"，约定给绑定该工作区的第一个会话
+    （与旧迁移函数同一约定）。"""
+    moved = 0
+    for ws in _all_session_workspaces():
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT id FROM sessions WHERE workspace=? ORDER BY created LIMIT 1",
+                (ws,)).fetchone()
+        if row:
+            moved += migrate_legacy_workspace_files(row["id"])
     return moved
 
 

@@ -34,6 +34,9 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
+import code_tools
+import db
+
 from code_tools import prepare_workspace
 from memory import memory_dir, memory_index_block
 from permissions import ALLOW, ASK, DENY, PermissionGate, Verdict, rejection_result
@@ -330,6 +333,10 @@ class Agent:
         # 状态挂在实例上而不是模块级全局，两个会话并发执行工具才不会串数据。
         self.ctx = ToolContext(workspace=prepare_workspace(workspace), vision_backend=vision_backend)
         self.ctx.session_id = session_id  # 文档工具据此确定文档归属（会话隔离）
+        # 沙箱桥接根自装配：附件区与会话记忆区物理上在数据区（不污染工作区 git），
+        # 文件工具经 attachments/、.agent-memory/ 前缀桥接访问（见 code_tools._resolve）。
+        # 惰性求值：ctx 挂着时附件区可能还没建，首次工具调用时才解析。
+        self.ctx.bridge_roots = self._bridge_roots
         # 浏览器管理器（browser_tools）：按会话惰性创建，第一次 browser_* 工具
         # 调用才拉起 Chromium；回合/会话收尾由 app.py 调 close_session 销毁。
         # session_id 为空（CLI/单测）时也创建一个独立实例，工具统一可用。
@@ -344,6 +351,17 @@ class Agent:
         # CLI、单测构造的实例都天然带能力，app.py 无需额外接线。子代理再构造
         # 子代理会被 allowed_tools 名单在 schema 与执行两处挡住（递归上限 1 层）。
         self.ctx.subagent_runner = self._spawn_subagent
+
+    def _bridge_roots(self) -> dict:
+        """沙箱桥接根（ctx.bridge_roots 的实现，文件工具执行时才调用）：
+        attachments/ → 本会话附件区，.agent-memory/ → 本会话记忆区（按工作区
+        token 分桶，物理位置都在数据区）。无会话（CLI/单测裸跑）时附件区不可
+        桥接（没有归属），记忆区仍可用（兜底桶）。"""
+        roots = {}
+        if self.ctx.session_id:
+            roots[code_tools.BRIDGE_ATTACH] = db.session_attachments_dir(self.ctx.session_id).resolve()
+        roots[code_tools.BRIDGE_MEMORY] = memory_dir(self.ctx.workspace).resolve()
+        return roots
 
     @staticmethod
     def _clean_outgoing(m: dict) -> dict:

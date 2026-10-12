@@ -122,6 +122,10 @@ class ToolContext:
                                                 # 运行器（spawn_subagent 用，支持并行扇出）。
                                                 # Agent 构造时自装配，工具层不 import
                                                 # agent——依赖保持单向
+    bridge_roots: object = None                 # fn() -> {前缀: 绝对路径}：沙箱桥接根
+                                                # （attachments/、.agent-memory/，物理上
+                                                # 在数据区）。Agent 构造时自装配；文件
+                                                # 工具经 code_tools._resolve 放行这些前缀
 
 TOOL_REGISTRY = {
     "todo_write": todo_write,
