@@ -173,6 +173,18 @@ class TestVisibleHistory(CompactTestBase):
         self.assertLess(stats["user"] + stats["assistant"], 500)  # 只算摘要+尾部
         self.assertGreater(stats["system"] + stats["tools"], 0)   # 构成仍在
 
+    def test_context_stats_keys_match_frontend_contract(self):
+        """分段键名必须与前端契约一致：前端 CTX_SEG_COLORS/labels 读的是
+        system/tools/user/assistant/tool_results。若后端仍用 "tool"，工具结果
+        那行会恒显 0.0%，且真实值仍计入分母使其余百分比整体失真。"""
+        agent = self.make_agent(history=[user("问题"), asst("回答")])
+        stats = agent.context_stats()
+        self.assertEqual(
+            set(stats.keys()),
+            {"system", "tools", "user", "assistant", "tool_results"},
+        )
+        self.assertNotIn("tool", stats)
+
 
 class TestCompactSplit(CompactTestBase):
     """切点选择：必须落在完整对话回合之间（纯函数）。"""

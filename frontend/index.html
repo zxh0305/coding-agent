@@ -211,12 +211,12 @@
 
   <!-- Token 用量卡（harness 式可观测）：总量与缓存命中构成 -->
   <div id="tok-pop" class="ctx-pop hidden">
-    <div class="ctx-head"><b>Token 用量</b><span id="tok-total" class="mono"></span></div>
+    <div class="ctx-head"><b>本回合 Token 消耗</b><span id="tok-total" class="mono"></span></div>
     <div class="ctx-row"><span>缓存命中</span><b id="tok-rate">—</b></div>
     <div class="ctx-row"><span>未缓存输入</span><b id="tok-miss">—</b></div>
     <div class="ctx-row"><span>缓存读取</span><b id="tok-hit">—</b></div>
     <div class="ctx-row"><span>输出</span><b id="tok-out">—</b></div>
-    <div class="ctx-hint">口径：本回合累计。工具循环每轮重发全部历史，故输入总量远大于当前上下文占用。</div>
+    <div class="ctx-hint">这是【本回合按量计费的总量】，不是上下文大小：工具循环每轮都重发全部历史，所以 4 轮的总量 ≈ 单轮大小 × 轮数，远大于当前上下文（见左侧 %）。</div>
   </div>
 
   <!-- 管理模型弹窗：供应商列表 + 编辑器（Base URL / Key / 模型列表 / 测试链接） -->

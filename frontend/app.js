@@ -3391,16 +3391,21 @@ function renderStatPop() {
 
 function renderTokPop() {
   const u = statUsage, t = statTiming;
-  const hit = u ? (u.prompt_cache_hit_tokens || 0) : 0;
-  const miss = u ? (u.prompt_cache_miss_tokens || 0) : 0;
+  // 缓存三行：供应商未返回 cache 字段时（本地中转常见）显示「未返回」而非 0，
+  // 否则会被误读成"缓存完全没命中"——那是另一回事（字段有值但命中率为 0）。
+  const hasCache = u && (u.prompt_cache_hit_tokens != null || u.prompt_cache_miss_tokens != null);
+  const hit = hasCache ? (u.prompt_cache_hit_tokens || 0) : 0;
+  const miss = hasCache ? (u.prompt_cache_miss_tokens || 0) : 0;
   const out = u ? (u.completion_tokens || 0) : 0;
-  const total = (u ? (u.prompt_tokens || 0) + out : 0);
+  const prompt = u ? (u.prompt_tokens || 0) : 0;
+  const total = prompt + out;
   $("tok-total").textContent = total ? fmtWan(total) + " tok" : "—";
   const rate = t ? t.cache_hit_rate
     : (hit + miss > 0 ? Math.round(hit / (hit + miss) * 100) : null);
-  $("tok-rate").textContent = rate != null ? rate + "%" : "—";
-  $("tok-miss").textContent = miss ? miss.toLocaleString() + " tok" : "0 tok";
-  $("tok-hit").textContent = hit ? hit.toLocaleString() + " tok" : "0 tok";
+  $("tok-rate").textContent = rate != null ? rate + "%"
+    : (hasCache ? "0%" : "未返回");
+  $("tok-hit").textContent = hasCache ? hit.toLocaleString() + " tok" : "—";
+  $("tok-miss").textContent = hasCache ? miss.toLocaleString() + " tok" : "—";
   $("tok-out").textContent = out ? out.toLocaleString() + " tok" : "0 tok";
 }
 

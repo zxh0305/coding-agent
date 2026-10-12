@@ -539,6 +539,10 @@ class Agent:
             out = dict(toks)
             out["system"] = estimate_tokens(sys_text)
             out["tools"] = estimate_tokens(tool_text)
+        # 键名对齐前端契约：chars 内部用 "tool"，但前端分段条读的是 "tool_results"
+        # （CTX_SEG_COLORS/labels 的键）。不对齐会导致工具结果那一行恒显 0.0%，
+        # 且其真实值仍计入分母，使其余四类百分比整体失真（真实踩过的坑）。
+        out["tool_results"] = out.pop("tool", 0)
         return out
 
     # ------------------------------------------------------------------
