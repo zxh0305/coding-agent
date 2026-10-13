@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 
 import db
+import memory
 from events import SSE_HEARTBEAT, sse_frame
 from services.messages import _build_user_message
 from services.session_boot import get_session
@@ -518,6 +519,7 @@ class SessionRoutes:
         数无界增长。_sigs（模型指纹）同理。
         """
         db.delete_session(sid)
+        memory.drop_extraction_lock(sid)  # 记忆提取锁以 sid 为键、只增不减，随会话回收
         with busref._lock:
             busref._agents.pop(sid, None)
             busref._sigs.pop(sid, None)          # 模型指纹：会话没了就无意义

@@ -24,6 +24,7 @@ import unittest
 
 import app
 import db
+import memory
 from routes import busref
 from tests.test_session_model import ApiTestBase
 
@@ -150,9 +151,12 @@ class SessionDeleteMemoryCleanupTest(ApiTestBase):
         # 这些内存 dict 是【进程级单例】，测试之间会互相污染：本类写入后若不
         # 复原，兄弟用例（如"从没跑过 → state=none"）会看到残留。逐个快照 +
         # 复原，保证本类对全局状态零副作用。
+        # memory._extraction_locks 不在 busref 上（它在 memory 模块里），但同为
+        # "以 sid 为键、只增不减"的进程级 dict，一并快照/复原。
         self._dicts = (busref._agents, busref._sigs, busref._ctx,
                        busref._turn_status, busref._running_agents,
-                       busref._session_locks, busref._buses)
+                       busref._session_locks, busref._buses,
+                       memory._extraction_locks)
         self._snapshots = [dict(d) for d in self._dicts]
 
     def tearDown(self):
@@ -169,6 +173,7 @@ class SessionDeleteMemoryCleanupTest(ApiTestBase):
         busref._turn_status[sid] = {"outcome": "done", "seen": False}
         busref._running_agents[sid] = object()
         busref._session_locks[sid] = threading.Lock()
+        memory._extraction_lock(sid)  # 轮末提取锁，只增不减，同样需要被清
 
     def test_delete_clears_every_per_session_dict(self):
         sid = "s1"
@@ -181,7 +186,8 @@ class SessionDeleteMemoryCleanupTest(ApiTestBase):
                         ("_ctx", busref._ctx), ("_turn_status", busref._turn_status),
                         ("_running_agents", busref._running_agents),
                         ("_session_locks", busref._session_locks),
-                        ("_buses", busref._buses)):
+                        ("_buses", busref._buses),
+                        ("memory._extraction_locks", memory._extraction_locks)):
             self.assertNotIn(sid, d, f"{name} 未清理——会话删了但内存态留下（慢性泄漏）")
 
     def test_delete_does_not_touch_other_sessions(self):

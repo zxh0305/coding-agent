@@ -499,6 +499,20 @@ def _extraction_lock(sid: str) -> threading.Lock:
         return _extraction_locks.setdefault(sid, threading.Lock())
 
 
+def drop_extraction_lock(sid: str) -> None:
+    """会话删除时回收该会话的提取锁。
+
+    原注释假设"数量级 = 会话数，常驻可接受"——只在会话从不被删除时成立；
+    长期增删会让锁表随删除过的会话数无界增长（与 app.py 的 _session_locks
+    同类问题）。删会话时必须显式回收，否则慢性泄漏。
+
+    安全性：提取是轮末异步单飞，会话删除时该会话已无新回合；即便某次提取
+    正持锁，pop 掉也只是让下次（不会发生的）调用拿到新锁，旧锁随线程回收。
+    """
+    with _extraction_locks_guard:
+        _extraction_locks.pop(sid, None)
+
+
 def extract_memories(sid: str, mem_dir: Path, chat, user_texts: list[str]) -> dict:
     """同步执行一次轮末提取。绝不抛异常、不发事件、不写数据库，失败只进日志。
 
