@@ -25,8 +25,54 @@ default_executor()。权限闸门先于执行判定，且只认工作区边界�
 防御的第二层，不能替代闸门。
 """
 
+import os
+import signal
 import subprocess
 from dataclasses import dataclass
+
+# ---------------------------------------------------------------------------
+# 超时终止：必须杀【进程组】，不能只杀直接子进程
+# ---------------------------------------------------------------------------
+#
+# 为什么：shell=True 时直接子进程是 `sh -c "<command>"`。复合命令（`a && b`、
+# 管道、`&` 后台作业、`for` 循环）会由 sh 再 fork 出孙进程。只 kill(sh) 的话
+# 孙进程被 init 收养后继续跑——实测 `sleep 300 & sleep 300` 超时 1s 后两个
+# sleep 仍存活。对 coding agent 这是真实损耗：被超时掐掉的 npm install /
+# pytest / dev server 会继续吃 CPU、占端口、持文件锁，长会话里累积。
+#
+# 解法：Popen 时 start_new_session=True（POSIX setsid / Windows
+# CREATE_NEW_PROCESS_GROUP）让子进程自成进程组组长，超时后 killpg 整组。
+_SPAWN_NEW_GROUP: dict = (
+    {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    if os.name == "nt" else {"start_new_session": True}
+)
+
+# 杀组之后给"抽干管道 + 回收子进程"的宽限（秒）。SIGKILL 后句柄立即关闭，
+# 正常情况下毫秒级返回；留这个上界只为防不可中断睡眠（D 状态）把 worker
+# 线程钉死——有界失败好过无限挂起。
+_KILL_DRAIN_TIMEOUT = 5.0
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """强杀 proc 所在【进程组】。进程组已消失时安静返回。
+
+    只对"我们亲手 setsid 出来的组长"下手：pid 回绕导致误杀无关进程组的
+    风险在于 killpg 的目标 id 可能被复用——这里以"组长已退出则跳过"收敛
+    （组长退出后进程组可能仍在，故先 poll 再 killpg）。
+    """
+    if proc.poll() is not None:
+        return  # 直接子进程已结束；组内残留交给下面的兜底
+    try:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        # 组不存在/无权限：退回杀直接子进程，绝不因清理动作本身抛错
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 @dataclass
@@ -43,18 +89,36 @@ class LocalExecutor:
     """本机子进程执行（默认提供者，与旧 run_bash 内联实现行为一致）。"""
 
     def run(self, command: str, cwd, timeout: int) -> ExecResult:
+        """跑一条 shell 命令。超时杀【整个进程组】并以 timed_out=True 返回。
+
+        与 subprocess.run(timeout=) 的差别有两点，都是有意的：
+        1. 超时杀的是进程组（见模块头注释），不留孤儿孙进程；
+        2. 超时时返回【已产生的部分输出】——subprocess.run 在 POSIX 上只
+           kill 再 wait、不抽管道，TimeoutExpired.stdout 通常是 None，模型
+           拿不到任何线索。这里主动 drain，让模型能看到"超时前跑出了什么"
+           （如测试日志的最后一屏），据此判断是加大超时还是换做法。
+        """
+        proc = subprocess.Popen(
+            command, shell=True, cwd=cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            **_SPAWN_NEW_GROUP,
+        )
         try:
-            proc = subprocess.run(
-                command, shell=True, cwd=cwd,
-                capture_output=True, text=True, timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as e:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            # 杀组后必须再 communicate 一次：既抽干管道（拿到部分输出），
+            # 也回收子进程（否则留僵尸）。SIGKILL 下管道立即关闭，正常很快；
+            # _KILL_DRAIN_TIMEOUT 是有界兜底，绝不无限等。
+            try:
+                out, err = proc.communicate(timeout=_KILL_DRAIN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                out, err = "", ""
             return ExecResult(exit_code=-1,
-                              stdout=e.stdout or "" if isinstance(e.stdout, str) else "",
-                              stderr=e.stderr or "" if isinstance(e.stderr, str) else "",
+                              stdout=out or "", stderr=err or "",
                               timed_out=True)
         return ExecResult(exit_code=proc.returncode,
-                          stdout=proc.stdout or "", stderr=proc.stderr or "")
+                          stdout=out or "", stderr=err or "")
 
 
 class DockerExecutor:

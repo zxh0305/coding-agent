@@ -15,6 +15,10 @@ run_bash 内联实现一致（这是本次接缝化的硬要求）。
 import json
 import shutil
 import tempfile
+import os
+import signal
+import subprocess
+import time
 import unittest
 from pathlib import Path
 
@@ -106,6 +110,45 @@ class ExecutorSeamTest(unittest.TestCase):
         """超时：ExecResult(timed_out=True)，绝不抛异常穿透到工具层。"""
         res = LocalExecutor().run("sleep 3", cwd=self.ws, timeout=0.4)
         self.assertTrue(res.timed_out)
+
+    @unittest.skipIf(os.name == "nt", "进程组语义仅在 POSIX 下验证")
+    def test_local_executor_timeout_kills_whole_process_group(self):
+        """超时必须杀掉【整个进程组】：孙进程不许活着逃出超时。
+
+        回归动机：subprocess.run(timeout=) 只 kill 直接子进程（sh），复合
+        命令 fork 出的孙进程会被 init 收养后继续跑。实测旧实现下
+        `sleep 300 & sleep 300` 超时后两个 sleep 全部存活——被掐掉的
+        npm install / dev server 会一直吃 CPU、占端口。
+        """
+        marker = f"dsh-orphan-probe-{os.getpid()}"
+        # 让子进程带上独特标记，避免和机器上其它 sleep 混淆
+        cmd = f"sleep 300 > /dev/null 2>&1 & sleep 300 > /dev/null 2>&1 & wait  # {marker}"
+        LocalExecutor().run(cmd, cwd=self.ws, timeout=0.6)
+        time.sleep(0.5)  # 给内核一点时间完成进程组清扫
+        try:
+            found = subprocess.run(["pgrep", "-f", marker],
+                                   capture_output=True, text=True)
+            survivors = [p for p in found.stdout.split() if p.strip()]
+        except (OSError, FileNotFoundError):
+            self.skipTest("pgrep 不可用，跳过进程组断言")
+        if survivors:
+            for pid in survivors:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except (OSError, ValueError):
+                    pass
+        self.assertEqual(survivors, [], f"超时后仍有孤儿孙进程存活: {survivors}")
+
+    def test_local_executor_timeout_returns_partial_output(self):
+        """超时返回【已产生的部分输出】：模型据此判断是加时还是换做法。
+
+        旧实现（subprocess.run）在 POSIX 上 kill 后不抽管道，stdout 恒为空，
+        模型拿不到任何线索；这里主动 drain，让最后一屏日志可用。
+        """
+        res = LocalExecutor().run("echo 超时前的一行; sleep 30",
+                                  cwd=self.ws, timeout=0.6)
+        self.assertTrue(res.timed_out)
+        self.assertIn("超时前的一行", res.stdout)
 
 
 if __name__ == "__main__":

@@ -938,6 +938,14 @@ class Agent:
         if not answer:
             answer = "（本轮没有产出文字回答；推理过程见执行过程）"
             log.warning("本轮 LLM 未返回正文内容，已用占位说明收尾")
+        # 截断如实标注（llm_client._classify_stream_end 判定，见其注释）：
+        # 半截回答此前会被当成完整回答静默落库，用户与模型都无从察觉。这里
+        # 追加一行明确提示——它同时进 history，下一轮模型知道自己上次被截断。
+        truncated = assistant_msg.get("_truncated")
+        if truncated:
+            answer += ("\n\n> ⚠️ 本次响应被中断，以上内容可能不完整（"
+                       + ("输出达到 max_tokens 上限" if truncated == "length"
+                          else "连接提前中断") + "）。可重新发送以获取完整回答。")
         elapsed = round(time.time() - metrics["start"], 1)
         timing = self._timing_summary(usage_total, metrics)
         self.history.append({"role": "assistant", "content": answer,
@@ -1705,14 +1713,24 @@ class Agent:
         if any(it["verdict"].verb == ASK for it in items):
             # ask：登记待确认（同一规则去重，一轮只弹一张卡）→ 发事件 →
             # 等决定 → 用一次性 overlay + 会话记忆对整轮重新判定。
+            # try/finally 是必须的：登记 → 等待 → 消费是三步，中间任何异常
+            # （含 SSE 推送失败、生成器被提前关闭）都会把条目永久留在
+            # _pending 里；残留的键会进 open_requests 的 claimed 集合，使该
+            # 规则【从此不再弹卡】并被强制按拒绝处理——单靠 apply_decisions
+            # 兜不住异常路径，所以收尾无条件清一次（close_pending 幂等）。
             requests = self.permissions.open_requests(
                 [(it["name"], it["args"], it["verdict"])
                  for it in items if it["verdict"].verb == ASK])
-            for req in requests:
-                self._log(f"🔐 等待权限确认: {req['tool']} {req['reason']}", "yellow")
-                yield "permission_request", req
-            decisions = self.permissions.wait_all(cancel=self.cancel_event)
-            overlay = self.permissions.apply_decisions(decisions)
+            try:
+                for req in requests:
+                    self._log(f"🔐 等待权限确认: {req['tool']} {req['reason']}", "yellow")
+                    yield "permission_request", req
+                decisions = self.permissions.wait_all(cancel=self.cancel_event)
+                overlay = self.permissions.apply_decisions(decisions)
+            finally:
+                # 正常路径下 apply_decisions 已清空 → 这里是空操作；
+                # 异常路径下把残留收敛掉，绝不留到下一个回合。
+                self.permissions.close_pending()
             for it in items:
                 it["verdict"] = self.permissions.check(it["name"], it["args"],
                                                        overlay=overlay)

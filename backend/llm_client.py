@@ -149,6 +149,52 @@ _RETRY_SLICE = 0.2             # 等待分片：长等待也要能及时响应�
 _sleep = time.sleep  # 模块级别名：单测替换它验证退避节奏（不真睡）
 
 
+# ---------------------------------------------------------------------------
+# 流终止判定：区分"模型说完了"与"流被掐断了"
+# ---------------------------------------------------------------------------
+#
+# 背景（真实缺口）：读取循环只在收到显式终止标记（OpenAI 的 `data: [DONE]`、
+# Anthropic 的 `message_stop`）时 break。若对端【干净关闭连接】（FIN）而不发
+# 终止标记，`for raw in resp:` 会正常结束——与"模型正常说完"在代码上无从区分，
+# 半截回答被当成完整回答 append 进 history 并永久落库。`finish_reason` 此前
+# 从未被检查，所以撞 max_tokens（"length"）同样静默。
+#
+# 判定规则（宁可漏判也不误判：假阳性会把正常回答判成中断，比漏判更伤体验）：
+#   * finish_reason == "length"        → 截断（撞 max_tokens）
+#     —— 必须先判：`[DONE]` 只说明 SSE 流干净关闭，不代表模型说完了。服务商
+#        给了 [DONE] 又给 finish_reason=length 时，内容确实是被上限切断的。
+#   * 见到终止标记                     → 完整
+#   * 见到 terminal finish_reason      → 完整（部分服务商不发 [DONE]）
+#   * 被用户主动停止                    → 完整（部分内容是预期行为）
+#   * 都没有                            → 中断（可疑：疑似连接被掐）
+_TERMINAL_FINISH_REASONS = frozenset({"stop", "tool_calls", "function_call", "end_turn",
+                                      "stop_sequence", "max_tokens_exceeded"})
+
+
+def _classify_stream_end(*, saw_terminator: bool, finish_reasons: list[str],
+                         cancelled: bool) -> str | None:
+    """判定流结束方式。返回 None=完整；否则返回截断原因码。
+
+    原因码（供上层决定处置）：
+      "length"  —— 撞 max_tokens，正文被模型侧截断
+      "unknown" —— 没见到任何终止标记，疑似连接被掐断
+    """
+    # 1) 模型侧明确说了"被上限截断"：优先于终止标记（见上方顺序说明）
+    if any(r == "length" for r in finish_reasons):
+        return "length"
+    # 2) 用户主动停止：带部分内容正常收尾
+    if cancelled:
+        return None
+    # 3) 见到终止标记（[DONE] / message_stop）
+    if saw_terminator:
+        return None
+    # 4) 没终止标记但给过 finish_reason：视为完整（兼容不发 [DONE] 的服务商）
+    if finish_reasons:
+        return None
+    # 5) 什么都没有：疑似连接被掐断
+    return "unknown"
+
+
 def _sleep_cancellable(seconds: float, cancel) -> bool:
     """分片睡眠，等待期间响应停止请求。返回 True=等待完成；False=已被取消。"""
     remaining = seconds
@@ -333,6 +379,8 @@ class OpenAIChatClient:
         usage: dict | None = None
         start = time.time()
         ttft: float | None = None  # 首个内容增量（正文或推理）到达时刻 - 请求开始，即首 token 延迟
+        saw_done = False           # 是否见到 `data: [DONE]`（流终止标记，见 _classify_stream_end）
+        finish_reasons: list[str] = []  # 各 chunk 的 finish_reason（判 length 截断用）
         with resp:
             try:
                 for raw in resp:  # 逐行读 SSE
@@ -341,6 +389,7 @@ class OpenAIChatClient:
                         continue  # 空行 / 注释 / 心跳
                     data = line[len("data:"):].strip()
                     if data == "[DONE]":
+                        saw_done = True
                         break
                     try:
                         chunk = json.loads(data)
@@ -365,6 +414,10 @@ class OpenAIChatClient:
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue
+                    # finish_reason 是"模型侧结束原因"：撞 max_tokens 时给
+                    # "length"。此前从不检查，截断因此完全静默（见函数头注释）。
+                    if choices[0].get("finish_reason"):
+                        finish_reasons.append(str(choices[0]["finish_reason"]))
                     delta = choices[0].get("delta") or {}
                     # 首 token 延迟：首个带内容的增量（推理或正文）到达即定格。
                     # 思考模型先出 reasoning，所以这里对两类增量都算首 token——
@@ -398,6 +451,36 @@ class OpenAIChatClient:
                 # cancel 置位导致的断连：当作正常结束，带着已收到的部分收尾
 
         content = "".join(content_parts)
+        # ── 终止判定（见 _classify_stream_end）──
+        # 走到这里意味着读取循环正常结束：要么见到终止标记，要么对端把连接
+        # 关了/流提前断了。后者此前与"正常说完"无从区分，半截回答会被当成完整
+        # 回答落库。这里显式判定并分两种处置：
+        truncated = _classify_stream_end(
+            saw_terminator=saw_done,
+            finish_reasons=finish_reasons,
+            cancelled=bool(cancel is not None and cancel.is_set()),
+        )
+        if truncated == "unknown":
+            # 疑似连接被掐断。分两种：
+            #  * 已经攒出工具调用 → 参数 JSON 极可能残缺（分片只到一半），
+            #    执行它等于拿半截参数去改文件/跑命令。宁可整轮失败，绝不
+            #    把畸形调用喂给执行层——抛给 agent 的错误路径收场（前端出
+            #    错误卡，且错误会进历史，模型下一轮知道上轮断在哪）。
+            #  * 纯文本 → 内容大概率仍有用，不丢弃；打上 _truncated 标记让
+            #    agent 在回答里如实告知用户"响应被中断，内容可能不完整"。
+            if calls:
+                raise RuntimeError(
+                    "LLM 流在工具调用参数传输中途中断（连接被对端关闭）："
+                    "参数不完整，已放弃执行本轮工具调用，请重试")
+            log.warning("LLM 流未收到终止标记即结束（疑似连接被掐断），已按不完整回答标注")
+        elif truncated == "length":
+            # 撞 max_tokens：正文被模型侧截断。内容可用，但要如实标注。
+            if calls:
+                raise RuntimeError(
+                    "LLM 输出达到 max_tokens 上限，工具调用参数未输出完："
+                    "已放弃执行本轮工具调用，请重试或缩短上下文")
+            log.warning("LLM 输出达到 max_tokens 上限，回答已截断")
+
         # 推理冒充正文的防御：极少数服务商（或网关转换层）把推理内容也塞进
         # content 分片，此时正文流与推理流逐字符相同。正文是空串会让前端在
         # done 时把推理覆盖成回答气泡（正文区出现\"思考过程\"），这里退回 None，
@@ -406,6 +489,9 @@ class OpenAIChatClient:
             log.warning("检测到 content 与推理内容完全相同（疑似服务商把推理混入正文），已按空回答处理")
             content = ""
         message: dict = {"role": "assistant", "content": content or None}
+        if truncated:
+            # 下划线前缀 = 内部字段，_clean_outgoing 会剥掉，绝不进模型请求
+            message["_truncated"] = truncated
         if self.reasoning_replay and reasoning_parts:
             # 回传开关开启：推理内容随消息进历史，下一轮请求按协议原样带回。
             # 只有这里写入历史；实时展示走 reasoning_delta 事件，两条路互不干扰。
@@ -608,6 +694,8 @@ class AnthropicMessagesClient:
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         start = time.time()
         ttft: float | None = None  # 首个内容 delta（text 或 thinking）到达 - 请求开始
+        saw_stop = False            # 是否见到 message_stop（流终止标记）
+        stop_reasons: list[str] = []  # message_delta 的 stop_reason（判 max_tokens 用）
         # cancel 在这里传给 _post：_arm_cancel_watchdog 之前的空窗，重试等待
         # 期间也能响应停止请求
         resp = self._post(body, cancel=cancel)
@@ -662,6 +750,10 @@ class AnthropicMessagesClient:
                             blk["json"] += d.get("partial_json", "")
                     elif t == "message_delta":
                         du = data.get("usage") or {}
+                        # stop_reason："max_tokens" 表示被上限截断（与 OpenAI 的
+                        # "length" 同义，"end_turn"/"tool_use" 为正常结束）
+                        if data.get("delta", {}).get("stop_reason"):
+                            stop_reasons.append(str(data["delta"]["stop_reason"]))
                         usage["completion_tokens"] = du.get("output_tokens", 0)
                         # 部分兼容网关 message_start 时不带 input_tokens（恒 0），
                         # 真实输入用量到 message_delta 才给——非 0 时合并，否则
@@ -676,6 +768,7 @@ class AnthropicMessagesClient:
                     elif t == "error":
                         raise RuntimeError(f"Anthropic API 错误：{(data.get('error') or {}).get('message', data)}")
                     elif t == "message_stop":
+                        saw_stop = True
                         break
         except (OSError, ValueError, AttributeError):
             if cancel is None or not cancel.is_set():
@@ -684,6 +777,25 @@ class AnthropicMessagesClient:
 
         usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
         yield "usage", usage
+
+        # 终止判定（与 OpenAIChatClient 同一套规则，见 _classify_stream_end）。
+        # Anthropic 用 message_stop 作终止标记、stop_reason=max_tokens 表示截断。
+        truncated = _classify_stream_end(
+            saw_terminator=saw_stop,
+            finish_reasons=["length" if r == "max_tokens" else r for r in stop_reasons],
+            cancelled=bool(cancel is not None and cancel.is_set()),
+        )
+        has_tool_use = any(b["type"] == "tool_use" for b in blocks.values())
+        if truncated == "unknown" and has_tool_use:
+            raise RuntimeError(
+                "LLM 流在工具调用参数传输中途中断（连接被对端关闭）："
+                "参数不完整，已放弃执行本轮工具调用，请重试")
+        if truncated == "length" and has_tool_use:
+            raise RuntimeError(
+                "LLM 输出达到 max_tokens 上限，工具调用参数未输出完："
+                "已放弃执行本轮工具调用，请重试或缩短上下文")
+        if truncated:
+            log.warning("Anthropic 流以 %s 结束（截断原因 %s）", "message_stop" if saw_stop else "无终止标记", truncated)
 
         message: dict = {"role": "assistant", "content": ""}
         tool_calls = []
@@ -697,6 +809,9 @@ class AnthropicMessagesClient:
         message["content"] = message["content"] or None
         if tool_calls:
             message["tool_calls"] = tool_calls
+        if truncated:
+            # 同 OpenAI 适配器：内部字段，_clean_outgoing 会剥掉
+            message["_truncated"] = truncated
         # 与 OpenAIChatClient.chat_stream 同口径的计时元数据（下划线内部字段）
         message["_timing"] = {
             "ttft_s": round(ttft, 3) if ttft is not None else None,
