@@ -671,6 +671,7 @@ async function doDeleteSession(id) {
     // 删的是当前打开的任务：清空对话区，回到待新建状态；事件流随任务一起
     // 消失（其他标签页的连接由 session_deleted 事件收摊）
     pendingQueue = pendingQueue.filter(it => it.sessionId !== id);  // 任务没了：排队的消息一起作废
+    persistQueue();
     renderQueueBar();
     currentSession = null;
     resetStreamState();
@@ -1035,6 +1036,12 @@ async function doSwitchSession(id) {
   loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换（内部顺带拉权限模式）
   closeGitPop();    // 工作区变了，旧的提交列表不再对应当前项目
   refreshGitChip(); // 按钮上的分支名随任务的工作区更新
+  // 恢复本会话上次未发完的排队消息（刷新/关标签页前排队的内容，见 persistQueue）。
+  // 只在内存里没有该会话的排队项时恢复，避免与当前内存队列重复。
+  if (id && !pendingQueue.some(it => it.sessionId === id)) {
+    const restored = restoreQueue(id);
+    if (restored) toast(`已恢复 ${restored} 条未发出的排队消息`);
+  }
   renderQueueBar(); // 队列条不随会话流清空：按新会话重画（旧卡片的 DOM 属于上一个任务）
   dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
   resetDocsPanel();      // 上一个会话的文档栏不留给新会话：收起并清空
@@ -2666,22 +2673,55 @@ function finishBoot(caughtUp) {
   }
 }
 
+// 回合收尾的【公共半边】：两条"回合结束"路径都必须走的清理与推进。
+//
+// 动作清单本身就是被单测锁死的契约：queue_state.endRound(state, kind) 返回
+// 该执行哪些动作，"normal"（turn_end 事件）与 "interrupted"（断线/重启后判定
+// 回合已死）共有 clearMetaTimer / setStreaming:false / clearNonce / advanceQueue。
+// 这里用 applyRoundEndActions 把动作名翻译成真实副作用——两边共用一份，
+// 从机制上杜绝"某个收尾路径漏了一步"。
+//
+// 此前漏掉的是 advanceQueue：用户排队 B、C → 流断/服务重启 → 重连判定回合已死
+// → 本页流式态复位但队列不动 → B、C 永远卡在队列条上，用户再发 D 还会插队到
+// 它们前面（send() 当时只判 streaming）。单测见 queue_state.test.mjs。
+function applyRoundEndActions(actions) {
+  for (const a of actions) {
+    switch (a) {
+      case "clearMetaTimer": clearInterval(metaTimer); break;
+      case "setStreaming:false": setStreaming(false); break;
+      case "clearNonce": myNonce = null; break;
+      case "advanceQueue": dispatchNextQueued(); break;
+      case "clearTraceRunning":
+        if (traceEl) traceEl.classList.remove("running");
+        break;
+      default:
+        // markSeen / appendInterruptNote 由调用方处理（它们需要 kind 相关
+        // 的上下文：markSeen 用 currentSession，note 文案带解释）
+        break;
+    }
+  }
+}
+
 // 断线/重启后回合已死（服务端 running=false 但本页挂着"生成中"）的统一收尾。
 // 原来这段在 finishBoot 里逐字重复两份，收敛到一处；渲染器路径的过程卡计时器
 // （render_blocks）见 running 类被摘即自停——这里必须摘 running，否则已死回合
 // 的秒数会在屏上永远走字。
+//
+// 与 turn_end 的差别（有意为之，不是遗漏）：这里【不】标记已读、【不】弹桌面
+// 通知——回合其实没跑完，宣称"回答已完成"是撒谎。但公共半边（计时器/流式态/
+// 队列推进）必须走同一份实现，这正是此前出 bug 的地方。
 function finalizeInterruptedRound() {
-  setStreaming(false);
-  clearInterval(metaTimer);
-  if (traceEl) traceEl.classList.remove("running");
+  applyRoundEndActions(endRound(refreshTurnState(), "interrupted"));
   if (liveBubble) {
     liveBubble.classList.remove("streaming");
     const note = document.createElement("div");
     note.className = "meta";
-    note.textContent = "（连接中断，本回合未完成，输入未保存）";
+    // 措辞纠正：用户消息在【回合开始时就已落库】（见 services/turn.py），
+    // 所以"输入未保存"是错的——保存了，缺的是这一轮的助手回答。
+    note.textContent = "（连接中断，本回合未完成；你的输入已保存，回答未生成）";
     chatEl.appendChild(note);
   }
-  toast("连接已恢复；中断的回合未保存，请重新发送");
+  toast("连接已恢复；中断的回合没有生成回答，可重新发送");
 }
 
 // resync：服务端判定缺口补不齐（缓冲被挤掉 / 服务重启内存清空）。
@@ -4005,9 +4045,9 @@ function applyEvent(evt, seq) {
     // 否则这条用户消息在导航条里永远缺席（其他标签页/刷新路径在 turn_start 已带上）
     if (evt.user_mid) tagLastUntaggedUser(evt.user_mid);
     refreshUserIndex();  // 本轮提问此刻才落库：导航条补上这一条
-    clearInterval(metaTimer);
-    setStreaming(false);
-    myNonce = null;
+    // 公共半边（计时器 / 流式态 / nonce / 队列推进）走与异常收尾【同一份】
+    // 动作清单（queue_state.endRound），两边各写一份正是"排队卡死"的根因。
+    applyRoundEndActions(endRound(refreshTurnState(), "normal"));
     // 本会话就在前台跑完：用户亲眼看到了结果，立即标记已读——否则服务端刚置的
     // 未读标记会让它在任务列表上亮起绿/红点（"你不在时才提醒"的语义下不该亮）。
     markSessionSeen(currentSession);
@@ -4016,7 +4056,6 @@ function applyEvent(evt, seq) {
     } else {
       notifyDesktop("回合完成", "本任务的回答已结束");
     }
-    dispatchNextQueued();
   } else if (t === "history_truncated") {
     // 某个标签页回退编辑删掉了一段历史：重拉时间线。本 tab 自己的回退在
     // send() 流程里已重拉过，事件重放到达时 3 秒内跳过，避免二次重拉竞态。
@@ -4048,6 +4087,7 @@ function applyEvent(evt, seq) {
     // 其他标签页删掉了这个任务：收摊回到新建态
     closeEvents();
     pendingQueue = pendingQueue.filter(it => it.sessionId !== currentSession);  // 任务没了：排队消息作废
+    persistQueue();
     renderQueueBar();
     currentSession = null;
     resetStreamState();
@@ -4222,6 +4262,94 @@ let pendingQueue = [];  // {text, payloadAtts, sessionId, immediate}
 let lastSent = null;    // 本 tab 最近一次成功发出的 {text, payloadAtts, outAtts}：出错重试用
 let roundErrored = false;  // 本回合是否发过 error 事件：turn_end 的通知去重
 
+// 回合状态机（queue_state.js，纯函数 + 单测）。
+//
+// 为什么保留 streaming / pendingQueue 这两个全局：它们是既有代码到处在用的
+// 事实来源，一次性重构替换风险太大。这里用 turnState 作【决策视图】——凡是要
+// 判断"该发还是该排队""该不该派发""回合收尾做什么"的地方一律问它，从而与
+// 单测覆盖的是同一份逻辑；下面这个 refreshTurnState() 保证视图不与实际漂移。
+const turnState = createTurnState();
+
+function refreshTurnState() {
+  turnState.streaming = streaming;
+  turnState.pendingQueue = pendingQueue;
+  turnState.nonce = myNonce;
+  return turnState;
+}
+
+// ---------------------------------------------------------------------------
+// 排队队列的持久化
+// ---------------------------------------------------------------------------
+// 为什么需要：pendingQueue 原本是纯内存数组，刷新/关标签页/浏览器崩溃就整队
+// 消失——用户排了三条修改意见，一个误刷新全没了，而且没有任何提示（最伤的
+// 是它静默：用户以为发了）。这里按会话存进 localStorage，启动时恢复。
+//
+// 只存文本与附件元数据，不存 sessionId（键里已经带了）；附件 base64 可能很大，
+// 超出配额时退化为"只存文本"并提示，绝不因为存不下而丢掉整条消息。
+const QUEUE_KEY = (sid) => `pending_queue_${sid}`;
+const QUEUE_MAX_ATT_BYTES = 2 * 1024 * 1024;   // 单条排队的附件总量上限（超出不入盘）
+
+function persistQueue() {
+  const bySid = {};
+  for (const it of pendingQueue) {
+    if (!it.sessionId) continue;
+    const atts = (it.payloadAtts || []).filter(a => a.kind !== "image");
+    const size = (it.payloadAtts || []).reduce((n, a) => n + ((a.data || "").length || 0), 0);
+    let payloadAtts = it.payloadAtts || [];
+    let dropped = false;
+    if (size > QUEUE_MAX_ATT_BYTES) {
+      // 图片 base64 太占配额：只留文本，避免整条消息因写不下而丢失
+      payloadAtts = atts;
+      dropped = true;
+    }
+    (bySid[it.sessionId] ||= []).push({ text: it.text, payloadAtts, dropped });
+  }
+  try {
+    for (const sid of Object.keys(bySid)) {
+      localStorage.setItem(QUEUE_KEY(sid), JSON.stringify(bySid[sid]));
+    }
+    // 清掉已经空了的会话键（队列跑完/被清空后不留垃圾）
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("pending_queue_")) {
+        const sid = k.slice("pending_queue_".length);
+        if (!bySid[sid]) localStorage.removeItem(k);
+      }
+    }
+  } catch (e) {
+    // 配额满：清理最旧的队列存档后重试一次；再失败就只留内存（不影响本次使用）
+    try {
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith("pending_queue_")) localStorage.removeItem(k);
+      }
+      for (const sid of Object.keys(bySid)) {
+        localStorage.setItem(QUEUE_KEY(sid), JSON.stringify(bySid[sid]));
+      }
+    } catch { /* 放弃持久化：内存队列照常工作 */ }
+  }
+}
+
+function restoreQueue(sid) {
+  try {
+    const raw = localStorage.getItem(QUEUE_KEY(sid));
+    if (!raw) return 0;
+    const items = JSON.parse(raw);
+    if (!Array.isArray(items)) return 0;
+    let n = 0;
+    for (const it of items) {
+      if (!it || !it.text) continue;
+      pendingQueue.push({ text: it.text, payloadAtts: it.payloadAtts || [],
+                          sessionId: sid, immediate: false });
+      n++;
+    }
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
+
 // /compact：手动触发上下文压缩。压缩成功后服务端会推 compacted 事件——
 // 分隔卡片、容量徽章、提示 toast 都由那条事件的既有处理完成，这里只在
 // "没压成"时给原因（压成了再 toast 会和事件处理里的重复）。
@@ -4294,9 +4422,18 @@ function send() {
     })();
     return;
   }
-  if (streaming) {
+  // 该直接发还是该排队：判据交给 queue_state.decideSend（纯函数，有单测）。
+  //
+  // 关键点（真实 bug）：判据必须是【该会话队列是否为空】，不是"此刻是否在
+  // 流式输出"。断线/重启后 streaming 已被复位成 false，但队列里可能还压着
+  // 消息；只判 streaming 会让新消息【插队】到积压消息前面，而积压消息永远
+  // 卡住。这条规则的单测见 queue_state.test.mjs 的 decideSend 用例组。
+  if (decideSend(refreshTurnState(), currentSession).action === "queue") {
     // 排队：只显示输入框上方的队列条，正式气泡等派发执行时再渲染（否则会出现两条重复消息）
     queueMessage(text, payloadAtts);
+    // 队列里有货但当前没在跑（上面的断线场景）：立刻推一次，别等下一个 turn_end
+    // ——那个信号可能永远不会再来，队列会一直干等。
+    dispatchNextQueued();
     return;
   }
   lastSent = { text, payloadAtts, outAtts };  // 出错重试的素材
@@ -4308,6 +4445,7 @@ function send() {
 
 function queueMessage(text, payloadAtts) {
   pendingQueue.push({ text, payloadAtts, sessionId: currentSession, immediate: false });
+  persistQueue();
   renderQueueBar();
 }
 
@@ -4354,11 +4492,13 @@ function renderQueueBar() {
       item.immediate = true;
       const i = pendingQueue.indexOf(item);
       if (i > 0) { pendingQueue.splice(i, 1); pendingQueue.unshift(item); }  // 提到队首
+      persistQueue();
       renderQueueBar();
       stopGeneration();  // 停掉当前生成；流结束后队列自动从队首开始发
     }, "q-immediate");
     mk("✏", "编辑", () => {
       pendingQueue.splice(pendingQueue.indexOf(item), 1);
+      persistQueue();
       renderQueueBar();
       inputEl.value = item.text;
       for (const a of item.payloadAtts) {
@@ -4370,6 +4510,7 @@ function renderQueueBar() {
     });
     mk("🗑", "删除", () => {
       pendingQueue.splice(pendingQueue.indexOf(item), 1);
+      persistQueue();
       renderQueueBar();
     });
     row.appendChild(actions);
@@ -4378,11 +4519,14 @@ function renderQueueBar() {
 }
 
 function dispatchNextQueued() {
-  if (streaming || !pendingQueue.length) return;
-  const item = pendingQueue[0];
-  // 用户已切到其他任务：先不发，切回来时再发（避免渲染混进别的对话视图）
-  if (item.sessionId !== currentSession) return;
+  // 派发判据交给 queue_state.nextDispatch（纯函数，有单测）：没在生成、
+  // 队首恰好属于当前会话才发。队首属于别的会话时【不跳过】——跳过会破坏
+  // FIFO，也会把消息渲染进错误的对话视图（见该函数注释与单测）。
+  const d = nextDispatch(refreshTurnState(), currentSession);
+  if (!d.ready) return;
+  const item = d.item;
   pendingQueue.shift();
+  persistQueue();
   renderQueueBar();   // 队列条上的卡片退场，换成正式的已发送气泡
   const outAtts = item.payloadAtts.map(a => ({
     kind: a.kind, name: a.name,
