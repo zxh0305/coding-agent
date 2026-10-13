@@ -1,7 +1,10 @@
 # CI：push/PR 时跑全量单元测试。
 # 后端套件纯标准库、不依赖网络与 .env（llm_client.load_env_file 对缺失文件直接
-# 返回，测试用例自带临时库与假 LLM）；前端三个 *.test.mjs 用 Node 原生 test
+# 返回，测试用例自带临时库与假 LLM）；前端 *.test.mjs 用 Node 原生 test
 # runner，同样零依赖——所以没有任何安装步骤，检出即跑。
+#
+# 前端测试用 shell glob 展开而不是逐个列文件名：新增测试文件自动纳入，
+# 不会再出现"写了测试但忘了加进 CI"的情况。
 name: CI
 
 on:
@@ -27,4 +30,4 @@ jobs:
         with:
           node-version: "22"
       - name: 前端单元测试
-        run: node --test frontend/blocks.test.mjs frontend/event_contract.test.mjs frontend/render_blocks.test.mjs
+        run: node --test frontend/*.test.mjs

@@ -214,7 +214,27 @@ python3 backend/cli.py "37*89+100 等于多少"  # 单次提问
 | ③ 后端 | SSE 推送，刻意用 HTTP/1.0"关闭连接即结束"语义，免写 chunked 分块；`wbufsize=0` 保证每次 write 直达网络 |
 | ④ 前端 | `EventSource` 常驻连接（自动重连 + `Last-Event-ID`）；`localStorage` 记每会话最近 seq，刷新后 `?since=` 补发；delta 按 `mid` 归并 |
 
-### 5.11 其他
+### 5.11 稳定性防线（每条都有单测）
+
+这些是"出问题时不静默、不挂死、不污染数据"的具体措施。共同取向：**宁可当场
+报错，也不把半截结果当成完整结果存下来**。
+
+| 防线 | 防的是什么 | 实现在哪 |
+|---|---|---|
+| **流终止判定** | 服务商把连接**干净关掉**（发 FIN 但不发 `[DONE]`）时，`for line in resp` 会正常结束——与"模型说完了"无从区分，半截回答会被当成完整回答**永久落库**。现在显式判定终止标记 / `finish_reason`：纯文本截断 → 保留内容 + 在回答里如实标注；**已攒出工具调用** → 直接抛错（绝不拿半截 JSON 参数去改文件/跑命令） | `llm_client._classify_stream_end` + `agent._tail_answer` |
+| **超时杀进程组** | `subprocess.run(timeout=)` 只杀直接子进程（`sh`），复合命令 fork 出的孙进程会被 init 收养后继续跑。实测 `sleep 300 & sleep 300` 超时后两个 sleep 全部存活——被掐掉的 `npm install`/dev server 会一直吃 CPU、占端口。现在 `start_new_session` 自成进程组 + 超时 `killpg` 整组，并**返回已产生的部分输出**供模型判断 | `executor._kill_process_group` |
+| **装配注入完备性** | 注入点漏赋值会留下恒为 `None` 的占位，直到请求走到那行才 500（真实事故：`GET /api/sessions` 每次 500，前端任务栏整条空掉）。现在装配完成即刻校验服务的每一个注入点，**坏启动而不是坏用户页面** | `app._assert_hooks_installed` + `busref.assert_installed` |
+| **权限待确认收敛** | `open_requests → wait_all → apply_decisions` 中间异常会留下残留条目；残留的规则键占住 `claimed` 集合，使该规则**从此不再弹确认卡**并被强制按拒绝处理。现在 `try/finally` 无条件收敛 | `permissions.close_pending` |
+| **会话删除清干净内存态** | 以 `sid` 为键的内存 dict 只增不减，长期建/删会话会无界增长。现在删除时逐项 `pop`（含此前漏掉的锁表与模型指纹），且不误伤其它会话 | `routes/sessions._delete_session_cleanup` |
+| **回合收尾单一真相** | "回合结束"有两个来源（`turn_end` 事件、断线后 `caught_up.running=false` 的判定），此前各写一份收尾逻辑，异常路径漏了"推进排队队列"→ 排队消息永久卡死，且新消息会**插队**到积压消息前面。现在两条路径走同一份动作清单 | `queue_state.endRound` + `app.applyRoundEndActions` |
+| **排队消息持久化** | 刷新/关标签页会让排队中的消息**静默消失**（用户以为发了）。现在按会话存 `localStorage`，切回时恢复并提示 | `app.persistQueue/restoreQueue` |
+
+前端因此形成与后端一致的"纯逻辑 + 单测"三层：`blocks.js`（数据→结构）、
+`render_blocks.js`（结构→DOM）、`queue_state.js`（状态→动作）。**回合编排第一次
+有了不依赖浏览器的手动点击就能跑的单测**——这正是那类"刷新后状态不对"的 bug
+反复出现的原因。
+
+### 5.12 其他
 
 - **assistant 的工具调用消息必须原样回填历史**——否则出现"没有请求却冒出工具结果"的悬空消息，服务端直接 400。
 - **`run_bash` 高危命令黑名单 + 权限闸门三态判定**——rm -rf / sudo / git push 等先弹确认，不靠模型自觉。
@@ -364,8 +384,8 @@ coding-agent/
 # 后端单元测试（纯标准库零依赖）
 cd backend && python3 -m unittest discover -s tests -t .
 
-# 前端单元测试（Node 原生 runner，零依赖；CI 同款命令）
-node --test frontend/blocks.test.mjs frontend/event_contract.test.mjs frontend/render_blocks.test.mjs
+# 前端单元测试（Node 原生 runner，零依赖；CI 同款命令，glob 自动纳入新文件）
+node --test frontend/*.test.mjs
 
 # 冒烟脚本：进行中回合 trace 的两条渲染路径（需 Node，不发请求）
 node backend/manual/smoke_running_trace.js
