@@ -706,6 +706,25 @@ class PermissionGate:
                     break  # 有一个决定到达就回循环重新评估（可能有全部）
         return {p.id: (p.decision or "deny") for p in ps}
 
+    def close_pending(self) -> int:
+        """丢弃全部待确认请求，返回丢弃条数（回合收尾的 finally 调用）。
+
+        为什么需要：pending 条目只在 apply_decisions 里 pop。open_requests →
+        wait_all → apply_decisions 之间若发生异常（或生成器被提前关闭），条目
+        会永久残留。残留的键会进 open_requests 的 claimed 集合，导致该规则键
+        【从此不再弹确认卡】，并在 agent 侧被强制按拒绝处理——表现为"某个工具
+        突然静默失效，怎么都不问、也永远不许"。回合收尾无条件清一次，把这类
+        残留收敛在一个回合的生命周期内。
+
+        幂等：没有 pending 时是空操作（正常路径每回合都会调到）。
+        """
+        with self._lock:
+            n = len(self._pending)
+            self._pending.clear()
+        if n:
+            log.warning("清理 %d 条未落定的权限确认请求（回合异常收尾/提前中止）", n)
+        return n
+
     def apply_decisions(self, decisions: dict[str, str]) -> dict[tuple, Verdict]:
         """把用户决定翻译成重判 overlay：规则键 → Verdict。
 

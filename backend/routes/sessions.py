@@ -510,12 +510,21 @@ class SessionRoutes:
 
     def _delete_session_cleanup(self, sid: str):
         """删除一个会话的全部收摊动作（原 do_DELETE 内联逻辑提为方法，供单删
-        与批量删共用）：落库删除、清内存态、广播 session_deleted 后关总线。"""
+        与批量删共用）：落库删除、清内存态、广播 session_deleted 后关总线。
+
+        内存态必须逐项清干净：这些 dict 都以 sid 为键、只增不减。漏一个就是
+        慢性泄漏——作者对 _session_locks 的原始注释是"数量级 = 任务数，可接受"，
+        但那个假设只在"会话从不被删除"时成立；长期增删会让锁表随删除过的会话
+        数无界增长。_sigs（模型指纹）同理。
+        """
         db.delete_session(sid)
         with busref._lock:
             busref._agents.pop(sid, None)
+            busref._sigs.pop(sid, None)          # 模型指纹：会话没了就无意义
             busref._ctx.pop(sid, None)
             busref._turn_status.pop(sid, None)
+            busref._running_agents.pop(sid, None)  # 正在跑的回合由它自己的 finally 再摘一次
+            busref._session_locks.pop(sid, None)   # 会话级锁对象，随会话回收
             bus = busref._buses.pop(sid, None)
         if bus is not None:
             # 先发 session_deleted 再关总线：其他标签页的常驻连接收到后

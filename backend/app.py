@@ -262,6 +262,8 @@ def install_service_hooks() -> None:
 
     这样下层模块通过模块属性访问 log / 会话锁 / 事件总线 等，既拿到的是同一
     对象，又不会形成 services → app / routes → app 的反向 import（那会循环）。
+    注入完成后立即校验完备性（见 _assert_hooks_installed）——漏注入要在启动时
+    就炸，不能等到某个请求走到那行才 500。
     """
     # services/*
     for mod in (_svc_title, _svc_browser, _svc_turn, _svc_session_boot):
@@ -298,6 +300,43 @@ def install_service_hooks() -> None:
         _spawn_memory_extraction=_spawn_memory_extraction,
         _run_round=_run_round,
     )
+    _assert_hooks_installed()
+
+
+# services/* 的注入点清单：模块 → 必须被赋值的属性名。
+#
+# 为什么要有这张表：services/* 用的是 `mod.attr = value` 直接写属性，没有任何
+# 编译期或运行期保护——新增一个 service 模块、忘了加进上面那个 for 循环，它
+# 的 log 就恒为 None，直到回合跑起来才在 worker 线程里炸，而且会被 turn.py 的
+# 兜底 except 吞成一句"服务器内部错误，详情见 backend 日志"（排查成本极高）。
+# 这里把"声明"与"校验"分开写：加注入点时补一行，装配完立刻验，漏了就启动失败。
+_SERVICE_INJECTIONS: dict = {
+    _svc_turn: ("log", "_session_lock", "_event_bus", "_lock", "_running_agents",
+                "_turn_status", "_ctx", "_spawn_memory_extraction",
+                "_spawn_title_generation"),
+    _svc_browser: ("log", "_event_bus"),
+    _svc_title: ("log", "_event_bus"),
+    _svc_session_boot: ("log", "_lock", "_agents", "_sigs", "_event_bus",
+                        "_build_permission_gate", "_vision_backend_for"),
+}
+
+
+def _assert_hooks_installed() -> None:
+    """装配完成后校验全部注入点非 None，缺失即抛错（fail fast）。
+
+    覆盖两条注入路径：services/* 的模块属性注入（本表）与 routes 的
+    busref 注入（busref.assert_installed 自校验）。
+    """
+    missing = []
+    for mod, names in _SERVICE_INJECTIONS.items():
+        modname = mod.__name__.rsplit(".", 1)[-1]
+        missing += [f"services.{modname}.{n}" for n in names
+                    if getattr(mod, n, None) is None]
+    if missing:
+        raise RuntimeError(
+            "装配层注入不完整，以下注入点仍为 None：" + "、".join(missing)
+            + "。请检查 install_service_hooks() 是否漏了对应的赋值。")
+    busref.assert_installed()
 
 
 install_service_hooks()  # 模块导入即装配（只需一次，重复调用幂等）

@@ -560,6 +560,50 @@ class TestSessionMemory(GateTestBase):
         self.assertFalse(gate.resolve(reqs[0]["id"], "hack"))   # 非法取值
 
 
+class TestPendingRequestCleanup(GateTestBase):
+    """未落定的待确认请求必须被收敛掉，不许永久残留。
+
+    回归动机：pending 条目只在 apply_decisions 里 pop。open_requests →
+    wait_all → apply_decisions 之间若异常（或生成器被提前关闭），条目会永久
+    留在 _pending 里。残留的键会进 open_requests 的 claimed 集合，导致该规则
+    键【从此不再弹确认卡】，并在 agent 侧被强制按拒绝处理——用户看到的是
+    "某个工具突然怎么都不问、也永远不许"，且重启进程才会好。
+    """
+
+    def test_close_pending_discards_all(self):
+        """close_pending 清空全部待确认条目并返回条数。"""
+        gate = self.make_gate(ask_timeout=60)
+        v = gate.check("run_bash", {"command": "git push origin main"})
+        self.assertEqual(v.verb, ASK)
+        gate.open_requests([("run_bash", {"command": "git push origin main"}, v)])
+        self.assertEqual(gate.pending_count, 1)
+        self.assertEqual(gate.close_pending(), 1)
+        self.assertEqual(gate.pending_count, 0, "残留会让该规则永久不再弹卡")
+
+    def test_close_pending_is_idempotent(self):
+        """无 pending 时是空操作（正常路径每回合都会调到）。"""
+        gate = self.make_gate(ask_timeout=60)
+        self.assertEqual(gate.close_pending(), 0)
+        self.assertEqual(gate.close_pending(), 0)
+
+    def test_stale_pending_would_suppress_future_cards(self):
+        """反证残留的危害：不清掉的话，同一规则键不会再弹第二张卡。"""
+        gate = self.make_gate(ask_timeout=60)
+        v = gate.check("run_bash", {"command": "git push origin main"})
+        gate.open_requests([("run_bash", {"command": "git push origin main"}, v)])
+        again = gate.open_requests([("run_bash", {"command": "git push origin main"}, v)])
+        self.assertEqual(again, [], "残留条目把规则键占住了 → 不再弹卡（就是要修的现象）")
+
+    def test_after_cleanup_cards_can_open_again(self):
+        """清掉残留后，同一规则键恢复可弹卡。"""
+        gate = self.make_gate(ask_timeout=60)
+        v = gate.check("run_bash", {"command": "git push origin main"})
+        gate.open_requests([("run_bash", {"command": "git push origin main"}, v)])
+        gate.close_pending()
+        again = gate.open_requests([("run_bash", {"command": "git push origin main"}, v)])
+        self.assertEqual(len(again), 1, "收敛后应重新弹卡")
+
+
 # ---------------------------------------------------------------------------
 # 时机约束（agent 级）：判定在分组调度之前、ask 暂停回合、恢复后重新调度
 # ---------------------------------------------------------------------------
