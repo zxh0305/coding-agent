@@ -31,6 +31,16 @@
  * "现在处于什么状态、下一步该干什么"。三层都是纯模块，三层都有单测。
  */
 
+(function (root, factory) {
+  // 浏览器（挂全局）与 Node（module.exports）双用：单测在 Node 里跑，
+  // 页面里直接 <script> 引入，无需构建步骤。与 blocks.js / render_blocks.js
+  // 同一套 UMD 写法——裸写 module.exports 会在浏览器里抛
+  // "module is not defined"，整个文件失效（踩过一次）。
+  if (typeof module === "object" && module.exports) module.exports = factory();
+  else root.CodingAgentQueueState = factory();
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
 /* ---------------------------------------------------------------------------
  * 1. 状态
  * ------------------------------------------------------------------------- */
@@ -153,7 +163,8 @@ function dropSessionQueued(state, sessionId) {
            pendingQueue: state.pendingQueue.filter((it) => it.sessionId !== sessionId) };
 }
 
-module.exports = {
-  createTurnState, decideSend, nextDispatch, endRound,
-  enqueue, dropQueued, promoteQueued, shiftQueued, dropSessionQueued,
-};
+  return {
+    createTurnState, decideSend, nextDispatch, endRound,
+    enqueue, dropQueued, promoteQueued, shiftQueued, dropSessionQueued,
+  };
+});

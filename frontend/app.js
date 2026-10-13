@@ -3551,6 +3551,13 @@ function ensureLiveMsg(mid) {
     }
     metaEl.textContent = metaText(((Date.now() - traceStart()) / 1000).toFixed(1), usageNow);
     chatEl.appendChild(metaEl);  // 统计行留在正文区末尾，跟随最终答案
+    // 【插进正文区即贴底】统计行是直接挂进 chatEl 的（不在任何自作贴底的框里），
+    // 它插入这一下就把页面撑高了；而增量补偿（pinBoxBottomAtView）挂在
+    // answer_delta 分支上，要等下一个 delta 才轮到——中间空出约一帧，用户看到
+    // 内容卡在半空再跳到底（实测离底 21px 持续约 40ms）。谁改布局谁负责对齐，
+    // 这里补一次。
+    if (noteBox) pinBoxBottomAtView(noteBox);
+    else if (stickBottom) chatEl.scrollTop = chatEl.scrollHeight;
   }
   liveBubble = b.el;  // 兼容既有的"当前气泡"语义（retire/done 收尾用）
   // 不再 scrollBottom：流式正文住在说明卡里（220px 上限内滚），flushStreamBuffers
@@ -3573,6 +3580,12 @@ function ensureNoteBox() {
     noteBox.className = "note-box";
     traceEl.appendChild(noteBox);
     orderTraceSections();  // 说明卡先建也要排在过程窗/修改区之后
+    // 【建卡即贴底】卡插入这一下就把页面撑高了（实测 +21px），而增量补偿
+    // （pinBoxBottomAtView）要等下一个 answer_delta 才被调用——中间空出一帧，
+    // 用户会看到内容"卡"在半空一帧再跳到底。这里在布局变更的源头补一次，
+    // 与 pinInside 的"谁改布局谁负责对齐"同一纪律。
+    pinInside(noteBox);
+    pinBoxBottomAtView(noteBox);
   }
   bindBoxScroll(noteBox);   // 说明卡同样自动贴底、上滚停止跟随
   return noteBox;
@@ -3742,7 +3755,14 @@ function pinBoxBottomAtView(box) {
   if (!box || !box.isConnected || !chatEl) return;
   const y = box.getBoundingClientRect().bottom;   // 框底相对视口
   const prev = pinMeter.get(box);
-  if (prev === undefined) { pinMeter.set(box, y); return; }   // 首次见到：只记基线
+  if (prev === undefined) {
+    // 首次见到：记基线。但若此刻页面本就该跟随却不在底部（框是新建的、
+    // 出现时就把内容顶下去了），也要补一次——否则基线记在"已离底"的位置，
+    // 之后的增量补偿都以这个错误位置为参照。
+    pinMeter.set(box, y);
+    pinFollowPage(box);
+    return;
+  }
   const dy = y - prev;                             // 本次真实长高（负值=变矮）
   // 负值（内容变矮，如收起/清理）不补偿：往下拽会把页面弹回去，反而更糟。
   if (dy > 0.5) {
@@ -3760,6 +3780,26 @@ function pinBoxBottomAtView(box) {
     // 压回，记账只会在之后把页面多推一截。
     pinMeter.set(box, y);
   }
+  // 【增量补偿之外的必要兜底】上面只补"框又长高了多少"。但框一旦触到自身的
+  // max-height（.note-box 是 260px）就不再长高——文字转为【框内滚动】，dy 恒
+  // 为 0，页面永远停在离底若干像素处（实测卡在 32px），直到 done 时
+  // finalizeAnswer 把答案移出、scrollBottom() 一次性拽到底。用户观感就是
+  // "流式期间不自动贴底，结束时才跳一下"。
+  // 所以跟随态下还要按"页面是否真的到底"收敛一次：这是奔向目标的闭环，
+  // 不是又一套独立规则（判据仍是全局 stickBottom + 该框 boxStick）。
+  pinFollowPage(box);
+}
+
+// 跟随态下把页面收敛到底部。与 pinInside 同精神：先比对目标位置，已在底部
+// （±1px）就不写——避免每帧无谓的同步布局。不跟随时完全不动（用户在看历史）。
+function pinFollowPage(box) {
+  if (!stickBottom || !boxIsSticky(box)) return;
+  const target = chatEl.scrollHeight - chatEl.clientHeight;
+  if (Math.abs(chatEl.scrollTop - target) < 1) return;
+  chatEl.scrollTop = target;
+  // 这一写会改变框的视口位置：把基线对齐到写后的实测值，否则下一帧会把这
+  // 次"页面移动"误算成"框长高"，再补一次（双重补偿 → 越过底部）。
+  pinMeter.set(box, box.getBoundingClientRect().bottom);
 }
 // 渲染器路径（render_blocks.js 建的过程窗/说明卡/修改区）也要能用同一条规则：
 // 它没有 app.js 的闭包作用域，挂全局给它取。
@@ -4262,12 +4302,10 @@ let pendingQueue = [];  // {text, payloadAtts, sessionId, immediate}
 let lastSent = null;    // 本 tab 最近一次成功发出的 {text, payloadAtts, outAtts}：出错重试用
 let roundErrored = false;  // 本回合是否发过 error 事件：turn_end 的通知去重
 
-// 回合状态机（queue_state.js，纯函数 + 单测）。
-//
-// 为什么保留 streaming / pendingQueue 这两个全局：它们是既有代码到处在用的
-// 事实来源，一次性重构替换风险太大。这里用 turnState 作【决策视图】——凡是要
-// 判断"该发还是该排队""该不该派发""回合收尾做什么"的地方一律问它，从而与
-// 单测覆盖的是同一份逻辑；下面这个 refreshTurnState() 保证视图不与实际漂移。
+// 回合状态机（queue_state.js，纯函数 + 单测）。浏览器里它挂在全局
+// CodingAgentQueueState 上（UMD，同 blocks.js / render_blocks.js 的写法）；
+// Node 单测走 require。这里显式取一次并解构，避免每处都写长前缀。
+const { createTurnState, decideSend, nextDispatch, endRound } = window.CodingAgentQueueState;
 const turnState = createTurnState();
 
 function refreshTurnState() {
