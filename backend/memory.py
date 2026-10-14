@@ -29,7 +29,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
+import time
 from pathlib import Path
 
 log = logging.getLogger("memory")
@@ -44,6 +46,24 @@ log = logging.getLogger("memory")
 # 前缀桥接读写（见 code_tools._resolve）。MEMORY_DIR_NAME 保留为桥接前缀名。
 MEMORY_DIR_NAME = ".agent-memory"   # agent 视角的前缀名（桥接），也是历史遗留目录名
 INDEX_NAME = "MEMORY.md"            # 索引文件：记忆目录内，无 frontmatter
+
+# ---- 双层记忆的存储布局（记忆 v2，见 docs/memory-v2-design.md）----
+# data/memory/projects/<project_id>/  项目记忆：这个代码库的事实
+# data/memory/users/<user_id>/        个人记忆：关于用户这个人，跨项目
+#
+# 为什么要有个人层：旧布局按工作区路径哈希分桶（唯一的轴是 type），于是
+# "用户偏好 pnpm 不用 npm" 这类【关于人】的偏好被存进了某个项目桶里，换个
+# 目录打开就消失。根因是 type 一个枚举同时在回答两个正交问题——这条记忆
+# 说谁的（who）和在哪成立（where）。owner/scope 两轴把它拆开。
+PROJECTS_SUBDIR = "projects"
+USERS_SUBDIR = "users"
+
+# 项目身份的显式标记文件（三级解析的第 1 级，优先级最高）：
+# 内容是一行 id，跟着目录走，改名/移动都不会丢记忆。
+PROJECT_ID_MARKER = ".agent-memory-id"
+# 标记值的白名单：字母数字开头，允许 . _ -，总长 <=64。
+# 它会被直接当作目录名，所以必须挡住 / 与 ..（防路径逃逸）。
+PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 # workspace 为空时的兜底记忆目录（数据区下不分桶）
 _FALLBACK_MEM_DIR = Path(__file__).resolve().parent.parent / "data" / "memories" / "default"
@@ -99,21 +119,164 @@ def workspace_token(workspace) -> str:
                           ).hexdigest()[:12]
 
 
-def memory_dir(workspace=None) -> Path:
-    """记忆目录：数据区 data/memory/<工作区token>/（2026-10-12 起不再落
-    <workspace>/.agent-memory/——那会污染绑定工作区的 git 变动区）。
+# ---------------------------------------------------------------------------
+# 项目身份：让记忆跟着【项目】走，而不是跟着路径走
+# ---------------------------------------------------------------------------
+#
+# 旧身份 = workspace_token（绝对路径哈希），有两个实测的硬伤：
+#   1. 把项目目录改名/搬走 → 记忆当场失忆（哈希对不上，且没有任何东西把
+#      新旧路径连起来）；对"用了六个月的个人记忆"这是不可接受的静默丢失；
+#   2. 每个 scratch 目录、每个 worktree 都成为一个全新的失忆项目。
+#
+# 三级解析（前者优先）：
+#   1. marker  —— <ws>/.agent-memory-id 里的一行 id。跟着目录走，最稳。
+#   2. remote  —— git remote URL 归一后哈希。跨机器、跨 clone 稳定。
+#   3. path    —— 回退到 workspace_token，与旧行为一致（保证老数据能对上）。
+#
+# 为什么不能只认 git remote（实测数据）：
+#   * 34 个会话里 18 个 workspace=None —— 超过一半根本没有项目；
+#   * 真实用过的 /Users/meta/Downloads、/Users/meta/Postman、/Volumes/agent_usb
+#     都不是 git 仓库，remote 解析必然失败；
+#   * mai_portal 有 2 个 remote（github + gitlab），只认 remote 会因"用哪个"
+#     而再次分裂 —— 所以多 remote 时按名字排序取第一个，保证确定性。
 
-    workspace 为空时退到 data/memories/default/。只解析路径不创建——目录
-    惰性创建（首次写入时），纯读路径（注入/清单扫描）绝不产生副作用。
+def normalize_git_remote(url: str) -> str | None:
+    """git remote URL → 稳定标识（去协议/去 .git/统一 scp 形式）。
+
+    git@github.com:zxh0305/coding-agent.git  → github.com/zxh0305/coding-agent
+    https://gitlab.metaglobal.cn/mai/x.git   → gitlab.metaglobal.cn/mai/x
+    两种写法指向同一仓库时必须归一到同一个值，否则同一个项目在 ssh 与
+    https 两种 clone 方式下会分裂成两个记忆桶。解析不出返回 None。
+    """
+    if not url or not isinstance(url, str):
+        return None
+    s = url.strip()
+    # scp 形式 user@host:path → host/path（先于通用处理，否则冒号会被留下）
+    m = re.match(r"^(?:[^@/]+@)?([^:/]+):(?!//)(.+)$", s)
+    if m and "://" not in s:
+        s = f"{m.group(1)}/{m.group(2)}"
+    else:
+        s = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", s)   # 去 scheme
+        s = re.sub(r"^[^@/]+@", "", s)                        # 去 user@
+    s = s.rstrip("/")
+    if s.endswith(".git"):
+        s = s[:-4]
+    s = s.strip("/").lower()
+    return s or None
+
+
+def _git_remote_url(workspace) -> str | None:
+    """取 workspace 的 remote URL。多 remote 时按名字排序取第一个（确定性）。
+
+    复用 git_tools._run（已处理 no-shell / 超时 / 错误），失败一律返回 None
+    —— 身份解析绝不能因为"git 没装"或"不是仓库"而抛异常影响主流程。
+    局部 import 避免模块级循环依赖（git_tools 不 import memory）。
+    """
+    try:
+        from git_tools import _run as _git_run, GitError
+    except Exception:       # noqa: BLE001 —— 依赖不可用时静默降级到下一级
+        return None
+    ws = Path(workspace).expanduser()
+    try:
+        names = [n.strip() for n in _git_run(ws, ["remote"]).splitlines() if n.strip()]
+        if not names:
+            return None
+        remote = "origin" if "origin" in names else sorted(names)[0]
+        url = _git_run(ws, ["remote", "get-url", remote]).strip()
+        return url or None
+    except Exception:       # noqa: BLE001 —— GitError / OSError / 超时，全部降级
+        return None
+
+
+def _read_project_marker(workspace) -> str | None:
+    """读显式标记文件。非法值（含 / 或 ..）返回 None 并告警——回退下一级。"""
+    ws = Path(workspace).expanduser()
+    for candidate in (ws / PROJECT_ID_MARKER, ws / ".git" / PROJECT_ID_MARKER):
+        try:
+            if not candidate.is_file():
+                continue
+            first = ""
+            for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.strip():
+                    first = line.strip()
+                    break
+            if not first:
+                continue
+            if PROJECT_ID_RE.match(first):
+                return first
+            log.warning("项目标记文件内容非法，已忽略：%s（值 %r）", candidate, first)
+        except OSError as e:
+            log.warning("项目标记文件读取失败：%s（%s）", candidate, e)
+    return None
+
+
+def project_identity(workspace) -> tuple[str | None, str]:
+    """解析项目身份，返回 (project_id, source)。
+
+    source ∈ {"marker", "git-remote", "path", "none"}，供 UI 提示
+    "此项目按路径识别，改名会丢记忆"（只有 "path" 需要提示）。
+
+    workspace 为空 → (None, "none")：无项目归属的会话（18/34 个），
+    调用方据此跳过项目层，只注入个人层（Step 2 实现）。
+    """
+    if not workspace:
+        return None, "none"
+    marker = _read_project_marker(workspace)
+    if marker:
+        return marker, "marker"
+    url = _git_remote_url(workspace)
+    if url:
+        normalized = normalize_git_remote(url)
+        if normalized:
+            return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12], "git-remote"
+    return workspace_token(workspace), "path"
+
+
+def _memory_root() -> Path:
+    """记忆数据根 data/memory/。跟随 db.DB_PATH.parent（测试重定向即隔离）。"""
+    import db  # 局部导入：db 不反向依赖本模块
+    return db.DB_PATH.parent / "memory"
+
+
+def memory_dir_for_project(workspace) -> Path:
+    """项目记忆目录：data/memory/projects/<project_id>/。
+
+    workspace 为空时退到 _FALLBACK_MEM_DIR（无项目归属 —— 这类会话在
+    Step 2 只注入个人层）。只解析路径不创建，与 memory_dir 同一惰性契约。
+    """
+    if not workspace:
+        return _FALLBACK_MEM_DIR
+    pid, _source = project_identity(workspace)
+    if not pid:
+        return _FALLBACK_MEM_DIR
+    return _memory_root() / PROJECTS_SUBDIR / pid
+
+
+def memory_dir_for_user(user_id) -> Path:
+    """个人记忆目录：data/memory/users/<user_id>/（一人一桶，永不随目录变）。
+
+    user_id 为 None（未登录 / 无归属）时退到 _FALLBACK_MEM_DIR。
+    """
+    if user_id is None:
+        return _FALLBACK_MEM_DIR
+    return _memory_root() / USERS_SUBDIR / str(int(user_id))
+
+
+def memory_dir(workspace=None) -> Path:
+    """记忆目录（当前生效层）：**项目记忆** → data/memory/projects/<项目身份>/。
+
+    这是 Step 1 之后唯一的项目记忆落点。历史：曾返回
+    data/memory/<工作区token>/（纯绝对路径哈希）——那时注入/提取/桥接五处
+    调用点都指向它。记忆 v2 迁移把内容搬进 projects/ 后，这里必须跟着切，
+    否则注入会读到已空的旧桶、模型看不到任何记忆（迁移与切换不可分割）。
+
+    workspace 为空时退到 _FALLBACK_MEM_DIR（无项目归属，Step 2 里这类会话
+    只注入个人层）。只解析路径不创建——目录惰性创建（首次写入时），
+    纯读路径（注入/清单扫描）绝不产生副作用。
 
     agent 读写记忆仍走文件工具，用 .agent-memory/ 相对前缀（沙箱桥接，
     见 code_tools._resolve），模型感知不到存储位置的变化。"""
-    if not workspace:
-        return _FALLBACK_MEM_DIR
-    # 跟随库文件所在目录（= 数据区）：测试重定向 db.DB_PATH 时记忆目录随行，
-    # 不污染项目根的 data/。
-    import db  # 局部导入：db 不反向依赖本模块，此处只为取 DB_PATH
-    return db.DB_PATH.parent / "memory" / workspace_token(workspace)
+    return memory_dir_for_project(workspace)
 
 
 def valid_memory_filename(name) -> bool:
@@ -131,16 +294,37 @@ def _inside(root: str, target: Path) -> bool:
 # frontmatter 与记忆文件（纯函数）
 # ---------------------------------------------------------------------------
 
-def render_frontmatter(name: str, description: str, mtype: str) -> str:
-    """frontmatter 只含三个字段。description 压成单行——它要进索引行，
-    换行会破坏"- 一行一条"的结构。"""
+def render_frontmatter(name: str, description: str, mtype: str,
+                       owner: str | None = None, scope: str | None = None,
+                       updated: str | None = None) -> str:
+    """frontmatter：三个必备字段 + 可选的新字段。description 压成单行——
+    它要进索引行，换行会破坏"- 一行一条"的结构。
+
+    新增字段全部可选且【默认不写】，因此现有调用方的产出逐字节不变
+    （已知兼容性要求：老文件 parse 出来的仍是恰好三键）。
+      owner   user | project —— 这条记忆说谁的（决定去哪一层）
+      scope   global | repo  —— 在哪成立（仅 project 层有意义）
+      updated ISO 日期       —— 判新旧；宿主盖章，不是模型自己写
+    只写裸值，不写 YAML 行内注释——本模块的解析器极简，注释会被当成值的一部分。
+    """
     description = " ".join(str(description).split())
-    return f"---\nname: {name}\ndescription: {description}\nmetadata:\n  type: {mtype}\n---\n"
+    extra = ""
+    if owner:
+        extra += f"  owner: {owner}\n"
+    if scope:
+        extra += f"  scope: {scope}\n"
+    if updated:
+        extra += f"  updated: {updated}\n"
+    return (f"---\nname: {name}\ndescription: {description}\nmetadata:\n"
+            f"  type: {mtype}\n{extra}---\n")
 
 
-def render_memory_file(name: str, description: str, mtype: str, body: str) -> str:
+def render_memory_file(name: str, description: str, mtype: str, body: str,
+                       owner: str | None = None, scope: str | None = None,
+                       updated: str | None = None) -> str:
     """完整的记忆文件内容 = frontmatter + 正文一段话。"""
-    return render_frontmatter(name, description, mtype) + body.rstrip() + "\n"
+    return (render_frontmatter(name, description, mtype, owner, scope, updated)
+            + body.rstrip() + "\n")
 
 
 def parse_frontmatter(text: str) -> tuple[dict | None, str]:
@@ -157,16 +341,24 @@ def parse_frontmatter(text: str) -> tuple[dict | None, str]:
     if end is None:
         return None, text
     name = desc = mtype = None
+    owner = scope = updated = None
     section = None  # 当前所在的顶层键（metadata 是唯一有缩进子键的）
     for line in lines[1:end]:
         stripped = line.strip()
         if not stripped:
             continue
-        if line[:1] in (" ", "\t"):          # 缩进行：只认 metadata 下的 type
+        if line[:1] in (" ", "\t"):          # 缩进行：只认 metadata 下的子键
             if section == "metadata":
                 key, _, value = stripped.partition(":")
-                if key.strip() == "type":
-                    mtype = value.strip() or None
+                key, value = key.strip(), value.strip()
+                if key == "type":
+                    mtype = value or None
+                elif key == "owner":
+                    owner = value or None
+                elif key == "scope":
+                    scope = value or None
+                elif key == "updated":
+                    updated = value or None
         else:                                 # 顶层键
             key, _, value = stripped.partition(":")
             key, value = key.strip(), value.strip()
@@ -177,7 +369,15 @@ def parse_frontmatter(text: str) -> tuple[dict | None, str]:
                 desc = value or None
     meta = None
     if name and desc and mtype:
+        # 必备三字段缺一不可（损坏文件静默跳过这一条不变）；
+        # 新字段是可选增量：老文件解析出来仍是恰好三键，调用方按 .get 读。
         meta = {"name": name, "description": desc, "type": mtype}
+        if owner:
+            meta["owner"] = owner
+        if scope:
+            meta["scope"] = scope
+        if updated:
+            meta["updated"] = updated
     return meta, "\n".join(lines[end + 1:]).strip()
 
 
@@ -640,3 +840,156 @@ def run_extraction_async(sid: str, mem_dir: Path, chat, user_texts: list[str]) -
     threading.Thread(target=extract_memories, daemon=True,
                      args=(sid, mem_dir, chat, list(user_texts)),
                      name=f"memory-extract-{sid}").start()
+
+
+# ---------------------------------------------------------------------------
+# 记忆 v2 布局迁移（一次性；由 db.init_db 的迁移 v26 调用）
+# ---------------------------------------------------------------------------
+#
+# 旧布局：data/memory/<工作区路径哈希>/        扁平、按路径分桶
+# 新布局：data/memory/projects/<project_id>/   项目身份（marker→remote→path）
+#         data/memory/users/<user_id>/         个人层（本步只建空桶）
+#
+# 三条硬性质：
+#   1. 幂等——由 db 的 PRAGMA user_version 记账（跑过就不再跑），且函数自身
+#      对"目标已存在"再兜一层：projects/ 已存在则连备份都跳过。
+#   2. 先备份、备份失败则【一个文件都不动】——半个备份比不迁移更糟。
+#   3. 逐桶容错——某个桶出 OSError 只跳过它并告警，绝不整批放弃
+#      （记忆全有或全无的教训刚在阶段 0 修过）。
+#
+# 本步【不写 owner 字段】：74+7 条原样留作 project，用户日后在 UI 里手动提升。
+# 误判成 user 会污染所有项目上下文，且是静默的不可逆方向，所以不由迁移代劳。
+
+def _merge_index_text(base_text: str, incoming_text: str) -> str:
+    """合并两份索引：按 `](文件名)` 键去重，base 优先（同名保留已有那行）。
+
+    与 upsert_index_line/remove_index_line 同一套"只认链接目标"的键语义，
+    保证合并结果与后续增删的判定口径一致。
+    """
+    def key_of(line: str) -> str | None:
+        m = re.search(r"\]\(([^)]+)\)", line)
+        return m.group(1) if m else None
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    for text in (base_text, incoming_text):
+        for line in (text or "").splitlines():
+            if not line.strip():
+                continue
+            k = key_of(line)
+            if k is None:
+                continue
+            if k in seen:
+                continue
+            seen.add(k)
+            lines.append(line)
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def migrate_memory_layout() -> dict:
+    """把旧扁平布局搬进 projects/<project_id>/，并建 users/<uid>/ 空桶。
+
+    返回对账 dict（供日志/启动打印）：
+      {skipped, reason, moved_dirs, moved_files, kept, collisions, backups, users, projects}
+    绝不抛异常——调用方是 init_db，记忆迁移失败不该阻止服务启动。
+    """
+    import db  # 局部导入（db 不反向依赖本模块，只借 DB_PATH 与查询）
+
+    result = {"skipped": False, "reason": "", "moved_dirs": 0, "moved_files": 0,
+              "kept": [], "collisions": [], "backup": None, "users": 0,
+              "projects": []}
+
+    root = _memory_root()
+    if not root.is_dir():
+        result["skipped"] = True
+        result["reason"] = "无记忆数据区（全新安装或测试环境）"
+        return result
+    if (root / PROJECTS_SUBDIR).is_dir():
+        # 迁移过的标记：第二次启动不该再备份/再搬
+        result["skipped"] = True
+        result["reason"] = "已是新布局（projects/ 已存在）"
+        return result
+
+    # ---- 1. 备份：失败就整体放弃，一个文件都不动 ----
+    backup = root.parent / "backups" / f"memory-pre-v2-{time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        backup.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(root, backup / "memory", dirs_exist_ok=True)
+    except OSError as e:
+        log.error("记忆迁移：备份失败，已放弃迁移（数据未改动）：%s", e)
+        result["skipped"] = True
+        result["reason"] = f"备份失败：{e}"
+        return result
+    result["backup"] = str(backup)
+
+    # ---- 2. 逐工作区搬迁（身份一律现解析，绝不 iterdir 盲扫）----
+    old_tokens: set[str] = set()
+    for ws in db._all_session_workspaces():
+        try:
+            token = workspace_token(ws)
+            src = root / token
+            if not src.is_dir():
+                continue          # 该工作区没有记忆（大多数是这种情况）
+            pid, source = project_identity(ws)
+            if not pid:
+                continue
+            dst = root / PROJECTS_SUBDIR / pid
+            dst.mkdir(parents=True, exist_ok=True)
+            moved_here = 0
+            for p in sorted(src.iterdir()):
+                if not p.is_file() or not p.name.endswith(".md"):
+                    continue
+                target = dst / p.name
+                if p.name == INDEX_NAME:
+                    # 索引：合并去重，绝不覆盖（可能是两个旧桶合流到同一项目）
+                    merged = _merge_index_text(
+                        read_index_text(dst), read_index_text(src))
+                    atomic_write_text(target, merged)
+                    continue
+                if target.exists():
+                    # 同名冲突：保留已有那份，源文件留在原地不删（保守），告警
+                    result["collisions"].append(f"{ws}:{p.name}")
+                    log.warning("记忆迁移：%s 已存在于目标项目，保留原有那份；"
+                                "源文件留在 %s", p.name, src)
+                    continue
+                try:
+                    shutil.move(str(p), str(target))
+                    moved_here += 1
+                    result["moved_files"] += 1
+                except OSError as e:
+                    log.warning("记忆迁移：移动失败 %s（跳过，继续其它文件）：%s", p, e)
+            # 迁移完成后旧桶应只剩已被合并走的 MEMORY.md：内容已在 projects/ 里，
+            # 旧索引留着只会造成"两处都有记忆"的困惑。先删掉它再尝试删目录。
+            # 有冲突文件（保留了源文件）时不删，留待人工处理并告警。
+            has_conflict = any(
+                p.name != INDEX_NAME and p.is_file()
+                for p in src.iterdir()) if src.is_dir() else False
+            if not has_conflict and moved_here:
+                try:
+                    (src / INDEX_NAME).unlink(missing_ok=True)
+                except OSError as e:
+                    log.warning("记忆迁移：清理旧索引失败 %s：%s", src / INDEX_NAME, e)
+            if src.is_dir() and not has_conflict:
+                try:
+                    src.rmdir()       # 只在空了才删得掉；非空留着并告警
+                    result["moved_dirs"] += 1
+                except OSError:
+                    result["kept"].append(str(src))
+            old_tokens.add(token)
+            result["projects"].append({"workspace": ws, "project_id": pid,
+                                       "source": source})
+        except Exception as e:        # noqa: BLE001 —— 单桶失败不影响其它桶
+            log.warning("记忆迁移：工作区 %s 处理失败（跳过）：%s", ws, e)
+
+    # ---- 3. 个人层空桶（本步不写入任何记忆，只建目录占位）----
+    for uid in db.all_user_ids():
+        try:
+            (root / USERS_SUBDIR / str(uid)).mkdir(parents=True, exist_ok=True)
+            result["users"] += 1
+        except OSError as e:
+            log.warning("记忆迁移：个人层建桶失败 uid=%s：%s", uid, e)
+
+    log.info("记忆迁移完成：搬移 %d 个项目目录 / %d 个文件，个人层 %d 个空桶，"
+             "备份 %s", result["moved_dirs"], result["moved_files"],
+             result["users"], result["backup"])
+    return result

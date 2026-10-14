@@ -300,8 +300,10 @@ class TestWorkspacePlacement(AttachTestBase):
         db.set_session_workspace("s1", str(ws))
         moved = db.migrate_legacy_workspace_files("s1")
         self.assertEqual(moved, 2)
-        bucket = db.DB_PATH.parent / "memory"
-        # 记忆按工作区 token 分桶
+        # 记忆 v2：落点由 memory_dir_for_project 决定（memory/projects/<项目身份>/），
+        # 不再由调用方手拼路径——布局归 memory.py 一处管。
+        import memory
+        bucket = db.DB_PATH.parent / "memory" / memory.PROJECTS_SUBDIR
         self.assertEqual(len(list(bucket.iterdir())), 1)
         self.assertTrue((next(bucket.iterdir()) / "user-pref.md").exists())
         self.assertTrue((next(bucket.iterdir()) / "MEMORY.md").exists())

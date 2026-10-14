@@ -266,6 +266,11 @@ MIGRATIONS: list[tuple[int, str | None]] = [
     #     （get_messages 按 mid 关联自然忽略）。老数据 kind 为 NULL，聚合一律
     #     COALESCE(kind,'turn')。
     (25, "ALTER TABLE message_usage ADD COLUMN kind TEXT DEFAULT 'turn'"),
+    # 26：记忆 v2 布局（纯文件系统迁移，无 schema 改动）。
+    #     data/memory/<路径哈希>/ → data/memory/projects/<项目身份>/
+    #     旧身份是工作区绝对路径哈希——改个目录名 74 条记忆当场失忆。
+    #     走 procedural 分支（_migrate_memory_layout），与迁移 6 同形。
+    (26, None),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -324,6 +329,15 @@ def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
         return "reasoning_replay" in _table_columns(conn, "providers")
     if version == 25:          # message_usage.kind（用量归账：turn/subagent/compact…）
         return "kind" in _table_columns(conn, "message_usage")
+    if version == 26:
+        # 记忆 v2 布局：探针 = 数据区里 projects/ 是否已存在。
+        # 数据区不存在（全新安装 / 测试临时库）视为"无需迁移"——返回 True 让
+        # 迁移整体跳过，这样重定向 DB_PATH 的测试不会凭空造出记忆目录。
+        import memory
+        root = memory._memory_root()
+        if not root.is_dir():
+            return True
+        return (root / memory.PROJECTS_SUBDIR).is_dir()
     return False
 
 
@@ -389,6 +403,52 @@ def _migrate_messages(conn: sqlite3.Connection) -> None:
             raise
 
 
+def _run_procedural_migration(conn: sqlite3.Connection, version: int) -> None:
+    """SQL 表达不了的迁移（procedural）分发 + 结果日志。
+
+    为什么要有这一层：此前 init_db 里是裸的 `if sql is None: _migrate_messages(conn)`
+    ——没有日志、没有结果传递。迁移 26 会搬几十个真实记忆文件，走那个分支会
+    【零输出】，出问题无从察觉。
+
+    失败语义按迁移的性质分：
+      * 6（messages 重建）：失败必须上抛——库不可用，不能带病启动；
+      * 26（记忆文件布局）：失败只记日志并吞掉——记忆是资产但不是依赖，
+        它的迁移失败不该阻止整个服务启动（启动后仍能正常对话，只是记忆
+        还在旧布局、下次启动重试）。
+    """
+    if version == 6:
+        _migrate_messages(conn)
+        return
+    if version == 26:
+        try:
+            from memory import migrate_memory_layout
+            report = migrate_memory_layout()
+        except Exception as e:      # noqa: BLE001 —— 记忆迁移不该拖垮启动
+            log.exception("记忆布局迁移失败（已忽略，下次启动重试）：%s", e)
+            return
+        if report.get("skipped"):
+            log.info("记忆布局迁移跳过：%s", report.get("reason"))
+        else:
+            log.info("记忆布局迁移完成：%d 个项目目录 / %d 个文件，个人层 %d 桶，"
+                     "冲突 %d，备份 %s",
+                     report.get("moved_dirs", 0), report.get("moved_files", 0),
+                     report.get("users", 0), len(report.get("collisions") or []),
+                     report.get("backup"))
+            _last_memory_migration_report.clear()
+            _last_memory_migration_report.update(report)
+        return
+    log.warning("未知的 procedural 迁移版本 v%d，已跳过", version)
+
+
+# 最近一次记忆迁移的对账报告（供启动时打印；进程内只留最后一次）
+_last_memory_migration_report: dict = {}
+
+
+def memory_migration_report() -> dict:
+    """取最近一次记忆迁移报告（无则空 dict）。app 启动后可据此打一行提示。"""
+    return dict(_last_memory_migration_report)
+
+
 def init_db() -> None:
     """建表 + 迁移 + 首次播种。每次服务启动时调用，幂等。"""
     with _conn() as conn:
@@ -398,7 +458,7 @@ def init_db() -> None:
             if version <= current or _migration_applied(conn, version):
                 continue  # 已执行过（版本记账）或老库当年已补过列（探针对账）
             if sql is None:
-                _migrate_messages(conn)
+                _run_procedural_migration(conn, version)
             else:
                 conn.execute(sql)
                 log.info("schema 迁移 v%d 已执行", version)
@@ -462,6 +522,13 @@ def verify_password(password: str, stored: str) -> bool:
 def count_users() -> int:
     with _conn() as conn:
         return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def all_user_ids() -> list[int]:
+    """全部用户 id（升序）。个人记忆层按 user_id 分桶，迁移建桶要用它——
+    users 表此前只有 count / 按名查，没有枚举接口。"""
+    with _conn() as conn:
+        return [r["id"] for r in conn.execute("SELECT id FROM users ORDER BY id")]
 
 
 def create_user(username: str, password: str) -> dict:
@@ -1383,13 +1450,16 @@ def migrate_legacy_workspace_files(sid: str) -> int:
             except OSError as e:
                 log.warning("附件迁移失败 sid=%r name=%r: %s", sid, p.name, e)
         _rmdir_if_empty_chain(old_dir, stop=base)
-    # 记忆：<ws>/.agent-memory/ 整目录收进数据区分桶（含 MEMORY.md 索引）
+    # 记忆：<ws>/.agent-memory/ 整目录收进数据区（含 MEMORY.md 索引）
     try:
-        from memory import _legacy_mem_dir, workspace_token
+        from memory import _legacy_mem_dir, memory_dir_for_project
         legacy_mem = _legacy_mem_dir(ws)
         if legacy_mem and legacy_mem.is_dir():
-            # 跟随库文件所在目录（= 数据区），测试重定向 DB_PATH 时随行
-            new_mem = DB_PATH.parent / "memory" / workspace_token(ws)
+            # 走 memory_dir_for_project（不是手拼路径）：布局归 memory.py 一处管。
+            # 此前这里硬编码 DB_PATH.parent/"memory"/workspace_token(ws)，
+            # 布局一变（记忆 v2 改成 memory/projects/<project_id>/）它就会把
+            # 回收的记忆散进一个无人读的平铺桶里。
+            new_mem = memory_dir_for_project(ws)
             new_mem.mkdir(parents=True, exist_ok=True)
             for p in list(legacy_mem.iterdir()):
                 if not p.is_file() or not p.name.endswith(".md"):
