@@ -80,21 +80,37 @@ def _resolve_client(sid: str | None = None) -> tuple[dict, object, str, str, boo
                            api_key=prov["api_key"], base_url=prov["base_url"], model=model,
                            reasoning_replay=bool(prov.get("reasoning_replay")))
     vision = _model_vision(prov, model)
-    sig = json.dumps([prov["id"], model, prov["base_url"], prov["api_key"], prov.get("api_format"), vision],
+    # context_window 必须进指纹：它是自动压缩触发线的基准，改窗口得让 Agent
+    # 重建才能让新阈值生效。此前不在指纹里，用户在「管理模型」里改同一模型的
+    # 窗口后实例仍是旧的、压缩按旧窗口判断——把窗口【改小】时尤其危险：
+    # 该压缩却不压，直接撞真实上限。
+    sig = json.dumps([prov["id"], model, prov["base_url"], prov["api_key"],
+                      prov.get("api_format"), vision, _window_for(prov, model)],
                      ensure_ascii=False)
     return prov, client, model, sig, vision
 
 
-def _active_window(sid: str | None = None) -> int:
-    """激活模型的上下文窗口。解析链：模型自填 → 供应商默认列 → .env/全局默认。
-    窗口既是前端容量显示的分母，也是自动压缩触发线（估算超 80% 即压缩）的基准。"""
-    prov, model = _resolve_active(sid)
-    for m in prov["models"]:
-        if m["name"] == model and m["context_window"]:
+def _window_for(prov: dict, model: str) -> int:
+    """从【已解析的】供应商/模型取上下文窗口（优先级同 _active_window：
+    模型自填 → 供应商默认 → 全局兜底）。抽出来是为了让 _resolve_client 不必
+    为拿窗口再解析一遍激活模型（那是重复的 DB 查询）。"""
+    for m in prov.get("models", []):
+        if m["name"] == model and m.get("context_window"):
             return m["context_window"]
     if prov.get("context_window"):
         return prov["context_window"]
     return _context_window_fallback()
+
+
+def _active_window(sid: str | None = None) -> int:
+    """激活模型的上下文窗口。解析链：模型自填 → 供应商默认列 → .env/全局默认。
+    窗口既是前端容量显示的分母，也是自动压缩触发线（估算超 80% 即压缩）的基准。
+
+    与 _window_for 共用同一套优先级——两处若各写一份，改优先级时必然漏一处，
+    而漏的那处（压缩触发线）偏了不会报错，只会"该压不压"。
+    """
+    prov, model = _resolve_active(sid)
+    return _window_for(prov, model)
 
 
 def _model_vision(prov: dict, model: str) -> bool:

@@ -65,32 +65,51 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
     # 工作区纳入配置指纹：任务的工作区被切换后，下次构建会重建 Agent（历史照旧从库里恢复）
     sig += "|" + str(workspace)
 
-    # 锁只保护实例缓存的读写这一瞬间。生成过程可能持续几分钟，绝不能全程
-    # 持锁——否则一条慢请求会把所有提问/删除/停止请求全部卡死（真实踩过的坑）。
+    # 锁只保护实例缓存的【读写这一瞬间】，绝不覆盖建 Agent 与历史恢复。
+    #
+    # 历史恢复要读库（count_messages + restore_window + fingerprints），大会话
+    # 上是实打实的 I/O；而 _lock 是【全局】锁（保护 state._agents/_sigs 这两个
+    # 跨会话字典）。此前整段恢复在锁内，于是一个大会话的恢复会卡住所有会话的
+    # 提问/删除/停止——正是本函数注释里警告过的坑，只是那次修的是"生成期不能
+    # 持锁"，恢复期同样不该持。
+    #
+    # 改为：锁内先判是否要重建并占位，锁外把 Agent 建好、恢复完，再回锁内登记。
+    # 代价是并发下同一会话可能被建两次（都写回缓存，后者胜）——浪费一次构建，
+    # 但不会错：两个实例读的是同一份库、同一份 sig，语义等价。而调用方随后拿
+    # 到的都是缓存里那一个，不会出现"两个线程各拿一个实例"的撕裂。
     with _lock:
-        if sid not in _agents or _sigs.get(sid) != sig:
-            agent = Agent(llm=client, verbose=False, vision_supported=vision,
-                          workspace=workspace, vision_backend=_vision_backend_for(sid),
-                          context_window=_active_window(sid),  # 压缩触发线的基准（切换模型后重建实例即更新）
-                          artifact_reader=db.read_artifact,  # 外置大消息的还原器（模型视图用）
-                          # 工具结果落盘 sink（结果落盘轻引用）：全文进 data/tool_results/<sid>/
-                          result_sink=lambda content, _sid=sid: db.write_tool_result(_sid, content),
-                          permission_gate=_build_permission_gate(workspace, sid),
-                          session_id=sid,  # 文档工具据此确定文档归属
-                          model_tag=(prov["id"], model),  # 随 _stats 落库，用量页按它聚合
-                          user_id=user_id)  # 记忆 v2：个人记忆层按 user_id 分桶
-            # 落盘工具结果的读侧（read_tool_result 工具用，与 result_sink 同一套目录）
-            agent.ctx.tool_result_reader = db.read_tool_result
-            # 窗口恢复：从未压缩 = 全量；压缩过 = 锚点 + 最后一条边界及其之后
-            # （边界摘要是后续再压缩的输入）。内存占用与当前窗口成正比，而非
-            # 全会话长度；模型视图与全量恢复逐字节一致。
-            total = db.count_messages(sid)
-            agent.history = db.restore_window(sid)
-            # 增量落盘的指纹账本从恢复的历史重建（只覆盖窗口内即可——窗口外
-            # 的行不会被 save_messages 触碰），重启后第一轮就是纯增量写。
-            agent.saved = db.fingerprints(agent.history)
-            _agents[sid] = agent
-            _sigs[sid] = sig
-            log.info("会话 %s Agent 就绪 model=%s 工作区=%s（恢复 %d/%d 条，视觉=%s）",
-                     sid, model, workspace, len(agent.history), total, vision)
-        return sid, _agents[sid]
+        if sid in _agents and _sigs.get(sid) == sig:
+            return sid, _agents[sid]
+
+    agent = Agent(llm=client, verbose=False, vision_supported=vision,
+                  workspace=workspace, vision_backend=_vision_backend_for(sid),
+                  context_window=_active_window(sid),  # 压缩触发线的基准（切换模型后重建实例即更新）
+                  artifact_reader=db.read_artifact,  # 外置大消息的还原器（模型视图用）
+                  # 工具结果落盘 sink（结果落盘轻引用）：全文进 data/tool_results/<sid>/
+                  result_sink=lambda content, _sid=sid: db.write_tool_result(_sid, content),
+                  permission_gate=_build_permission_gate(workspace, sid),
+                  session_id=sid,  # 文档工具据此确定文档归属
+                  model_tag=(prov["id"], model),  # 随 _stats 落库，用量页按它聚合
+                  user_id=user_id)  # 记忆 v2：个人记忆层按 user_id 分桶
+    # 落盘工具结果的读侧（read_tool_result 工具用，与 result_sink 同一套目录）
+    agent.ctx.tool_result_reader = db.read_tool_result
+    # 窗口恢复：从未压缩 = 全量；压缩过 = 锚点 + 最后一条边界及其之后
+    # （边界摘要是后续再压缩的输入）。内存占用与当前窗口成正比，而非
+    # 全会话长度；模型视图与全量恢复逐字节一致。
+    total = db.count_messages(sid)
+    agent.history = db.restore_window(sid)
+    # 增量落盘的指纹账本从恢复的历史重建（只覆盖窗口内即可——窗口外
+    # 的行不会被 save_messages 触碰），重启后第一轮就是纯增量写。
+    agent.saved = db.fingerprints(agent.history)
+
+    with _lock:
+        # 登记。若期间另一线程已为该会话建好同指纹的实例，就沿用它的——
+        # 保持"同一会话同时只有一个实例"的既有性质（调用方持有引用去跑回合，
+        # 换成别人的实例会让 agent.saved 账本与它自己的历史对不上）。
+        if sid in _agents and _sigs.get(sid) == sig:
+            return sid, _agents[sid]
+        _agents[sid] = agent
+        _sigs[sid] = sig
+        log.info("会话 %s Agent 就绪 model=%s 工作区=%s（恢复 %d/%d 条，视觉=%s）",
+                 sid, model, workspace, len(agent.history), total, vision)
+        return sid, agent
