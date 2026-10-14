@@ -300,9 +300,17 @@ class DispatchMixin:
                 self._json({"error": "未知接口"}, 404)
         except _BodyTooLarge as e:
             # 体积问题要单独出口：混进下面的 400 会让文案变成"字段缺失"，
-            # 用户传了大附件却被告知输入为空（真实踩过）
+            # 用户传了大附件却被告知输入为空（真实踩过）。
+            #
+            # 文案要指向最可能的成因：图片内联 base64（单图上限 6MB）——两张图
+            # 就顶到 12MB 体限了，所以"一次发 3 张以上图片"必然撞这里，而这与
+            # 用户心里想的"我就传了几张小图"完全对不上。不点破的话，他只会
+            # 反复重试同样的操作。
             self._json({"error": f"请求体过大（{e.length} 字节，上限 "
-                                 f"{MAX_BODY_BYTES} 字节）——大文件请改用附件上传",
+                                 f"{MAX_BODY_BYTES} 字节）。"
+                                 f"最常见原因是【一次附带了多张图片】（图片以内联"
+                                 f"方式传输，单张上限约 4.5MB，两张就会超限）——"
+                                 f"可改为分次发送，或把大文件放到工作区后用 read_file 读取",
                         "code": "body_too_large"}, 413)
         except json.JSONDecodeError as e:
             self._json({"error": f"请求体不是合法 JSON：{e}"}, 400)

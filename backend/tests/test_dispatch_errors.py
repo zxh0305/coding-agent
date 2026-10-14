@@ -172,6 +172,9 @@ class TestBadBodyGetsJsonError(ApiTestBase):
         # 文案要能指导用户怎么办，并带上真实上限
         self.assertIn("过大", body["error"])
         self.assertIn(str(MAX_BODY_BYTES), body["error"])
+        # 必须点出最可能的成因：多张图片内联。单图上限 6MB、体限 12MB，所以
+        # "一次发 3 张图"必然撞这里——不说破的话用户只会反复重试同样的操作。
+        self.assertIn("图片", body["error"])
 
     def test_oversized_body_not_read_into_memory(self):
         """超限时【不读】body——否则"防内存爆"的初衷就落空了。
