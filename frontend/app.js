@@ -398,7 +398,11 @@ function startStatePolling() {
   }, 8000);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) loadSessions();
+    else flushSeq();   // 切走/后台：把待写的续接锚点落盘（rAF 在后台会暂停）
   });
+  // 关页面/刷新：同步冲刷待写锚点，否则最近 1 秒内的 seq 会丢——刷新后
+  // 会从更早的位置补发（内容正确，但白重放一段，且可能重复渲染用户气泡）
+  window.addEventListener("pagehide", flushSeq);
 }
 
 function removeSessionLocal(id) {
@@ -2566,6 +2570,43 @@ let todoDoneTimer = null;       // 完成展示的自动收起定时器
 
 const seqKey = (sid) => `sse_seq_${sid}`;
 
+// 续接锚点（localStorage）的【合帧写】：只在每帧写一次"目前见到过的最大 seq"。
+// 原先每条带 id 的事件都同步 setItem 一次，而 answer_delta 是逐 token 到达的
+// ——一条长回答就是几千次同步 localStorage 写（同步 API，会阻塞主线程并触发
+// 落盘），期间点击/滚动都发涩。真正需要持久化的只是最大 seq，逐条写是纯冗余。
+// 与 pendingDeltas 用 rAF 合帧渲染同一个套路，保持前端只有一套节流节奏。
+let pendingSeq = null;     // 待写锚点；null = 无待写
+let seqSession = null;     // 该锚点属于哪个会话（切会话时防止写到新会话名下）
+
+function noteSeq(sid, seq) {
+  if (!sid || seq == null) return;
+  // 同会话累积最大值；换了会话就立刻把上一个冲刷掉，避免串会话
+  if (seqSession !== null && seqSession !== sid) flushSeq();
+  seqSession = sid;
+  pendingSeq = pendingSeq === null ? seq : Math.max(pendingSeq, seq);
+  if (seqFlushScheduled) return;
+  seqFlushScheduled = true;
+  // rAF 在后台标签页会被暂停——那正是最需要落盘的时候（用户切走/关页面），
+  // 所以配一个 setTimeout 兜底，两者谁先到都冲刷。
+  requestAnimationFrame(flushSeq);
+  setTimeout(flushSeq, 1000);
+}
+
+let seqFlushScheduled = false;
+
+function flushSeq() {
+  seqFlushScheduled = false;
+  if (pendingSeq === null || !seqSession) return;
+  try {
+    localStorage.setItem(seqKey(seqSession), String(pendingSeq));
+  } catch (e) {
+    // 隐私模式/配额满：续接锚点写不进去只是"刷新后可能重复补发"，
+    // 前端按 mid 归并幂等，不该因此打断事件处理
+  }
+  pendingSeq = null;
+  // 保留 seqSession：同会话后续 noteSeq 继续累积
+}
+
 function closeEvents() {
   if (es) { es.close(); es = null; }
   bootBuffer = null;
@@ -2592,8 +2633,9 @@ function onSSEEvent(e) {
   try { evt = JSON.parse(e.data); } catch { return; }
   const seq = e.lastEventId ? Number(e.lastEventId) : null;
   if (seq != null && !Number.isNaN(seq) && currentSession) {
-    // 每条业务事件都续存 localStorage：页面随时刷新都能以最新 seq 续接
-    localStorage.setItem(seqKey(currentSession), String(seq));
+    // 续存"看过的最新 seq"：页面随时刷新都能以它续接。合帧写（见 noteSeq）
+    // ——逐 token 事件下逐条同步 setItem 会明显卡主线程。
+    noteSeq(currentSession, seq);
   }
   if (evt.type === "caught_up") return finishBoot(evt);
   if (evt.type === "resync") return handleResync(evt);
@@ -2732,7 +2774,15 @@ function handleResync(evt) {
   if (es) { es.close(); es = null; }
   bootBuffer = null;
   lastSeq = null;        // 时间线即将整页重建：闸门清零
-  if (currentSession) localStorage.setItem(seqKey(currentSession), String(evt.seq ?? 0));
+  // 锚点直接写（不走合帧）：紧接着就要 switchSession 重连，读的就是这个值，
+  // 延迟一帧写会让重连读到旧锚点、白补一段。先把待写的合帧值冲刷掉再写新值，
+  // 否则 flushSeq 稍后会把旧的最大值盖回来。
+  flushSeq();
+  if (currentSession) {
+    seqSession = currentSession;
+    pendingSeq = evt.seq ?? 0;
+    flushSeq();
+  }
   const keep = currentSession;
   currentSession = null;  // 绕过 switchSession 的同 id 早退
   switchSession(keep);
