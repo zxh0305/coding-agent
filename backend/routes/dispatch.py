@@ -31,6 +31,24 @@ log = busref.log
 class DispatchMixin:
     """do_GET / do_POST / do_DELETE 三条分发链。"""
 
+    def _method_not_allowed(self, method: str):
+        """未实现的 HTTP 方法（PUT/PATCH/HEAD…）统一回 JSON 405。
+
+        不覆写的话会落进 SimpleHTTPRequestHandler 的默认实现：回 501 + **HTML**
+        错误页。本项目所有接口都是 JSON 契约，前端按 `res.json().error` 取文案，
+        拿到 HTML 时解析抛错、只能显示一个笼统的"请求失败"，真实原因（方法不对）
+        反而丢了。405（方法不允许）也比 501（未实现）更准确——没实现的是这个
+        方法，不是这个服务。
+        """
+        log.info("不支持的 HTTP 方法 %s %s", method, self.path)
+        self._json({"error": f"该接口不支持 {method} 方法", "code": "method_not_allowed"}, 405)
+
+    # 未实现的方法显式接管，避免落回 SimpleHTTPRequestHandler 的 HTML 501
+    do_PUT = lambda self: self._method_not_allowed("PUT")          # noqa: E731
+    do_PATCH = lambda self: self._method_not_allowed("PATCH")      # noqa: E731
+    do_HEAD = lambda self: self._method_not_allowed("HEAD")        # noqa: E731
+    do_OPTIONS = lambda self: self._method_not_allowed("OPTIONS")  # noqa: E731
+
     def do_GET(self):
         # 与 do_POST 同款兜底：GET 链路任何接口异常原先会一路抛到 socketserver
         # ——socket 被直接关掉、不回任何 HTTP 响应，前端 fetch 只能报"无法连接

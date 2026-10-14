@@ -196,6 +196,34 @@ class TestBadBodyGetsJsonError(ApiTestBase):
             s.close()
         self.assertIn("413", resp.split("\r\n")[0])
 
+    def test_unsupported_methods_return_json_not_html(self):
+        """PUT/PATCH/HEAD/OPTIONS 必须回 JSON 405，不能落回 HTML 501。
+
+        不接管的话会走 SimpleHTTPRequestHandler 默认实现：501 + HTML 错误页。
+        前端按 res.json().error 取文案，拿到 HTML 会解析失败、只能显示笼统的
+        "请求失败"，真实原因（方法用错）反而丢了。
+        """
+        import http.client
+        host, port = self.base.replace("http://", "").split(":")
+        for method in ("PUT", "PATCH", "HEAD", "OPTIONS"):
+            conn = http.client.HTTPConnection(host, int(port), timeout=10)
+            try:
+                conn.request(method, "/api/sessions", None,
+                             {"Authorization": "Bearer " + self.token})
+                resp = conn.getresponse()
+                body = resp.read()
+                ctype = resp.getheader("Content-Type") or ""
+            finally:
+                conn.close()
+            self.assertEqual(resp.status, 405, f"{method} 应为 405（方法不允许）")
+            self.assertIn("application/json", ctype, f"{method} 响应不是 JSON")
+            if method == "HEAD":
+                # HTTP 规定 HEAD 不返回 body（客户端也不会读），只校验状态与类型
+                self.assertEqual(body, b"")
+                continue
+            data = json.loads(body or b"{}")
+            self.assertEqual(data.get("code"), "method_not_allowed")
+
     def test_normal_body_still_works(self):
         """413 的改动不能误伤正常请求。"""
         status, raw = self.raw_post("/api/auth/login",
