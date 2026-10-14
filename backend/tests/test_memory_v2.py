@@ -19,6 +19,7 @@ Step 1 只做数据模型与迁移，**不改注入**（双块注入是 Step 2�
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -468,3 +469,102 @@ class TestDirectoryFns(V2Base):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# F. frontmatter 回填（一次性修复的回归）
+# ---------------------------------------------------------------------------
+
+class TestBackfillFrontmatter(unittest.TestCase):
+    """33/74 条真实记忆没有 frontmatter（模型当年直接 write_file 写的），
+    parse_frontmatter 跳过它们 → 不进提取器清单 → 去重纪律失效 → 持续产生重复。
+    回填脚本给它们补前缀，正文一字不动。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="backfill_"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "manual"))
+        import backfill_memory_frontmatter as bf
+        self.bf = bf
+
+    def _write(self, name, text):
+        (self.tmp / name).write_text(text, encoding="utf-8")
+
+    def test_adds_frontmatter_from_h1_title(self):
+        self._write("legacy.md", "# 某功能修复\n\n正文第一段。\n第二段。\n")
+        desc = self.bf.backfill_one(self.tmp / "legacy.md")
+        self.assertEqual(desc, "某功能修复")
+        meta, body = memory.parse_frontmatter(
+            (self.tmp / "legacy.md").read_text(encoding="utf-8"))
+        self.assertIsNotNone(meta, "补完必须能解析")
+        self.assertEqual(meta["type"], "project")
+        self.assertEqual(meta["name"], "legacy")
+        self.assertIn("正文第一段。", body)
+        self.assertIn("第二段。", body)
+
+    def test_body_is_byte_identical(self):
+        """只加头部，正文一个字节不动——这些是手工写下的记录，重组会破坏它们。"""
+        original = "# 标题\n\n- 要点一\n- 要点二\n\n  缩进行与空行都要留住\n"
+        self._write("keep.md", original)
+        self.bf.backfill_one(self.tmp / "keep.md")
+        _, body = memory.parse_frontmatter((self.tmp / "keep.md").read_text(encoding="utf-8"))
+        self.assertEqual(body.strip(), original.strip())
+        for frag in ("- 要点一", "- 要点二", "  缩进行与空行都要留住"):
+            self.assertIn(frag, body)
+
+    def test_idempotent_skips_existing_frontmatter(self):
+        self._write("done.md", memory.render_memory_file("done", "已有描述", "user", "正文"))
+        before = (self.tmp / "done.md").read_bytes()
+        self.assertIsNone(self.bf.backfill_one(self.tmp / "done.md"),
+                          "已有 frontmatter 必须跳过")
+        self.assertEqual((self.tmp / "done.md").read_bytes(), before)
+
+    def test_no_heading_falls_back_to_stem(self):
+        self._write("plain.md", "没有标题的一行\n更多内容\n")
+        self.bf.backfill_one(self.tmp / "plain.md")
+        meta, body = memory.parse_frontmatter((self.tmp / "plain.md").read_text(encoding="utf-8"))
+        self.assertIsNotNone(meta)
+        self.assertIn("没有标题的一行", body)
+
+    def test_long_title_truncated_for_index_line(self):
+        """索引行的钩子不能过长——过长的描述会挤掉其它条目的可见性。"""
+        self._write("long.md", "# " + "很长" * 80 + "\n正文\n")
+        desc = self.bf.backfill_one(self.tmp / "long.md")
+        self.assertLessEqual(len(desc), self.bf.DESC_MAX + 1)   # +1 为省略号
+
+    def test_rebuild_index_adds_missing_lines_only(self):
+        """索引只补缺的，不整表重建——已有行是人工/提取器措辞，重建会丢掉。"""
+        self._write("a.md", "# 甲\n正文\n")
+        self.bf.backfill_one(self.tmp / "a.md")
+        memory.atomic_write_text(self.tmp / memory.INDEX_NAME,
+                                 "- [手工措辞](a.md) — 这句话是人写的，不许被覆盖\n")
+        self._write("b.md", "# 乙\n正文\n")
+        self.bf.backfill_one(self.tmp / "b.md")
+        n = self.bf.rebuild_index(self.tmp)
+        self.assertEqual(n, 1, "只该补 b")
+        idx = memory.read_index_text(self.tmp)
+        self.assertIn("这句话是人写的", idx, "已有行必须原样保留")
+        self.assertIn("b.md", idx)
+
+    def test_after_backfill_extractor_sees_what_entries_are(self):
+        """端到端：回填后提取器清单里这些条目**有描述**了。
+
+        注意盲区的准确形状：无 frontmatter 的文件【本来就在】scan_inventory
+        的清单里（文件名的意义上），但 type 与 description 都是空的——
+        提取器看得到"有这么个文件"，看不到"这条记忆是什么"，
+        于是"更新旧文件而不是新建重复"这条纪律对它无从执行。
+        回填补上 description，去重判断才第一次有了依据。
+        """
+        for i in range(3):
+            self._write(f"m{i}.md", f"# 记忆{i}\n正文\n")
+        before = memory.scan_inventory(self.tmp)
+        self.assertEqual(len(before), 3, "文件本来就在清单里")
+        self.assertTrue(all(not i["description"] for i in before),
+                        "但描述为空——这才是真正的盲区")
+        for i in range(3):
+            self.bf.backfill_one(self.tmp / f"m{i}.md")
+        after = memory.scan_inventory(self.tmp)
+        self.assertEqual(len(after), 3)
+        self.assertTrue(all(i["description"] for i in after),
+                        "回填后每条都有描述，去重才有依据")
+        self.assertTrue(all(i["type"] for i in after), "类型也不该为空")
