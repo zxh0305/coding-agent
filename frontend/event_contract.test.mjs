@@ -14,18 +14,20 @@
  *   backend/app.py    _run_round() 的 docstring（回合边界事件 + mid 规则）
  *
  * 事件协议（实证）：
- *   turn_start  {nonce, input, atts}                    注意：不带 user_mid
+ *   turn_start  {nonce, input, atts, user_mid, started_at}  带 user_mid（落库早于发布，
+ *                                                           mid 此时已定），前端据此
+ *                                                           去重补画用户气泡
  *   round       {round, mid, wrap_up?}                  mid 由 app.py 现生成
  *   reasoning_delta {delta}                             【不带 mid】
  *   answer_delta    {delta, mid}
  *   tool_call   {name, arguments}                       arguments 是 JSON 字符串
  *   tool_result {name, result}
  *   permission_request {id, tool, input, reason}        input 可能是对象
- *   usage       {...prompt_tokens, completion_tokens, round?, round_cache_hit_rate?, context_tokens?}
+ *   usage       {...prompt_tokens, prompt_tokens_total?, completion_tokens, round?, round_cache_hit_rate?, context_tokens?}
  *   done        {answer, mid, elapsed_s, usage, timing?, stopped?, stopped_reason?}
  *                                                        timing = {llm_total_s, tool_total_s, ttft_avg_s, tps, cache_hit_rate, rounds}
  *   compacted   {summary, prompt_tokens, context}
- *   turn_end    {user_mid}                              mid 在此才回填
+ *   turn_end    {user_mid}                              mid 在此再次带上
  */
 
 import { test } from "node:test";
@@ -65,11 +67,26 @@ test("契约：完整回合的事件流不产生未知/异常块", () => {
   }
 });
 
-test("契约：turn_start 不带 user_mid（mid 在 turn_end 才回填）", () => {
-  // 前端不能指望 turn_start 有 user_mid；缺了也不能崩
+test("契约：turn_start 带 user_mid（前端据此去重补画用户气泡）", () => {
+  // 【本用例曾断言反了】原文写着"turn_start 不带 user_mid / 后端此时确实没有
+  // mid"——但 backend/services/turn.py 在发 turn_start 时就带上了 user_mid
+  // （用户消息落库早于发布，mid 已定），且 app.js 的 alreadyShown 与 blocks.js
+  // 的 mid 读取都依赖它。旧断言只是因为 fixture 漏写该字段才"通过"，等于把错误
+  // 契约固化进测试：谁照注释去改、删掉 user_mid，多标签页/刷新路径就会重复渲染
+  // 用户气泡或漏画输入。
+  const blocks = blocksFromEvents([
+    { type: "turn_start", nonce: "x", input: "你好", atts: [], user_mid: "useruuid1" },
+  ]);
+  assert.equal(blocks[0].kind, "user");
+  assert.equal(blocks[0].mid, "useruuid1");   // 带上，且被采纳
+  assert.equal(blocks[0].text, "你好");
+});
+
+test("契约：turn_start 缺 user_mid 时不崩（老数据/降级路径）", () => {
+  // 字段缺失要能容错（历史补发的老事件可能没有），只是去重退化为"不去重"
   const blocks = blocksFromEvents([{ type: "turn_start", nonce: "x", input: "你好", atts: [] }]);
   assert.equal(blocks[0].kind, "user");
-  assert.equal(blocks[0].mid, null); // 后端此时确实没有 mid
+  assert.equal(blocks[0].mid, null);
   assert.equal(blocks[0].text, "你好");
 });
 
