@@ -120,6 +120,7 @@
           <button id="perm-chip" class="chip" title="权限模式：只读 = 写入和命令逐次确认；确认 = 高危操作才确认；完全访问 = 全部放行">🛡 <span id="perm-label">确认</span></button>
           <button id="ws-pick" class="chip" title="选择工作区文件夹">📁 <span id="ws-short">工作区</span></button>
           <button id="docs-chip" class="chip" title="查看本会话生成的文档">📄 文档 <span id="docs-count">0</span></button>
+          <button id="memory-chip" class="chip" title="查看与管理记忆（个人 / 项目两层）">🧠 记忆</button>
           <button id="browser-chip" class="chip hidden" title="查看 agent 的内置浏览器画面">🌐 浏览器</button>
           <button id="bell-chip" class="chip" title="桌面通知：关">🔕</button>
           <button id="model-chip" class="chip" title="切换模型 / 管理模型">⚙️ <span id="model-label">模型</span></button>
@@ -348,6 +349,53 @@
     <button id="pop-logout" class="up-btn danger">⎋ 退出登录</button>
   </div>
 
+  <!-- 记忆面板：两层记忆的查看/编辑/删除/换层。
+       用浮层而非第三个并列面板——并列面板共用 --docs-w 宽度，加第三个要改
+       互斥与宽度两套账；记忆是低频操作，浮层更省事也更好关。 -->
+  <div id="memory-pop" class="memory-pop hidden">
+    <div class="mp-head">
+      <b>🧠 记忆</b>
+      <span id="mp-hint" class="hint"></span>
+      <button id="memory-close" class="docs-x" title="关闭">✕</button>
+    </div>
+    <div class="mp-tabs">
+      <button class="mp-tab active" data-layer="personal">
+        👤 个人记忆 <span id="mp-count-personal" class="mp-count">0</span>
+      </button>
+      <button class="mp-tab" data-layer="project">
+        📁 项目记忆 <span id="mp-count-project" class="mp-count">0</span>
+      </button>
+    </div>
+    <p id="mp-desc" class="mp-desc"></p>
+    <div class="mp-body">
+      <ul id="mp-list" class="mp-list"></ul>
+      <div id="mp-editor" class="mp-editor hidden">
+        <div class="mp-field">
+          <label>文件名</label>
+          <input id="mp-name" class="mp-input" placeholder="kebab-case.md"
+                 spellcheck="false" autocomplete="off">
+        </div>
+        <div class="mp-field">
+          <label>一句话摘要<span class="hint">（模型靠它判断是否相关）</span></label>
+          <input id="mp-desc-input" class="mp-input" placeholder="留空则取正文首行">
+        </div>
+        <div class="mp-field">
+          <label>正文</label>
+          <textarea id="mp-content" class="mp-textarea" rows="8" spellcheck="false"></textarea>
+        </div>
+        <div class="mp-editor-actions">
+          <button id="mp-save" class="mp-btn ok">保存</button>
+          <button id="mp-cancel" class="mp-btn">取消</button>
+          <span id="mp-error" class="mp-error"></span>
+        </div>
+      </div>
+    </div>
+    <div class="mp-foot">
+      <button id="mp-new" class="mp-btn">＋ 新建</button>
+      <span class="hint">改动立即生效，下一轮对话即被模型看到</span>
+    </div>
+  </div>
+
   <!-- 权限模式气泡：四选，按工作区记忆 -->
   <div id="perm-pop" class="ctx-pop hidden">
     <div class="perm-row" data-mode="readonly"><b>🔍 只读</b><span class="hint">看代码可以，写文件与执行命令每一步都先确认</span></div>
@@ -469,6 +517,7 @@
        与 blocks.js / render_blocks.js 同属"纯模块 + 单测"三层：数据→结构、
        结构→DOM、状态→动作。必须排在 app.js 之前。 -->
   <script src="queue_state.js"></script>
+  <script src="memory_view.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

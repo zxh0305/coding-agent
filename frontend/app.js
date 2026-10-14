@@ -4741,6 +4741,30 @@ bind("p-test", "click", testProv);
 bind("p-delete", "click", deleteProv);
 bind("ws-pick", "click", openPicker);
 bind("docs-chip", "click", toggleDocsPanel);
+// 记忆面板：打开一个就关掉其它浮层，避免两层浮窗叠在一起
+bind("memory-chip", "click", () => {
+  for (const id of ["attach-pop", "perm-pop", "model-pop", "git-pop", "todo-pop", "user-pop"]) {
+    const el = $(id);
+    if (el) el.classList.add("hidden");
+  }
+  toggleMemoryPanel();
+});
+bind("memory-close", "click", closeMemoryPanel);
+bind("mp-new", "click", () => openMemoryEditor(null));
+bind("mp-save", "click", saveMemoryEntry);
+bind("mp-cancel", "click", hideMemoryEditor);
+for (const t of document.querySelectorAll(".mp-tab")) {
+  t.onclick = () => {
+    if (t.dataset.layer === "project" && !MemoryView.projectLayerAvailable(currentSession)) {
+      // 仍允许切换以看到提示文案，只是列表会是"没有工作区"
+    }
+    switchMemoryLayer(t.dataset.layer);
+  };
+}
+// 编辑器里 Ctrl/Cmd+Enter 保存（编辑长正文时不必去够按钮）
+$("mp-content").addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); saveMemoryEntry(); }
+});
 bind("attach-chip", "click", toggleAttachPop);
 bind("attach-close", "click", () => $("attach-pop").classList.add("hidden"));
 bind("docs-close", "click", closeDocsPanel);
@@ -4837,7 +4861,7 @@ document.addEventListener("click", (e) => {
     renderSessions(sessionsCache);
   }
   // 点弹窗外空白处关闭浮动层
-  for (const [pop, btn] of [["ctx-pop", "stat-seg-ctx"], ["stat-pop", "stat-seg-run"], ["tok-pop", "stat-seg-tok"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"], ["perm-pop", "perm-chip"], ["todo-pop", "todo-chip"]]) {
+  for (const [pop, btn] of [["ctx-pop", "stat-seg-ctx"], ["stat-pop", "stat-seg-run"], ["tok-pop", "stat-seg-tok"], ["model-pop", "model-chip"], ["user-pop", "user-btn"], ["git-pop", "git-chip"], ["attach-pop", "attach-chip"], ["perm-pop", "perm-chip"], ["todo-pop", "todo-chip"], ["memory-pop", "memory-chip"]]) {
     const el = $(pop);
     // git 的分支二级面板挂在外层（不在 git-pop 内）：点它不算点空白，否则
     // git 浮窗被关掉而分支面板还留着（真实踩过的坑）
@@ -6795,3 +6819,224 @@ document.addEventListener("click", (e) => {
   pop.classList.add("hidden");
 });
 loadArchiveCount();
+
+// ---------- 记忆面板（个人层 / 项目层） ----------
+// 记忆 v2 之前用户看不到也改不了记忆；这个面板是第一个给人用的入口。
+// 纯逻辑（时间格式、条目装饰、文件名校验）在 memory_view.js，可单测。
+let memLayer = "personal";
+let memCache = { personal: [], project: [] };
+
+function memoryPopEl() { return $("memory-pop"); }
+
+function toggleMemoryPanel() {
+  const p = memoryPopEl();
+  if (!p) return;
+  if (p.classList.contains("hidden")) {
+    p.classList.remove("hidden");
+    loadMemory(memLayer);
+  } else {
+    p.classList.add("hidden");
+  }
+}
+
+function closeMemoryPanel() {
+  const p = memoryPopEl();
+  if (p) p.classList.add("hidden");
+}
+
+function switchMemoryLayer(layer) {
+  memLayer = layer;
+  for (const t of document.querySelectorAll(".mp-tab")) {
+    t.classList.toggle("active", t.dataset.layer === layer);
+  }
+  hideMemoryEditor();
+  // 每次切换都重新拉：两层的内容不同（项目层依赖当前会话的工作区），
+  // 且用户可能在别处（如切了会话）改了它。只渲染缓存会显示错误的层。
+  loadMemory(layer);
+}
+
+function memoryQs(layer) {
+  // 项目层要靠会话解析工作区；个人层不需要，但带上无害（后端会校验归属）
+  const parts = [`layer=${encodeURIComponent(layer)}`];
+  if (layer === "project" && currentSession) {
+    parts.push(`session_id=${encodeURIComponent(currentSession)}`);
+  }
+  return parts.join("&");
+}
+
+async function loadMemory(layer) {
+  const p = memoryPopEl();
+  if (!p || p.classList.contains("hidden")) return;
+  memLayer = layer;
+  for (const t of document.querySelectorAll(".mp-tab")) {
+    t.classList.toggle("active", t.dataset.layer === layer);
+  }
+  $("mp-desc").textContent = MemoryView.layerDesc(layer);
+  const list = $("mp-list");
+  if (layer === "project" && !MemoryView.projectLayerAvailable(currentSession)) {
+    list.innerHTML = "";
+    renderMemoryEmpty("当前没有绑定工作区的会话，所以还没有项目记忆。个人记忆不受影响。");
+    return;
+  }
+  renderMemoryEmpty("加载中…");
+  try {
+    const data = await api(`/api/memory?${memoryQs(layer)}`);
+    memCache[layer] = data.memories || [];
+    $("mp-hint").textContent = data.dir ? "" : "";
+    refreshMemoryCounts();
+    renderMemoryList();
+  } catch (e) {
+    renderMemoryEmpty("加载失败：" + e.message);
+  }
+}
+
+function refreshMemoryCounts() {
+  const c = MemoryView.counts(memCache.personal, memCache.project);
+  const pe = $("mp-count-personal"), pr = $("mp-count-project");
+  if (pe) pe.textContent = c.personal;
+  if (pr) pr.textContent = c.project;
+}
+
+function renderMemoryEmpty(msg) {
+  const list = $("mp-list");
+  list.innerHTML = "";
+  const li = document.createElement("li");
+  li.className = "mp-empty";
+  li.textContent = msg;
+  list.appendChild(li);
+}
+
+function renderMemoryList() {
+  const list = $("mp-list");
+  const rows = memCache[memLayer] || [];
+  list.innerHTML = "";
+  if (!rows.length) {
+    renderMemoryEmpty(memLayer === "personal"
+      ? "个人记忆还是空的。把「你这个人的偏好」放这里——换任何项目都跟着你。"
+      : "本项目还没有记忆。把「这个代码库的事实」放这里。");
+    return;
+  }
+  for (const raw of rows) {
+    const m = MemoryView.decorate(raw);
+    const li = document.createElement("li");
+    li.className = "mp-row" + (m.uncurated ? " uncurated" : "");
+
+    const main = document.createElement("div");
+    main.className = "mp-row-main";
+    const title = document.createElement("div");
+    title.className = "mp-row-file";
+    title.textContent = m.file;
+    const desc = document.createElement("div");
+    desc.className = "mp-row-desc";
+    desc.textContent = m.desc;
+    main.append(title, desc);
+
+    const meta = document.createElement("div");
+    meta.className = "mp-row-meta";
+    const bits = [];
+    if (m.type) bits.push(m.type);
+    if (m.sensitive) bits.push("🔒 含敏感信息（不注入）");
+    if (m.when) bits.push(m.when);
+    meta.textContent = bits.join(" · ");
+    main.appendChild(meta);
+    if (m.excerpt) {
+      const ex = document.createElement("div");
+      ex.className = "mp-row-excerpt";
+      ex.textContent = m.excerpt;
+      main.appendChild(ex);
+    }
+
+    const acts = document.createElement("div");
+    acts.className = "mp-row-acts";
+    acts.append(
+      memAct("编辑", "mp-act", () => openMemoryEditor(raw)),
+      memAct(memLayer === "personal" ? "移到项目层" : "移到个人层", "mp-act",
+             () => moveMemoryEntry(m.file, memLayer)),
+      memAct("删除", "mp-act danger", () => deleteMemoryEntry(m.file, memLayer)),
+    );
+    li.append(main, acts);
+    list.appendChild(li);
+  }
+}
+
+function memAct(label, cls, fn) {
+  const b = document.createElement("button");
+  b.className = cls;
+  b.textContent = label;
+  b.onclick = (e) => { e.stopPropagation(); fn(); };
+  return b;
+}
+
+function openMemoryEditor(entry) {
+  const ed = $("mp-editor");
+  ed.classList.remove("hidden");
+  $("mp-error").textContent = "";
+  $("mp-name").value = entry ? entry.file : "";
+  $("mp-name").disabled = !!entry;  // 改名 = 新建一条，容易搞出重复；只允许改内容
+  $("mp-desc-input").value = entry ? (entry.description || "") : "";
+  ed.dataset.file = entry ? entry.file : "";
+  if (entry) {
+    api(`/api/memory?${memoryQs(memLayer)}&name=${encodeURIComponent(entry.file)}`)
+      .then((d) => { $("mp-content").value = d.body || ""; })
+      .catch((e) => { $("mp-error").textContent = "读取失败：" + e.message; });
+  } else {
+    $("mp-content").value = "";
+  }
+  ($("mp-content")).focus();
+}
+
+function hideMemoryEditor() {
+  const ed = $("mp-editor");
+  if (ed) { ed.classList.add("hidden"); ed.dataset.file = ""; }
+}
+
+async function saveMemoryEntry() {
+  const ed = $("mp-editor");
+  const name = ($("mp-name").value || "").trim();
+  const err = MemoryView.checkName(name);
+  if (err) { $("mp-error").textContent = err; return; }
+  const body = {
+    layer: memLayer,
+    name,
+    body: $("mp-content").value,
+    description: ($("mp-desc-input").value || "").trim(),
+  };
+  if (memLayer === "project") body.session_id = currentSession;
+  try {
+    await api("/api/memory", { method: "POST", body: JSON.stringify(body) });
+    hideMemoryEditor();
+    await loadMemory(memLayer);
+  } catch (e) {
+    $("mp-error").textContent = e.message;
+  }
+}
+
+async function deleteMemoryEntry(file, layer) {
+  if (!confirm(`删除记忆「${file}」？\n\n这条记忆会从模型以后看到的记忆里消失。`)) return;
+  try {
+    const data = await api(`/api/memory/${encodeURIComponent(file)}?${memoryQs(layer)}`,
+                           { method: "DELETE" });
+    if (currentSession && layer === "project") { /* 保持当前层 */ }
+    await loadMemory(layer);
+  } catch (e) {
+    alert("删除失败：" + e.message);
+  }
+}
+
+async function moveMemoryEntry(file, fromLayer) {
+  const toLayer = fromLayer === "personal" ? "project" : "personal";
+  const toName = toLayer === "personal" ? "个人记忆（任何项目都生效）" : "项目记忆（只在本项目）";
+  if (!confirm(`把「${file}」移到${toName}？`)) return;
+  const body = { name: file, from: fromLayer, to: toLayer };
+  if (currentSession) body.session_id = currentSession;
+  try {
+    await api("/api/memory/move", { method: "POST", body: JSON.stringify(body) });
+    // 两层都可能变化，各拉一次以保证计数准确
+    memCache[fromLayer] = (await api(`/api/memory?${memoryQs(fromLayer)}`).catch(() => ({ memories: [] }))).memories || [];
+    memCache[toLayer] = (await api(`/api/memory?${memoryQs(toLayer)}`).catch(() => ({ memories: [] }))).memories || [];
+    refreshMemoryCounts();
+    renderMemoryList();
+  } catch (e) {
+    alert("搬移失败：" + e.message);
+  }
+}

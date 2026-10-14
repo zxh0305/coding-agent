@@ -148,6 +148,9 @@ class DispatchMixin:
                 # 任务清单：todo_write 落库后的最新一份（空数组 = 已清空）
                 return self._json({"todos": db.get_todos(sid)})
             return self._handle_session_messages(sid)
+        elif path == "/api/memory":
+            # 记忆（两层）：?layer=personal|project&session_id=&name=
+            return self._handle_memory_list()
         elif self.path.startswith("/api/context"):
             sid = (self._query().get("session_id") or [""])[0]
             if sid and db.session_owner(sid) != self.user["id"]:
@@ -284,6 +287,10 @@ class DispatchMixin:
                 self._handle_session_seen(sid)
             elif self.path == "/api/workspace":
                 self._handle_workspace_set()
+            elif self.path == "/api/memory":
+                self._handle_memory_save()
+            elif self.path == "/api/memory/move":
+                self._handle_memory_move()
             elif self.path == "/api/git/checkout":
                 self._handle_git_checkout()
             else:
@@ -322,6 +329,11 @@ class DispatchMixin:
             except FileNotFoundError:
                 pass  # 幂等：已不存在视为删除成功
             return self._json({"ok": True})
+        # 记忆：删除一条（?layer=personal|project&session_id= 指定层）
+        m = re.fullmatch(r"/api/memory/([^/]+)",
+                         urllib.parse.urlparse(self.path).path)
+        if m:
+            return self._handle_memory_delete(m.group(1))
         if urllib.parse.urlparse(self.path).path == "/api/sessions":  # self.path 带 ?query，须剥掉再比较
             # 两种形态：?session_id=xxx 单删（原有入口，归档区行内 🗑）；
             # body {"ids": [...]} 批量删（归档区勾选后的批量删除按钮）。

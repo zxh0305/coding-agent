@@ -130,6 +130,7 @@ from routes.base import HandlerBase
 from routes.chat import ChatRoutes
 from routes.dispatch import DispatchMixin
 from routes.git import GitRoutes
+from routes.memory import MemoryRoutes
 from routes.models import ModelRoutes
 from routes.sessions import SessionRoutes
 from routes.workspace import WorkspaceRoutes
@@ -354,7 +355,7 @@ install_service_hooks()  # 模块导入即装配（只需一次，重复调用�
 
 
 class Handler(AuthRoutes, SessionRoutes, ChatRoutes, ModelRoutes,
-              GitRoutes, WorkspaceRoutes, DispatchMixin, HandlerBase):
+              GitRoutes, WorkspaceRoutes, MemoryRoutes, DispatchMixin, HandlerBase):
     """API 路由 + 静态文件托管（frontend/ 目录）。
 
     HandlerBase 必须排在最后（提供 SimpleHTTPRequestHandler 基类与 __init__），

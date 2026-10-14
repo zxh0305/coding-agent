@@ -492,6 +492,142 @@ def _read_text(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 供 UI 使用的增删改查（记忆面板的后端）
+# ---------------------------------------------------------------------------
+#
+# 之前记忆只有一个读者（模型）和一个写者（轮末提取器）——用户看不见也改不了。
+# 这一层给"用户自己管记忆"提供入口：列/读/改/删/换层。
+# 全部复用已有的纯函数（parse_frontmatter / render_memory_file / atomic_write_text /
+# upsert_index_line / remove_index_line / valid_memory_filename），不另造存储逻辑，
+# 保证 UI 写的文件与提取器写的文件格式完全一致。
+
+def list_entries(mem_dir: Path) -> list[dict]:
+    """列出某层全部记忆，按 mtime 降序。
+
+    比 scan_inventory 多给 UI 需要的字段：mtime（排序/显示"多久前"）、bytes、
+    owner/scope/updated（层信息）、以及 has_frontmatter——后者很重要：真实数据里
+    有 33/74 条是模型当年直接用 write_file 写的、没有 frontmatter，它们解析不出
+    type/description，在 UI 上必须如实标出来，而不是显示成空白让人以为坏了。
+    """
+    if not mem_dir.is_dir():
+        return []
+    rows = []
+    try:
+        candidates = list(mem_dir.iterdir())
+    except OSError:
+        return []
+    for p in candidates:
+        if not p.is_file() or not p.name.endswith(".md") or p.name == INDEX_NAME:
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        text = _read_text(p)
+        meta, body = parse_frontmatter(text)
+        rows.append({
+            "file": p.name,
+            "type": (meta or {}).get("type", ""),
+            "description": (meta or {}).get("description", ""),
+            "owner": (meta or {}).get("owner", ""),
+            "scope": (meta or {}).get("scope", ""),
+            "updated": (meta or {}).get("updated", ""),
+            "mtime": st.st_mtime,
+            "bytes": st.st_size,
+            "has_frontmatter": meta is not None,
+            "sensitive": is_sensitive_text(text),
+            "excerpt": " ".join((body or "").split())[:160],
+        })
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows
+
+
+def _entry_path(mem_dir: Path, name: str) -> Path:
+    """校验并解析一条记忆的文件路径。名字非法即抛 ValueError（调用方转 400）。
+
+    只走白名单 + 一层 realpath 包含校验，与执行器 _validate_op 同一套闸门——
+    UI 是新增的写入面，不能比提取器那条路更松。
+    """
+    if not valid_memory_filename(name):
+        raise ValueError(
+            "文件名只能是小写字母/数字/短横线 + .md（如 pnpm-not-npm.md）")
+    target = mem_dir / name
+    if not _inside(os.path.realpath(str(mem_dir)), target):
+        raise ValueError("路径越界")
+    return target
+
+
+def read_entry(mem_dir: Path, name: str) -> dict:
+    """读一条记忆的完整内容（正文 + frontmatter）。不存在抛 FileNotFoundError。"""
+    target = _entry_path(mem_dir, name)
+    if not target.is_file():
+        raise FileNotFoundError(name)
+    text = _read_text(target)
+    meta, body = parse_frontmatter(text)
+    return {"file": name, "body": body, "raw": text,
+            "has_frontmatter": meta is not None,
+            "type": (meta or {}).get("type", ""),
+            "description": (meta or {}).get("description", "")}
+
+
+def write_entry(mem_dir: Path, name: str, body: str, description: str = "",
+                mtype: str = "project", owner: str | None = None,
+                scope: str | None = None) -> dict:
+    """新建或覆盖一条记忆（用户编辑走这里），并同步索引行。
+
+    描述缺省时从正文首行兜底——索引行需要一句话摘要，用户只改正文时不该
+    让索引退化成空钩子（索引行是模型召回时唯一的判断依据）。
+    """
+    target = _entry_path(mem_dir, name)
+    body = (body or "").strip()
+    desc = " ".join(str(description or "").split())
+    if not desc:
+        first = next((ln.strip(" #*-\t") for ln in body.splitlines() if ln.strip()), "")
+        desc = first[:80] or "(无描述)"
+    if mtype not in MEMORY_TYPES:
+        mtype = "project"
+    now = time.strftime("%Y-%m-%d")
+    atomic_write_text(target, render_memory_file(
+        Path(name).stem, desc, mtype, body, owner=owner, scope=scope, updated=now))
+    atomic_write_text(mem_dir / INDEX_NAME,
+                      upsert_index_line(read_index_text(mem_dir), name, desc))
+    return {"file": name, "description": desc}
+
+
+def delete_entry(mem_dir: Path, name: str) -> bool:
+    """删除一条记忆 + 它的索引行。文件本就不存在返回 False（幂等）。"""
+    target = _entry_path(mem_dir, name)
+    existed = target.is_file()
+    target.unlink(missing_ok=True)
+    atomic_write_text(mem_dir / INDEX_NAME,
+                      remove_index_line(read_index_text(mem_dir), name))
+    return existed
+
+
+def move_entry(src_dir: Path, dst_dir: Path, name: str,
+               owner: str | None = None) -> dict:
+    """把一条记忆从一层搬到另一层（个人 ↔ 项目）。
+
+    这是"用户自己挑"的核心动作——个人层初始为空，只有靠它才会长出内容。
+    实现 = 读源 → 写目标（带新 owner 戳）→ 删源；顺序有意如此：先写目标再删源，
+    中途失败最坏是两边都有一份（可人工删），而不是两边都没有。
+    """
+    data = read_entry(src_dir, name)
+    if data["has_frontmatter"]:
+        mtype = data["type"] or "project"
+        desc = data["description"]
+    else:
+        # 无 frontmatter 的老记忆（模型当年直接 write_file 写的）：搬过去时
+        # 补全为规范格式，这是它进入可管理状态的时机。
+        mtype = "project" if owner != "user" else "user"
+        desc = ""
+    write_entry(dst_dir, name, data["body"], description=desc, mtype=mtype,
+                owner=owner, scope="global" if owner == "user" else None)
+    delete_entry(src_dir, name)
+    return {"file": name, "from": str(src_dir), "to": str(dst_dir)}
+
+
+# ---------------------------------------------------------------------------
 # 注入：契约 + 索引 → system 尾段
 # ---------------------------------------------------------------------------
 
