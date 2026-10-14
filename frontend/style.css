@@ -1203,7 +1203,7 @@ button.primary:hover { background: var(--accent-hover); }
   from { opacity: 0; transform: translateX(-50%) translateY(-14px); }
   to   { opacity: 1; transform: translateX(-50%) translateY(0); }
 }
-/* 状态图标：成功 / 错误 */
+/* 状态图标：成功 / 错误 / 提示 */
 .toast-icon {
   flex-shrink: 0;
   width: 17px; height: 17px; border-radius: 50%;
@@ -1212,6 +1212,7 @@ button.primary:hover { background: var(--accent-hover); }
 }
 .toast.success .toast-icon { background: #34c77b; }
 .toast.error   .toast-icon { background: #f0614d; }
+.toast.info    .toast-icon { background: #5b8def; }   /* 中性提示，别与成功/失败混淆 */
 
 /* ---------- 模型切换气泡 ---------- */
 .model-pop {

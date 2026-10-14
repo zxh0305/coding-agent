@@ -138,7 +138,12 @@ class HandlerBase(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        # HEAD 响应按 RFC 9110 不得携带消息体：照写的话，http.client / 浏览器 /
+        # 代理都会按规范对 HEAD 读 0 字节，这堆 body 就残留在 socket 里，污染
+        # keep-alive 连接上的下一个响应（实测下一个请求直接 BadStatusLine）。
+        # Content-Length 仍照发（HEAD 的语义是"与对应 GET 同样的头、不含体"）。
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def _body(self) -> dict:
         length = int(self.headers.get("Content-Length", 0))

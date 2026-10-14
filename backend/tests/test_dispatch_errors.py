@@ -218,11 +218,39 @@ class TestBadBodyGetsJsonError(ApiTestBase):
             self.assertEqual(resp.status, 405, f"{method} 应为 405（方法不允许）")
             self.assertIn("application/json", ctype, f"{method} 响应不是 JSON")
             if method == "HEAD":
-                # HTTP 规定 HEAD 不返回 body（客户端也不会读），只校验状态与类型
+                # HEAD 不返回 body（客户端按规范也不会读），只校验状态与类型
                 self.assertEqual(body, b"")
                 continue
             data = json.loads(body or b"{}")
             self.assertEqual(data.get("code"), "method_not_allowed")
+
+    def test_head_body_not_left_in_socket(self):
+        """HEAD 响应不得写 body，否则会污染 keep-alive 连接上的下一个请求。
+
+        回归用例：_json 曾无条件 wfile.write，对 HEAD 也写了带 Content-Length
+        的 body。上面那条按 method 各开一条连接，逐个读响应——客户端对 HEAD
+        读 0 字节，残留字节看不到，所以旧测试是假绿。只有**复用同一连接**再发
+        一个请求，才能暴露「残留 body 被当成下一个响应的状态行」。实测旧代码
+        在这里直接 http.client.BadStatusLine。
+        """
+        import http.client
+        host, port = self.base.replace("http://", "").split(":")
+        conn = http.client.HTTPConnection(host, int(port), timeout=10)
+        try:
+            auth = {"Authorization": "Bearer " + self.token}
+            conn.request("HEAD", "/api/sessions", None, auth)
+            head = conn.getresponse()
+            self.assertEqual(head.status, 405)
+            self.assertEqual(head.read(), b"")           # 客户端侧读到 0 字节
+
+            # 同一连接上的下一个请求必须能正常解析——若 HEAD 写了残留 body，
+            # 读取状态行时会把残留字节当响应开头，抛 BadStatusLine。
+            conn.request("GET", "/api/sessions", None, auth)
+            nxt = conn.getresponse()
+            self.assertEqual(nxt.status, 200)
+            json.loads(nxt.read() or b"null")
+        finally:
+            conn.close()
 
     def test_normal_body_still_works(self):
         """413 的改动不能误伤正常请求。"""

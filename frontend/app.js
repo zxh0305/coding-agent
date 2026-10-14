@@ -347,12 +347,13 @@ function fmtTime(ts) {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;  // 前天起就显示日期
 }
 
-// toast(text, type)：type="success" | "error"，默认 success。
+// toast(text, type)：type="success" | "error" | "info"，默认 success。
 // 顶部居中弹出，2.5s 自动收起；点击可提前关闭。
 function toast(text, type = "success") {
   const t = $("toast");
   t.className = "toast " + type;
-  t.innerHTML = `<span class="toast-icon">${type === "error" ? "✕" : "✓"}</span>`;
+  const icon = type === "error" ? "✕" : (type === "info" ? "i" : "✓");
+  t.innerHTML = `<span class="toast-icon">${icon}</span>`;
   t.appendChild(document.createTextNode(text));  // 文本走 textNode，避免消息内容被当 HTML 解析
   t.onclick = () => t.classList.add("hidden");   // 点击可提前关闭
   t.classList.remove("hidden");
@@ -4462,7 +4463,15 @@ function sendOnCooldown() {
 async function stopGeneration() {
   // 刚发出就来的"停止"多半是双击抖动，不是用户真想停。真正的停止发生在
   // 回合跑起来之后（几百 ms 起步），所以这个窗口不会挡住正常操作。
-  if (sendOnCooldown()) return;
+  //
+  // 但被吞掉的点击不能完全无反馈：万一用户真是"刚发出就想撤回"（比如发错
+  // 会话、发错内容），按钮停在"发送/停止"外观毫无变化，用户会以为点空了、
+  // 反复点。这里给一句轻提示，让他知道这次点击被识别了、只是刚发出去还
+  // 来不及停，并提示再点一次即可（下一击已在窗口外）。
+  if (sendOnCooldown()) {
+    toast("刚发出，稍等一下再点停止", "info");
+    return;
+  }
   $("send").textContent = "停止中…";
   try {
     await api("/api/chat/stop", { method: "POST", body: JSON.stringify({ session_id: currentSession }) });
