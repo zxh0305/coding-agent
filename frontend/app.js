@@ -2214,8 +2214,11 @@ async function loadUsage() {
     const card = document.createElement("div");
     card.className = "usage-card";
     const sum = models.reduce((a, r) => a + r.prompt_tokens + r.completion_tokens, 0);
+    // 供应商名与模型名都来自用户可编辑的配置（供应商名可自填），必须转义后再
+    // 拼进 innerHTML——否则一个叫 `<img src=x onerror=...>` 的供应商就能注入。
+    // 同文件的其它用量表（项目行/会话行）早就用了 esc()，这里当初漏了。
     card.innerHTML =
-      `<div class="usage-card-head"><b>${pname}</b>` +
+      `<div class="usage-card-head"><b>${esc(pname)}</b>` +
       `<span>共 ${fmtTokens(sum)} tokens</span></div>` +
       `<table class="usage-table"><thead><tr>` +
       `<th>模型</th><th>回合</th><th>输入 ↑</th><th>输出 ↓</th><th>缓存命中</th>` +
@@ -2223,9 +2226,11 @@ async function loadUsage() {
       models.map(r => {
         const rate = r.prompt_tokens ? Math.round(r.cached_tokens / r.prompt_tokens * 100) : 0;
         // 模型行可点：展开该模型在各个会话上的用量明细（usageExpanded 记状态）
-        return `<tr class="usage-model-row" data-provider="${r.provider_id}" data-model="${r.model}" ` +
-               `data-key="${r.provider_id}|${r.model}">` +
-               `<td class="mono"><span class="usage-arrow">▸</span> ${r.model}</td><td>${r.turns}</td>` +
+        // data-* 属性同样转义：它们会被读回（tr.dataset.key 等）并出现在选择器里
+        return `<tr class="usage-model-row" data-provider="${esc(r.provider_id)}" ` +
+               `data-model="${esc(r.model)}" ` +
+               `data-key="${esc(r.provider_id + "|" + r.model)}">` +
+               `<td class="mono"><span class="usage-arrow">▸</span> ${esc(r.model)}</td><td>${r.turns}</td>` +
                `<td>${fmtTokens(r.prompt_tokens)}</td><td>${fmtTokens(r.completion_tokens)}</td>` +
                `<td>${r.cached_tokens ? `${fmtTokens(r.cached_tokens)}（${rate}%）` : "—"}</td></tr>`;
       }).join("") +
