@@ -73,6 +73,9 @@
       bytes: entry.bytes || 0,
       sensitive: !!entry.sensitive,
       uncurated: !has,
+      // 已作废：文件还在、能看到能改，但【不进注入】——模型看不到它，
+      // 所以必须在列表里标出来，否则用户会以为它还生效。
+      deprecated: !!entry.deprecated,
       excerpt: entry.excerpt || "",
       // 层归属只认 owner 字段：没有它就是项目层（迁移时没写 owner，
       // 全部按项目层处理——这与后端 _op_target_dir 的默认一致）。

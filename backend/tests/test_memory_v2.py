@@ -647,3 +647,82 @@ class TestTruncateByValue(unittest.TestCase):
         text = "- [ghost](ghost.md) — 已实施：某条\n- [real](real.md) — 用户偏好\n"
         out = memory.truncate_index(text, max_lines=2, rank=memory._layer_rank(self.tmp))
         self.assertIn("real.md", out)
+
+
+# ---------------------------------------------------------------------------
+# H. 已作废条目：留文件、不进注入
+# ---------------------------------------------------------------------------
+
+class TestDeprecatedEntries(unittest.TestCase):
+    """契约要求"发现旧记忆与现状矛盾时修正或删除它"，但没有机制保证，于是真实
+    库里留下了"（已作废）面板放左侧"这类条目——每轮随索引进 system，还可能被
+    当成现行结论；而它本身是有用的历史（解释了为何最终选另一条路）。
+    折中：标 status=deprecated → 留磁盘、UI 可见可改，但不进注入。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dep_"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _seed(self, name, desc, status=None, mtype="project"):
+        memory.write_entry(self.tmp, name, "正文", description=desc, mtype=mtype)
+        if status:
+            p = self.tmp / name
+            meta, body = memory.parse_frontmatter(p.read_text(encoding="utf-8"))
+            memory.atomic_write_text(p, memory.render_memory_file(
+                meta["name"], meta["description"], meta["type"], body, status=status))
+
+    def test_deprecated_parses_and_is_detected(self):
+        self._seed("old.md", "旧决策", status="deprecated")
+        meta, _ = memory.parse_frontmatter((self.tmp / "old.md").read_text(encoding="utf-8"))
+        self.assertEqual(meta["status"], "deprecated")
+        self.assertTrue(memory.is_deprecated(meta))
+
+    def test_normal_entry_not_flagged(self):
+        self._seed("ok.md", "现行决策")
+        meta, _ = memory.parse_frontmatter((self.tmp / "ok.md").read_text(encoding="utf-8"))
+        self.assertFalse(memory.is_deprecated(meta))
+        self.assertFalse(memory.is_deprecated(None), "无 meta 不该被判作废")
+
+    def test_injection_skips_deprecated_but_keeps_file(self):
+        self._seed("live.md", "现行方案")
+        self._seed("old.md", "旧方案", status="deprecated")
+        block = memory.memory_index_block(self.tmp)
+        self.assertIn("live.md", block)
+        self.assertNotIn("old.md", block, "已作废条目不得进注入")
+        self.assertTrue((self.tmp / "old.md").is_file(), "文件必须保留在磁盘")
+        self.assertIn("已作废", block, "要如实告知有几条被滤，不能静默消失")
+
+    def test_deprecated_does_not_consume_injection_budget(self):
+        """必须在截断【之前】滤掉，否则作废条目会先吃掉预算、把有效条目挤出去。"""
+        for i in range(5):
+            self._seed(f"old-{i}.md", f"旧{i}", status="deprecated")
+        self._seed("keep.md", "重要的现行记忆")
+        block = memory.memory_index_block(self.tmp)
+        self.assertIn("keep.md", block)
+
+    def test_layered_injection_also_skips(self):
+        self._seed("old.md", "旧", status="deprecated")
+        self._seed("new.md", "新")
+        blk = memory.memory_blocks(self.tmp)
+        self.assertNotIn("old.md", blk)
+        self.assertIn("new.md", blk)
+
+    def test_round_trip_preserves_other_fields(self):
+        p = self.tmp / "r.md"
+        memory.write_entry(self.tmp, "r.md", "正文", description="d", mtype="user")
+        meta, body = memory.parse_frontmatter(p.read_text(encoding="utf-8"))
+        memory.atomic_write_text(p, memory.render_memory_file(
+            meta["name"], meta["description"], meta["type"], body,
+            owner="user", scope="global", updated="2026-01-01", status="deprecated"))
+        meta2, _ = memory.parse_frontmatter(p.read_text(encoding="utf-8"))
+        self.assertEqual(meta2["owner"], "user")
+        self.assertEqual(meta2["scope"], "global")
+        self.assertEqual(meta2["updated"], "2026-01-01")
+        self.assertEqual(meta2["status"], "deprecated")
+
+    def test_list_entries_exposes_status(self):
+        self._seed("old.md", "旧", status="deprecated")
+        rows = memory.list_entries(self.tmp)
+        row = next(r for r in rows if r["file"] == "old.md")
+        self.assertEqual(row["status"], "deprecated")
+        self.assertTrue(row["deprecated"], "UI 要能标出来，否则用户以为它还生效")

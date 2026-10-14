@@ -2527,3 +2527,11 @@ body.docs-resizing .docs-panel { transition: none; }
   padding: 10px 14px; border-top: 1px solid var(--border-soft);
 }
 .mp-foot .hint { font-size: 11px; color: var(--text-3); }
+/* 已作废：文件还在、可编辑，但不进注入（模型看不到）。视觉上明确区分，
+   否则用户会以为它还在生效。 */
+.mp-row.deprecated { opacity: 0.62; }
+.mp-row.deprecated .mp-row-file::after {
+  content: "已作废"; margin-left: 6px; padding: 0 5px;
+  font-family: inherit; font-size: 10px; font-weight: 400;
+  border-radius: 4px; background: var(--warning-weak, #fdf3e3); color: var(--warning, #b45309);
+}

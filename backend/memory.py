@@ -111,7 +111,9 @@ MEMORY_CONTRACT = (
     "project=代码与 git 历史推导不出的进行中事项（相对日期转绝对日期）；"
     "reference=外部资源链接。禁止记录：代码结构、既往修复、git 可查的历史、仅本次对话"
     "有效的临时信息。写之前先看索引是否已有同类记忆，更新旧文件而不是新建重复文件；"
-    "发现旧记忆与现状矛盾时修正或删除它。需要记忆正文时用 read_file 打开对应文件。"
+    "发现旧记忆与现状矛盾时修正或删除它——若那段历史仍有参考价值（如\"当初为什么"
+    "没选另一条路\"），保留它但在 frontmatter 标 status: deprecated，它就不再进注入。"
+    "需要记忆正文时用 read_file 打开对应文件。"
 )
 
 
@@ -303,7 +305,8 @@ def _inside(root: str, target: Path) -> bool:
 
 def render_frontmatter(name: str, description: str, mtype: str,
                        owner: str | None = None, scope: str | None = None,
-                       updated: str | None = None) -> str:
+                       updated: str | None = None,
+                       status: str | None = None) -> str:
     """frontmatter：三个必备字段 + 可选的新字段。description 压成单行——
     它要进索引行，换行会破坏"- 一行一条"的结构。
 
@@ -312,6 +315,8 @@ def render_frontmatter(name: str, description: str, mtype: str,
       owner   user | project —— 这条记忆说谁的（决定去哪一层）
       scope   global | repo  —— 在哪成立（仅 project 层有意义）
       updated ISO 日期       —— 判新旧；宿主盖章，不是模型自己写
+      status  deprecated     —— 已作废：文件保留、UI 可见可改，但【不进注入】
+                                （见 DEPRECATED_STATUS 处的论证）
     只写裸值，不写 YAML 行内注释——本模块的解析器极简，注释会被当成值的一部分。
     """
     description = " ".join(str(description).split())
@@ -322,16 +327,19 @@ def render_frontmatter(name: str, description: str, mtype: str,
         extra += f"  scope: {scope}\n"
     if updated:
         extra += f"  updated: {updated}\n"
+    if status:
+        extra += f"  status: {status}\n"
     return (f"---\nname: {name}\ndescription: {description}\nmetadata:\n"
             f"  type: {mtype}\n{extra}---\n")
 
 
 def render_memory_file(name: str, description: str, mtype: str, body: str,
                        owner: str | None = None, scope: str | None = None,
-                       updated: str | None = None) -> str:
+                       updated: str | None = None,
+                       status: str | None = None) -> str:
     """完整的记忆文件内容 = frontmatter + 正文一段话。"""
-    return (render_frontmatter(name, description, mtype, owner, scope, updated)
-            + body.rstrip() + "\n")
+    return (render_frontmatter(name, description, mtype, owner, scope, updated,
+                               status) + body.rstrip() + "\n")
 
 
 def parse_frontmatter(text: str) -> tuple[dict | None, str]:
@@ -348,7 +356,7 @@ def parse_frontmatter(text: str) -> tuple[dict | None, str]:
     if end is None:
         return None, text
     name = desc = mtype = None
-    owner = scope = updated = None
+    owner = scope = updated = status = None
     section = None  # 当前所在的顶层键（metadata 是唯一有缩进子键的）
     for line in lines[1:end]:
         stripped = line.strip()
@@ -366,6 +374,8 @@ def parse_frontmatter(text: str) -> tuple[dict | None, str]:
                     scope = value or None
                 elif key == "updated":
                     updated = value or None
+                elif key == "status":
+                    status = value or None
         else:                                 # 顶层键
             key, _, value = stripped.partition(":")
             key, value = key.strip(), value.strip()
@@ -385,7 +395,23 @@ def parse_frontmatter(text: str) -> tuple[dict | None, str]:
             meta["scope"] = scope
         if updated:
             meta["updated"] = updated
+        if status:
+            meta["status"] = status
     return meta, "\n".join(lines[end + 1:]).strip()
+
+
+# 已作废标记。为什么要有它：契约明写"发现旧记忆与现状矛盾时修正或删除它"，
+# 但没有机制保证，于是真实库里留下了"（已作废）面板放左侧"这类条目——它每轮
+# 都随索引进 system，还可能被模型当成现行结论引用；而它本身是有用的历史
+# （解释了为什么最终改成右侧）。删除可惜、留着占位。
+# 折中：标 status=deprecated 的文件【保留在磁盘、UI 里可见可改】，但【不进注入】。
+# 需要时模型仍可用 read_file 打开它（正文里通常链到现行方案）。
+DEPRECATED_STATUS = "deprecated"
+
+
+def is_deprecated(meta: dict | None) -> bool:
+    """这条记忆是否已作废（不参与注入，但保留在磁盘上）。"""
+    return bool(meta) and str(meta.get("status") or "").lower() == DEPRECATED_STATUS
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +589,8 @@ def list_entries(mem_dir: Path) -> list[dict]:
             "owner": (meta or {}).get("owner", ""),
             "scope": (meta or {}).get("scope", ""),
             "updated": (meta or {}).get("updated", ""),
+            "status": (meta or {}).get("status", ""),
+            "deprecated": is_deprecated(meta),
             "mtime": st.st_mtime,
             "bytes": st.st_size,
             "has_frontmatter": meta is not None,
@@ -676,10 +704,17 @@ def memory_index_block(mem_dir: Path) -> str:
     索引每次组装时从磁盘现读：模型或提取线程刚写的记忆，下一轮立即可见；
     读失败视为空索引（read_index_text 兜底），不阻塞主循环。
     """
-    index = truncate_index(read_index_text(mem_dir))
+    # 与 _relabel 同一套滤除顺序：先剔已作废（不占预算）→ 截断 → 滤敏感行
+    index, deprecated = drop_deprecated_lines(read_index_text(mem_dir), mem_dir)
+    index = truncate_index(index)
     index, withheld = redact_sensitive_lines(index)
+    notes = []
     if withheld:
-        index += f"\n（另有 {withheld} 条含敏感信息的记忆未注入，需用时请用户在本机确认）"
+        notes.append(f"另有 {withheld} 条含敏感信息的记忆未注入，需用时请用户在本机确认")
+    if deprecated:
+        notes.append(f"另有 {deprecated} 条已作废的历史决策未注入（需要时用 read_file 读对应文件）")
+    if notes:
+        index += "\n（" + "；".join(notes) + "）"
     body = index if index else "（暂无记忆）"
     return f"\n\n{INDEX_HEADING}\n\n{body}"
 
@@ -735,18 +770,49 @@ def _layer_rank(mem_dir: Path):
     return rank
 
 
+def drop_deprecated_lines(index_text: str, mem_dir: Path) -> tuple[str, int]:
+    """滤掉 status=deprecated 的条目行，返回 (清洗后的索引, 被滤条数)。
+
+    为什么在【注入】这一步做而不是写盘时删：作废的记忆仍是有用的历史
+    （"当初为什么选了另一条路"），删了可惜；但它不该每轮占 system 预算、
+    更不该被模型当成现行结论。留文件、不进注入是唯一两头都占的做法。
+
+    必须在截断【之前】滤：否则它们会先吃掉预算、把有效条目挤出去。
+    文件不存在（索引行悬空）时按未作废处理——交给正常路径去暴露。
+    """
+    kept, dropped = [], 0
+    for line in (index_text or "").splitlines():
+        fname = None
+        if "](" in line:
+            fname = line.split("](")[1].split(")")[0]
+        if fname and valid_memory_filename(fname):
+            meta, _ = parse_frontmatter(_read_text(mem_dir / fname))
+            if is_deprecated(meta):
+                dropped += 1
+                continue
+        kept.append(line)
+    return "\n".join(kept) + ("\n" if kept else ""), dropped
+
+
 def _relabel(block: str, heading: str, max_lines: int, mem_dir: Path) -> str:
     """把 memory_index_block 的通用标题换成层名，并按该层的预算重新截断。
 
     重新截断是必要的：memory_index_block 用的是全局 INDEX_MAX_LINES(150)，
     两层的预算各不相同的（40 / 110），不能靠它一档管到底。
     截断时按价值排序（见 _layer_rank），不再按插入顺序丢最早的。
+
+    顺序：先滤已作废（不占预算）→ 再按价值截断 → 再滤敏感行。
     """
-    index = truncate_index(read_index_text(mem_dir), max_lines=max_lines,
-                           rank=_layer_rank(mem_dir))
+    index, deprecated = drop_deprecated_lines(read_index_text(mem_dir), mem_dir)
+    index = truncate_index(index, max_lines=max_lines, rank=_layer_rank(mem_dir))
     index, withheld = redact_sensitive_lines(index)
+    notes = []
     if withheld:
-        index += f"\n（另有 {withheld} 条含敏感信息的记忆未注入，需用时请用户在本机确认）"
+        notes.append(f"另有 {withheld} 条含敏感信息的记忆未注入，需用时请用户在本机确认")
+    if deprecated:
+        notes.append(f"另有 {deprecated} 条已作废的历史决策未注入（需要时用 read_file 读对应文件）")
+    if notes:
+        index += "\n（" + "；".join(notes) + "）"
     body = index if index else "（暂无记忆）"
     return f"\n\n{heading}\n\n{body}"
 

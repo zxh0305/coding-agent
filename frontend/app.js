@@ -6926,7 +6926,8 @@ function renderMemoryList() {
   for (const raw of rows) {
     const m = MemoryView.decorate(raw);
     const li = document.createElement("li");
-    li.className = "mp-row" + (m.uncurated ? " uncurated" : "");
+    li.className = "mp-row" + (m.uncurated ? " uncurated" : "")
+                 + (m.deprecated ? " deprecated" : "");
 
     const main = document.createElement("div");
     main.className = "mp-row-main";
@@ -6942,6 +6943,7 @@ function renderMemoryList() {
     meta.className = "mp-row-meta";
     const bits = [];
     if (m.type) bits.push(m.type);
+    if (m.deprecated) bits.push("⛔ 已作废（不注入）");
     if (m.sensitive) bits.push("🔒 含敏感信息（不注入）");
     if (m.when) bits.push(m.when);
     meta.textContent = bits.join(" · ");
