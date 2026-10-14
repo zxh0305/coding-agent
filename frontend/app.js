@@ -999,9 +999,17 @@ async function switchSession(id) {
 async function doSwitchSession(id) {
   if (id === currentSession) return;
   saveDraft(currentSession);     // 离开前：把输入框内容存进旧会话的草稿
+  // 【必须先关旧流，再清界面】下面 loadHistoryPage() 是 await（一次历史请求），
+  // 期间如果旧会话的 es 还活着，它推来的 answer_delta 会被 applyEvent 直接画进
+  // 刚清空的聊天区——实测：切到一个正在长篇输出的会话，新会话视图里会出现
+  // 【上一个会话的执行过程与正文】（"内容跑到别的会话里"）。
+  // 原先只有 openEvents() 里的 closeEvents() 关流，而它排在 loadHistoryPage()
+  // 之后，于是整个历史加载期间旧流都是活的。resetStreamState 的注释写着
+  // "旧会话的事件流已断"，但那时其实还没断——注释与事实不符。
+  closeEvents();
   currentSession = id;
   markSessionSeen(id);            // 进入即视为已读：清掉该任务的未读徽标
-  resetStreamState();  // 旧会话的事件流已断，流式状态必须随之复位
+  resetStreamState();  // 流式状态随旧会话一起复位（事件流已在上一步断开）
   // 归档态先同步定一次（用现有 cache）：resetStreamState 里 setStreaming(false)
   // 会用【上一个会话】的归档标志刷 placeholder，不立刻纠正的话，整个历史加载
   // 期间输入框一直显示错误文案（从非归档切进归档任务时尤为明显）。
