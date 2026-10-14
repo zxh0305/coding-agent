@@ -221,8 +221,11 @@ class TestTruncateEndpoint(RewindTestBase):
         self.assertEqual(set(agent.saved),
                          {hist[0]["_mid"], hist[1]["_mid"]}, "指纹账本随内存裁剪")
         self.assertEqual(len(db.get_messages(self.SID)), 2)
-        self.assertGreater(db.get_last_seq(self.SID), before_seq,
-                           "history_truncated 已发布且 seq 持久化")
+        # history_truncated 已发布（seq 前进）。它【不是回合边界】，落库走降频
+        # 刻度（PERSIST_INTERVAL_S），所以这里断言内存计数而非库里的 last_seq
+        # ——库里晚一拍不丢事件：补发有 resync 兜底，不依赖它即时落库。
+        self.assertGreater(app._event_bus(self.SID).current_seq, before_seq,
+                           "history_truncated 已发布")
 
 
 if __name__ == "__main__":

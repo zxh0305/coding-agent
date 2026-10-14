@@ -3317,6 +3317,43 @@ async function decidePermission(evt, decision, noteEl, buttons) {
   }
 }
 
+// 确认卡的正文：写文件类（apply_patch / write_file）渲染成红绿 diff，其余工具
+// 回退到格式化 JSON。此前一律 JSON.stringify——默认「确认」模式下每次写文件都
+// 弹卡，而弹卡恰恰是你唯一需要判断"它要干什么"的时刻，却给你一坨转义 \n 的
+// JSON。buildDiffBody 早就写好了，只是接在了工具【结果】卡上（即改完之后）。
+function buildPermissionBody(evt) {
+  const input = evt.input;
+  const args = (input && typeof input === "object") ? input : null;
+  const wrap = document.createElement("div");
+  if (args && evt.tool === "apply_patch"
+      && typeof args.search === "string" && typeof args.replace === "string") {
+    wrap.className = "perm-diff";
+    if (args.path) {
+      const p = document.createElement("div");
+      p.className = "perm-path";
+      p.textContent = args.path;
+      wrap.appendChild(p);
+    }
+    wrap.appendChild(buildDiffBody(args.search, args.replace));
+    return wrap;
+  }
+  if (args && evt.tool === "write_file" && typeof args.content === "string") {
+    wrap.className = "perm-diff";
+    if (args.path) {
+      const p = document.createElement("div");
+      p.className = "perm-path";
+      p.textContent = args.path;
+      wrap.appendChild(p);
+    }
+    wrap.appendChild(buildDiffBody("", args.content));
+    return wrap;
+  }
+  const pre = document.createElement("pre");
+  pre.textContent = typeof input === "string" ? input : JSON.stringify(input, null, 2);
+  wrap.appendChild(pre);
+  return wrap;
+}
+
 function showPermissionCard(evt) {
   flushStreamBuffers();
   demoteLiveBubbleToTrace();  // 权限卡前的正文也是过程说明，降级进面板
@@ -3332,8 +3369,7 @@ function showPermissionCard(evt) {
   const reason = document.createElement("div");
   reason.className = "perm-reason";
   reason.textContent = "触发原因：" + (evt.reason || "该操作需要确认");
-  const pre = document.createElement("pre");
-  pre.textContent = typeof evt.input === "string" ? evt.input : JSON.stringify(evt.input, null, 2);
+  const body = buildPermissionBody(evt);
   const btns = document.createElement("div");
   btns.className = "perm-btns";
   const mk = (label, decision, cls) => {
@@ -3350,7 +3386,7 @@ function showPermissionCard(evt) {
   const note = document.createElement("div");
   note.className = "perm-note";
   note.textContent = "等待你的决定（5 分钟未确认将按拒绝处理）";
-  card.append(title, reason, pre, btns, note);
+  card.append(title, reason, body, btns, note);
   // 确认卡不进过程监视窗（窗内滚、会被滚走）：它是必须看到并操作的交互卡，
   // 挂在面板底部（说明卡 order:2 之后）常驻可见。不算执行步骤。
   traceEl.appendChild(card);

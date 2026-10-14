@@ -42,7 +42,8 @@ MAX_READ_LINES = 2_000    # 单次 read_file 的行数上限：防止大文件�
                           # 两个口径统一后模型的心算成本最低。
 MAX_OUTPUT_CHARS = 8_000  # 命令输出上限（保留末尾，报错通常在尾部）
 MAX_GREP_MATCHES = 50
-BASH_TIMEOUT = 30
+BASH_TIMEOUT = 30          # run_bash 默认超时（秒），模型可用 timeout 参数放宽
+BASH_TIMEOUT_MAX = 600     # 单次超时上限：可以要更久，但不能无界占用会话锁
 
 # 行号栏宽度（右对齐空格填充）：4 位足够容纳绝大多数源文件；行号与正文之间
 # 用制表符分隔。行号化是给 apply_patch 铺路的——锚定成功率直接取决于模型
@@ -445,13 +446,17 @@ def grep(pattern: str, path: str = ".", ctx=None) -> str:
     return _ok({"path": path, "result": matches, "total": len(matches)})
 
 
-def run_bash(command: str, ctx=None) -> str:
-    """在工作区目录里执行 shell 命令（cwd 锁定工作区、30 秒超时、输出截断）。
+def run_bash(command: str, ctx=None, timeout: int = 0) -> str:
+    """在工作区目录里执行 shell 命令（cwd 锁定工作区、默认 30 秒超时、输出截断）。
 
     高危判定不在这里做：本函数只管执行。allow/deny/ask 三态判定（含命令
     拆解与用户确认）在调度前的权限闸门（permissions.py）完成——那里能把
     `ls;rm -rf /` 拆开看、也能让 `rm -rf /tmp/test` 这类操作先过问用户。
     到达这里 = 已获放行。
+
+    timeout：秒，0/缺省 = BASH_TIMEOUT(30)，上限 BASH_TIMEOUT_MAX(600)。
+    install / 测试套件 / 构建这类合法慢命令必须能要到足够时间——此前超时是
+    常量、schema 里没有这个参数，模型对 npm install 只能反复被掐断而无路可走。
 
     "怎么跑"由执行提供者决定（ctx.executor，executor.py seam）：默认本机
     子进程；注入 Docker 提供者即得沙箱隔离，本函数与权限闸门一行不改。
@@ -460,11 +465,17 @@ def run_bash(command: str, ctx=None) -> str:
     """
     if not command or not isinstance(command, str):
         return _err("command 不能为空", "把要执行的命令写进 command 参数")
+    try:
+        limit = int(timeout or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    limit = BASH_TIMEOUT if limit <= 0 else min(limit, BASH_TIMEOUT_MAX)
     executor = getattr(ctx, "executor", None) or default_executor()
-    res = executor.run(command, cwd=_ws(ctx), timeout=BASH_TIMEOUT)
+    res = executor.run(command, cwd=_ws(ctx), timeout=limit)
     if res.timed_out:
-        return _err(f"命令执行超过 {BASH_TIMEOUT} 秒被终止",
-                    "拆成更小的步骤分次执行，或给命令加超时/分页控制（如 head 限制输出）")
+        return _err(f"命令执行超过 {limit} 秒被终止",
+                    f"确认这是慢命令（安装/构建/测试）就把 timeout 参数放宽到 ≤{BASH_TIMEOUT_MAX} 后重试；"
+                    "或拆成更小的步骤分次执行、给输出加 head/tail 控制")
     stdout = (res.stdout or "")[-MAX_OUTPUT_CHARS:]
     stderr = (res.stderr or "")[-MAX_OUTPUT_CHARS // 2:]
     combined = (stdout + ("\n[stderr]\n" + stderr if stderr else "")).strip() or "（无输出）"
@@ -587,16 +598,25 @@ CODE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "run_bash",
-            "description": "在工作区目录里执行一条 shell 命令（30 秒超时，输出超长时保留尾部 8000 字符）。"
+            "description": "在工作区目录里执行一条 shell 命令（默认 30 秒超时，可用 timeout 参数放宽到最多 600 秒；"
+                           "输出超长时保留尾部 8000 字符）。"
                            "什么时候用：跑程序/测试验证改动、git status、pip list 这类检查。"
                            "什么时候不用：能被专用工具做的事——读文件用 read_file（不要 cat，前者带行号且受限工作区内）、"
                            "搜索用 grep（不要 grep 命令，专用的会返回结构化结果）、改文件绝不走 sed/echo 重定向。"
                            "调用前先用一句话说明这条命令的目的；预期输出很长时主动接 head/tail 缩窄。"
+                           "慢命令（npm/pip install、pytest、构建）请显式传 timeout，别让它被默认的 30 秒掐断；"
+                           "装包类可再加 --no-audit/--prefer-offline 等提速开关。"
                            "高危命令（rm -rf、sudo、git push 等）会先弹卡请求用户确认，拒绝会带原因返回。"
-                           "示例：run_bash {\"command\": \"python3 demo.py\"}；长输出如 run_bash {\"command\": \"ls -la | head -30\"}。",
+                           "示例：run_bash {\"command\": \"python3 demo.py\"}；"
+                           "run_bash {\"command\": \"npm install\", \"timeout\": 300}；"
+                           "长输出如 run_bash {\"command\": \"ls -la | head -30\"}。",
             "parameters": {
                 "type": "object",
-                "properties": {"command": {"type": "string", "description": "要执行的 shell 命令"}},
+                "properties": {
+                    "command": {"type": "string", "description": "要执行的 shell 命令"},
+                    "timeout": {"type": "integer",
+                                "description": "超时秒数，默认 30、上限 600。安装/构建/测试等慢命令请显式调大"},
+                },
                 "required": ["command"],
             },
         },

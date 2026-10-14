@@ -6,8 +6,8 @@ cd backend && python3 -m unittest tests.test_sse -v
 
 覆盖 events.SessionEvents 与 seq 持久化的核心不变式（跑在临时库里，不碰
 项目根的 agent_data.db）：
-1. seq 单调递增、每条落库；模拟重启（内存丢弃、仅剩 sessions.last_seq）后
-   从持久化值继续，绝不归零；
+1. seq 单调递增、落库【降频】（回合边界强制、其余按刻度）；模拟重启（内存
+   丢弃、仅剩 sessions.last_seq）后从持久化值继续，绝不归零；
 2. since 命中缓冲 → 尾部补发序列正确（seq 升序、内容一致）；
 3. since 过旧（缓冲挤掉缺口）/ 超前于计数器（重启回退）→ resync；
 4. 心跳不进缓冲（不占 seq、不占格子），业务事件全部进缓冲；
@@ -56,21 +56,32 @@ class SSETestBase(unittest.TestCase):
 
 class TestSeqPersistence(SSETestBase):
 
-    def test_seq_monotonic_and_persisted_every_event(self):
-        """每发布一条 seq +1 且立刻落库——WAL 下一行 UPDATE 是微秒级，
-        换"客户端见过的 seq 重启后绝不回退"的强保证。"""
+    def test_seq_monotonic_and_persisted_on_turn_boundary(self):
+        """seq 每发布一条 +1；落库只在【回合边界】与降频刻度上发生。
+
+        为什么不再是"每条都落库"：answer_delta 逐 token 发布，逐条落库意味着
+        一条 5000 token 的回答要开 5000 次连接 + UPDATE + COMMIT（自用工具最大
+        的一笔自找开销，还会把 WAL 撑到数倍于库文件）。降频不牺牲正确性——
+        见下一个用例对"重启不撞号"的验证。
+        """
         bus = self.wired_bus()
         seqs = [bus.publish({"type": "answer_delta", "delta": "字"}) for _ in range(5)]
         self.assertEqual(seqs, [1, 2, 3, 4, 5])
-        self.assertEqual(db.get_last_seq("s1"), 5)
+        # 纯 delta 期间不逐条落库：5 条 delta 最多只在初始刻度写一次
+        self.assertLessEqual(db.get_last_seq("s1"), 1)
+        # 回合边界强制落库：这是重启续接的权威锚点
+        bus.publish({"type": "turn_end"})
+        self.assertEqual(db.get_last_seq("s1"), 6)
 
     def test_restart_continues_from_persisted_value(self):
         """模拟重启：进程内的计数器与缓冲全部丢失，仅剩库里的 last_seq。
         新总线必须从持久化值继续（下一条 seq=8），重启后绝不归零——否则
-        新事件与客户端见过的旧事件撞号，前端 seq 闸门会把新事件误丢。"""
+        新事件与客户端见过的旧事件撞号，前端 seq 闸门会把新事件误丢。
+        落库降频后这条仍是强保证：turn_end 是每个回合结束都会写的边界。"""
         bus = self.wired_bus()
-        for _ in range(7):
+        for _ in range(6):
             bus.publish({"type": "x"})
+        bus.publish({"type": "turn_end"})  # 第 7 条：回合边界，强制落库
         bus2 = self.wired_bus()  # "重启"：从库恢复
         self.assertEqual(bus2.current_seq, 7)
         self.assertEqual(bus2.publish({"type": "x"}), 8)
@@ -85,6 +96,32 @@ class TestSeqPersistence(SSETestBase):
         with sqlite3.connect(db.DB_PATH) as conn:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
         self.assertEqual(sum(c == "last_seq" for c in cols), 1)
+
+    def test_persist_throttled_to_boundaries_and_interval(self):
+        """落库降频：5000 条 delta 只写常数次（此前是 5002 次）。
+
+        这是自用工具最大的一笔自找开销——answer_delta 逐 token 发布，逐条落库
+        等于一条回答期间开几千次 SQLite 连接 + UPDATE + COMMIT，并把 WAL 撑到
+        数倍于库文件。降频后：回合边界必写，其余按 PERSIST_INTERVAL_S 收口。
+        """
+        writes = []
+        bus = SessionEvents(last_seq=0, persist=writes.append)
+        bus.publish({"type": "turn_start"})
+        for _ in range(5000):
+            bus.publish({"type": "answer_delta", "delta": "字"})
+        bus.publish({"type": "turn_end"})
+        self.assertLessEqual(len(writes), 3,
+                             f"逐 token 落库没被降频，写了 {len(writes)} 次")
+        self.assertEqual(writes[-1], 5002, "回合结束时必须落到最新 seq")
+
+    def test_boundary_always_persists(self):
+        """回合边界强制落库——重启续接的权威锚点，不受降频影响。"""
+        bus = self.wired_bus()
+        bus.publish({"type": "turn_start"})
+        self.assertEqual(db.get_last_seq("s1"), 1)
+        bus.publish({"type": "answer_delta", "delta": "x"})
+        bus.publish({"type": "turn_end"})
+        self.assertEqual(db.get_last_seq("s1"), 3)
 
     def test_set_last_seq_never_goes_backwards(self):
         """标量 MAX：乱序到达的旧值不能把计数器拉回去。"""

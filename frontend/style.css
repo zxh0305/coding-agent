@@ -17,11 +17,19 @@
   --think-bg: #eef1f7;      /* 执行过程·思考流块软底（比页面底深一档，成"块"） */
   --think-border: #dfe4ef;  /* 执行过程·思考流块边框 */
 
-  /* ---- 文本层：主 → 次 → 弱 → 反白 ---- */
-  --text: #1f2430;          /* 正文（也作 hover 加深色） */
-  --text-2: #5a6478;        /* 次要说明 */
-  --text-3: #8a93a6;        /* 弱提示 / 占位 / 元信息 */
-  --text-4: #a0a8ba;        /* 过程痕迹专用浅灰 */
+  /* ---- 文本层：主 → 次 → 弱 → 反白 ----
+     对比度是硬约束，不是审美偏好：三段灰都锚在 WCAG AA（正文 4.5:1）之上，
+     实测值见行内注释（对 --bg #f4f6fa 计算）。旧值 --text-4 #a0a8ba 只有
+     2.2:1，而它恰好落在过程痕迹/工具结果/推理流上——一个 coding agent 最
+     主要的阅读内容成了全屏最看不清的东西。弱提示靠字重与字号区分层次，
+     不靠"淡到近乎不可见"。 */
+  --text: #1f2430;          /* 正文（也作 hover 加深色） 13.9:1 */
+  --text-2: #5a6478;        /* 次要说明 5.6:1 */
+  --text-3: #5f6879;        /* 弱提示 / 占位 / 元信息 5.1:1（原 #8a93a6 仅 2.9:1） */
+  --text-4: #676e7c;        /* 过程痕迹专用灰 4.7:1（原 #a0a8ba 仅 2.2:1） */
+  --text-1: var(--text);    /* 历史遗留别名：曾有 3 处引用但从未定义，
+                               未定义 var() 会让整条声明失效（.note-box 正文
+                               静默继承父色）。指向 --text 兜住这三处。 */
   --text-inverse: #fff;     /* 品牌色/深色底上的反白文字 */
 
   /* ---- 边框层 ---- */
@@ -1656,6 +1664,15 @@ button.primary:hover { background: var(--accent-hover); }
 .perm-btn:disabled { opacity: 0.45; cursor: default; }
 .perm-note { margin-top: 6px; font-size: 11px; color: var(--text-3); }
 .perm-note.resolved { color: var(--success-strong); }
+/* 确认卡的写文件正文（复用 .diff 的红绿行）：卡片底色是暖色告警底，
+   这里的 diff 自带 --panel 底，需要自身边框把它从告警底里拎出来 */
+.perm-diff { margin: 6px 0; }
+.perm-diff .diff { max-height: 200px; }
+.perm-path {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11.5px; color: var(--text); font-weight: 600;
+  margin-bottom: 3px; word-break: break-all;
+}
 
 /* ---------- Git 提交记录浮窗 ---------- */
 /* 右上角触发按钮：显示当前分支，做得比其它 chip 明显一些——它是进入

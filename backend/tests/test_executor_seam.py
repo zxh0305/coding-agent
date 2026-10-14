@@ -22,7 +22,7 @@ import time
 import unittest
 from pathlib import Path
 
-from code_tools import BASH_TIMEOUT, run_bash
+from code_tools import BASH_TIMEOUT, BASH_TIMEOUT_MAX, run_bash
 from executor import ExecResult, LocalExecutor
 from tools import ToolContext
 
@@ -58,6 +58,23 @@ class ExecutorSeamTest(unittest.TestCase):
         self.assertEqual(self.fake.calls[0]["command"], "echo hi")
         self.assertEqual(Path(self.fake.calls[0]["cwd"]).resolve(), self.ws.resolve())
         self.assertEqual(self.fake.calls[0]["timeout"], BASH_TIMEOUT)
+
+    def test_timeout_param_overrides_default_and_clamps(self):
+        """timeout 参数：0/缺省走默认 30s，显式值生效，超上限钳到 BASH_TIMEOUT_MAX。
+
+        回归背景：超时曾是常量、schema 里没有这个参数，install/构建/测试套件
+        这类合法慢命令一律被 30 秒掐断，模型无路可走只能让人去终端手跑。
+        """
+        run_bash("echo hi", self.ctx)                      # 缺省
+        self.assertEqual(self.fake.calls[-1]["timeout"], BASH_TIMEOUT)
+        run_bash("echo hi", self.ctx, 0)                   # 显式 0 = 缺省
+        self.assertEqual(self.fake.calls[-1]["timeout"], BASH_TIMEOUT)
+        run_bash("echo hi", self.ctx, 300)                 # 显式值生效
+        self.assertEqual(self.fake.calls[-1]["timeout"], 300)
+        run_bash("echo hi", self.ctx, 99999)               # 超上限被钳
+        self.assertEqual(self.fake.calls[-1]["timeout"], BASH_TIMEOUT_MAX)
+        run_bash("echo hi", self.ctx, "bad")               # 非法值回落默认
+        self.assertEqual(self.fake.calls[-1]["timeout"], BASH_TIMEOUT)
 
     def test_success_envelope_from_provider_result(self):
         """成功：exit_code=0 → ok 信封，stdout 进 result（截断拼合是工具层职责）。"""

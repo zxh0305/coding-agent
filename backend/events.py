@@ -45,6 +45,10 @@ REPLAY_BUFFER_SIZE = 500
 # 走到了网络上，代理的空闲计时器会被重置——这就是它防掐连接的全部原理。
 SSE_HEARTBEAT = b": ping\n\n"
 
+# last_seq 落库的最小间隔（秒）。回合边界无条件落库，其余情况按此降频——
+# 逐 token 落库是这个项目最大的一笔自找开销（见 publish 的论证）。
+PERSIST_INTERVAL_S = 1.0
+
 
 def sse_frame(seq: int | None, event: dict) -> bytes:
     """把一条事件编成 SSE 帧。业务事件带 seq → 写 id: 行（浏览器记为
@@ -73,6 +77,9 @@ class SessionEvents:
         self._subs: list[Queue] = []       # 在线订阅者，每条 events 连接一个
         self._lock = threading.Lock()
         self._persist = persist            # fn(seq)：最新 seq 落库，可缺省
+        # 上次落库的单调时刻（time.monotonic()）：last_seq 按 PERSIST_INTERVAL_S
+        # 降频写，回合边界强制写一次。见 publish 的论证。
+        self._persisted_at = time.monotonic()
         # 回合边界状态（由 turn_start/turn_end 事件顺带维护）：
         # replay_plan 靠它们把"正在进行的回合"从起点整段补发。
         self.running = False
@@ -103,12 +110,22 @@ class SessionEvents:
     # ---------- 发布（唯一写入路径） ----------
 
     def publish(self, event: dict) -> int:
-        """发布一条业务事件：分配 seq → 入环形缓冲 → 分发订阅者 → 落库。
+        """发布一条业务事件：分配 seq → 入环形缓冲 → 分发订阅者 → 择机落库。
 
         分发先于落库：订阅者看到事件的时刻不依赖 DB；落库失败只打日志不
         阻断（重启兜底本来就是 resync，回退几个 seq 号无碍正确性——参见
         模块 docstring 对"只需不撞号"的论证）。返回分配到的 seq。
+
+        【落库降频】last_seq 只在【回合边界】或距上次落库 PERSIST_INTERVAL_S
+        以上才写。此前是每条事件都写一次，而 answer_delta 是逐 token 发布的
+        ——一条 5000 token 的回答就是 5000 次 `sqlite3.connect` + 两条 PRAGMA
+        + UPDATE + COMMIT，自用工具最大的一笔自找开销，并把 WAL 撑到数倍于
+        库文件（现场：5MB 的库配 12MB 的 -wal）。降频不牺牲正确性：last_seq
+        只用于"重启后 seq 不撞号"，回退几个号的最坏后果是补发时把已发过的
+        帧再发一遍（前端按 mid 归并，幂等），而缓冲缺口本来就有 resync 兜底。
+        进程被 kill 时最多丢最近 PERSIST_INTERVAL_S 内的事件计数——窗外无差。
         """
+        should_persist = False   # 锁内赋真值；预置防锁内异常导致下方 NameError
         with self._lock:
             self._seq += 1
             seq = self._seq
@@ -127,9 +144,16 @@ class SessionEvents:
             elif etype == "turn_end":
                 self.running = False
             subs = list(self._subs)
+            # 是否落库（在锁内判定，避免多个发布者竞争同一刻度）
+            boundary = etype in ("turn_start", "turn_end")
+            now = time.monotonic()
+            should_persist = (self._persist is not None
+                              and (boundary or now - self._persisted_at >= PERSIST_INTERVAL_S))
+            if should_persist:
+                self._persisted_at = now
         for q in subs:
             q.put(item)
-        if self._persist is not None:
+        if should_persist:
             try:
                 self._persist(seq)
             except Exception as e:  # 落库失败不影响事件流

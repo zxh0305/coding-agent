@@ -30,6 +30,7 @@ $/反引号的命令一律转 ask 就是这个原因；真正要铁桶就上 Doc
 import fnmatch
 import json
 import logging
+import re
 import shlex
 import threading
 import time
@@ -121,6 +122,101 @@ def split_segments(command: str) -> list[list[str]]:
     if current:
         segments.append(current)
     return segments
+
+
+# ---------------------------------------------------------------------------
+# 透明前缀剥离：让真命令回到"命令词"位置
+# ---------------------------------------------------------------------------
+#
+# 为什么必须做：规则匹配是【位置 0 前缀匹配】(words_match)，而 shell 里有一批
+# "包装器"只负责改变执行环境、不改变真正要跑的命令——`env rm -rf /tmp/x` 与
+# `rm -rf /tmp/x` 语义完全相同，但前者的段是 ['env','rm','-rf','/tmp/x']，
+# rm 掉到位置 1，`rm -rf` 规则看不见它。实测以下全部 allow（默认 confirm 模式）：
+#     env rm -rf /tmp/x      nice sudo ls         xargs rm -rf
+#     bash -c "rm -rf /tmp"  HELLO=1 sudo ls      command rm -rf /tmp/x
+# 这是安全叙事上最糟的一类洞：README 承诺"rm -rf / sudo / git push 等先弹确认"，
+# 而加一个 `env ` 就绕过去了。剥离后再匹配，规则回到"看真命令"的语义上。
+#
+# 保守原则：只剥"确定不改变后续命令语义"的包装，剥不掉的原样保留（宁可漏剥
+# 让规则不命中、也不要错剥导致误伤）。`sh -c <串>` 是例外——它后面跟的是一整
+# 段 shell 源码（单个 token），必须【再拆一次】才能看见里面的 rm；这一步是
+# 递归的（`env sh -c "bash -c 'rm -rf /'"` 要剥两层）。
+_WRAPPERS = {"env", "nice", "nohup", "command", "time", "stdbuf", "setsid", "ionice"}
+# 带 -c 语义的 shell 包装：其后的 token 是被执行的源码，需要递归再拆
+_SHELL_C = {"sh", "bash", "zsh", "dash", "ksh"}
+# 包装器自身可能带的、需要额外吃一个参数的选项（如 nice -n 10 cmd）
+_WRAPPER_ARG_OPTS = {"-n", "--adjustment", "-u", "--user", "--nice"}
+
+# 内联脚本里的「破坏性调用」特征（见 _semantic_asks 的 d 分支）。
+# 只匹配会删/改/覆盖文件或起进程的调用，不匹配普通 import/print——否则
+# `python3 -c "import demo; print(demo.add(2,2))"` 这种最常用的验证手段
+# 每次都要弹卡，用户最终会关掉确认模式，得不偿失。
+_DESTRUCTIVE_SCRIPT = re.compile(
+    r"shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir|os\.removedirs"
+    r"|os\.system|os\.popen|subprocess\.|os\.chmod|os\.chown|shutil\.move"
+    r"|open\([^)]*['\"][wa]|Path\([^)]*\)\.unlink|\.write_text|\.write_bytes"
+    r"|sys\.exit|exec\(|eval\(")
+
+
+def _unwrap_segment(seg: list[str], _depth: int = 0) -> list[list[str]]:
+    """把一个命令段剥掉透明前缀，返回它真正代表的命令段列表。
+
+    返回列表是因为 `sh -c "a; b"` 展开后可能是多段。剥不动时返回 [seg] 原样。
+    """
+    if not seg or _depth > 4:          # 深度上限：防构造的嵌套把解析拖爆
+        return [seg]
+    out: list[list[str]] = []
+    rest = list(seg)
+    while rest:
+        head = rest[0]
+        # 1) VAR=value 形式的临时环境变量赋值：只影响环境，不改变命令
+        if "=" in head and not head.startswith("-") and "/" not in head.split("=", 1)[0]:
+            rest = rest[1:]
+            continue
+        # 2) 包装器（env / nice / nohup / …）：吃掉自己与它的选项
+        if head in _WRAPPERS or head.endswith("/env") or head.endswith("/nice"):
+            rest = rest[1:]
+            while rest and rest[0].startswith("-"):
+                opt = rest[0]
+                rest = rest[1:]
+                if opt in _WRAPPER_ARG_OPTS and rest:
+                    rest = rest[1:]        # 该选项还带一个值
+            continue
+        # 2b) xargs：它把余下的词当【要执行的命令】。`xargs rm -rf` 里 rm 在位置
+        #     1，剥离后回到位置 0 被规则看见。xargs 自己的选项（-0 -n1 -I{}）
+        #     先吃掉；`-I{}` 还带一个值。
+        if head == "xargs" or head.endswith("/xargs"):
+            rest = rest[1:]
+            while rest and rest[0].startswith("-"):
+                opt = rest[0]
+                rest = rest[1:]
+                if opt in ("-I", "-n", "--max-args", "-P", "--max-procs",
+                           "-s", "--max-chars") and rest:
+                    rest = rest[1:]
+            continue
+        # 3) shell -c <源码>：把源码当命令再拆一遍（递归，可多层）
+        if head.split("/")[-1] in _SHELL_C and len(rest) >= 2 and rest[1] == "-c":
+            src = " ".join(rest[2:])
+            try:
+                inner = split_segments(src)
+            except CommandParseError:
+                return [seg]               # 拆不动就退回原段（规则不命中即 ask 兜底）
+            for sub in (inner or [rest]):
+                out.extend(_unwrap_segment(sub, _depth + 1))
+            return out or [seg]
+        # 4) 已经不是包装器了：剩下的就是真命令
+        out.append(rest)
+        return out
+    return out or [seg]
+
+
+def normalize_segments(command: str) -> list[list[str]]:
+    """split_segments + 透明前缀剥离。规则匹配一律用它，不用裸 split_segments——
+    否则 `env rm -rf /` 这类写法直接绕过全部 ask 规则（见 _unwrap_segment 注释）。"""
+    normalized: list[list[str]] = []
+    for seg in split_segments(command):
+        normalized.extend(_unwrap_segment(seg))
+    return normalized
 
 
 def _word_eq(pattern_word: str, token: str) -> bool:
@@ -222,6 +318,10 @@ BUILTIN_RULES = [
     Rule("run_bash", "shutdown", ASK, "关机（shutdown）"),
     Rule("run_bash", "reboot", ASK, "重启（reboot）"),
     Rule("run_bash", "git reset --hard", ASK, "丢弃全部未提交改动（git reset --hard）"),
+    Rule("run_bash", "git clean", ASK, "清理未跟踪文件（git clean，-fdx 会删掉整片目录）"),
+    Rule("run_bash", "chmod", ASK, "修改文件权限（chmod，-R 作用于整棵树）"),
+    Rule("run_bash", "chown", ASK, "修改文件属主（chown）"),
+    Rule("run_bash", "truncate", ASK, "截断文件（truncate，会把文件清零）"),
 ]
 
 # 工具级兜底（规则清单之外的第三种内置逻辑）：文件写工具的判定不看规则表，
@@ -492,6 +592,72 @@ class PermissionGate:
             log.warning("用户权限规则加载失败，本次退回内置规则：%s", e)
             return []
 
+    @staticmethod
+    def _absorb(overlay: dict | None, remembered: dict, verb: str, reason: str,
+                key: tuple) -> list[tuple[str, str, tuple]]:
+        """把一条 ask 判定过一遍「本轮一次性决定 → 会话记忆」，返回吸收后的
+        单元素列表（前缀规则与语义规则共用这一份吸收语义，避免两处漂移）。"""
+        if overlay and key in overlay:
+            v = overlay[key]
+            return [(v.verb, v.reason, key)]
+        if remembered.get(key) == ALLOW:
+            return [(ALLOW, f"{reason}（本会话已允许）", key)]
+        return [(verb, reason, key)]
+
+    def _semantic_asks(self, tool: str, arguments: dict) -> list[tuple[str, str, tuple]]:
+        """前缀规则表达不了的语义判定，返回 [(verb, reason, key)]。
+
+        为什么需要这一层：words_match 是【位置 0 前缀匹配】，而有一类危险是
+        "任意位置出现某个词"——`find . -delete`、`curl … | sh`、`mv /etc/hosts`、
+        `tee /etc/passwd`。把它们也塞进 BUILTIN_RULES 当模式词是错的（前缀匹配
+        表达不了），所以单列这一层。每条都带固定的 rule 键（不是虚拟键），
+        这样「本会话内允许」能记账、ask 恢复时 overlay 找得到它。
+        """
+        if tool != "run_bash":
+            return []
+        command = str(arguments.get("command") or "")
+        hits: list[tuple[str, str, tuple]] = []
+        try:
+            segments = split_segments(command)   # 用未剥离的段：管道/删除标志要看原形
+        except CommandParseError:
+            return []                            # 解析失败已由 _builtin_verdict 转 ask
+        ws = str(self.workspace)
+        for seg in segments:
+            if not seg:
+                continue
+            head = seg[0].split("/")[-1]
+            rest = seg[1:]
+            # a) `… | sh` / `… | bash`：把上游输出直接喂进 shell 执行（curl|sh 式）
+            if head in _SHELL_C:
+                key = ("run_bash", "<pipe-to-shell>")
+                hits.append((ASK, f"把管道输入交给 shell 执行（| {head}）："
+                                  "上游内容会被当命令跑", key))
+            # b) find 的 -delete / -exec rm：删文件，但命令词是 find
+            if head == "find" and any(t in ("-delete", "-exec", "-execdir") for t in rest):
+                key = ("run_bash", "find * -delete")
+                hits.append((ASK, "find 带 -delete/-exec：会在遍历中删除或执行命令", key))
+            # c) 目标在工作区之外的写出类命令（mv / cp / tee / ln / install）。
+            #    只认绝对路径：相对路径的越界由执行层 _resolve 兜（这里不重复
+            #    判断，避免两处边界漂移）。self.workspace 是 resolve 过的绝对
+            #    路径，前缀比对用字符串即可。
+            if head in ("mv", "cp", "tee", "ln", "install") and any(
+                    t.startswith("/") and not (t == ws or t.startswith(ws + "/"))
+                    for t in rest if not t.startswith("-")):
+                key = ("run_bash", "<write-outside-workspace>")
+                hits.append((ASK, f"{head} 的目标路径在工作区之外：会写出工作区边界", key))
+            # d) python -c / perl -e / node -e：整段脚本藏在参数里，静态审查看不见。
+            #    但【不能一律拦】——`python3 -c "import demo; print(demo.add(2,2))"`
+            #    是模型验证改动最常用的手段，每次弹卡会把人逼去 yolo 模式（更糟）。
+            #    只查真正的破坏性调用：删文件/改权限/起进程/覆盖写。
+            if head in ("python", "python3", "perl", "ruby", "node") and any(
+                    t in ("-c", "-e", "--eval", "-pe") for t in rest):
+                script = " ".join(t for t in rest if not t.startswith("-"))
+                if _DESTRUCTIVE_SCRIPT.search(script):
+                    key = ("run_bash", "<inline-script-destructive>")
+                    hits.append((ASK, f"{head} 内联脚本里含破坏性调用"
+                                      f"（rmtree/unlink/os.system/subprocess/覆盖写）", key))
+        return hits
+
     def check(self, tool: str, arguments: dict, overlay: dict | None = None) -> Verdict:
         """判定一次工具调用。overlay 是本轮一次性决定（规则 key → Verdict），
         由 ask 恢复后重新判定时传入；deny 优先于一切，且不受记忆/overlay 翻案。"""
@@ -530,6 +696,21 @@ class PermissionGate:
             elif remembered.get(key) == ALLOW:
                 base = Verdict(ALLOW, f"{base.reason}（本会话已允许）", key)
         matched.append((base.verb, base.reason, base.rule_key))
+        # 语义层（位置无关的高危判定：管道喂 shell、find -delete、越界写出、
+        # 内联脚本）：与前缀规则同等参与「最严者胜」，同样可被本轮 overlay /
+        # 会话记忆吸收——否则用户点了「本会话内允许」，恢复重判会被它原样再拦，
+        # 回合永远走不出等待。
+        semantic = [(v, r, k) for v, r, k in self._semantic_asks(tool, arguments)
+                    for (v, r, k) in self._absorb(overlay, remembered, v, r, k)]
+        matched.extend(semantic)
+        # 整工具 allow（用户规则 pattern=None，reason/键形如 ("run_bash","")）是
+        # 一个显式的「这个工具我全权托付」决定，优先级高于【内置的】位置规则与
+        # 语义规则——否则用户写了 allow 却仍被每一条内置 ask 拦，等于该规则失效。
+        # 但绝不越过 deny：最严者胜对 deny 依然成立（下面循环的第一个 verb）。
+        whole_tool_allow = any(k and k[0] == tool and not k[1]
+                               for v, _, k in matched if v == ALLOW)
+        if whole_tool_allow and not any(v == DENY for v, _, _ in matched):
+            return Verdict(ALLOW, "该工具已整工具放行（用户规则）", None)
         # 最严者胜：deny > ask > allow。同类取第一个命中者（次序见 _effective_rules）。
         for verb in (DENY, ASK):
             for v, reason, key in matched:
@@ -633,7 +814,9 @@ class PermissionGate:
             return False
         command = str(arguments.get("command") or "")
         try:
-            segments = split_segments(command)
+            # 用 normalize_segments（含透明前缀剥离）：`env rm -rf /` 若不剥离，
+            # rm 不在位置 0，`rm -rf` 规则命中不了，命令零提示放行。
+            segments = normalize_segments(command)
         except CommandParseError:
             return False  # 解析失败时模式规则不可信；base 已把整条命令转 ask
         return any(words_match(rule.pattern, seg) for seg in segments)
