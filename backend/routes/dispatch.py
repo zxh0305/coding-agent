@@ -12,6 +12,7 @@ routes → app 的反向 import：
   DELETE /api/sessions,...      → sessions mixin 的 _delete_session_cleanup
 """
 
+import json
 import re
 import urllib.parse
 
