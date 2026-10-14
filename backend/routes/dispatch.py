@@ -17,6 +17,8 @@ import re
 import urllib.parse
 
 import db
+from routes.base import _BodyTooLarge
+from services.messages import MAX_BODY_BYTES
 from services.model_resolve import _active_window, _mask, _resolve_active
 
 from routes import busref
@@ -296,6 +298,12 @@ class DispatchMixin:
                 self._handle_git_checkout()
             else:
                 self._json({"error": "未知接口"}, 404)
+        except _BodyTooLarge as e:
+            # 体积问题要单独出口：混进下面的 400 会让文案变成"字段缺失"，
+            # 用户传了大附件却被告知输入为空（真实踩过）
+            self._json({"error": f"请求体过大（{e.length} 字节，上限 "
+                                 f"{MAX_BODY_BYTES} 字节）——大文件请改用附件上传",
+                        "code": "body_too_large"}, 413)
         except json.JSONDecodeError as e:
             self._json({"error": f"请求体不是合法 JSON：{e}"}, 400)
         except ValueError as e:
@@ -309,6 +317,20 @@ class DispatchMixin:
     def do_DELETE(self):
         if not self._require_auth():
             return
+        try:
+            self._do_delete()
+        except _BodyTooLarge as e:
+            self._json({"error": f"请求体过大（{e.length} 字节，上限 "
+                                 f"{MAX_BODY_BYTES} 字节）", "code": "body_too_large"}, 413)
+        except json.JSONDecodeError as e:
+            self._json({"error": f"请求体不是合法 JSON：{e}"}, 400)
+        except ValueError as e:
+            self._json({"error": str(e)}, 400)
+        except Exception:
+            log.exception("删除接口处理出错")
+            self._json({"error": "服务器内部错误，详情见 backend 日志"}, 500)
+
+    def _do_delete(self):
         # /api/sessions/<sid>/attachments?name=xxx / docs?name=xxx：单文件删除
         # （附件浮窗与文档面板的 🗑 按钮）。归属校验与 GET 同一套。
         m = re.fullmatch(r"/api/sessions/([^/]+)/(attachments|docs)",

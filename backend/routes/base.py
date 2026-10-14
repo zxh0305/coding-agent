@@ -32,11 +32,50 @@ from state import _agents, _buses, _ctx, _lock, _running_agents, _session_locks,
 log = logging.getLogger("app")
 
 
+class _BodyTooLarge(Exception):
+    """请求体超过 MAX_BODY_BYTES。由 _body 抛出、do_POST/do_DELETE 捕获成 413。
+
+    为什么用异常而不是返回空字典：空字典会让 handler 按"字段缺失"回一个语义
+    错误的 400（前端显示"用户名不能为空"，而用户其实传了个 13MB 的日志包）。
+    异常能把"这是体积问题"这一事实带到统一错误出口，文案才说得清。
+    """
+
+    def __init__(self, length: int):
+        super().__init__(f"请求体 {length} 字节超过上限 {MAX_BODY_BYTES}")
+        self.length = length
+
+
 class HandlerBase(SimpleHTTPRequestHandler):
     """API 路由 + 静态文件托管的公共骨架（鉴权 / 响应 / 分发）。"""
 
+    # HTTP/1.1：启用 keep-alive，一个 TCP 连接复用多条请求。
+    # 默认（BaseHTTPRequestHandler.protocol_version = "HTTP/1.0"）下每个请求
+    # 都要新建 TCP 连接——前端一次页面加载会并发打十几个 /api/*（config、
+    # sessions、context、内存、git…），每次 3 次握手不是小开销；在公网/隧道
+    # （用户会从手机或外网访问）下尤其明显。实测本机响应头此前是 HTTP/1.0。
+    #
+    # 1.1 要求响应必须带 Content-Length 或分块编码，否则客户端会一直等后续
+    # 内容而挂住。本项目的 JSON/静态响应都由 _json 与 SimpleHTTPRequestHandler
+    # 带 Content-Length；SSE 是唯一的例外，它【显式】把自己降回 1.0 +
+    # Connection: close（见 sessions._handle_session_events）——那是刻意的：
+    # 长连接不能被 keep-alive 复用，且该处依赖"连接结束即帧边界"的语义。
+    protocol_version = "HTTP/1.1"
+
     def __init__(self, *args, **kwargs):
+        # 每次响应前重置（同一连接可能复用；BaseHTTPRequestHandler 每个请求
+        # 都新建实例，但显式初始化更稳，也让 end_headers 的判断无歧义）。
+        self._cache_control_sent = False
         super().__init__(*args, directory=str(FRONTEND_DIR), **kwargs)
+
+    def send_header(self, keyword, value):
+        """记录 Cache-Control 是否已发，供 end_headers 去重。
+
+        不走 self._headers_buffer：那是 [(keyword, value)] 的列表，但需要
+        逐条解析字符串、且不同 Python 版本实现有差异，直接在这里打标最可靠。
+        """
+        if keyword.lower() == "cache-control":
+            self._cache_control_sent = True
+        super().send_header(keyword, value)
 
     def log_message(self, fmt, *args):  # 访问日志降级为 DEBUG，不刷屏
         log.debug("HTTP %s", fmt % args)
@@ -45,7 +84,15 @@ class HandlerBase(SimpleHTTPRequestHandler):
         # 禁止缓存：浏览器对静态文件有启发式缓存，曾出现"新 index.html 配旧 app.js"
         # 的版本错配——旧脚本在新页面上找不到元素，执行中断，所有按钮集体失灵。
         # 本地开发页面每次都重新验证（文件没变时服务端回 304，开销极小）。
-        self.send_header("Cache-Control", "no-cache, must-revalidate")
+        #
+        # 只在【别名未发过】时补一条：SSE 端点自己发过 Cache-Control: no-cache，
+        # 此前这里会再发一次，响应里于是有两个同名头（实测 SSE 响应确实如此：
+        # `Cache-Control: no-cache` 紧跟 `Cache-Control: no-cache, must-revalidate`）。
+        # 重复头不出错，但要靠"后一条覆盖前一条"的隐式规则，中间层（代理/网关）
+        # 解释顺序未必一致——统一成一条更省心。
+        if not self._cache_control_sent:
+            self._cache_control_sent = True
+            self.send_header("Cache-Control", "no-cache, must-revalidate")
         super().end_headers()
 
     # ---------- 鉴权 ----------
@@ -98,11 +145,16 @@ class HandlerBase(SimpleHTTPRequestHandler):
         # 请求体上限：单用户本地服务，但没上限的话一个超大 body 会被原样
         # read 进内存再 json.loads——白白占用内存与一个线程。图片附件走
         # base64 内联（单图上限 MAX_IMAGE_B64≈6MB），12MB 足够覆盖"一条消息
-        # + 若干附件"。超限时不读、返回 {}，各 handler 会按"输入为空/字段缺失"
-        # 走干净的 400，而不是把超大内容读进来。
+        # + 若干附件"。
+        #
+        # 超限时抛 _BodyTooLarge 而不是返回 {}：返回空字典会让各 handler 按
+        # "字段缺失"回一个 400，而文案是"用户名不能为空"之类——用户传了个
+        # 大附件却被告知输入为空，完全误导（真实踩过：13MB 的日志包上传被
+        # 报成"输入不能为空"）。由 do_POST/do_DELETE 统一捕获成 413，
+        # 文案直说"请求体过大"并带上限值，才是可操作的反馈。
         if length > MAX_BODY_BYTES:
             log.warning("请求体超限已拒绝: %d 字节 > %d", length, MAX_BODY_BYTES)
-            return {}
+            raise _BodyTooLarge(length)
         return json.loads(self.rfile.read(length) or b"{}")
 
     def _query(self) -> dict:

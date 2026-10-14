@@ -156,6 +156,50 @@ class TestBadBodyGetsJsonError(ApiTestBase):
         self.assertEqual(status, 400)
         self.assertIsInstance(json.loads(raw).get("error"), str)
 
+    def test_oversized_body_returns_413_with_actionable_message(self):
+        """超大 body 必须回 413，而不是伪装成"字段缺失"的 400。
+
+        旧行为：_body 超限时返回 {}，handler 按输入为空回 400——用户传了个
+        13MB 日志包，却被告知"用户名不能为空"，完全误导。这条锁住新语义。
+        """
+        from services.messages import MAX_BODY_BYTES
+        status, raw = self.raw_post("/api/auth/login", b"{}",
+                                    {"Content-Type": "application/json",
+                                     "Content-Length": str(MAX_BODY_BYTES + 1)})
+        self.assertEqual(status, 413)
+        body = json.loads(raw)
+        self.assertEqual(body.get("code"), "body_too_large")
+        # 文案要能指导用户怎么办，并带上真实上限
+        self.assertIn("过大", body["error"])
+        self.assertIn(str(MAX_BODY_BYTES), body["error"])
+
+    def test_oversized_body_not_read_into_memory(self):
+        """超限时【不读】body——否则"防内存爆"的初衷就落空了。
+
+        这里只声明大 Content-Length、实际发很少的字节：若服务端真去 read
+        那么长，会一直等到超时；能立刻拿到 413 就证明它没读。
+        """
+        from services.messages import MAX_BODY_BYTES
+        import socket
+        host, port = self.base.replace("http://", "").split(":")
+        s = socket.create_connection((host, int(port)), 10)
+        try:
+            s.sendall((f"POST /api/auth/login HTTP/1.1\r\nHost: x\r\n"
+                       f"Content-Type: application/json\r\n"
+                       f"Content-Length: {MAX_BODY_BYTES + 1000}\r\n\r\n").encode())
+            s.settimeout(5)
+            resp = s.recv(4096).decode("utf-8", "replace")
+        finally:
+            s.close()
+        self.assertIn("413", resp.split("\r\n")[0])
+
+    def test_normal_body_still_works(self):
+        """413 的改动不能误伤正常请求。"""
+        status, raw = self.raw_post("/api/auth/login",
+                                    json.dumps({"username": "x", "password": "yyyy"}).encode(),
+                                    {"Content-Type": "application/json"})
+        self.assertEqual(status, 401)   # 账号不存在：走正常业务路径
+
 
 class TestExceptClausesOnlyUseImportedNames(unittest.TestCase):
     """通用护栏：`except 名.属性` 里的名必须真的导入过。
