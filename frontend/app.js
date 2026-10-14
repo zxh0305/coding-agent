@@ -3930,6 +3930,13 @@ function applyEvent(evt, seq) {
     // 正在进行的回合也走同一套初始化）
     liveMsgs = new Map();
     liveBubble = null; traceEl = null; procBox = null; traceCurrent = "";
+    // editBox 必须与 procBox 一同作废：它同样指向【上一回合】traceEl 里的
+    // .edit-box。旧 traceEl 在回合结束后不从 DOM 移除（done 只摘 running、
+    // 改 summary），所以 editBox.isConnected 仍为真——editBoxEl() 的
+    // `if (editBox && editBox.isConnected) return editBox` 会把上一回合的修改区
+    // 原样交回，本回合的 write_file/apply_patch 卡片全被 append 进上一回合的卡里，
+    // 而本回合卡片空无一物（用户看到的"改动跑到别的块里"）。
+    editBox = null;
     placeholderOpen = false; autoThinkOpen = false; userToggledTrace = false;
     // ↑ 开合状态随回合重建作废（新卡、新开合语义）
     tracePhase = "正在理解问题…";  // 回合开场：模型还没吐任何内容时的友好占位
@@ -4283,6 +4290,7 @@ function resetStreamState() {
   liveBubble = null; metaEl = null;
   thinkBox = null; thinkSeg = null; noteBox = null; curRoundNo = 0; roundNeedHead = true;
   procBox = null;  // 过程监视窗引用随会话作废（窗子元素挂在旧 traceEl 上）
+  editBox = null;  // 修改区同理：它挂在同一个旧 traceEl 上，不清会串进下个会话
   traceEl = null;
   liveMsgs = new Map(); pendingCalls = [];
   permissionCards = new Map();
