@@ -2890,6 +2890,13 @@ function traceCloseAtEnd() {
 
 function traceTick() {
   if (!traceEl) return;
+  // 【只在回合进行中跳动】done 会摘掉 running 并把摘要定稿（"已工作 X 秒 ·
+  // N 步"，不带阶段文案）。但收尾与「下一回合 turn_start 起新计时器」之间
+  // 有一帧窗口：旧计时器若在此刻再跑一次 traceTick，就会把已经定稿的摘要
+  // 重新写成带 tracePhase 的实时文案——实测表现为**已结束的回合摘要停在
+  // "深度思考中… · 已工作 7.0 秒"**（阶段文案冻结在完结的卡上）。
+  // 用 running 类当"这个块还活着"的唯一判据：摘掉即不再被任何 tick 改写。
+  if (!traceEl.classList.contains("running")) return;
   const st = liveTracker.state();
   const steps = st ? st.steps : 0;
   const el = fmtElapsed((Date.now() - traceStart()) / 1000);
