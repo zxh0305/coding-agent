@@ -137,6 +137,82 @@ def _http_post_json(url: str, headers: dict, payload: dict, timeout: int):
 
 
 # ---------------------------------------------------------------------------
+# 上下文口径：一次请求"模型到底看进去多少 token"
+# ---------------------------------------------------------------------------
+#
+# 【为什么需要单独一个口径】同一个字段名在两家的含义是相反的：
+#
+#   Anthropic  input_tokens            = 全部输入（缓存命中的**也含在内**）
+#              cache_read_input_tokens = 其中命中缓存的部分（输入的子集）
+#              → 上下文大小 = input_tokens 本身
+#
+#   DeepSeek /  OpenAI 兼容的 prompt_tokens = **仅未命中**的部分（不含缓存命中）
+#              prompt_cache_hit_tokens     = 另外还有这么多命中了缓存
+#              → 上下文大小 = prompt_tokens + prompt_cache_hit_tokens
+#
+# 旧代码统一按 Anthropic 语义理解 prompt_tokens，于是"缓存命中越多、
+# 算出来的上下文越小"。实测（真实会话）：prompt_tokens=102 而
+# 命中 8448 → 真实上下文 8550，被当成 102。
+#
+# 这个被低估的数有【三个受害者】共用：前端上下文徽章、自动压缩的触发线、
+# 以及 context_stats 里 prompt_tokens/字符数 的校准系数。三者一起偏小，
+# 表现为"上下文占用看着很小、压缩迟迟不触发，直到某天窗口满了直接崩"。
+#
+# 注意与【计费口径】的区别：prompt_tokens 作为"未命中部分"正是要写入
+# message_usage 供账单与缓存命中率用的，**不能改**。这里只新增一个
+# prompt_tokens_total 供"上下文大小"口径使用，两者并存。
+# ---------------------------------------------------------------------------
+
+def infer_prompt_excludes_cache(usage: dict) -> bool:
+    """判断这份 usage 里的 prompt_tokens 是否【不含】缓存命中。
+
+    【为什么不能按 api_format 判断】实测踩坑：一个配成 api_format=anthropic 的
+    网关（maiya生产），响应里报的却是 `input_tokens=102` + `cache_read_input_-
+    tokens=8448`——字段名是 Anthropic 的，语义却是 DeepSeek 的（input 不含命中）。
+    同 provider 的 34 条记录里 24 条"额外"、10 条"子集"，连按量级猜都不可靠。
+
+    【可靠信号】缓存字段的**原始名字**：
+      - 出现 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+        → 这是 DeepSeek/OpenAI 兼容风格，其 prompt_tokens 是【仅未命中】；
+      - 只出现 `cache_read_input_tokens` → Anthropic 原生风格，
+        input_tokens 已含命中（cache_read 是它的子集）。
+
+    调用方在【解析原始响应处】用这个函数打标，不要等归一化之后再猜——那时
+    两家字段名已被统一成 prompt_cache_hit_tokens，判别信息就丢了。
+
+    没有缓存字段（首次请求/服务商不报）→ 返回 False（不加），
+    此时 hit 恒 0，加不加结果相同，选 False 少一次无谓运算。
+    """
+    # 归一化后 prompt_cache_miss_tokens 只由 OpenAI 分支或 Anthropic 的
+    # cache_creation 写；单靠它不够。真正的分野是【原始字段名】，
+    # 由解析处显式传入（见各调用点）。这里作兜底：有 hit 就按"额外"处理，
+    # 因为实测本项目的网关全部是这一种。
+    return bool(usage.get("prompt_cache_hit_tokens"))
+
+
+def input_token_total(usage: dict, *, prompt_excludes_cache: bool) -> int:
+    """一次请求的【总输入】token——即"模型当前上下文有多大"。
+
+    必须由调用方告知语义，不能靠字典形状猜：usage 走到这里时两家字段名已被
+    统一（都叫 prompt_tokens / prompt_cache_hit_tokens），仅看字典分不出：
+
+    - Anthropic 的 input_tokens=8550 里【已含】命中，若再加 hit=8448
+      会得到 16998（近两倍虚高）；
+    - DeepSeek 的 prompt_tokens=102 里【不含】命中，必须加 hit 才是 8550。
+
+    prompt_excludes_cache=True：prompt 仅未命中，总数 = prompt + hit；
+    False：prompt 已是全量，原样返回。
+
+    宁小勿大地兜底：拿不到输入时返回 0，调用方（context_tokens 走 max）
+    会保留上一轮已知值，不会把上下文误报成 0。
+    """
+    prompt = usage.get("prompt_tokens") or 0
+    if prompt_excludes_cache:
+        return prompt + (usage.get("prompt_cache_hit_tokens") or 0)
+    return prompt
+
+
+# ---------------------------------------------------------------------------
 # 瞬态错误退避重试：429（TPM 限流）、5xx 网关抖动、连接失败这类"等一等就能好"
 # 的错误，在【请求发出前】退避重试自愈，不再把整个回合打死。
 # ---------------------------------------------------------------------------
@@ -410,6 +486,9 @@ class OpenAIChatClient:
                             usage["prompt_cache_miss_tokens"] = u.get(
                                 "prompt_cache_miss_tokens",
                                 max((u.get("prompt_tokens") or 0) - hit, 0))
+                        # OpenAI 兼容语义：prompt_tokens 不含缓存命中，须加 hit
+                        usage["prompt_tokens_total"] = input_token_total(
+                            usage, prompt_excludes_cache=True)
                         yield "usage", usage
                     choices = chunk.get("choices") or []
                     if not choices:
@@ -666,6 +745,13 @@ class AnthropicMessagesClient:
         usage = {"prompt_tokens": u.get("input_tokens", 0),
                  "completion_tokens": u.get("output_tokens", 0),
                  "total_tokens": u.get("input_tokens", 0) + u.get("output_tokens", 0)}
+        # 缓存字段（Anthropic 语义：cache_read 是 input 的子集，用于命中率展示）
+        if u.get("cache_read_input_tokens"):
+            usage["prompt_cache_hit_tokens"] = u["cache_read_input_tokens"]
+        if u.get("cache_creation_input_tokens"):
+            usage["prompt_cache_miss_tokens"] = u["cache_creation_input_tokens"]
+        usage["prompt_tokens_total"] = input_token_total(
+            usage, prompt_excludes_cache=False)
         return message, usage
 
     def chat(self, messages: list, tools: list | None = None,
@@ -723,6 +809,23 @@ class AnthropicMessagesClient:
                         if u.get("cache_creation_input_tokens"):
                             # 新写入的部分视作未命中（本回合首次发送的前缀）
                             usage["prompt_cache_miss_tokens"] = u["cache_creation_input_tokens"]
+                        # 【关键】input_tokens 是否含缓存命中，各网关不一致：
+                        # 官方 Anthropic 含（cache_read 是其子集）；但实测
+                        # api_format=anthropic 的网关报 DeepSeek 语义——
+                        # 抓到的真实 message_start：
+                        #   {"input_tokens":138,"cache_read_input_tokens":8448}
+                        # 命中量(8448)比输入总量(138)还大，在"子集"语义下算术
+                        # 不可能成立，故 input 必为【仅未命中】。
+                        #
+                        # 用这条【算术不可能性】判别，比按 api_format 猜可靠
+                        # （该网关 api_format 恰是 anthropic，按它猜必错）：
+                        # hit > input ⟹ input 仅未命中，真实上下文 = input + hit。
+                        # 相等或更小时无从区分，保守按官方 Annex 语义（不加）
+                        # ——那也正是旧行为，至少不比改前更差。
+                        _hit_raw = usage.get("prompt_cache_hit_tokens") or 0
+                        usage["prompt_tokens_total"] = input_token_total(
+                            usage,
+                            prompt_excludes_cache=_hit_raw > (usage["prompt_tokens"] or 0))
                     elif t == "content_block_start":
                         block = data.get("content_block") or {}
                         blocks[data.get("index", 0)] = {"type": block.get("type", "text"), "text": "",
@@ -765,6 +868,13 @@ class AnthropicMessagesClient:
                             usage["prompt_cache_hit_tokens"] = du["cache_read_input_tokens"]
                         if du.get("cache_creation_input_tokens"):
                             usage["prompt_cache_miss_tokens"] = du["cache_creation_input_tokens"]
+                        # 用量补齐后重算总输入：这条分支正是"去重"的地方——
+                        # message_start 若已定过值，这里按【补齐后的最新数字】
+                        # 重算（input/hit 刚被 message_delta 更新），否则会出现
+                        # "total 停在 message_start 的空字典上 = 0"。
+                        _hit = usage.get("prompt_cache_hit_tokens") or 0
+                        usage["prompt_tokens_total"] = input_token_total(
+                            usage, prompt_excludes_cache=_hit > (usage["prompt_tokens"] or 0))
                     elif t == "error":
                         raise RuntimeError(f"Anthropic API 错误：{(data.get('error') or {}).get('message', data)}")
                     elif t == "message_stop":
@@ -776,6 +886,14 @@ class AnthropicMessagesClient:
             # cancel 置位导致的断连：当作正常结束，带着已收到的部分收尾
 
         usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+        # prompt_tokens_total 已在 message_start 处按该网关的真实语义定好
+        # （见那里的"算术不可能性"判别）。这里只在 message_start 缺失
+        # （部分兼容网关直接给 message_delta）时补一个兜底值——同样用
+        # hit > input 判别，不要无条件按官方 Annex 语义覆盖掉已判定的结果。
+        if "prompt_tokens_total" not in usage:
+            _hit = usage.get("prompt_cache_hit_tokens") or 0
+            usage["prompt_tokens_total"] = input_token_total(
+                usage, prompt_excludes_cache=_hit > (usage["prompt_tokens"] or 0))
         yield "usage", usage
 
         # 终止判定（与 OpenAIChatClient 同一套规则，见 _classify_stream_end）。

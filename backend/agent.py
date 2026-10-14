@@ -673,7 +673,11 @@ class Agent:
         usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
                        # 缓存命中/未命中随 _stats 落库（message_usage.cached_tokens），
                        # 用量页「缓存命中」列的数据来源
-                       "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
+                       "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0,
+                       # 总输入（含缓存命中）。累计口径下取【各轮求和】——它是
+                       # 计费视角的"一回合共喂进去多少"，与 context_tokens 的
+                       # "最后一次请求的上下文大小"是两个不同问题，不可混用。
+                       "prompt_tokens_total": 0}
         # 跨轮回调状态（主循环与收尾轮共用一套）：缓存命中率、上下文估算、计时起点。
         # 由 _consume_stream / 两个收尾方法就地更新。
         # context_tokens：本回合【最后一次】请求的真实 prompt_tokens——那才是模型
@@ -840,13 +844,20 @@ class Agent:
                 # 缓存命中/未命中一并累计（工具循环的多次请求求和），否则落库
                 # 的 _stats 里永远没有这两个键 → 用量页「缓存命中」列恒为空
                 for key in ("prompt_tokens", "completion_tokens", "total_tokens",
-                            "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+                            "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
+                            "prompt_tokens_total"):
                     usage_total[key] = usage_total.get(key, 0) + (payload.get(key) or 0)
                 hit = payload.get("prompt_cache_hit_tokens")
                 miss = payload.get("prompt_cache_miss_tokens")
                 if hit is not None and (hit + (miss or 0)) > 0:
                     metrics["cache_hit_rate"] = round(hit / (hit + (miss or 0)) * 100, 1)
-                last_prompt = payload.get("prompt_tokens") or 0
+                # 【上下文口径】必须用"总输入"(prompt_tokens_total)，而不是
+                # payload["prompt_tokens"]：后者在 DeepSeek 语义下只算【未命中】
+                # 部分，缓存命中越多它越小——拿它当上下文大小会系统性低估
+                # （实测 102 vs 真实 8550），并把 context_stats 的校准系数与
+                # 自动压缩触发线一起带小。字段缺失时退回 prompt_tokens 保旧行为。
+                last_prompt = (payload.get("prompt_tokens_total")
+                               or payload.get("prompt_tokens") or 0)
                 metrics["context_tokens"] = max(metrics["context_tokens"] or 0, last_prompt)
                 metrics["context"] = self.context_stats(prompt_tokens=last_prompt)
                 # 轮级计时：本轮的缓存命中/未命中、TTFT、生成耗时、TPS。TTFT 与
