@@ -64,6 +64,17 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
         workspace = prepare_workspace(None)
     # 工作区纳入配置指纹：任务的工作区被切换后，下次构建会重建 Agent（历史照旧从库里恢复）
     sig += "|" + str(workspace)
+    #
+    # 【已核实】中途重建是安全的，不必额外加锁拦它：
+    #   * 用户消息在回合【开始】就已落库（services/turn.py 的 save_messages），
+    #     所以重建后 restore_window 一定拿得到本回合的提问；
+    #   * agent.saved 账本由 db.fingerprints(恢复的历史) 重建，实测续写新一轮
+    #     只写新消息、旧行不重写（增量幂等靠 mid 主键 + 指纹比对）；
+    #   * 正在跑的回合持有的是【旧实例】的局部引用，其收尾落盘走旧引用；
+    #     turn.py 的 finally 只在"仍是本实例"时才摘 _running_agents 登记，
+    #     已显式考虑到中途换实例。
+    # 唯一代价：回合跑一半改配置，则该回合【尚未落盘】的助手输出会随旧实例
+    # 一起被丢弃（那段内容本来也只有收尾才落盘，属既定取舍而非本次引入）。
 
     # 锁只保护实例缓存的【读写这一瞬间】，绝不覆盖建 Agent 与历史恢复。
     #

@@ -2612,13 +2612,20 @@ function flushSeq() {
   // 保留 seqSession：同会话后续 noteSeq 继续累积
 }
 
-function closeEvents() {
+function closeEvents(resetBackoff = true) {
   if (es) { es.close(); es = null; }
   bootBuffer = null;
+  // 只取消"待执行的重连"，不无条件清零退避间隔。
+  // 【踩过的坑】openEvents 开头就调 closeEvents()，若这里顺手把 reconnectDelay
+  // 归位 MIN，那么每次重连都把退避重置——3s→6s→12s 永远停在 3s，退避形同虚设
+  // （实测连续重连的延迟始终在 3s 附近抖动，从未增长）。
+  cancelReconnectTimer(resetBackoff);
 }
 
-function openEvents(sid) {
-  closeEvents();
+function openEvents(sid, keepBackoff = false) {
+  // keepBackoff：本次是"失败后重连"，不清退避（否则永远从 MIN 重来）。
+  // 用户主动切会话/首次打开则清空，从最短间隔起步。
+  closeEvents(!keepBackoff);
   if (!sid) return;
   lastSeq = null;          // 新连接的 DOM 可能刚重建过：闸门清零，补发全量应用
   bootBuffer = [];         // 补发段先缓冲，caught_up 后一次性定性（见 finishBoot）
@@ -2627,10 +2634,48 @@ function openEvents(sid) {
   if (stored != null) qs.push(`since=${stored}`);
   es = new EventSource(`/api/sessions/${encodeURIComponent(sid)}/events?` + qs.join("&"));
   es.onmessage = onSSEEvent;
-  // onerror 不额外处理：EventSource 会自动重连（携带 Last-Event-ID 头）；
-  // 需要"放弃续接"的场景（缺口太大/服务重启）由服务端 resync 事件驱动。
-  // 唯一例外：已登出还无限重连没有意义，这里直接停。
-  es.onerror = () => { if (!authToken) closeEvents(); };
+  // onerror 默认交给 EventSource 自动重连（携带 Last-Event-ID 头），缺口太大/
+  // 服务重启由服务端 resync 事件驱动。两个例外：
+  //  1) 已登出：无限重连没意义，直接停。
+  //  2) 连接数被服务端限流（503 too_many_streams）：此时浏览器默认的 ~3s 固定
+  //     重连会与其它标签页形成"越连越满"的正反馈——服务端刚腾出槽，一批重连
+  //     立刻打满，谁都连不上，表现为"刷新几次后彻底连不上"。这里按指数退避
+  //     （3s→6s→12s…封顶 30s）错开，并给各标签页加随机抖动，让它们不要同时
+  //     回来。成功连上（收到任何事件）后退避计时清零。
+  es.onerror = () => {
+    if (!authToken) { closeEvents(); return; }
+    // 任何 onerror 都接管重连（不再依赖 readyState===CLOSED 判断）：
+    // 实测服务端返回 4xx 时 readyState 未必是 CLOSED，照那个条件判断会导致
+    // 永远不重连——静默失联比紧密重连更糟。这里统一走退避重连；而正常的
+    // 瞬断也由同一路径覆盖，行为一致。
+    scheduleReconnect(sid);
+  };
+  // 收到任何一条事件都算连上了：退避计时归零，下次断开从最短间隔重试
+  es.addEventListener("open", () => { reconnectDelay = RECONNECT_MIN_MS; });
+}
+
+let reconnectDelay = 3000;      // 当前退避间隔（ms）
+let reconnectTimer = null;
+const RECONNECT_MIN_MS = 3000;
+const RECONNECT_MAX_MS = 30000;   // 封顶：再久用户就明显感到"卡住了"
+
+function scheduleReconnect(sid) {
+  if (reconnectTimer) return;      // 已有待执行的重连：不叠加
+  // ±30% 抖动：多标签页同时被限流时错开，避免同刻一起回来再次打满
+  const jitter = reconnectDelay * (0.7 + Math.random() * 0.6);
+  // 先推进退避（而不是等回调里再推进）：否则任何"提前取消计时器"的路径
+  // 都会让间隔卡在 MIN，退避失效。
+  reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (sid === currentSession) openEvents(sid, /* keepBackoff */ true);
+  }, jitter);
+}
+
+/** 取消待执行的重连。reset=true 时把退避间隔也归位（用户主动切会话用）。 */
+function cancelReconnectTimer(reset) {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (reset) reconnectDelay = RECONNECT_MIN_MS;
 }
 
 function onSSEEvent(e) {
@@ -2778,6 +2823,9 @@ function finalizeInterruptedRound() {
 function handleResync(evt) {
   if (es) { es.close(); es = null; }
   bootBuffer = null;
+  // 清掉退避：下面的 switchSession 会立刻重连，留着的计时器会在片刻后再连一次
+  // 造成重复连接（且新连接的退避间隔会从旧值起步）。
+  cancelReconnectTimer(true);
   lastSeq = null;        // 时间线即将整页重建：闸门清零
   // 锚点直接写（不走合帧）：紧接着就要 switchSession 重连，读的就是这个值，
   // 延迟一帧写会让重连读到旧锚点、白补一段。先把待写的合帧值冲刷掉再写新值，
@@ -4279,6 +4327,12 @@ function applyEvent(evt, seq) {
     roundErrored = true;
     notifyDesktop("回合出错", summarize(evt.message, 80));
     // 生成中状态不在这里复位：turn_end 紧随 error 事件到达，由它统一收尾
+  } else {
+    // 认不出的类型：不静默吞掉。后端加了新事件而前端没跟上时，此前是
+    // 完全无声（不报错、不打日志、界面上什么都不发生）——排查时只能靠猜。
+    // 这里留一条线索：控制台可见但不弹窗、不影响渲染。caught_up/resync 在
+    // onSSEEvent 里已被提前分流，不会走到这儿。
+    console.debug("[event] 未处理的事件类型:", t, evt);
   }
 }
 
