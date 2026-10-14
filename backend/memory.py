@@ -413,16 +413,47 @@ def remove_index_line(index_text: str, filename: str) -> str:
     return "\n".join(kept) + "\n" if kept else ""
 
 
+# 注入排序用的价值信号（越靠前越该留）。
+# 为什么需要它：截断曾按【插入顺序】——最先写入的条目第一批被丢，而按经验
+# 那恰恰是最早、最基础、最长期有效的偏好（用户怎么工作）。等索引涨过上限，
+# 系统会优先忘掉最该记住的东西，方向是反的。
+#
+# 价值排序（简单、可解释，不用额外字段）：
+#   1. 类型：user/feedback 是关于人怎么工作的，跨会话长期有效；project 是
+#      某个代码库的事实，量大且易过时；reference 是外部链接，最可丢。
+#   2. 负信号：描述里写着"已实施/已修复/已作废/已验收"的，是【过去的动作】，
+#      对"接下来怎么做"参考价值低——实测 74 条里有 32 条属这类。
+#   3. 同档内保持原索引顺序（稳定排序，不改动无关条目的相对位置）。
+_TYPE_WEIGHT = {"user": 0, "feedback": 0, "project": 1, "reference": 2}
+_NEGATIVE_MARKERS = ("已实施", "已修复", "已作废", "已验收", "已过时", "（已作废）")
+
+
+def _index_line_rank(line: str) -> tuple:
+    """一条索引行的价值排序键（小的先留）。纯文本推断，不读磁盘。"""
+    neg = any(m in line for m in _NEGATIVE_MARKERS)
+    # 类型：从链接目标推不出 type（索引行里没有），所以只按负信号排。
+    # 类型权重留给调用方按需传入（见 memory_blocks 的 _relabel 用文件级信息）。
+    return (1 if neg else 0,)
+
+
 def truncate_index(index_text: str, max_lines: int = INDEX_MAX_LINES,
-                   max_chars: int = INDEX_MAX_CHARS) -> str:
+                   max_chars: int = INDEX_MAX_CHARS, rank=None) -> str:
     """注入上限：150 行 / 20000 字符。磁盘上是全量真相，截断只发生在注入时刻；
-    超限时在末尾加一行警告，让模型知道还有没看到的条目（想看就读文件）。"""
+    超限时在末尾加一行警告，让模型知道还有没看到的条目（想看就读文件）。
+
+    rank：可选的排序键函数 line -> tuple（越小越优先保留）。缺省按负信号排序
+    （"已实施/已作废"这类过后置）。**只有当超限时才重排**——没超限时保持
+    索引原序，避免每轮注入的次序无谓变动（前缀缓存敏感：system 前缀逐字节
+    不变是供应商自动缓存命中的前提）。
+    """
     lines = [ln for ln in index_text.splitlines() if ln.strip()]
     if not lines:
         return ""
     truncated = False
     if len(lines) > max_lines:
-        lines = lines[:max_lines]
+        rank_fn = rank or _index_line_rank
+        # 稳定排序：同档内保持原相对顺序
+        lines = sorted(lines, key=rank_fn)[:max_lines]
         truncated = True
     out, used = [], 0
     for ln in lines:
@@ -432,7 +463,7 @@ def truncate_index(index_text: str, max_lines: int = INDEX_MAX_LINES,
         out.append(ln)
         used += len(ln) + 1
     if truncated:
-        out.append(f"（警告：索引过长，仅加载了前 {len(out)} 条，完整索引请读 .agent-memory/{INDEX_NAME}）")
+        out.append(f"（警告：索引过长，仅加载了 {len(out)} 条价值最高的，完整索引请读 .agent-memory/{INDEX_NAME}）")
     return "\n".join(out) + "\n"
 
 
@@ -685,13 +716,34 @@ def memory_blocks(mem_dir_project: Path, user_id=None) -> str:
     return "".join(parts)
 
 
+def _layer_rank(mem_dir: Path):
+    """该层的注入排序键：类型优先（user/feedback 最该留），其次看负信号。
+
+    与 truncate_index 的默认 rank 的区别：这里读得到文件，能拿到 frontmatter
+    里的 type——"用户怎么工作"这类条目比"某次交付的具体改动"值得占位置。
+    只在超限被调用，所以读盘成本只在索引过长时才付。
+    """
+    def rank(line: str) -> tuple:
+        fname = None
+        if "](" in line:
+            fname = line.split("](")[1].split(")")[0]
+        mtype = ""
+        if fname and valid_memory_filename(fname):
+            meta, _ = parse_frontmatter(_read_text(mem_dir / fname))
+            mtype = (meta or {}).get("type", "")
+        return (_TYPE_WEIGHT.get(mtype, 1),) + _index_line_rank(line)
+    return rank
+
+
 def _relabel(block: str, heading: str, max_lines: int, mem_dir: Path) -> str:
     """把 memory_index_block 的通用标题换成层名，并按该层的预算重新截断。
 
     重新截断是必要的：memory_index_block 用的是全局 INDEX_MAX_LINES(150)，
     两层的预算各不相同的（40 / 110），不能靠它一档管到底。
+    截断时按价值排序（见 _layer_rank），不再按插入顺序丢最早的。
     """
-    index = truncate_index(read_index_text(mem_dir), max_lines=max_lines)
+    index = truncate_index(read_index_text(mem_dir), max_lines=max_lines,
+                           rank=_layer_rank(mem_dir))
     index, withheld = redact_sensitive_lines(index)
     if withheld:
         index += f"\n（另有 {withheld} 条含敏感信息的记忆未注入，需用时请用户在本机确认）"

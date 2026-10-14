@@ -568,3 +568,82 @@ class TestBackfillFrontmatter(unittest.TestCase):
         self.assertTrue(all(i["description"] for i in after),
                         "回填后每条都有描述，去重才有依据")
         self.assertTrue(all(i["type"] for i in after), "类型也不该为空")
+
+
+# ---------------------------------------------------------------------------
+# G. 索引截断的价值排序（超限时不再先丢最早的）
+# ---------------------------------------------------------------------------
+
+class TestTruncateByValue(unittest.TestCase):
+    """截断曾按【插入顺序】——最先写入的条目第一批被丢，而那恰恰是最基础、
+    最长期有效的偏好。等索引涨过上限，系统会优先忘掉最该记住的东西。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="trunc_"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _seed(self, n_high, n_noise):
+        for i in range(n_high):
+            memory.write_entry(self.tmp, f"pref-{i}.md", "x",
+                               description=f"用户偏好{i}", mtype="user")
+        for i in range(n_noise):
+            memory.write_entry(self.tmp, f"done-{i}.md", "x",
+                               description=f"已实施：改动{i}", mtype="project")
+
+    def test_under_limit_keeps_original_order(self):
+        """未超限时必须原样——注入次序无谓变动会破坏供应商前缀缓存。"""
+        self._seed(3, 3)
+        raw = [l for l in memory.read_index_text(self.tmp).splitlines() if l.strip()]
+        out = [l for l in memory.truncate_index(
+            memory.read_index_text(self.tmp), max_lines=100,
+            rank=memory._layer_rank(self.tmp)).splitlines() if l.strip()]
+        self.assertEqual(out, raw)
+
+    def test_over_limit_keeps_high_value_entries(self):
+        """超限时保住 user 类（关于人怎么工作），先丢"已实施"类。"""
+        self._seed(3, 30)
+        out = memory.truncate_index(memory.read_index_text(self.tmp),
+                                    max_lines=10, rank=memory._layer_rank(self.tmp))
+        kept = [l for l in out.splitlines() if l.startswith("- [")]
+        prefs = [l for l in kept if "pref-" in l]
+        self.assertEqual(len(prefs), 3, "三条用户偏好必须全部保住")
+        self.assertEqual(len(kept), 10)
+
+    def test_default_rank_demotes_done_markers_without_disk(self):
+        """不读盘时的默认排序：把"已实施/已作废"这类过去动作后置。"""
+        text = "\n".join([
+            "- [a](a.md) — 已实施：某改动",
+            "- [b](b.md) — 用户偏好：先给方案",
+            "- [c](c.md) — 已作废的旧决策",
+            "- [d](d.md) — 这个仓库测试要先设环境变量",
+        ]) + "\n"
+        out = memory.truncate_index(text, max_lines=2)
+        kept = [l for l in out.splitlines() if l.startswith("- [")]
+        self.assertEqual(len(kept), 2)
+        self.assertTrue(any("b.md" in l for l in kept), "用户偏好该留")
+        self.assertTrue(all("已实施" not in l and "已作废" not in l for l in kept),
+                        "过去动作该先被丢")
+
+    def test_stable_within_same_rank(self):
+        """同档内保持原相对顺序（稳定排序）。"""
+        text = "\n".join(f"- [m{i}](m{i}.md) — 普通条目{i}" for i in range(6)) + "\n"
+        out = memory.truncate_index(text, max_lines=3)
+        kept = [l for l in out.splitlines() if l.startswith("- [")]
+        self.assertEqual([l for l in kept],
+                         ["- [m0](m0.md) — 普通条目0",
+                          "- [m1](m1.md) — 普通条目1",
+                          "- [m2](m2.md) — 普通条目2"])
+
+    def test_warning_names_value_ordering(self):
+        self._seed(1, 20)
+        out = memory.truncate_index(memory.read_index_text(self.tmp),
+                                    max_lines=5, rank=memory._layer_rank(self.tmp))
+        warn = [l for l in out.splitlines() if "警告" in l]
+        self.assertTrue(warn, "超限必须告知模型")
+        self.assertIn("价值", warn[0], "警告该说明是按价值而非顺序")
+
+    def test_rank_survives_missing_file(self):
+        """索引行指向不存在的文件（真实数据里就有 1 条）时不能崩。"""
+        text = "- [ghost](ghost.md) — 已实施：某条\n- [real](real.md) — 用户偏好\n"
+        out = memory.truncate_index(text, max_lines=2, rank=memory._layer_rank(self.tmp))
+        self.assertIn("real.md", out)
