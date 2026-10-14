@@ -90,26 +90,25 @@ class V2Base(unittest.TestCase):
 
 class TestBridgePrefixOrder(V2Base):
 
-    def test_longer_prefix_first_resolves_correctly(self):
-        """长前缀排在前 → 各自的文件落到各自层（Step 2 采用的顺序）。"""
-        from code_tools import _resolve
+    def _agent_bridge_roots(self):
+        from agent import Agent
         ws = self.make_ws()
-        personal = (self.tmp / "u" / "1").resolve()
-        project = (self.tmp / "p" / "x").resolve()
-        personal.mkdir(parents=True)
-        project.mkdir(parents=True)
-        bridge = {".agent-memory/project": project, ".agent-memory": personal}
-        self.assertEqual(_resolve(".agent-memory/x.md", ws, bridge),
-                         personal / "x.md")
-        self.assertEqual(_resolve(".agent-memory/project/y.md", ws, bridge),
-                         project / "y.md")
+        ag = Agent(llm=None, verbose=False, workspace=str(ws),
+                   session_id="s-br", user_id=51)
+        return ag._bridge_roots(), ws
 
-    def test_short_prefix_first_swallows_longer(self):
-        """短前缀排在前 → 项目层文件被吞进个人层。
+    def _app_bridge_roots(self):
+        import app as app_mod
+        ws = self.make_ws()
+        self.add_session(ws, sid="s-br", uid=51)
+        return app_mod._bridge_roots_for("s-br")
 
-        这条用例不测"期望行为"，而是把 _resolve 的**既有语义**钉住：
-        遍历命中第一个前缀即返回，所以长前缀必须先注册。Step 2 注册子前缀时
-        若顺序写反，这里会立刻发现——这是设计文档 §10 列为最高风险的那一项。
+    def test_both_prefixes_resolve_regardless_of_registration_order(self):
+        """两层的文件各归各处，**与注册顺序无关**。
+
+        设计文档原本把"长前缀必须写前面否则被吞"列为最高风险项。与其靠每个
+        调用方都记得排序，不如在 _resolve 里按前缀长度降序匹配，把这个隐藏
+        依赖消掉——这条用例把两种注册顺序都跑一遍，锁住"顺序无关"。
         """
         from code_tools import _resolve
         ws = self.make_ws()
@@ -117,10 +116,34 @@ class TestBridgePrefixOrder(V2Base):
         project = (self.tmp / "p" / "x").resolve()
         personal.mkdir(parents=True)
         project.mkdir(parents=True)
-        bridge = {".agent-memory": personal, ".agent-memory/project": project}
-        # 被吞：解析到 personal/project/y.md，而不是 project/y.md
-        self.assertEqual(_resolve(".agent-memory/project/y.md", ws, bridge),
-                         personal / "project" / "y.md")
+        for bridge in (
+            {".agent-memory/project": project, ".agent-memory": personal},   # 长在前
+            {".agent-memory": personal, ".agent-memory/project": project},   # 短在前
+        ):
+            self.assertEqual(_resolve(".agent-memory/x.md", ws, bridge),
+                             personal / "x.md")
+            self.assertEqual(_resolve(".agent-memory/project/y.md", ws, bridge),
+                             project / "y.md")
+            # 深一层也不会被吞
+            self.assertEqual(_resolve(".agent-memory/project/sub/z.md", ws, bridge),
+                             project / "sub" / "z.md")
+
+    def test_agent_and_gate_bridge_tables_agree(self):
+        """Agent 与权限闸门的两张桥接表必须同源。
+
+        闸门按这张表判"写入是否落在放行的桥接区"，Agent 按它解析实际路径；
+        两处不一致 = 闸门放行的路径与实际落点不同（放行了一个写不到的地方，
+        或实际写到了没放行的地方）。
+        """
+        from unittest import mock
+        import agent as agent_mod
+        import app as app_mod
+        from code_tools import BRIDGE_MEMORY, BRIDGE_MEMORY_PROJECT
+        a, _ = self._agent_bridge_roots()
+        b = self._app_bridge_roots()
+        self.assertEqual(set(a), set(b), "两张表的键集合必须一致")
+        for k in (BRIDGE_MEMORY, BRIDGE_MEMORY_PROJECT):
+            self.assertEqual(Path(a[k]), Path(b[k]), f"{k} 的落点必须一致")
 
 
 # ---------------------------------------------------------------------------

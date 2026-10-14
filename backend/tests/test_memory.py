@@ -28,6 +28,7 @@ from unittest import mock
 import memory
 from agent import Agent
 from memory import (BODY_MAX_CHARS, INDEX_MAX_CHARS, INDEX_MAX_LINES, MEMORY_CONTRACT,
+                    PERSONAL_HEADING, PROJECT_HEADING,
                     apply_extraction, build_extraction_messages, memory_dir,
                     parse_extraction_reply, parse_frontmatter, read_index_text,
                     recent_user_texts,
@@ -664,12 +665,38 @@ class TestAgentInjection(unittest.TestCase):
         agent, llm = self.make_agent(ws)
         list(agent.run("第一轮"))
         first_system = llm.calls[0][0]["content"]
-        self.assertIn("（暂无记忆）", first_system)
+        # 项目层为空（个人层在未传 user_id 时不注入）
+        self.assertIn(PROJECT_HEADING, first_system)
         seed_memory(memory_dir(ws), "new-fact.md", "第二轮前刚写入的记忆")
         list(agent.run("第二轮"))
         second_system = llm.calls[1][0]["content"]
-        self.assertNotIn("（暂无记忆）", second_system)
         self.assertIn("new-fact.md", second_system)
+
+    def test_two_layers_injected_project_only_without_user(self):
+        """没传 user_id（CLI / 单测裸跑）时只注入项目层——个人层不出现空段。"""
+        ws = Path(tempfile.mkdtemp(prefix="memory_agent_ws3_"))
+        self.addCleanup(shutil.rmtree, ws, ignore_errors=True)
+        agent, llm = self.make_agent(ws)
+        list(agent.run("你好"))
+        system = llm.calls[0][0]["content"]
+        self.assertIn(PROJECT_HEADING, system)
+        self.assertNotIn(PERSONAL_HEADING, system,
+                         "没有用户归属时不该注入个人层空段")
+
+    def test_personal_layer_injected_when_user_id_given(self):
+        """给了 user_id：个人层与项目层都在，个人层在前（更稳定的内容靠前，
+        对供应商前缀缓存更友好）。"""
+        import db as _db
+        ws = Path(tempfile.mkdtemp(prefix="memory_agent_ws4_"))
+        self.addCleanup(shutil.rmtree, ws, ignore_errors=True)
+        llm = CaptureLLM()
+        agent = Agent(llm=llm, verbose=False, workspace=str(ws), user_id=51)
+        list(agent.run("你好"))
+        system = llm.calls[0][0]["content"]
+        self.assertIn(PERSONAL_HEADING, system)
+        self.assertIn(PROJECT_HEADING, system)
+        self.assertLess(system.index(PERSONAL_HEADING), system.index(PROJECT_HEADING),
+                        "个人层必须排在项目层之前")
 
 
 if __name__ == "__main__":

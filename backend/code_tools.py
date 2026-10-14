@@ -129,7 +129,11 @@ def _ws(ctx) -> Path:
 # 仍用 attachments/… 与 .agent-memory/… 这两个相对前缀访问它们。前缀名不变，
 # 因为 system 里的记忆契约写的是 .agent-memory/，且历史会话的轨迹里也是它。
 BRIDGE_ATTACH = "attachments"       # 本会话附件区根（read_file/apply_patch/list_dir/grep 可达）
-BRIDGE_MEMORY = ".agent-memory"     # 本会话记忆区根（读写均放行；轮末提取也写这里）
+BRIDGE_MEMORY = ".agent-memory"     # 记忆区根（读写均放行；轮末提取也写这里）
+# 记忆 v2：.agent-memory/ 是【个人层】（关于用户这个人的跨项目偏好），
+# 其下 project/ 子目录是【项目层】（这个代码库的事实）。默认路径给个人层，
+# 因为"你这个人的偏好"是最高频、最该跟着人走的那类。
+BRIDGE_MEMORY_PROJECT = ".agent-memory/project"
 
 
 def _bridge_roots(ctx) -> dict[str, Path]:
@@ -151,11 +155,17 @@ def _resolve(path: str, ws: Path, bridge: dict[str, Path] | None = None) -> Path
     桥接前缀（attachments/、.agent-memory/）按字面前缀匹配——不是路径包含
     判断，"..%2e" 之类的花活拼不出这个字面前缀；且后续还要过根内包含校验，
     双闸都在。桥接根之外的一切照旧只认工作区，最严边界不放松。
+
+    前缀**按长度降序**匹配，不按注册顺序：`.agent-memory/project/x.md` 同时
+    满足 `.agent-memory/` 的 startswith，若先撞上短前缀就会被吞进个人层
+    （实测过）。排序把"调用方注册顺序"这个隐藏依赖消掉——调用方随便怎么
+    组装 bridge 表都不会错，而不是靠每个调用方都记得把长前缀写前面。
     """
     if not path or not isinstance(path, str):
         raise ValueError("path 不能为空")
     norm = path.replace("\\\\", "/").lstrip("/")
-    for prefix, root in (bridge or {}).items():
+    for prefix, root in sorted((bridge or {}).items(),
+                               key=lambda kv: len(kv[0]), reverse=True):
         if norm == prefix or norm.startswith(prefix + "/"):
             target = (root / norm[len(prefix):].lstrip("/")).resolve()
             if target == root or root in target.parents:

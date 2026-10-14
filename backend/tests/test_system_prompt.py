@@ -75,7 +75,9 @@ class TestPromptContract(unittest.TestCase):
         agent = Agent(llm=_StaticLLM(), verbose=False, workspace=str(ws))
         system = agent._system_content()
         self.assertEqual(system.count(memory.MEMORY_CONTRACT), 1)
-        self.assertIn("用户记忆索引（跨会话持久）", system)
+        # 记忆 v2：原单一"用户记忆索引"标题换成两层各自的标题；未传 user_id
+        # 时只注入项目层（个人层不出现空段）。
+        self.assertIn(memory.PROJECT_HEADING, system)
         self.assertIn("（暂无记忆）", system)  # 空 workspace 的降级文案
 
     def test_output_discipline_section_present(self):

@@ -99,7 +99,8 @@ from events import SessionEvents
 from llm_client import (create_client, load_env_file, save_env_values,
                         ApiHTTPError, ApiConnectionError, _RETRYABLE_STATUS)  # noqa: F401
 from logger import setup_logging
-from memory import memory_dir, recent_user_texts, run_extraction_async
+from memory import (memory_dir, memory_dir_for_user, recent_user_texts,
+                    run_extraction_async)
 from permissions import PermissionGate
 from state import (_agents, _buses, _ctx, _lock, _running_agents, _session_locks,
                    _sigs, _turn_status)
@@ -222,11 +223,19 @@ def _build_permission_gate(workspace: Path, sid: str | None = None) -> Permissio
 
 
 def _bridge_roots_for(sid: str) -> dict:
-    """闸门与 Agent 共用的桥接根解析（前缀 → 物理绝对路径，物理位置在数据区）。"""
+    """闸门与 Agent 共用的桥接根解析（前缀 → 物理绝对路径，物理位置在数据区）。
+
+    与 Agent._bridge_roots 必须同源：闸门按这张表判"写入是否落在放行的桥接区"，
+    Agent 按它解析实际路径。两处不一致 = 闸门放行的路径与实际落点不同。
+    记忆 v2 起有两层：.agent-memory/（个人）+ .agent-memory/project/（项目）。
+    """
     roots = {}
     if sid:
         roots[code_tools.BRIDGE_ATTACH] = db.session_attachments_dir(sid).resolve()
-        roots[code_tools.BRIDGE_MEMORY] = memory_dir(db.get_session_workspace(sid)).resolve()
+        roots[code_tools.BRIDGE_MEMORY_PROJECT] = memory_dir(
+            db.get_session_workspace(sid)).resolve()
+        roots[code_tools.BRIDGE_MEMORY] = memory_dir_for_user(
+            db.session_owner(sid)).resolve()
     return roots
 
 
@@ -242,7 +251,9 @@ def _spawn_memory_extraction(sid: str, agent: Agent) -> None:
     try:
         texts = recent_user_texts(list(agent.history))  # 快照：线程内只用字符串
         # 传 chat() 方法本身（memory 约定 chat(messages, temperature=0) 可调用）
-        run_extraction_async(sid, memory_dir(agent.ctx.workspace), agent.llm.chat, texts)
+        # 项目层是清单来源与默认落点；user_mem_dir 给了才允许提升到个人层
+        run_extraction_async(sid, memory_dir(agent.ctx.workspace), agent.llm.chat,
+                             texts, memory_dir_for_user(db.session_owner(sid)))
     except Exception:
         log.exception("[会话 %s] 记忆提取线程启动失败（忽略，不影响回合）", sid)
 

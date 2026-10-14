@@ -38,7 +38,7 @@ import code_tools
 import db
 
 from code_tools import prepare_workspace
-from memory import memory_dir, memory_index_block
+from memory import memory_blocks, memory_dir, memory_dir_for_user
 from permissions import ALLOW, ASK, DENY, PermissionGate, Verdict, rejection_result
 from subagent_tools import (SUBAGENT_MAX_PARALLEL, SUBAGENT_REPORT_MAX_CHARS,
                             SUBAGENT_TOOLSET)
@@ -247,7 +247,7 @@ class Agent:
                  artifact_reader=None, permission_gate=None, session_id=None,
                  model_tag: tuple[str, str] | None = None,
                  allowed_tools: tuple[str, ...] | None = None,
-                 result_sink=None):
+                 result_sink=None, user_id=None):
         # max_rounds=40：上限只是兜底（真失控另有指纹提醒拦截），合法的长任务
         # （读代码→改→跑验证→再修）经常要几十轮，40 是给它们的余量；到限走
         # 收尾轮（_wrap_up_round）而不是"强制停止"。
@@ -333,6 +333,9 @@ class Agent:
         # 状态挂在实例上而不是模块级全局，两个会话并发执行工具才不会串数据。
         self.ctx = ToolContext(workspace=prepare_workspace(workspace), vision_backend=vision_backend)
         self.ctx.session_id = session_id  # 文档工具据此确定文档归属（会话隔离）
+        # 记忆 v2：个人层按 user_id 分桶。为空（CLI / 单测裸跑）时只注入项目层，
+        # 行为与旧版一致——不报错、也不注入一个空段。
+        self.user_id = user_id
         # 沙箱桥接根自装配：附件区与会话记忆区物理上在数据区（不污染工作区 git），
         # 文件工具经 attachments/、.agent-memory/ 前缀桥接访问（见 code_tools._resolve）。
         # 惰性求值：ctx 挂着时附件区可能还没建，首次工具调用时才解析。
@@ -352,15 +355,32 @@ class Agent:
         # 子代理会被 allowed_tools 名单在 schema 与执行两处挡住（递归上限 1 层）。
         self.ctx.subagent_runner = self._spawn_subagent
 
+    def _memory_blocks(self) -> str:
+        """当前两层记忆的注入段（个人层 + 项目层）。
+
+        单独成方法是因为注入有两条入口：回合开始的快照（_run，主路径）与
+        _system_content 的兜底（从未跑过回合就直接取 system，如单测）。
+        两处必须用同一份组装，否则会漂移出"快照路径有个人层、兜底路径没有"
+        这种只在边缘出现的 bug。
+        """
+        return memory_blocks(memory_dir(self.ctx.workspace), self.user_id)
+
     def _bridge_roots(self) -> dict:
         """沙箱桥接根（ctx.bridge_roots 的实现，文件工具执行时才调用）：
-        attachments/ → 本会话附件区，.agent-memory/ → 本会话记忆区（按工作区
-        token 分桶，物理位置都在数据区）。无会话（CLI/单测裸跑）时附件区不可
-        桥接（没有归属），记忆区仍可用（兜底桶）。"""
+          attachments/            → 本会话附件区
+          .agent-memory/          → 个人记忆层（关于用户这个人，跨项目）
+          .agent-memory/project/  → 项目记忆层（本代码库的事实）
+        物理位置都在数据区。无会话（CLI/单测裸跑）时附件区不可桥接（没有
+        归属），记忆区仍可用（项目层兜底桶）。
+
+        注意 _resolve 按前缀【长度降序】匹配，所以这里注册顺序无所谓——
+        曾经是"长前缀必须写前面否则被吞"的隐藏依赖，已在 _resolve 里消掉。
+        """
         roots = {}
         if self.ctx.session_id:
             roots[code_tools.BRIDGE_ATTACH] = db.session_attachments_dir(self.ctx.session_id).resolve()
-        roots[code_tools.BRIDGE_MEMORY] = memory_dir(self.ctx.workspace).resolve()
+        roots[code_tools.BRIDGE_MEMORY_PROJECT] = memory_dir(self.ctx.workspace).resolve()
+        roots[code_tools.BRIDGE_MEMORY] = memory_dir_for_user(self.user_id).resolve()
         return roots
 
     @staticmethod
@@ -405,7 +425,7 @@ class Agent:
         memory.run_extraction_async 即可，是同一个钩子。
         """
         block = (self._memory_snapshot if self._memory_snapshot is not None
-                 else memory_index_block(memory_dir(self.ctx.workspace)))
+                 else self._memory_blocks())
         if self._time_block is None:
             now = datetime.datetime.now()
             self._time_block = (
@@ -627,7 +647,7 @@ class Agent:
         #    代价是一次性的前缀缓存失效（旧消息内容变了），换来的是本回合每轮
         #    都少带几万字符——长任务下稳赚。回合内不再重复清理：边界每轮前移
         #    会把"上一轮还是原文"的消息改成占位符，前缀逐轮失效，得不偿失。
-        self._memory_snapshot = memory_index_block(memory_dir(self.ctx.workspace))
+        self._memory_snapshot = self._memory_blocks()
         self._clear_old_tool_results()
         # 提取本轮附带的图片（OpenAI content 数组里的 image_url 部分），挂进工具上下文。
         # 主模型看不见像素；analyze_image 工具借"视觉模型"看图时用的就是这份数据。

@@ -94,13 +94,20 @@ MIN_USER_WORDS = 3        # 短于 3 个词的用户消息（"好的"/"继续"�
 
 INDEX_HEADING = "用户记忆索引（跨会话持久）"
 
-# 使用契约（原样注入 system）。写明类型语义、禁区、更新纪律，让模型在回合内
-# 自己完成"写正文 + 更新索引"；轮末提取只是兜底，捕获模型没落盘的信息。
-# 模型始终用 .agent-memory/ 前缀读写（沙箱桥接），存储位置的变化对模型透明。
+# 使用契约（原样注入 system）。写明两个记忆层的路径、类型语义、禁区、更新纪律，
+# 让模型在回合内自己完成"写正文 + 更新索引"；轮末提取只是兜底，捕获模型没落盘的
+# 信息。模型用 .agent-memory/ 前缀读写（沙箱桥接），物理位置对它透明。
 MEMORY_CONTRACT = (
-    "你有持久记忆目录 .agent-memory/，每条记忆是一个 md 文件。判断需要记住新信息时，"
-    "直接用 write_file 写入，然后同步更新 MEMORY.md 索引加一行。类型语义："
-    "user=用户身份与偏好；feedback=用户对工作方式的纠正与确认（必须带 Why 和 How to apply）；"
+    "你有两层持久记忆，每层一个目录、每条记忆是一个 md 文件：\n"
+    "  · .agent-memory/          —— 个人层：关于用户这个人的偏好与习惯，"
+    "在任何项目目录下都生效（回复语言/语气、工具与包管理偏好、工作习惯、对你的纠正）。\n"
+    "  · .agent-memory/project/  —— 项目层：只属于当前代码库的事实"
+    "（构建/测试命令、架构决策、这里不用什么、环境要求、踩过的坑）。\n"
+    "判断去哪层看【这条信息说谁】：提到具体文件/模块/表/接口名 → 项目层；"
+    "说用户怎么做事 → 个人层。拿不准放项目层。写错层的代价不对称——"
+    "个人层会跟着用户进每一个项目。\n"
+    "写入：用 write_file 写正文，然后同步更新【同层】MEMORY.md 索引加一行。类型语义："
+    "user=身份与偏好；feedback=用户对工作方式的纠正与确认（必须带 Why 和 How to apply）；"
     "project=代码与 git 历史推导不出的进行中事项（相对日期转绝对日期）；"
     "reference=外部资源链接。禁止记录：代码结构、既往修复、git 可查的历史、仅本次对话"
     "有效的临时信息。写之前先看索引是否已有同类记忆，更新旧文件而不是新建重复文件；"
@@ -510,6 +517,52 @@ def memory_index_block(mem_dir: Path) -> str:
     return f"\n\n{INDEX_HEADING}\n\n{body}"
 
 
+# 两层的标题与各自的注入预算。分开给预算是关键：个人层是"你怎么和我打交道"
+# ——它必须永远有位置，不能因为某个项目记忆膨胀（74 条那种）而被挤到截断线外。
+# 旧实现是单一 150 行预算且按插入顺序截断，最早写入的（往往正是最基础的个人
+# 偏好）第一批被丢。
+PERSONAL_HEADING = "【个人记忆】关于你（跨项目持久，任何目录都生效）"
+PROJECT_HEADING = "【项目记忆】本代码库"
+PERSONAL_MAX_LINES = 40
+PROJECT_MAX_LINES = 110
+
+
+def memory_blocks(mem_dir_project: Path, user_id=None) -> str:
+    """两层记忆的完整注入段：个人层在前、项目层在后。
+
+    顺序有讲究：越稳定、越该长期不变的内容放越前——个人偏好比项目事实变得慢。
+    这也是前缀缓存友好的排列（system 前缀逐字节不变是供应商自动缓存命中的前提，
+    见 agent.py 取快照处的论证）。
+
+    user_id 缺省（None）= 没有用户归属（CLI / 单测裸跑 / 无主会话）→
+    只注入项目层。判据必须是 user_id 而不是"目录参数是否为 None"：
+    memory_dir_for_user(None) 返回的是兜底目录而不是 None，拿它当判据会让
+    无归属会话也注入一个"（暂无记忆）"的个人层空段（实测踩到）。
+    """
+    parts = []
+    if user_id is not None:
+        personal_dir = memory_dir_for_user(user_id)
+        parts.append(_relabel(memory_index_block(personal_dir), PERSONAL_HEADING,
+                              max_lines=PERSONAL_MAX_LINES, mem_dir=personal_dir))
+    parts.append(_relabel(memory_index_block(mem_dir_project), PROJECT_HEADING,
+                          max_lines=PROJECT_MAX_LINES, mem_dir=mem_dir_project))
+    return "".join(parts)
+
+
+def _relabel(block: str, heading: str, max_lines: int, mem_dir: Path) -> str:
+    """把 memory_index_block 的通用标题换成层名，并按该层的预算重新截断。
+
+    重新截断是必要的：memory_index_block 用的是全局 INDEX_MAX_LINES(150)，
+    两层的预算各不相同的（40 / 110），不能靠它一档管到底。
+    """
+    index = truncate_index(read_index_text(mem_dir), max_lines=max_lines)
+    index, withheld = redact_sensitive_lines(index)
+    if withheld:
+        index += f"\n（另有 {withheld} 条含敏感信息的记忆未注入，需用时请用户在本机确认）"
+    body = index if index else "（暂无记忆）"
+    return f"\n\n{heading}\n\n{body}"
+
+
 # ---------------------------------------------------------------------------
 # 敏感信息闸门：注入前过滤（不是写入前过滤——写入闸门挡不住模型直接 write_file）
 # ---------------------------------------------------------------------------
@@ -609,20 +662,32 @@ def recent_user_texts(history: list[dict], limit: int = SNAPSHOT_MESSAGES,
 
 
 EXTRACT_SYSTEM_PROMPT = """\
-你是持久记忆的提取器。分析用户的最近发言，判断是否有值得写入记忆目录的新信息\
-（user=身份与偏好 / feedback=对工作方式的反馈 / project=代码与 git 推导不出的\
-进行中事项 / reference=外部资源）。禁区：代码结构、既往修复、git 可查的历史、\
-仅本次对话有效的临时信息。
+你是持久记忆的提取器。分析用户的最近发言，判断是否有值得写入记忆目录的新信息。
+
+记忆分两层，靠 owner 决定去哪层——这是最关键的一次判断：
+- owner="user"（个人层，跟着人走、在任何项目目录都生效）：
+  用户这个人怎么工作的偏好——说话/回复风格、工具与包管理偏好、工作习惯
+  （先方案后代码、改完就提交、不要过度抽象）、对助手的纠正。
+  典型："我一直用 pnpm 不用 npm" / "别给我的代码加注释" / "回答用中文"。
+- owner="project"（项目层，只在本项目生效）：这个代码库的事实——构建/测试
+  命令、架构决策、"这里不用 X"、环境要求、API 坑。
+  典型："这个仓库测试要先设 DB_DSN" / "我们决定砍掉 Oracle 分支"。
+- 判断依据是【这条信息说谁】而不是【在哪说的】：提到具体文件/模块/表/接口名
+  → 一律 project；说的是人怎么做事 → user。
+- 拿不准就选 project（判断错时它只影响一个项目，而不是污染所有项目）。
+
+type 是标签（user=身份与偏好 / feedback=对工作方式的反馈 / project=进行中事项 /
+reference=外部资源）。禁区：代码结构、既往修复、git 可查的历史、仅本次对话有效的临时信息。
 
 输出规则（二选一，绝不输出任何其他内容）：
 1. 没有值得记住的新信息 → 只输出 NOTHING_TO_SAVE；
 2. 有 → 只输出一个 JSON 对象（不要包代码块、不要解释）：
 {"memories": [{"action": "write", "file": "slug-name.md", "frontmatter": \
-{"name": "slug-name", "description": "一句话摘要", "metadata": {"type": "user"}}, \
-"body": "正文一段话"}]}
+{"name": "slug-name", "description": "一句话摘要", "metadata": {"type": "user", \
+"owner": "user"}}, "body": "正文一段话"}]}
 要求：
 - 要更新已有记忆清单里的某条，就用 action="write" + 沿用它的文件名（body 给更新后的\
-完整正文）——写入即覆盖，不需要独立的 update 动作；已确认过时的记忆才用 action="delete"；\
+完整正文）——写入即覆盖，不需要独立的 update 动作；已确认过时的记忆才用 action="delete"；
 - 没有任何值得记住的新信息就返回 NOTHING_TO_SAVE；
 - action 只能是 "write" 或 "delete"，其它取值会让整条被拒；
 - file 只能是小写字母/数字/短横线 + .md；
@@ -701,12 +766,30 @@ def _validate_op(op, mem_dir: Path) -> str | None:
     return None
 
 
-def apply_extraction(mem_dir: Path, payload) -> dict:
+def _op_target_dir(op: dict, mem_dir: Path,
+                   user_mem_dir: Path | None) -> Path:
+    """按 owner 决定这条操作落到哪一层。
+
+    只有调用方提供了 user_mem_dir（即知道当前用户）时才允许提升到个人层；
+    否则一律落项目层——这是老行为的延伸，也保证 CLI / 单测场景不变。
+    缺 owner 默认 project（保守：拿不准就留在项目层，爆炸半径小）。
+    """
+    if user_mem_dir is None:
+        return mem_dir
+    meta = (op.get("frontmatter") or {}).get("metadata") or {}
+    return user_mem_dir if meta.get("owner") == "user" else mem_dir
+
+
+def apply_extraction(mem_dir: Path, payload,
+                     user_mem_dir: Path | None = None) -> dict:
     """宿主执行器：把提取模型产出的操作清单落盘。
 
     输入：记忆目录 + 清单 JSON（{"memories": [...]}）；输出：执行结果
     {"written": [...], "deleted": [...], "rejected": [(file, 原因)], "abandoned": 原因|None}。
     只碰记忆目录内的文件，无网络、无全局状态——纯函数，单测直接喂 JSON。
+
+    user_mem_dir：个人记忆层目录（可选）。给了则按每条 op 的 owner 路由到
+    对应层，两层索引各自同步；没给则一切落 mem_dir（项目层），行为同旧版。
 
     【逐条落盘，一条坏操作只丢它自己】。此前是"全有或全无"——任一条非法就
     放弃整批、磁盘一个字节不动。配合提示词里"优先用 action=update"（而校验器
@@ -730,26 +813,32 @@ def apply_extraction(mem_dir: Path, payload) -> dict:
             result["rejected"].append((str(fname), reason))
             log.warning("记忆操作被拒（%s）：%s", fname, reason)
             continue
-        fname, target = op["file"], mem_dir / op["file"]
+        # 按 owner 路由：个人层条目落 user_mem_dir，其余落项目层。
+        dst = _op_target_dir(op, mem_dir, user_mem_dir)
+        fname, target = op["file"], dst / op["file"]
         try:
             if op["action"] == "write":
                 fm = op["frontmatter"]
+                meta = fm.get("metadata") or {}
                 body = op["body"]
                 if len(body) > BODY_MAX_CHARS:  # 提取模型偶尔长篇大论，截断保平安
                     body = body[:BODY_MAX_CHARS]
+                owner = meta.get("owner") if dst is not mem_dir else None
                 atomic_write_text(target, render_memory_file(
-                    Path(fname).stem, fm["description"], fm["metadata"]["type"], body))
+                    Path(fname).stem, fm["description"], meta["type"], body,
+                    owner=owner, scope="global" if owner == "user" else None))
                 # 提取是宿主行为，模型没机会改索引：索引行由执行器代为同步——
                 # 否则正文落了盘、索引没更新，注入永远看不到这条记忆。
-                atomic_write_text(mem_dir / INDEX_NAME,
-                                  upsert_index_line(read_index_text(mem_dir),
+                # 索引跟着正文走同一层，否则条目在个人层、索引行却挂在项目层。
+                atomic_write_text(dst / INDEX_NAME,
+                                  upsert_index_line(read_index_text(dst),
                                                     fname, fm["description"]))
                 result["written"].append(fname)
             else:
                 existed = target.exists()
                 target.unlink(missing_ok=True)  # 已不存在视为删除成功（幂等）
-                atomic_write_text(mem_dir / INDEX_NAME,
-                                  remove_index_line(read_index_text(mem_dir), fname))
+                atomic_write_text(dst / INDEX_NAME,
+                                  remove_index_line(read_index_text(dst), fname))
                 if existed:
                     result["deleted"].append(fname)
         except OSError as e:
@@ -790,13 +879,20 @@ def drop_extraction_lock(sid: str) -> None:
         _extraction_locks.pop(sid, None)
 
 
-def extract_memories(sid: str, mem_dir: Path, chat, user_texts: list[str]) -> dict:
+def extract_memories(sid: str, mem_dir: Path, chat, user_texts: list[str],
+                     user_mem_dir: Path | None = None) -> dict:
     """同步执行一次轮末提取。绝不抛异常、不发事件、不写数据库，失败只进日志。
 
     chat：fn(messages, temperature=0) -> message dict（该会话的 llm_client）。
     user_texts：调用方快照好的用户发言（纯字符串），线程内只用快照。
+    user_mem_dir：个人记忆层目录。给了才允许把条目提升到个人层（见下）。
 
     单飞：acquire(blocking=False) 拿不到锁 = 上一次还没跑完 → 直接跳过。
+
+    两层归属：清单读项目层（历史记忆绝大多数在此），但模型可在操作里带
+    owner=user 把"关于这个人"的条目写到个人层——只有调用方提供了
+    user_mem_dir 时才允许（没提供就统一落项目层，老行为不变）。
+    宿主按 owner 路由，见 apply_extraction。
     """
     lock = _extraction_lock(sid)
     if not lock.acquire(blocking=False):
@@ -814,7 +910,8 @@ def extract_memories(sid: str, mem_dir: Path, chat, user_texts: list[str]) -> di
             return {"abandoned": "模型输出无法解析"}
         if not ops:  # NOTHING_TO_SAVE
             return {"written": [], "deleted": []}
-        outcome = apply_extraction(mem_dir, {"memories": ops})
+        outcome = apply_extraction(mem_dir, {"memories": ops},
+                                   user_mem_dir=user_mem_dir)
         if outcome.get("abandoned"):
             log.warning("[会话 %s] 记忆提取：操作非法已放弃（%s，下轮重试）",
                         sid, outcome["abandoned"])
@@ -831,14 +928,16 @@ def extract_memories(sid: str, mem_dir: Path, chat, user_texts: list[str]) -> di
         lock.release()
 
 
-def run_extraction_async(sid: str, mem_dir: Path, chat, user_texts: list[str]) -> None:
+def run_extraction_async(sid: str, mem_dir: Path, chat, user_texts: list[str],
+                         user_mem_dir: Path | None = None) -> None:
     """worker 调用的入口：daemon 线程跑 extract_memories，绝不阻塞回合收尾。
 
     入参全部是不可变快照（字符串列表 / 路径 / 客户端引用），提取线程不持有
     会话锁（worker 要拿锁跑下一回合）、不与 worker 共享任何可变状态。
+    user_mem_dir：个人记忆层目录；给了才允许提取器把条目提升到个人层。
     """
     threading.Thread(target=extract_memories, daemon=True,
-                     args=(sid, mem_dir, chat, list(user_texts)),
+                     args=(sid, mem_dir, chat, list(user_texts), user_mem_dir),
                      name=f"memory-extract-{sid}").start()
 
 

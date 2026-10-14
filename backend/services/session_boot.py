@@ -77,7 +77,8 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
                           result_sink=lambda content, _sid=sid: db.write_tool_result(_sid, content),
                           permission_gate=_build_permission_gate(workspace, sid),
                           session_id=sid,  # 文档工具据此确定文档归属
-                          model_tag=(prov["id"], model))  # 随 _stats 落库，用量页按它聚合
+                          model_tag=(prov["id"], model),  # 随 _stats 落库，用量页按它聚合
+                          user_id=user_id)  # 记忆 v2：个人记忆层按 user_id 分桶
             # 落盘工具结果的读侧（read_tool_result 工具用，与 result_sink 同一套目录）
             agent.ctx.tool_result_reader = db.read_tool_result
             # 窗口恢复：从未压缩 = 全量；压缩过 = 锚点 + 最后一条边界及其之后
