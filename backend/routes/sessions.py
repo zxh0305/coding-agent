@@ -21,6 +21,7 @@ from pathlib import Path
 
 import db
 import memory
+import events
 from events import SSE_HEARTBEAT, sse_frame
 from services.messages import _build_user_message
 from services.session_boot import get_session
@@ -132,8 +133,23 @@ class SessionRoutes:
         参数（来自 localStorage）。保留 HTTP/1.0 + Connection close + 禁
         缓存的既有措施——代理不缓冲、连接语义简单，与心跳配合防超时。
         """
-        bus = busref._event_bus(sid)
-        sub = bus.subscribe()  # 先订阅（见上）
+        # 【并发闸门】SSE 每连接占一个常驻线程，必须在分配线程之前拦一道——
+        # 否则连接风暴（多标签页/前端无退避重连）会把 OS 线程打满，届时连
+        # 普通 API 都被内核 RST，整个服务不可用且不会自愈（实测 2600 连接
+        # 逼近 macOS maxproc 2666）。这里非阻塞抢槽：抢不到立即 503 收工，
+        # 不占线程、不排队。客户端 EventSource 会自动重连，届时多半已腾出槽
+        # （断开的连接因心跳最多 15s 内回收）。
+        if not events.SSE_SLOTS.acquire(blocking=False):
+            busref.log.warning("SSE 连接数已达上限 %d，拒绝新连接（sid=%s）",
+                               events.MAX_SSE_CONNECTIONS, sid)
+            return self._json({"error": "事件流连接数已达上限，请稍后自动重连",
+                               "code": "too_many_streams"}, 503)
+        try:
+            bus = busref._event_bus(sid)
+            sub = bus.subscribe()  # 先订阅（见上）
+        except BaseException:
+            events.SSE_SLOTS.release()  # 订阅失败也要还槽，否则漏一次永久少一级
+            raise
         try:
             position = None
             header_id = (self.headers.get("Last-Event-ID") or "").strip()
@@ -191,6 +207,7 @@ class SessionRoutes:
             pass
         finally:
             bus.unsubscribe(sub)
+            events.SSE_SLOTS.release()  # 连接收尾：还槽，让下一个连接能进来
 
     # ---------- 任务消息（分页回放 + 归档全文） ----------
 

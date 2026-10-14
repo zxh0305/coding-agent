@@ -32,7 +32,7 @@ import logging
 import threading
 import time
 from collections import deque
-from queue import Queue
+from queue import Empty, Full, Queue
 
 log = logging.getLogger("events")
 
@@ -48,6 +48,35 @@ SSE_HEARTBEAT = b": ping\n\n"
 # last_seq 落库的最小间隔（秒）。回合边界无条件落库，其余情况按此降频——
 # 逐 token 落库是这个项目最大的一笔自找开销（见 publish 的论证）。
 PERSIST_INTERVAL_S = 1.0
+
+# 单个订阅者队列的容量上限。事件里 answer_delta 是逐 token 发布的，一个长回答
+# 就是几千条——若客户端不读（笔记本休眠 / 网络挂起 / TCP 发送缓冲写满），
+# 服务端的 SSE 线程会卡在 wfile.write 上不再取队列，无界队列就随发布者线性
+# 增长（实测 20 万条 0.13s 进队，无任何背压），单个坏连接可把内存吃光甚至 OOM。
+#
+# 用法是"丢最旧的"而不是阻塞发布者：SSE 是实时流，客户端真正需要的永远是
+# 最新状态；丢掉旧 delta 不会让会话错乱——前端本就按 mid 归并、且任何缺口都
+# 走 resync 全量重连（见 sessions._handle_session_events 的缺口处理）。
+# 取 5000：远超正常一回合的 delta 量（长回答约 2~5k），又远小于内存风险线。
+SUBSCRIBER_QUEUE_MAX = 5000
+
+# 丢事件警告的最小间隔（秒）。卡住的客户端会持续丢（逐 token 时每来一条丢一条），
+# 逐条打会瞬间刷爆日志把信号埋掉——按时间降频，并附累计丢弃数。
+DROP_WARN_INTERVAL_S = 5.0
+
+# 同时打开的 SSE 连接上限。SSE 在 http.server 下是"一连接一线程"且**常驻**
+# （直到客户端断开），实测 2600 条连接就逼近 macOS 默认 maxproc 2666——
+# 打满后连【普通 API】也会被内核 RST，整个服务对所有用户不可用，而不是
+# "只是 SSE 连不上"。因为占满线程的正是永不超时的 SSE 线程，它无法自愈。
+#
+# 取 256 的理由：远超单人自用工具的真实需求（几个标签页 + 手机端最多十几条），
+# 又远低于任何平台的线程上限。超出上限的请求立刻收到 503 + 明确文案，客户端
+# 按 SSE 自动重连退避后会成功，比"内核静默 RST"可控得多。
+MAX_SSE_CONNECTIONS = 256
+
+# 全局 SSE 连接计数信号量。放在这里（而非 app.py）是因为它保护的正是
+# subscribe/unsubscribe 这对生命周期，两者挨着不易漂移。
+SSE_SLOTS = threading.BoundedSemaphore(MAX_SSE_CONNECTIONS)
 
 
 def sse_frame(seq: int | None, event: dict) -> bytes:
@@ -80,6 +109,10 @@ class SessionEvents:
         # 上次落库的单调时刻（time.monotonic()）：last_seq 按 PERSIST_INTERVAL_S
         # 降频写，回合边界强制写一次。见 publish 的论证。
         self._persisted_at = time.monotonic()
+        # 订阅者队列满而丢事件的累计数与上次告警时刻（告警按时间降频，
+        # 见 publish 里的论证）：卡住的客户端会持续丢，逐条打会刷爆日志。
+        self._dropped_total = 0
+        self._drop_warned_at = 0.0
         # 回合边界状态（由 turn_start/turn_end 事件顺带维护）：
         # replay_plan 靠它们把"正在进行的回合"从起点整段补发。
         self.running = False
@@ -126,6 +159,7 @@ class SessionEvents:
         进程被 kill 时最多丢最近 PERSIST_INTERVAL_S 内的事件计数——窗外无差。
         """
         should_persist = False   # 锁内赋真值；预置防锁内异常导致下方 NameError
+        dropped = 0              # 本次发布因队列满丢弃的事件数（锁外统计）
         with self._lock:
             self._seq += 1
             seq = self._seq
@@ -152,7 +186,31 @@ class SessionEvents:
             if should_persist:
                 self._persisted_at = now
         for q in subs:
-            q.put(item)
+            # 【绝不阻塞发布者】SSE 是实时流，一个卡住的客户端不能拖住整个
+            # 会话的事件分发（发布者就是正在跑回合的那个线程）。
+            # 队列满 ⟹ 该客户端已经不读了（线程卡在 wfile.write），此时丢
+            # 最旧的、留最新的：它恢复读取时拿到的是最新状态，中间缺口由
+            # replay_plan/resync 兜底（前端本就按 mid 归并，重复无害）。
+            try:
+                q.put_nowait(item)
+            except Full:
+                try:
+                    q.get_nowait()      # 丢最旧
+                    q.put_nowait(item)  # 再放最新的
+                    dropped += 1
+                except (Empty, Full):
+                    pass  # 与消费者竞态：队列刚被取空/又满，跳过这一条即可
+        if dropped:
+            # 不静默，但【按时间降频】：一个卡住的客户端会持续丢事件（逐 token
+            # 发布时每来一条就丢一条），逐条打警告会把日志刷爆（实测 3 万条
+            # 事件刷出上万行），反而把真正的信号埋掉。5 秒最多一条，附累计数。
+            now = time.monotonic()
+            if now - self._drop_warned_at >= DROP_WARN_INTERVAL_S:
+                self._drop_warned_at = now
+                log.warning("订阅者队列已满，正在丢弃最旧事件（客户端读取过慢，"
+                            "累计已丢 %d 条）——其缺口将由 resync 补齐",
+                            self._dropped_total + dropped)
+            self._dropped_total += dropped
         if should_persist:
             try:
                 self._persist(seq)
@@ -163,8 +221,12 @@ class SessionEvents:
     # ---------- 订阅 ----------
 
     def subscribe(self) -> Queue:
-        """注册一个订阅者（一条 events 连接），返回它的专属队列。"""
-        q: Queue = Queue()
+        """注册一个订阅者（一条 events 连接），返回它的专属队列。
+
+        队列有容量上限（SUBSCRIBER_QUEUE_MAX），满了由 publish 丢最旧的——
+        详见该常量的说明。这里只负责建队列，丢弃策略在发布侧统一实现。
+        """
+        q: Queue = Queue(maxsize=SUBSCRIBER_QUEUE_MAX)
         with self._lock:
             self._subs.append(q)
         return q
