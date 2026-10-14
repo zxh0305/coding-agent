@@ -21,6 +21,7 @@ busref 的模块 docstring 早已写明"绝不可以在 import 期取值"，但�
 import importlib
 import threading
 import unittest
+from pathlib import Path
 
 import app
 import db
@@ -254,6 +255,66 @@ class MessagePaginationTest(ApiTestBase):
                     ("assistant", "", "m2")])
         _, data = self._page(limit=2)
         self.assertTrue(data["has_more"])
+
+
+class EventBusLifecycleTest(unittest.TestCase):
+    """_event_bus 不得为已删会话重建总线（那是只增不减的内存滞留）。
+
+    真实触发路径：首轮结束后的标题生成是【异步】的（spawn_title_generation），
+    它可能在用户已经删掉会话之后才回来 `_event_bus(sid).publish(...)`。
+    若无条件重建，就会给一个库中已不存在的 sid 造出永久滞留在 _buses 里的总线。
+    已删会话的事件本就无人需要（能收到它的前端连接已随 session_deleted 收摊）。
+    """
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="bus_test_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._orig = db.DB_PATH
+        db.DB_PATH = Path(self.tmp) / "test.db"
+        db.init_db()
+        db.create_user("tester", "pw")
+        self.uid = db.get_user_by_name("tester")["id"]
+        self.addCleanup(app._buses.clear)
+
+    def tearDown(self):
+        db.DB_PATH = self._orig
+
+    def test_live_session_is_cached(self):
+        db.create_session("live1", self.uid)
+        app._event_bus("live1").publish({"type": "x"})
+        self.assertIn("live1", app._buses)
+
+    def test_deleted_session_bus_is_not_resurrected(self):
+        """晚到的发布者（如异步标题生成）不得把死会话的总线拉回缓存。"""
+        db.create_session("dead1", self.uid)
+        app._event_bus("dead1")                 # 先正常建立
+        with app._lock:
+            app._buses.pop("dead1", None)       # 模拟删除时的收摊
+        db.delete_session("dead1")
+
+        bus = app._event_bus("dead1")           # 晚到的发布者
+        bus.publish({"type": "session_title", "title": "晚到的标题"})
+        self.assertNotIn("dead1", app._buses,
+                         "已删会话的总线被重建并永久滞留——_buses 只增不减")
+
+    def test_never_existed_session_is_not_cached(self):
+        """从未存在的 sid 同样不缓存（stale SSE / 竞态窗口）。"""
+        app._event_bus("never-existed").publish({"type": "x"})
+        self.assertNotIn("never-existed", app._buses)
+
+    def test_returned_bus_is_still_usable(self):
+        """调用点写的 `_event_bus(sid).publish(...)` 不能因丢弃语义而炸。
+
+        丢弃时返回的是一条不缓存、不落库的临时总线——publish 照常可用，
+        只是没人收。这样各发布点不必都去加判空。
+        """
+        db.create_session("d2", self.uid)
+        db.delete_session("d2")
+        bus = app._event_bus("d2")
+        bus.publish({"type": "session_title", "title": "x"})   # 不应抛异常
+        self.assertNotIn("d2", app._buses)
 
 
 if __name__ == "__main__":

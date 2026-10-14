@@ -159,12 +159,30 @@ def _session_lock(sid: str) -> threading.Lock:
 
 
 def _event_bus(sid: str) -> SessionEvents:
+    """取（或建）会话事件总线。
+
+    【不复活已删会话】会话删除时 _delete_session_cleanup 会把总线从 _buses 摘掉
+    并 close。但有几个发布者是【异步晚到】的——最典型是首轮结束后的标题生成
+    （title.py），它可能在用户已经删掉这个会话之后才回来 publish。若这里无条件
+    重建，就会为一个库中已不存在的 sid 造出一条永久滞留在 _buses 里的总线
+    （_buses 只增不减，与 _delete_session_cleanup 特意清干净的那些字典同类）。
+
+    已删会话的事件【本来就无人需要】：能收到它的前端连接已被 session_deleted
+    通知收摊。所以这里直接丢弃——返回一个不再缓存、也不落库的临时总线，publish
+    进去的事件自然没人收。既避免泄漏，也让调用点的 `_event_bus(sid).publish(...)`
+    写法照旧可用（不必在每个发布点加判空）。
+    """
     with _lock:
         bus = _buses.get(sid)
-        if bus is None:
-            bus = SessionEvents(last_seq=db.get_last_seq(sid),
-                                persist=lambda seq, _sid=sid: db.set_last_seq(_sid, seq))
-            _buses[sid] = bus
+        if bus is not None:
+            return bus
+        # 库中不存在 → 不缓存（丢弃语义）。仍查一次库：这个分支只在"总线尚未
+        # 建立"时走到，不在热路径上（已存在会话的常规调用在上面就返回了）。
+        if db.session_owner(sid) is None:
+            return SessionEvents(persist=None)
+        bus = SessionEvents(last_seq=db.get_last_seq(sid),
+                            persist=lambda seq, _sid=sid: db.set_last_seq(_sid, seq))
+        _buses[sid] = bus
         return bus
 
 
