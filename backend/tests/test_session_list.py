@@ -200,5 +200,61 @@ class SessionDeleteMemoryCleanupTest(ApiTestBase):
         self.assertIn("s2", busref._sigs)
 
 
+class MessagePaginationTest(ApiTestBase):
+    """GET /api/sessions/<id>/messages 的 has_more 判定。
+
+    回归：has_more 必须按【数据库抓取到的那一页】判断，而不是按过滤后的
+    时间线项判断。工具消息、带 tool_calls 的中间 assistant、空正文消息都会被
+    过滤掉；若一页恰好全是这类消息，items 为空 → 旧代码的
+    `bool(items) and ...` 直接短路成 False——明明前面还有用户可见的消息，
+    却告诉前端"没有更早的了"，向上翻页入口消失，时间线永远卡在最近一页。
+    """
+
+    def _page(self, limit=2):
+        return self.call("GET", f"/api/sessions/s1/messages?limit={limit}")
+
+    def _seed(self, rows):
+        """rows = [(role, content, mid)]，按序落库（ord 由 ORD_GAP 自动递增）。"""
+        db.save_messages("s1", [{"role": r, "content": c, "_mid": m} for r, c, m in rows], {})
+
+    def test_has_more_false_when_page_reaches_the_beginning(self):
+        """抓完整个会话 → has_more 必须是 False（别再显示"加载更早"）。"""
+        self._seed([("user", "只有一条", "m1")])
+        _, data = self._page(limit=10)
+        self.assertEqual([m["mid"] for m in data["messages"]], ["m1"])
+        self.assertFalse(data["has_more"])
+
+    def test_has_more_true_when_older_messages_exist(self):
+        """前面还有消息 → has_more True。"""
+        self._seed([("user", "老问题", "m1"), ("assistant", "老回答", "m2"),
+                    ("user", "新问题", "m3")])
+        _, data = self._page(limit=2)
+        self.assertTrue(data["has_more"])
+
+    def test_page_of_only_filtered_rows_still_reports_has_more(self):
+        """【核心回归】整页都是会被过滤的消息时，仍须如实报告 has_more。
+
+        造法：最旧一条是可见消息，其后紧跟两条 tool 消息。limit=2 时抓到的恰好
+        是那两条 tool —— 过滤后 items 为空，但前面确实还有可见消息。
+        旧代码在此返回 False，翻页入口消失且无任何提示。
+        """
+        self._seed([("assistant", "在更早的可见消息", "m0"),
+                    ("tool", "工具输出 1", "m1"),
+                    ("tool", "工具输出 2", "m2")])
+        _, data = self._page(limit=2)
+        self.assertEqual(data["messages"], [], "这一页应被全部过滤（前提）")
+        self.assertTrue(data["has_more"],
+                        "整页被滤空时旧代码报 has_more=False，翻页入口消失——"
+                        "前面明明还有可见消息")
+
+    def test_has_more_ignores_empty_content_rows(self):
+        """空正文消息同样会被过滤，不能影响抓取边界。"""
+        self._seed([("assistant", "可见", "m0"),
+                    ("assistant", "", "m1"),      # 空正文：被过滤
+                    ("assistant", "", "m2")])
+        _, data = self._page(limit=2)
+        self.assertTrue(data["has_more"])
+
+
 if __name__ == "__main__":
     unittest.main()

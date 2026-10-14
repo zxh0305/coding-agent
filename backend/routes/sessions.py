@@ -273,8 +273,17 @@ class SessionRoutes:
         for it in items:
             if it["mid"] in traces:
                 it["trace"] = traces[it["mid"]]
-        # has_more：本页最小 ord 之前还有更早的消息（向上翻页入口的显隐依据）
-        has_more = bool(items) and db.has_messages_before(sid, items[0]["ord"])
+        # has_more：本页【抓取范围】的最小 ord 之前还有更早的消息
+        # （向上翻页入口的显隐依据）。
+        #
+        # 必须用 msgs（数据库返回的原始一页）而不是 items（过滤后的时间线项）：
+        # 工具消息、带 tool_calls 的中间 assistant、以及正文为空的消息都会被上面
+        # 的循环滤掉。若本页最旧的那条恰好被滤掉，items[0]["ord"] 就比真实抓取
+        # 边界【更大】，has_messages_before 会误判为"没有更早的了"——用户点
+        # "加载更早"没反应，时间线卡住一截且无任何提示。空页时同样按抓取边界
+        # 判断：一页全是工具消息也要能继续往前翻。
+        oldest_ord = msgs[0]["_ord"] if msgs else None
+        has_more = oldest_ord is not None and db.has_messages_before(sid, oldest_ord)
         # 进行中回合的快照：切走再切回的页面靠它补画执行过程（含已累积的思考
         # 内容）。回合结束后快照行已删、正式轨迹已按 answer_mid 落库，这里自然
         # 取不到——running=false 时这笔查询直接跳过，正常路径零额外开销。
