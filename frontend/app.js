@@ -4386,7 +4386,24 @@ function notifyDesktop(title, body) {
   } catch { /* 构造失败不致命 */ }
 }
 
+// 刚刚发出回合的时刻。发送按钮是"发送/停止"双角色，靠 streaming 分流
+// （见 bind("send")），而 performSend 一进来就同步 setStreaming(true)——
+// 于是首帧还没画完、按钮看着仍是"发送"时，双击的第二次点击已经落进
+// stopGeneration，把刚发出的回合立刻掐掉（真实踩过：双击发送 → 消息发出去
+// 又被自己停掉，表现为"发了但没回答"）。
+// 这里给"刚发出"一个极短的冷却窗：窗内的点击视作同一次发送的抖动，忽略。
+// 取 300ms：短于人有意识双击停止所需的时间，又长于任何真实双击的间隔。
+let lastSendAt = 0;
+const SEND_DEBOUNCE_MS = 300;
+
+function sendOnCooldown() {
+  return Date.now() - lastSendAt < SEND_DEBOUNCE_MS;
+}
+
 async function stopGeneration() {
+  // 刚发出就来的"停止"多半是双击抖动，不是用户真想停。真正的停止发生在
+  // 回合跑起来之后（几百 ms 起步），所以这个窗口不会挡住正常操作。
+  if (sendOnCooldown()) return;
   $("send").textContent = "停止中…";
   try {
     await api("/api/chat/stop", { method: "POST", body: JSON.stringify({ session_id: currentSession }) });
@@ -4685,6 +4702,7 @@ async function performSend(item) {
   todoDoneAnnounced = false;
   clearTimeout(todoDoneTimer);
   setStreaming(true);
+  lastSendAt = Date.now();   // 起冷却窗：挡住紧随其后的抖动点击变成"停止"
   // 【即时反馈】回合真起点此刻还不知道（turn_start 要等 POST 返回 + 事件流送达，
   // 后端还要先抢到会话锁——上一回合收尾/冷启动时这里能空白好几秒，用户以为
   // "没反应"）。这里先乐观地画一张占位过程卡："正在思考…" + 本地计时起跳，
