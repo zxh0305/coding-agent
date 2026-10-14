@@ -197,7 +197,10 @@ class TestPathBoundary(unittest.TestCase):
                     {"action": "delete", "file": "../../secret.txt"}]
         for op in evil_ops:
             out = apply_extraction(mem_dir, {"memories": [op]})
-            self.assertTrue(out["abandoned"], f"应拒绝 {op['file']!r}")
+            # 逐条拒绝（不再整包 abandoned）：安全属性不变，只是报告口径改了
+            self.assertEqual(len(out["rejected"]), 1, f"应拒绝 {op['file']!r}")
+            self.assertEqual(out["written"], [])
+            self.assertEqual(out["deleted"], [])
             self.assertFalse((mem_dir / "evil.md").exists())
             self.assertEqual(self.secret.read_text(encoding="utf-8"), "机密")
             self.assertFalse((mem_dir / "MEMORY.md").exists())  # 索引也不得被创建
@@ -660,7 +663,8 @@ class TestMemorySafety(unittest.TestCase):
         before = self._snapshot()
         for op in bad_ops:
             out = apply_extraction(self.mem_dir, {"memories": [op]})
-            self.assertTrue(out["abandoned"], f"应拒绝 {op!r}")
+            self.assertEqual(len(out["rejected"]), 1, f"应拒绝 {op!r}")
+            self.assertEqual(out["written"], [])
         self.assertEqual(self._snapshot(), before, "磁盘一字节不动")
 
     def test_body_over_8000_truncated(self):
@@ -672,16 +676,23 @@ class TestMemorySafety(unittest.TestCase):
         self.assertNotIn("长" * 8001, text)
         self.assertLess(len(text), 8200)
 
-    def test_all_or_nothing_on_mixed_batch(self):
-        """混合批次里一条非法：整批放弃，合法的那条也不得落盘——半套记忆
-        （正文写了、索引没跟上）比没有更糟。"""
+    def test_bad_op_isolated_good_op_lands(self):
+        """混合批次里一条非法：坏的只丢自己，合法的那条必须落盘。
+
+        语义变更背景：此前是全有或全无，而提取提示词又让模型"优先用
+        action=update"（校验器只认 write/delete）——模型越守规矩，整批越会
+        被整批丢弃，连同完全合法的条目，且用户毫无感知。现在逐条隔离。
+        安全属性不变：非法条目照样零落盘、索引不被污染。
+        """
         good = self._write_op(fname="good-one.md")
         bad = self._write_op(fname="../evil.md")
-        before = self._snapshot()
         out = apply_extraction(self.mem_dir, {"memories": [good, bad]})
-        self.assertTrue(out["abandoned"])
-        self.assertEqual(out["written"], [])
-        self.assertEqual(self._snapshot(), before, "整批放弃，磁盘一字节不动")
+        self.assertEqual(out["written"], ["good-one.md"])
+        self.assertEqual(len(out["rejected"]), 1)
+        self.assertTrue((self.mem_dir / "good-one.md").exists())
+        # 越界那条绝不能落盘，也绝不进索引
+        self.assertFalse((self.mem_dir.parent / "evil.md").exists())
+        self.assertNotIn("evil", (self.mem_dir / "MEMORY.md").read_text(encoding="utf-8"))
 
     def test_delete_syncs_index_and_idempotent(self):
         apply_extraction(self.mem_dir, {"memories": [self._write_op()]})

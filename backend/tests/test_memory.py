@@ -29,7 +29,8 @@ import memory
 from agent import Agent
 from memory import (BODY_MAX_CHARS, INDEX_MAX_CHARS, INDEX_MAX_LINES, MEMORY_CONTRACT,
                     apply_extraction, build_extraction_messages, memory_dir,
-                    parse_extraction_reply, parse_frontmatter, recent_user_texts,
+                    parse_extraction_reply, parse_frontmatter, read_index_text,
+                    recent_user_texts,
                     remove_index_line, render_index_line, render_memory_file,
                     scan_inventory, system_memory_block, truncate_index,
                     upsert_index_line, valid_memory_filename)
@@ -59,12 +60,18 @@ def write_op(fname="dark-theme.md", description="用户偏好深色主题", mtyp
 
 def seed_memory(mem_dir: Path, fname: str, description: str, mtype="user",
                 body="正文") -> None:
-    """直接落一条记忆 + 索引行（绕过执行器，做删除/注入类测试的底料）。"""
+    """直接落一条记忆 + 索引行（绕过执行器，做删除/注入类测试的底料）。
+
+    索引行是【追加/更新】而非整文件覆盖：连续 seed 多条时，覆盖会把前一条的
+    索引行抹掉（曾因此在多条目用例里让"正常记忆照常注入"的断言假失败）。
+    用 upsert_index_line，与执行器的写入语义一致。
+    """
     mem_dir.mkdir(parents=True, exist_ok=True)
     (mem_dir / fname).write_text(
         render_memory_file(fname[:-3], description, mtype, body), encoding="utf-8")
     (mem_dir / "MEMORY.md").write_text(
-        render_index_line(fname, description) + "\n", encoding="utf-8")
+        upsert_index_line(read_index_text(mem_dir), fname, description),
+        encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -243,14 +250,16 @@ class TestApplyExtraction(unittest.TestCase):
         mem_dir = make_mem_dir(self)
         for fname in ("../evil.md", "/tmp/evil.md", "sub/dir.md", "OK.md", "x.txt"):
             result = apply_extraction(mem_dir, {"memories": [write_op(fname=fname)]})
-            self.assertIsNotNone(result["abandoned"], fname)
-            self.assertEqual(result["written"], [])
-            self.assertFalse(mem_dir.exists(), "放弃时磁盘一个字节都不该动")
+            self.assertEqual(result["written"], [], fname)
+            self.assertEqual(len(result["rejected"]), 1, fname)
+            self.assertEqual(result["rejected"][0][0], fname)
+            self.assertFalse(mem_dir.exists(), "被拒的条目不该动磁盘")
 
     def test_rejects_illegal_ops(self):
         mem_dir = make_mem_dir(self)
         cases = [
             write_op(action="upsert"),                       # 非法 action
+            write_op(action="update"),                       # 历史 bug：提示词曾让模型用它
             write_op(mtype="secret"),                        # 非法 type
             write_op(description=""),                        # 空 description
             write_op(frontmatter=None),                      # 缺 frontmatter
@@ -260,15 +269,46 @@ class TestApplyExtraction(unittest.TestCase):
         for op in cases:
             payload = op if op.get("memories") else {"memories": [op]}
             result = apply_extraction(mem_dir, payload)
-            self.assertIsNotNone(result["abandoned"], op)
-            self.assertFalse(mem_dir.exists())
+            # 顶层形状错误仍是整包放弃（无从逐条）；单条非法则是逐条拒绝
+            if op.get("memories"):
+                self.assertIsNotNone(result["abandoned"], op)
+                self.assertFalse(mem_dir.exists())
+            else:
+                self.assertIsNone(result["abandoned"], op)
+                self.assertEqual(len(result["rejected"]), 1, op)
+                self.assertFalse(mem_dir.exists())
 
-    def test_all_or_nothing_on_mixed_batch(self):
-        """合法与非法混合：整批放弃（半套记忆比没有更糟）。"""
+    def test_bad_op_does_not_discard_good_ones(self):
+        """一条坏操作只丢它自己——同批合法的 write 必须落盘。
+
+        回归背景：此前是全有或全无，而提示词又让模型"优先用 action=update"
+        （校验器只认 write/delete）——模型越守规矩，整批越会被整批丢掉，
+        连同完全合法的条目。表现为"刚讨论出的结论下次完全不记得"。
+        """
         mem_dir = make_mem_dir(self)
-        result = apply_extraction(mem_dir, {"memories": [write_op(), write_op(fname="../x.md")]})
-        self.assertIsNotNone(result["abandoned"])
-        self.assertFalse(mem_dir.exists())
+        result = apply_extraction(mem_dir, {"memories": [
+            write_op(fname="good-a.md", description="合法A"),
+            write_op(fname="bad.md", action="update"),      # 坏：整批曾经因此全丢
+            write_op(fname="good-b.md", description="合法B"),
+        ]})
+        self.assertIsNone(result["abandoned"])
+        self.assertEqual(result["written"], ["good-a.md", "good-b.md"])
+        self.assertEqual(len(result["rejected"]), 1)
+        self.assertTrue((mem_dir / "good-a.md").exists())
+        self.assertTrue((mem_dir / "good-b.md").exists())
+        index = (mem_dir / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertIn("good-a.md", index)
+        self.assertIn("good-b.md", index)
+
+    def test_index_survives_extraction_roundtrip(self):
+        """同名 write 覆盖 = 更新（提示词给模型的更新方式），索引描述随之刷新。"""
+        mem_dir = make_mem_dir(self)
+        apply_extraction(mem_dir, {"memories": [write_op(fname="pref.md", description="旧描述")]})
+        apply_extraction(mem_dir, {"memories": [write_op(fname="pref.md", description="新描述")]})
+        index = (mem_dir / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertIn("新描述", index)
+        self.assertNotIn("旧描述", index)
+        self.assertEqual(index.count("pref.md"), 1, "覆盖不该在索引里留下重复行")
 
     def test_delete_removes_file_and_index_line(self):
         mem_dir = make_mem_dir(self)
@@ -286,9 +326,12 @@ class TestApplyExtraction(unittest.TestCase):
         self.assertIsNone(result["abandoned"])
 
     def test_delete_still_respects_whitelist(self):
+        """越界删除照样被拒（逐条拒绝，不再整包放弃）。"""
         mem_dir = make_mem_dir(self)
         result = apply_extraction(mem_dir, {"memories": [{"action": "delete", "file": "../x.md"}]})
-        self.assertIsNotNone(result["abandoned"])
+        self.assertEqual(result["deleted"], [])
+        self.assertEqual(len(result["rejected"]), 1)
+        self.assertIn("文件名", result["rejected"][0][1])
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +511,65 @@ class TestSystemBlock(unittest.TestCase):
         self.assertIn("dark-theme.md", block)
         self.assertIn("用户偏好深色主题", block)
 
+    def test_sensitive_memories_withheld_from_injection(self):
+        """含凭据/密钥的记忆不注入 system，但如实告知条数。
+
+        回归背景：真实事故——data/memory/ 里存着明文 SSH 与数据库口令，索引
+        每轮随 system 发往云端 LLM，且索引行里写着目标 IP，等于向模型点名
+        "这里有这台机器的账号密码"。拦在注入层（不是提取层）是因为写入有两条
+        路径（轮末提取 + 模型直接 write_file），注入是唯一公共出口。
+        被拦的条目要【计数告知】，不能静默消失——静默丢失比看不到更糟。
+        """
+        mem_dir = make_mem_dir(self)
+        seed_memory(mem_dir, "keep-git-clean.md", "修改文件时保持 git 工作区干净")
+        seed_memory(mem_dir, "credentials-prod.md",
+                    "服务器 192.168.77.248 账号 devops 密码 Passw0rd!", mtype="reference")
+        block = system_memory_block(mem_dir)
+        self.assertIn("keep-git-clean.md", block, "正常记忆照常注入")
+        self.assertNotIn("Passw0rd", block, "口令绝不能进 prompt")
+        self.assertNotIn("devops", block)
+        self.assertIn("未注入", block, "被拦条目必须计数告知，不能静默消失")
+
+    def test_redact_hits_bare_lines_and_spares_normal_ones(self):
+        """逐行判敏感，不只看 "- " 条目行；正常记忆零误伤。"""
+        from memory import redact_sensitive_lines
+        text = "\n".join([
+            "- [pref](pref.md) — 用户偏好：前端用 pnpm",
+            "password: hunter2",                      # 裸行（非条目）：也必须滤
+            "- [cmd](cmd.md) — 测试命令：python3 -m unittest",
+            "- [api](api.md) — 接口 401 包装成 200",
+        ])
+        clean, n = redact_sensitive_lines(text)
+        self.assertEqual(n, 1)
+        self.assertNotIn("hunter2", clean)
+        self.assertIn("pnpm", clean)
+        self.assertIn("python3 -m unittest", clean)
+
+    @staticmethod
+    def _sensitive_samples():
+        return [
+            "- [credential](c.md) — 服务器 192.168.77.248 账号 devops 密码 Passw0rd!",
+            "password: hunter2", "api_key = sk-abc123",
+            "SSH: ssh devops@192.168.77.248", "mysql://root:secret@localhost/db",
+            "- [x](x.md) — 数据库口令：abc", "BEGIN RSA PRIVATE KEY",
+            "token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abcdefghijklmnopqrstuvwxyz0",
+            "服务器账号：root",
+        ]
+
+    def test_sensitive_detector_catches_real_forms(self):
+        from memory import is_sensitive_text
+        for s in self._sensitive_samples():
+            self.assertTrue(is_sensitive_text(s), f"漏拦: {s}")
+
+    def test_sensitive_detector_spares_working_memories(self):
+        from memory import is_sensitive_text
+        for s in ["- [pnpm](p.md) — 前端包管理用 pnpm 不用 npm",
+                  "- [plan](p.md) — 先出方案讨论，确认后再改代码",
+                  "- [db](d.md) — 四张表加 *_txt 生成列（迁移 10~14）",
+                  "项目用 DeepSeek，注意 token 计费口径",
+                  "- [api](a.md) — 接口返回 code/body 双段，401 包装成 200"]:
+            self.assertFalse(is_sensitive_text(s), f"误伤: {s}")
+
     def test_empty_dir_degrades_and_stays_lazy(self):
         mem_dir = make_mem_dir(self)
         block = system_memory_block(mem_dir)
@@ -513,6 +615,24 @@ class CaptureLLM:
 
 class TestAgentInjection(unittest.TestCase):
 
+    def setUp(self):
+        """把数据区重定向到临时目录（模式同 test_storage / test_sse）。
+
+        必须做：memory_dir(ws) 会哈希 ws 的绝对路径落到 db.DB_PATH.parent/memory/
+        下。这两个用例用 tempfile.mkdtemp() 造随机工作区，不重定向的话每跑一次
+        就在**真实的** data/memory/ 里永久新增一个两文件垃圾桶——累计已污染出
+        78 个桶，且会成为"提升个人层"迁移的输入（把测试 fixture 提升进真实记忆）。
+        """
+        import db
+        self._tmp = tempfile.mkdtemp(prefix="memory_agent_data_")
+        self._orig_db_path = db.DB_PATH
+        db.DB_PATH = Path(self._tmp) / "agent_data.db"
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+
+    def tearDown(self):
+        import db
+        db.DB_PATH = self._orig_db_path
+
     def make_agent(self, ws: Path) -> tuple[Agent, CaptureLLM]:
         llm = CaptureLLM()
         agent = Agent(llm=llm, verbose=False, workspace=str(ws))
@@ -523,6 +643,8 @@ class TestAgentInjection(unittest.TestCase):
         ws = Path(tempfile.mkdtemp(prefix="memory_agent_ws_"))
         self.addCleanup(shutil.rmtree, ws, ignore_errors=True)
         mem_dir = memory_dir(ws)
+        self.assertTrue(str(mem_dir).startswith(self._tmp),
+                        "记忆目录必须落在临时数据区，不能污染项目 data/")
         seed_memory(mem_dir, "dark-theme.md", "用户偏好深色主题")
         agent, llm = self.make_agent(ws)
         events = list(agent.run("随便聊聊"))

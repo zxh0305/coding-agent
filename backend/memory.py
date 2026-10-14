@@ -64,7 +64,11 @@ MEMORY_TYPES = ("user", "feedback", "project", "reference")
 INDEX_MAX_LINES = 150     # 索引注入上限（行）：索引无限增长会挤占每次请求的 system
 INDEX_MAX_CHARS = 20000   # 索引注入上限（字符）：单行超长描述的兜底
 BODY_MAX_CHARS = 8000     # 单条记忆正文上限：提取模型偶尔长篇大论，截断保平安
-INVENTORY_LIMIT = 50      # 提取请求带上的已有记忆清单条数上限（按 mtime 降序）
+INVENTORY_LIMIT = 200     # 提取请求带上的已有记忆清单条数上限（按 mtime 降序）。
+                          # 曾为 50，而真实记忆已 74 条——清单里看不见的条目，
+                          # 提取器就不知道它存在，"更新旧文件而不是新建重复"这条
+                          # 纪律结构上无法执行，重复条目由此攒出来。上限只需
+                          # 挡住无界增长，放到远高于真实规模即可。
 SNAPSHOT_MESSAGES = 20    # 提取输入的快照窗口：最近 20 条消息里的用户发言
 MIN_USER_WORDS = 3        # 短于 3 个词的用户消息（"好的"/"继续"）不值得提取
 
@@ -299,8 +303,64 @@ def memory_index_block(mem_dir: Path) -> str:
     读失败视为空索引（read_index_text 兜底），不阻塞主循环。
     """
     index = truncate_index(read_index_text(mem_dir))
+    index, withheld = redact_sensitive_lines(index)
+    if withheld:
+        index += f"\n（另有 {withheld} 条含敏感信息的记忆未注入，需用时请用户在本机确认）"
     body = index if index else "（暂无记忆）"
     return f"\n\n{INDEX_HEADING}\n\n{body}"
+
+
+# ---------------------------------------------------------------------------
+# 敏感信息闸门：注入前过滤（不是写入前过滤——写入闸门挡不住模型直接 write_file）
+# ---------------------------------------------------------------------------
+#
+# 为什么必须在【注入】这一步拦：记忆索引每轮随 system 发往云端 LLM。一旦某条
+# 记忆里出现服务器口令、token、私钥，它就每轮都出网一次，且"事后删文件"救不了
+# ——泄露已经发生。真实事故：data/memory/<桶>/credentials-192.168.77.248.md
+# 明文存着 SSH 与数据库口令，索引行里还直接写着目标 IP，等于向模型点名"这里有
+# 这台机器的账号密码"。提取线程每轮还会把最近 20 条用户原话再发一次。
+#
+# 拦在注入层而不是提取层，是因为写入路径有两条（轮末提取 + 模型自己 write_file），
+# 只在提取器里拦会漏掉后者；注入层是唯一的公共出口。命中即不注入并计数，
+# 让模型知道"有条信息存在但不可见"，需要时请用户在本机确认——如实告知而非静默。
+_SECRET_PATTERNS = [
+    re.compile(r"(?i)\b(password|passwd|pwd|passphrase)\b\s*[:=：]"),
+    re.compile(r"(?i)\b(api[_-]?key|secret[_-]?key|access[_-]?key|token|bearer)\b\s*[:=：]"),
+    re.compile(r"(?i)\b(private[_-]?key|id_rsa|BEGIN [A-Z ]*PRIVATE KEY)"),
+    re.compile(r"ssh\s+\S+@|scp\s+\S+@"),               # ssh user@host
+    re.compile(r"(?i)\b(mysql|psql|redis|mongodb|oracle)://\S+:\S+@"),  # 带口令的连接串
+    # 中文关键词不能加 \b：CJK 是 word 字符而全角冒号不是，\b 在"口令："处不成立
+    # （实测 '数据库口令：abc' 会漏），故用前后非中文字符的显式边界。
+    re.compile(r"(?i)(账号|密码|口令|密钥|凭据|秘钥)\s*[:=：]"),
+    re.compile(r"(?i)(数据库|服务器|主机|登录)\s*\S{0,10}(账号|密码|口令)"),
+    re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b.{0,20}\b(密码|口令|账号|password)\b"),
+    re.compile(r"(?i)\b[A-Za-z0-9+/]{40,}={0,2}\b"),     # 长 base64 串（密钥/令牌）
+]
+
+
+def is_sensitive_text(text: str) -> bool:
+    """文本是否含疑似凭据/密钥。宁可多拦一条（模型看不到，可请用户确认），
+    也不要漏一条（每轮出网、不可撤回）。"""
+    if not text:
+        return False
+    return any(p.search(text) for p in _SECRET_PATTERNS)
+
+
+def redact_sensitive_lines(index_text: str) -> tuple[str, int]:
+    """从索引里滤掉含敏感信息的行，返回 (清洗后的索引, 被滤条数)。
+
+    逐行判敏感，不只看 "- " 开头的条目行：索引文件可能被模型直接改写、混进
+    非条目行（实测过裸的 `password: hunter2` 这种情况会被漏放），任何一行
+    命中都拦。被滤的行不出现在注入内容里——但计数会告诉模型"有 N 条不可见"，
+    而不是让它以为记忆里没有这件事（静默丢失比看不到更糟）。
+    """
+    kept, withheld = [], 0
+    for line in (index_text or "").splitlines():
+        if line.strip() and is_sensitive_text(line):
+            withheld += 1
+            continue
+        kept.append(line)
+    return "\n".join(kept), withheld
 
 
 def system_memory_block(mem_dir: Path) -> str:
@@ -361,8 +421,10 @@ EXTRACT_SYSTEM_PROMPT = """\
 {"name": "slug-name", "description": "一句话摘要", "metadata": {"type": "user"}}, \
 "body": "正文一段话"}]}
 要求：
-- 优先 update 已有记忆清单里的文件（file 沿用其文件名、body 给出更新后的完整正文），\
-无新信息就返回 NOTHING_TO_SAVE；确认某条记忆已过时才用 action=delete；
+- 要更新已有记忆清单里的某条，就用 action="write" + 沿用它的文件名（body 给更新后的\
+完整正文）——写入即覆盖，不需要独立的 update 动作；已确认过时的记忆才用 action="delete"；\
+- 没有任何值得记住的新信息就返回 NOTHING_TO_SAVE；
+- action 只能是 "write" 或 "delete"，其它取值会让整条被拒；
 - file 只能是小写字母/数字/短横线 + .md；
 - feedback 类型的 body 必须包含 **Why:** 与 **How to apply:** 两行；
 - 相关记忆之间用 [[name]] 互相链接（指向尚不存在的记忆也合法）；相对日期改成绝对日期。\
@@ -374,7 +436,7 @@ def build_extraction_messages(inventory: list[dict], user_texts: list[str]) -> l
     inv = "\n".join(f"- {it['file']}（type={it['type'] or '未知'}）{it['description']}"
                     for it in inventory) or "（暂无记忆）"
     texts = "\n".join(f"{i}. {t}" for i, t in enumerate(user_texts, 1)) or "（无）"
-    content = (f"=== 已有记忆清单（优先 update 这些文件） ===\n{inv}\n\n"
+    content = (f"=== 已有记忆清单（要更新某条就用 action=write + 同名 file 覆盖） ===\n{inv}\n\n"
                f"=== 最近用户发言 ===\n{texts}")
     return [{"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
             {"role": "user", "content": content}]
@@ -443,44 +505,59 @@ def apply_extraction(mem_dir: Path, payload) -> dict:
     """宿主执行器：把提取模型产出的操作清单落盘。
 
     输入：记忆目录 + 清单 JSON（{"memories": [...]}）；输出：执行结果
-    {"written": [...], "deleted": [...], "abandoned": 原因|None}。
+    {"written": [...], "deleted": [...], "rejected": [(file, 原因)], "abandoned": 原因|None}。
     只碰记忆目录内的文件，无网络、无全局状态——纯函数，单测直接喂 JSON。
 
-    全有或全无：任何一条操作非法就放弃整批（磁盘一个字节不动）——半套记忆
-    比没有更糟（比如正文删了、索引行还挂着），放弃后下轮提取自然重试。
+    【逐条落盘，一条坏操作只丢它自己】。此前是"全有或全无"——任一条非法就
+    放弃整批、磁盘一个字节不动。配合提示词里"优先用 action=update"（而校验器
+    只认 write/delete），后果是：模型越守规矩地更新旧记忆，整批越会被整批丢弃
+    ——连同同批完全合法的 write 一起。表现为"刚讨论出的重要结论下次完全不记得"，
+    且用户毫无感知，下一轮照旧重试、照旧丢。
+    现在每条独立校验、独立落盘；被拒的记进 rejected（带原因）供日志排查，
+    合法的照常生效。半套记忆的风险由"单条原子写"和索引随写同步兜住
+    （write 先写正文再更新索引，delete 先删正文再删索引行，两步各自原子）。
     """
-    result = {"written": [], "deleted": [], "abandoned": None}
+    result = {"written": [], "deleted": [], "rejected": [], "abandoned": None}
     ops = payload.get("memories") if isinstance(payload, dict) else None
     if not isinstance(ops, list):
         result["abandoned"] = "清单不是 {'memories': [...]} 形状"
         return result
-    for op in ops:  # 第一遍：全部校验通过才动手
+    for op in ops:
         reason = _validate_op(op, mem_dir)
         if reason:
-            result["abandoned"] = reason
-            return result
-    for op in ops:  # 第二遍：落盘
+            # 单条被拒：不影响同批其它条目。file 可能不是合法文件名，取原始值兜底。
+            fname = op.get("file") if isinstance(op, dict) else None
+            result["rejected"].append((str(fname), reason))
+            log.warning("记忆操作被拒（%s）：%s", fname, reason)
+            continue
         fname, target = op["file"], mem_dir / op["file"]
-        if op["action"] == "write":
-            fm = op["frontmatter"]
-            body = op["body"]
-            if len(body) > BODY_MAX_CHARS:  # 提取模型偶尔长篇大论，截断保平安
-                body = body[:BODY_MAX_CHARS]
-            atomic_write_text(target, render_memory_file(
-                Path(fname).stem, fm["description"], fm["metadata"]["type"], body))
-            # 提取是宿主行为，模型没机会改索引：索引行由执行器代为同步——
-            # 否则正文落了盘、索引没更新，注入永远看不到这条记忆。
-            atomic_write_text(mem_dir / INDEX_NAME,
-                              upsert_index_line(read_index_text(mem_dir),
-                                                fname, fm["description"]))
-            result["written"].append(fname)
-        else:
-            existed = target.exists()
-            target.unlink(missing_ok=True)  # 已不存在视为删除成功（幂等）
-            atomic_write_text(mem_dir / INDEX_NAME,
-                              remove_index_line(read_index_text(mem_dir), fname))
-            if existed:
-                result["deleted"].append(fname)
+        try:
+            if op["action"] == "write":
+                fm = op["frontmatter"]
+                body = op["body"]
+                if len(body) > BODY_MAX_CHARS:  # 提取模型偶尔长篇大论，截断保平安
+                    body = body[:BODY_MAX_CHARS]
+                atomic_write_text(target, render_memory_file(
+                    Path(fname).stem, fm["description"], fm["metadata"]["type"], body))
+                # 提取是宿主行为，模型没机会改索引：索引行由执行器代为同步——
+                # 否则正文落了盘、索引没更新，注入永远看不到这条记忆。
+                atomic_write_text(mem_dir / INDEX_NAME,
+                                  upsert_index_line(read_index_text(mem_dir),
+                                                    fname, fm["description"]))
+                result["written"].append(fname)
+            else:
+                existed = target.exists()
+                target.unlink(missing_ok=True)  # 已不存在视为删除成功（幂等）
+                atomic_write_text(mem_dir / INDEX_NAME,
+                                  remove_index_line(read_index_text(mem_dir), fname))
+                if existed:
+                    result["deleted"].append(fname)
+        except OSError as e:
+            # 单条落盘失败（磁盘满、权限、索引写不进去）只丢这一条：
+            # 异常不能冒泡到调用方，否则整批的成果随一次磁盘抖动一起丢。
+            result["rejected"].append((fname, f"{type(e).__name__}: {e}"))
+            log.warning("记忆落盘失败（%s）：%s", fname, e)
+            continue
     return result
 
 
