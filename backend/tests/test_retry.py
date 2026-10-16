@@ -241,6 +241,50 @@ class TestClientWiring(unittest.TestCase):
             self.assertIs(cap.records[-1]["cancel"], evt)
 
 
+class TestStreamOptionsDegradation(unittest.TestCase):
+    """服务商拒绝 stream_options 时，降级必须真的把参数【去掉】。
+
+    回归背景：payload 是同一个 dict，`payload["stream_options"] = {...}` 一旦
+    执行就把键写进去了。旧降级只置 want_usage=False（"下次别再添加"），却没
+    pop 掉已有的键 —— 重试请求与原请求**逐字节相同**，服务商照样拒绝，于是
+    "降级"形同虚设：任何不支持该参数的服务商都永远无法流式对话。
+
+    实测修前重试序列 [True, True]（两次都带），修后 [True, False]。
+    """
+
+    def _client_with(self, seen: list):
+        client = OpenAIChatClient(api_key="k", base_url="https://x/v1", model="m")
+
+        def fake_post(body, cancel=None):
+            seen.append("stream_options" in body)
+            if "stream_options" in body:
+                raise RuntimeError("Bad request: unknown parameter stream_options")
+            return FakeResp(lines=["data: " + json.dumps(
+                {"choices": [{"delta": {"content": "hi"}}]}), "data: [DONE]"])
+
+        client._post = fake_post
+        return client
+
+    def test_retry_drops_the_parameter_and_succeeds(self):
+        seen: list = []
+        client = self._client_with(seen)
+        out = [p for k, p in client.chat_stream(messages=[{"role": "user", "content": "x"}])
+               if k == "message"]
+        self.assertEqual(seen, [True, False],
+                         f"重试仍带着 stream_options（序列 {seen}）——降级没生效")
+        self.assertTrue(out, "降级后应能正常拿到回答")
+
+    def test_degradation_is_remembered_across_calls(self):
+        """降级一次后应记住，后续调用直接用可用形态（不再白撞一次失败）。"""
+        seen: list = []
+        client = self._client_with(seen)
+        list(client.chat_stream(messages=[{"role": "user", "content": "x"}]))
+        self.assertFalse(client._stream_usage)
+        seen.clear()
+        list(client.chat_stream(messages=[{"role": "user", "content": "y"}]))
+        self.assertEqual(seen, [False], f"第二次调用仍带该参数：{seen}")
+
+
 # ---------------------------------------------------------------------------
 # 四、tools=None 的请求体不带 tools / tool_choice
 # ---------------------------------------------------------------------------

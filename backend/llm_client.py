@@ -444,6 +444,12 @@ class OpenAIChatClient:
                 if want_usage and "stream_options" in str(e):
                     self._stream_usage = False
                     want_usage = False
+                    # 【必须把键删掉】降级不只是"下次别再加"——payload 是同一个
+                    # dict，上面那行已经把它写进去了。若只置 want_usage=False，
+                    # 重试请求里该参数【原样还在】，服务商照样拒绝 → 重试与首次
+                    # 完全相同 → 最终抛错，任何拒绝 stream_options 的服务商都
+                    # 永远无法流式（实测重试序列 [True, True]，降级形同虚设）。
+                    payload.pop("stream_options", None)
                     log.info("服务商不支持 stream_options，降级为不返回 token 用量")
                     continue
                 raise
