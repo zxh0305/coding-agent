@@ -698,6 +698,18 @@ async function newTask(presetProject = null) {
   currentSession = null;
   confirmingDelete = null;
   pendingProjectPath = presetProject;
+  // 【权限模式必须复位】permMode 是全局变量，进会话时由 loadPermMode() 刷成
+  // 该会话工作区的模式；而新任务分支里 loadPermMode 会早退（没有 session 可查），
+  // 于是【上一个会话的值原样留着】。发送首条消息时又要"跟随工作区写入"它
+  // （见 performSend），结果：先看过一个 yolo（完全访问）会话，再点新任务，
+  // 首条消息就在【未经选择】的情况下以 yolo 建会话——安全相关状态的静默泄漏。
+  //
+  // 复位成默认值：新任务若真想要别的模式，用户会在下拉里显式选（那条路径会
+  // 重新赋值 permMode），此时才写进新会话。默认值用工作区的记忆值更准——但
+  // 新任务的工作区此刻还没落定（用户可能紧接着改），故先用 confirm，
+  // 待首条消息建会话后由 loadPermMode() 从服务端读回该工作区的真实记忆。
+  permMode = "confirm";
+  renderPermChip();
   loadConfig();  // 回到新建态：标签显示全局默认（新任务将用的初始模型）
   resetStreamState();  // 旧任务的事件流已断，流式状态必须随之复位
   closeEvents();      // 旧任务的事件流断开：新任务未建，第一条消息发出后再连
