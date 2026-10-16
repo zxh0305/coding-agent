@@ -6852,7 +6852,16 @@ function openArchiveDelete(sid, title) {
 }
 
 function closeArchiveDelete() {
+  // 【两个 pending 一起清】这个弹窗同时服务单删与批量删，靠 pendingDeleteIds
+  // 是否为空分流（见 archive-del-confirm）。只清其中一个＝状态残留：
+  // 取消批量删后 pendingDeleteIds 仍在 → 之后点任意一条单删都会被判成"批量"，
+  // 删掉的是【那批已被取消的 id】，而用户真正要删的那条安然无恙（且删除不可恢复）。
+  //
+  // 清在这里而不是各调用点：本函数是所有关闭路径的必经之地（取消按钮、点遮罩、
+  // 确认后收尾）。逐处清就会漏——历史上正是"遮罩路径只调了本函数的一半动作"
+  // 才出的事。放在这里，新增关闭入口自动正确。
   pendingDeleteSid = null;
+  pendingDeleteIds = null;
   $("archive-del-mask").classList.add("hidden");
 }
 
