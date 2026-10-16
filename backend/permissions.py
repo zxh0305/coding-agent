@@ -141,11 +141,35 @@ def split_segments(command: str) -> list[list[str]]:
 # 让规则不命中、也不要错剥导致误伤）。`sh -c <串>` 是例外——它后面跟的是一整
 # 段 shell 源码（单个 token），必须【再拆一次】才能看见里面的 rm；这一步是
 # 递归的（`env sh -c "bash -c 'rm -rf /'"` 要剥两层）。
-_WRAPPERS = {"env", "nice", "nohup", "command", "time", "stdbuf", "setsid", "ionice"}
+#
+# 【命令词归一】剥离之外还有一件事：把位置 0 的**绝对路径**归一成 basename。
+# 规则是词精确匹配，`/bin/rm` != `rm`，于是 /bin/、/usr/bin/ 前缀曾让【全部】
+# 高危规则失效（rm -rf / sudo / git push / chmod / dd / mkfs / truncate…）。
+# 绝对路径恰恰是最常见的写法（sh 的 hash 表、脚本、包管理器都用）。实测 200 个
+# 「4 种路径前缀 × 5 种包装器 × 10 条高危命令」组合，修前 5 类全部可绕、修后 0 条。
+# 只归位置 0；参数位置的路径保持原样（`cat /etc/rm.conf` 不该命中 rm 规则）。
+_WRAPPERS = {"env", "nice", "nohup", "command", "time", "stdbuf", "setsid", "ionice",
+             # 补漏（实测可绕过全部高危规则）：
+             #   timeout 5 rm -rf /x   → timeout 吃一个"时长"参数后才是真命令
+             #   eval rm -rf /x        → eval 把余下当命令再执行一次
+             #   builtin rm -rf /x     → builtin 强制走内建（对 rm 无意义但语法合法）
+             #   doas / pkexec         → 提权包装，与 sudo 同类
+             # exec 会把当前进程替换成目标命令，语义上等于直接执行
+             "timeout", "eval", "builtin", "doas", "pkexec", "exec"}
 # 带 -c 语义的 shell 包装：其后的 token 是被执行的源码，需要递归再拆
 _SHELL_C = {"sh", "bash", "zsh", "dash", "ksh"}
 # 包装器自身可能带的、需要额外吃一个参数的选项（如 nice -n 10 cmd）
 _WRAPPER_ARG_OPTS = {"-n", "--adjustment", "-u", "--user", "--nice"}
+# 需要额外吃一个【位置参数】的包装器：timeout 的时长是【必需】的，
+# 少了这张表 `timeout 5 rm -rf /x` 剥完 timeout 后会把 "5" 当成命令词，
+# 于是 rm 掉到位置 1、规则照样看不见它（补了包装器名却仍绕过）。
+#
+# 【注意 doas/pkexec 不在此列】它们的用户名是可选的：`doas ls` 与
+# `doas root ls` 都合法。若按"必需位置参数"处理，`doas rm -rf /x` 会把
+# 真命令 rm 当作用户名吃掉，反而放行（实测第一版就是这样漏了 20 条）。
+# 对它们只吃【纯选项】，不猜位置参数——宁可少剥一层，让规则在 `doas root rm`
+# 上漏判（退化成 ask 兜底），也不要把命令吃掉。
+_WRAPPER_POSITIONAL = {"timeout"}
 
 # 内联脚本里的「破坏性调用」特征（见 _semantic_asks 的 d 分支）。
 # 只匹配会删/改/覆盖文件或起进程的调用，不匹配普通 import/print——否则
@@ -156,6 +180,22 @@ _DESTRUCTIVE_SCRIPT = re.compile(
     r"|os\.system|os\.popen|subprocess\.|os\.chmod|os\.chown|shutil\.move"
     r"|open\([^)]*['\"][wa]|Path\([^)]*\)\.unlink|\.write_text|\.write_bytes"
     r"|sys\.exit|exec\(|eval\(")
+
+
+def _is_shell_c_flag(tok: str) -> bool:
+    """该 token 是否表示 shell 的 `-c`（把余下参数当源码执行）。
+
+    不能只判 `tok == "-c"`：`bash -lc "rm -rf /"` 里 `-lc` 是**单个 token**
+    （-l 与 -c 合并），旧判定认不出，于是"递归拆 shell 源码"这条防线在组合
+    短选项下直接失效。实测修前 `/bin/bash -lc "rm -rf /tmp/x"` 会走到规则
+    之外（见下方实测表）。
+
+    规则：以 - 开头、不是长选项（--），且字符集里含 c。`-c`、`-lc`、`-xc`
+    都命中；`--login`、`-l` 不命中。
+    """
+    if not tok.startswith("-") or tok.startswith("--"):
+        return False
+    return "c" in tok[1:]
 
 
 def _unwrap_segment(seg: list[str], _depth: int = 0) -> list[list[str]]:
@@ -169,23 +209,34 @@ def _unwrap_segment(seg: list[str], _depth: int = 0) -> list[list[str]]:
     rest = list(seg)
     while rest:
         head = rest[0]
+        # 【命令词归一】取 basename 再判包装器与后续规则。
+        # 为什么必须做：shell 里 /bin/rm、/usr/bin/sudo 与裸 rm、sudo 完全等价，
+        # 但规则是【词精确匹配】，少一个归一就让 /bin/ 前缀绕过全部高危规则。
+        # 实测（修前）：/bin/rm -rf /x、/usr/bin/sudo …、/bin/dd … 全部 allow。
+        # 只对【位置 0】归一——那个位置才是命令词；参数位置的 /bin/rm 是普通
+        # 字符串（`cat /etc/rm.conf` 不该命中 rm 规则），保持原样。
+        head_base = head.rsplit("/", 1)[-1] if "/" in head else head
         # 1) VAR=value 形式的临时环境变量赋值：只影响环境，不改变命令
         if "=" in head and not head.startswith("-") and "/" not in head.split("=", 1)[0]:
             rest = rest[1:]
             continue
-        # 2) 包装器（env / nice / nohup / …）：吃掉自己与它的选项
-        if head in _WRAPPERS or head.endswith("/env") or head.endswith("/nice"):
+        # 2) 包装器（env / nice / timeout / eval / …）：吃掉自己与它的选项
+        if head_base in _WRAPPERS:
             rest = rest[1:]
             while rest and rest[0].startswith("-"):
                 opt = rest[0]
                 rest = rest[1:]
                 if opt in _WRAPPER_ARG_OPTS and rest:
                     rest = rest[1:]        # 该选项还带一个值
+            # 2a) 位置参数（timeout 的时长、doas/pkexec 的用户名）：再吃一个
+            #     非选项词，否则它会被当成命令词、真命令又被挤到位置 1。
+            if head_base in _WRAPPER_POSITIONAL and rest and not rest[0].startswith("-"):
+                rest = rest[1:]
             continue
         # 2b) xargs：它把余下的词当【要执行的命令】。`xargs rm -rf` 里 rm 在位置
         #     1，剥离后回到位置 0 被规则看见。xargs 自己的选项（-0 -n1 -I{}）
         #     先吃掉；`-I{}` 还带一个值。
-        if head == "xargs" or head.endswith("/xargs"):
+        if head_base == "xargs":
             rest = rest[1:]
             while rest and rest[0].startswith("-"):
                 opt = rest[0]
@@ -195,7 +246,9 @@ def _unwrap_segment(seg: list[str], _depth: int = 0) -> list[list[str]]:
                     rest = rest[1:]
             continue
         # 3) shell -c <源码>：把源码当命令再拆一遍（递归，可多层）
-        if head.split("/")[-1] in _SHELL_C and len(rest) >= 2 and rest[1] == "-c":
+        #    `-c` 可能与其它短选项合并成单 token（`bash -lc "rm -rf /"`），
+        #    故按"短选项串里含 c"识别，而不是只认恰好等于 "-c"。
+        if head_base in _SHELL_C and len(rest) >= 2 and _is_shell_c_flag(rest[1]):
             src = " ".join(rest[2:])
             try:
                 inner = split_segments(src)
@@ -204,7 +257,13 @@ def _unwrap_segment(seg: list[str], _depth: int = 0) -> list[list[str]]:
             for sub in (inner or [rest]):
                 out.extend(_unwrap_segment(sub, _depth + 1))
             return out or [seg]
-        # 4) 已经不是包装器了：剩下的就是真命令
+        # 4) 已经不是包装器了：剩下的就是真命令。
+        #    【必须先归一命令词再交给规则】——规则是词精确匹配，若这里原样留着
+        #    `/bin/rm`，"rm -rf" 规则就永远命不中它（前面只把 base 用于判包装器，
+        #    不改写 rest 的话，绝对路径绕过依旧成立——实测修版第一版就是这样）。
+        #    只改位置 0；参数保持原样（`cat /etc/rm.conf` 不该命中 rm 规则）。
+        if head_base != head:
+            rest = [head_base, *rest[1:]]
         out.append(rest)
         return out
     return out or [seg]

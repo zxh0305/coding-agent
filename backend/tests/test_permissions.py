@@ -144,6 +144,84 @@ class TestVerdicts(GateTestBase):
             v = gate.check("run_bash", {"command": cmd})
             self.assertEqual(v.verb, ASK, f"{cmd!r} 绕过了高危规则，实际 {v.verb}")
 
+    def test_absolute_path_command_words_do_not_bypass(self):
+        """【核心回归】绝对路径的命令词不得绕过规则。
+
+        规则是词精确匹配，`/bin/rm` != `rm`——只补包装器名不够。实测修前
+        /bin/ 「/usr/bin/ 前缀能让【全部】高危规则失效（rm -rf / sudo /
+        git push / chmod / dd / mkfs / truncate…），而绝对路径恰恰是最自然的
+        写法（sh 的 hash 表、脚本、包管理器都用它）。
+
+        修法：位置 0 取 basename 再匹配。只改位置 0——参数位置的 `/bin/rm`
+        是普通字符串（`cat /etc/rm.conf` 不该命中 rm 规则）。
+        """
+        gate = self.make_gate()
+        for prefix in ("/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"):
+            for cmd in ("rm -rf /tmp/x", "sudo ls", "git push origin main",
+                        "chmod -R 777 /", "dd if=/dev/zero of=/dev/x",
+                        "mkfs.ext4 /dev/sda1", "truncate -s 0 /tmp/f",
+                        "git reset --hard", "git clean -fdx", "chown -R me /"):
+                full = prefix + cmd
+                v = gate.check("run_bash", {"command": full})
+                self.assertEqual(v.verb, ASK,
+                                 f"{full!r} 用绝对路径绕过了高危规则，实际 {v.verb}")
+
+    def test_argument_position_paths_are_not_matched(self):
+        """反面：参数位置的路径不该被当成命令词（防误伤）。"""
+        gate = self.make_gate()
+        for cmd in ("cat /etc/rm.conf",
+                    "echo /bin/rm",
+                    "ls /usr/bin/rm",
+                    "grep -rn rm ."):
+            v = gate.check("run_bash", {"command": cmd})
+            self.assertEqual(v.verb, ALLOW,
+                             f"{cmd!r} 被误判为高危命令，实际 {v.verb}")
+
+    def test_positional_wrappers_do_not_bypass(self):
+        """带【必需位置参数】的包装器：timeout 的时长。
+
+        `timeout 5 rm -rf /x` —— 若只剥包装器名不吃那个时长，"5" 会被当成
+        命令词，rm 又退回位置 1，补了名字照样绕过。
+        """
+        gate = self.make_gate()
+        for cmd in ("timeout 5 rm -rf /tmp/x",
+                    "timeout 30 sudo ls",
+                    "/usr/bin/timeout 5 rm -rf /tmp/x",
+                    "eval rm -rf /tmp/x",
+                    "builtin rm -rf /tmp/x",
+                    "doas rm -rf /tmp/x",
+                    "pkexec rm -rf /tmp/x"):
+            v = gate.check("run_bash", {"command": cmd})
+            self.assertEqual(v.verb, ASK, f"{cmd!r} 绕过了高危规则，实际 {v.verb}")
+
+    def test_combined_shell_c_flag_is_recognized(self):
+        """`bash -lc`：-l 与 -c 合并成单 token，不能只认恰好等于 "-c"。
+
+        旧判定 `rest[1] == "-c"` 认不出 `-lc`，于是"递归拆 shell 源码"这条
+        防线在组合短选项下失效。
+        """
+        gate = self.make_gate()
+        for cmd in ('bash -lc "rm -rf /tmp/x"',
+                    'bash -xc "sudo ls"',
+                    'sh -c "rm -rf /tmp/x"'):
+            v = gate.check("run_bash", {"command": cmd})
+            self.assertEqual(v.verb, ASK, f"{cmd!r} 绕过了高危规则，实际 {v.verb}")
+
+    def test_normal_commands_still_allowed(self):
+        """防误伤护栏：修绕过不能把日常命令一起拦掉，否则用户会关掉确认模式。"""
+        gate = self.make_gate()
+        for cmd in ("ls", "ls -la", "pwd", "git status", "git log --oneline -5",
+                    "git diff", "cat README.md", "head -20 app.js",
+                    "grep -rn TODO .", 'find . -name "*.py"', "wc -l *.py",
+                    "echo hello", "which python3", 'python3 -c "print(1+1)"',
+                    "python3 -m unittest discover -s tests -t .",
+                    "npm run build", "make", "pytest", "tree -L 2",
+                    'sed -n 1,10p app.js', "diff a.txt b.txt", "du -sh .",
+                    "git commit -m x", "git add -A", "cp -r src dst", "mkdir -p a/b"):
+            v = gate.check("run_bash", {"command": cmd})
+            self.assertEqual(v.verb, ALLOW,
+                             f"日常命令 {cmd!r} 被误拦（实际 {v.verb}: {v.reason}）")
+
     def test_semantic_position_independent_rules(self):
         """位置无关的高危语义：危险词不在位置 0 也要拦。"""
         gate = self.make_gate()
