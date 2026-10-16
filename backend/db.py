@@ -415,17 +415,20 @@ def _run_procedural_migration(conn: sqlite3.Connection, version: int) -> None:
       * 26（记忆文件布局）：失败只记日志并吞掉——记忆是资产但不是依赖，
         它的迁移失败不该阻止整个服务启动（启动后仍能正常对话，只是记忆
         还在旧布局、下次启动重试）。
+
+    返回值：True = 成功（可记账）；False = 失败但可容忍（**不可记账**，
+    下次启动必须重试）。未知版本返回 True（跳过不等于待重试）。
     """
     if version == 6:
         _migrate_messages(conn)
-        return
+        return True
     if version == 26:
         try:
             from memory import migrate_memory_layout
             report = migrate_memory_layout()
         except Exception as e:      # noqa: BLE001 —— 记忆迁移不该拖垮启动
-            log.exception("记忆布局迁移失败（已忽略，下次启动重试）：%s", e)
-            return
+            log.exception("记忆布局迁移失败（本次忽略，下次启动会重试）：%s", e)
+            return False            # 不记账 → user_version 停在 25 → 下次重跑
         if report.get("skipped"):
             log.info("记忆布局迁移跳过：%s", report.get("reason"))
         else:
@@ -436,8 +439,9 @@ def _run_procedural_migration(conn: sqlite3.Connection, version: int) -> None:
                      report.get("backup"))
             _last_memory_migration_report.clear()
             _last_memory_migration_report.update(report)
-        return
+        return True
     log.warning("未知的 procedural 迁移版本 v%d，已跳过", version)
+    return True
 
 
 # 最近一次记忆迁移的对账报告（供启动时打印；进程内只留最后一次）
@@ -454,15 +458,29 @@ def init_db() -> None:
     with _conn() as conn:
         conn.executescript(_BASE_DDL)
         current = conn.execute("PRAGMA user_version").fetchone()[0]
+        # failed_non_fatal：本次有哪些"可失败"的迁移没成功（目前只有 26）。
+        # 它们不能被版本号"记账为已完成"，否则【永远不会重试】——而
+        # _run_procedural_migration 的注释明写"下次启动重试"，版本号却无条件
+        # 写成 SCHEMA_VERSION，两者矛盾：迁移 26 失败一次就被永久跳过，
+        # 记忆文件永远停在旧布局（且用户看不到任何提示）。
+        failed_non_fatal: set[int] = set()
         for version, sql in MIGRATIONS:
             if version <= current or _migration_applied(conn, version):
                 continue  # 已执行过（版本记账）或老库当年已补过列（探针对账）
             if sql is None:
-                _run_procedural_migration(conn, version)
+                if not _run_procedural_migration(conn, version):
+                    failed_non_fatal.add(version)
             else:
                 conn.execute(sql)
                 log.info("schema 迁移 v%d 已执行", version)
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        # 版本号取"最大的成功编号"：失败的非致命迁移不进账，下次启动会重跑。
+        # 其余（6 等致命迁移会直接上抛，走不到这里）照旧。
+        ver_to_write = SCHEMA_VERSION
+        if failed_non_fatal:
+            ver_to_write = min(v for v in failed_non_fatal) - 1
+            log.warning("迁移 %s 未成功，版本号停在 v%d，下次启动会重试",
+                        sorted(failed_non_fatal), ver_to_write)
+        conn.execute(f"PRAGMA user_version = {ver_to_write}")
         # (session_id, ord) 是 get_messages / 分页 / 窗口恢复的全部查询路径。
         # 放在迁移之后统一建：全新库的 messages 直接是最终形态（迁移 6 被跳过），
         # 老库迁移完也必有 ord 列；不能放进 _BASE_DDL——老库还没有 ord 列时会报错。
@@ -708,10 +726,24 @@ def truncate_from(sid: str, mid: str) -> dict:
                         p.unlink(missing_ok=True)
             except (json.JSONDecodeError, OSError):
                 continue
-        q = ",".join("?" * len(mids))
-        conn.execute(f"DELETE FROM messages WHERE session_id=? AND mid IN ({q})", (sid, *mids))
-        conn.execute(f"DELETE FROM message_usage WHERE session_id=? AND mid IN ({q})", (sid, *mids))
-        conn.execute(f"DELETE FROM session_traces WHERE session_id=? AND mid IN ({q})", (sid, *mids))
+        # 【分批删】不能把所有 mid 拼进一条 IN：SQLite 的变量上限是 32766
+        # （实测第 32767 个即抛 "too many SQL variables"）。长会话回退编辑
+        # 会一次删除该点之后的全部消息，条数轻易越界——而这里是回退编辑的
+        # 唯一删除路径，越界即整次回退失败（且此前已删的行不回滚，留下半截）。
+        #
+        # 分批大小取 900：远低于上限，又足以让常规会话一次删完（绝大多数
+        # 回退只删几十条，根本不进第二趟循环）。
+        _BATCH = 900
+        # 整体放进一个事务：三张表 + 多批之间要么全成、要么全不成。否则中途
+        # 失败会留下"messages 删了、message_usage 还在"的不一致。
+        with conn:  # sqlite3 连接作为上下文管理器：异常回滚、正常提交
+            for i in range(0, len(mids), _BATCH):
+                chunk = mids[i:i + _BATCH]
+                q = ",".join("?" * len(chunk))
+                for table in ("messages", "message_usage", "session_traces"):
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE session_id=? AND mid IN ({q})",
+                        (sid, *chunk))
     _usage_cache_invalidate()  # 删了 usage 行，聚合缓存一并作废
     return {"removed": len(mids), "ord": target_ord}
 

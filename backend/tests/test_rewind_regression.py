@@ -19,6 +19,7 @@
    裁剪，history_truncated 事件发布并持久化 seq（断线重连补发的账本不倒退）。
 """
 
+import json
 import shutil
 import sqlite3
 import tempfile
@@ -136,6 +137,36 @@ class TestOrdLedgerAfterTruncate(RewindTestBase):
         self.assertEqual(new_ords, sorted(new_ords))
         self.assertTrue(all(o > kept_ords[-1] for o in new_ords),
                         "新 ord 必须接在保留段之后，不得与保留段并列")
+
+    def test_truncate_long_session_exceeding_sql_variable_limit(self):
+        """长会话回退不得因 SQL 变量上限而崩。
+
+        回归背景：删除语句把所有 mid 拼进一条 `IN (?,?,…)`，而 SQLite 变量上限
+        是 32766（实测第 32767 个即抛 "too many SQL variables"）。回退删的是该点
+        之后的【全部】消息，长会话轻易越界——而这是回退的唯一删除路径，越界即
+        整次回退失败。改为分批（每批 900）后不再受此限制。
+
+        用 33000 条（高于上限）确保必然越界；同时校验 message_usage 被一致清理。
+        """
+        n = 33000
+        with db._conn() as conn:
+            conn.executemany(
+                "INSERT INTO messages(session_id,mid,ord,role,content) VALUES(?,?,?,?,?)",
+                [("s1", f"m{i:06d}", i * db.ORD_GAP, "user",
+                  json.dumps({"role": "user", "content": "x"})) for i in range(n)])
+            conn.executemany(
+                "INSERT OR REPLACE INTO message_usage(session_id,mid,prompt_tokens) "
+                "VALUES(?,?,1)", [("s1", f"m{i:06d}") for i in range(5000)])
+
+        # 切点是 m000010（ord = 10*GAP）。truncate_from 删的是 ord>=切点 的消息，
+        # 故保留的是 m000000..m000009 共 10 条（不是 9——切点自身也在删除之列）。
+        out = db.truncate_from("s1", "m000010")
+        self.assertEqual(out["removed"], n - 10)
+        self.assertEqual(db.count_messages("s1"), 10, "保留切点之前的 10 条")
+        with db._conn() as conn:
+            left = conn.execute(
+                "SELECT count(*) FROM message_usage WHERE session_id='s1'").fetchone()[0]
+        self.assertEqual(left, 10, "message_usage 应同步清理（与 messages 剩余数一致）")
 
 
 class TestTruncateEndpoint(RewindTestBase):

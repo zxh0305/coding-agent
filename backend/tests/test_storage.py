@@ -294,6 +294,63 @@ class TestMigrations(StorageTestBase):
                  self.row("PRAGMA user_version")[0])
         self.assertEqual(snap1, snap2)
 
+    # ---------- 非致命迁移的记账语义（回归：失败一次就被永久跳过） ----------
+
+    def _make_old_memory_layout(self):
+        """造"记忆根目录存在、但 projects/ 未建立"的旧布局。
+
+        v26 的探针正是看 projects/ 是否存在——只有这种状态才会真正执行搬迁，
+        失败路径才可达（全新库没有记忆根目录时探针返回"无需迁移"直接跳过）。
+
+        搬迁只认【会话绑定的工作区】（逐 ws 现解析身份，绝不 iterdir 盲扫），
+        所以必须造一个绑定了工作区的会话，且旧桶名 = 该工作区的 token，否则
+        迁移跑完什么也不会发生（第一版测试就踩了这个：桶名是瞎编的）。
+        """
+        import memory
+        ws = Path(self.tmp) / "proj"
+        ws.mkdir(parents=True, exist_ok=True)
+        db.set_session_workspace("s1", str(ws))
+
+        root = Path(self.tmp) / "memory_v2_probe"
+        (root / memory.workspace_token(ws)).mkdir(parents=True, exist_ok=True)
+        (root / memory.workspace_token(ws) / "m.md").write_text("x", encoding="utf-8")
+        self.addCleanup(setattr, memory, "_memory_root", memory._memory_root)
+        memory._memory_root = lambda: root
+        with sqlite3.connect(db.DB_PATH) as c:
+            c.execute("PRAGMA user_version = 25")
+            c.commit()
+        return root
+
+    def test_failed_nonfatal_migration_is_not_recorded(self):
+        """v26 失败时不得把版本号记成 26——否则"下次启动重试"是句空话。
+
+        回归背景：init_db 末尾无条件 `PRAGMA user_version = SCHEMA_VERSION`，
+        而 _run_procedural_migration 对 v26 失败是"记日志并吞掉"。两者叠加的
+        结果是：记忆布局迁移失败一次就被永久跳过，记忆文件永远停在旧布局，
+        且用户看不到任何提示——注释里的"下次启动重试"根本没发生过。
+        """
+        from unittest import mock
+        import memory
+        self._make_old_memory_layout()
+        with mock.patch.object(memory, "migrate_memory_layout",
+                               side_effect=RuntimeError("模拟磁盘满")):
+            db.init_db()
+        self.assertLess(self.row("PRAGMA user_version")[0], 26,
+                        "失败的迁移被记进版本号，下次启动不会再试")
+
+    def test_retry_after_failure_succeeds_and_records(self):
+        """失败后重跑一次（迁移已恢复）应真正执行并记账。"""
+        from unittest import mock
+        import memory
+        root = self._make_old_memory_layout()
+        with mock.patch.object(memory, "migrate_memory_layout",
+                               side_effect=RuntimeError("模拟磁盘满")):
+            db.init_db()
+        db.init_db()          # 第二次：不打桩，正常执行
+        self.assertEqual(self.row("PRAGMA user_version")[0], db.SCHEMA_VERSION)
+        self.assertTrue((root / memory.PROJECTS_SUBDIR).is_dir(),
+                        "重试后记忆目录应已迁到新布局")
+
     def test_fresh_db_gets_final_schema_and_version(self):
         """全新库：直接建最终形态、版本号一步到位（无 legacy 表可迁）。"""
         self.assertEqual(self.row("PRAGMA user_version")[0], db.SCHEMA_VERSION)
