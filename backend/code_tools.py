@@ -28,6 +28,35 @@ from executor import default_executor
 _PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_WORKSPACE = _PROJECT_DIR / "workspace"
 
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """先写同目录 .tmp 再 os.replace —— 写入用户文件一律走这里。
+
+    【为什么必须原子】os.replace 在同一文件系统内是原子的：读方（编辑器、
+    另开的一个 read_file、下一次 apply_patch）永远看不到"写了一半"的文件。
+    而直接 write_text 会先把目标清零再逐块写入，中间态是**截断的文件**——
+    此刻断电 / kill -9 / OOM，用户正在编辑的源码就停在半截，且没有备份可回滚。
+
+    实测本仓此前只有这一条写入路径没做原子写（memory.py / db.py 的
+    artifact、attachment、doc、tool_result 全都做了）。而 apply_patch 与
+    write_file 恰恰是 agent 改代码的最高频路径——最该保护的地方反而漏了。
+
+    tmp 名带 pid：多个进程/线程同时写同一文件时不会互相踩（os.replace 仍
+    保证最终只有一份完整内容胜出）。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        # 写失败（磁盘满、权限、被锁）要清掉半截 tmp，别在用户目录里留垃圾
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
 # 遍历时永远跳过的目录。除通用噪音外，还包含 data/ 下的运行时产物目录：
 # browser-profiles（浏览器扩展源码含整张 TLD 域名表，曾被整读进历史后触发
 # 供应商风控、全会话 400）、logs（服务端日志里全是报错原文，读入即自我污染）、
@@ -114,7 +143,7 @@ def prepare_workspace(ws: str | Path | None = None) -> Path:
         # 只给内置默认工作区放练习文件；用户自选的目录保持原样，别往里塞东西
         if target == DEFAULT_WORKSPACE:
             for name, content in _WORKSPACE_SEED.items():
-                (target / name).write_text(content, encoding="utf-8")
+                atomic_write_text(target / name, content)
     return target
 
 
@@ -250,7 +279,7 @@ def write_file(path: str, content: str, ctx=None) -> str:
         return _err(f"{path} 是目录，不能当作文件写入",
                     "换一个文件路径；若想看该目录里已有什么，用 list_dir")
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
+    atomic_write_text(p, content)   # 原子写：崩溃不会留下截断的文件（见该函数注释）
     return _ok({"path": path,
                 "result": f"已写入 {path}（{len(content.encode('utf-8'))} 字节 / {len(content.splitlines())} 行）",
                 "bytes": len(content.encode("utf-8")), "lines": len(content.splitlines())})
@@ -386,7 +415,7 @@ def apply_patch(path: str, search: str, replace: str, ctx=None) -> str:
             new_text = "\n".join(new_lines) + ("\n" if text.endswith("\n") else "")
             how = "锚定救援：search 与原文存在缩进/行尾空白差异，已按原文件逐行缩进对齐替换"
             first_line = i + 1
-    p.write_text(new_text, encoding="utf-8")
+    atomic_write_text(p, new_text)   # 原子写：崩溃不会截断用户正在编辑的源码
     payload = {
         "path": path,
         "result": f"已修改 {path}（第 {first_line} 行起 +{len(replace.splitlines())} / −{len(search.splitlines())} 行）",

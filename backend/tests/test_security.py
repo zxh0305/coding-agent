@@ -282,6 +282,67 @@ class TestApplyPatchSafety(unittest.TestCase):
         self.assertEqual(body, "def f():\n    return 2\n")
         self.assertNotIn("\t", body)
 
+    def test_write_is_atomic_reader_never_sees_truncation(self):
+        """【核心回归】写回必须原子：并发读方绝不看到"写了一半"的文件。
+
+        事故场景：apply_patch/write_file 直接 write_text 会先把目标清零再逐块
+        写入，中间态是【截断的文件】。此刻断电 / kill -9 / OOM，用户正在编辑的
+        源码就停在半截，且无备份可回滚。本仓其它写入（artifact / attachment /
+        doc / tool_result / 记忆）都做了 .tmp + os.replace，唯独这条 agent 改
+        代码的最高频路径漏了。
+
+        用"大内容反复写 + 另一线程持续读"捕捉中间态：只要读出既非 A 也非 B 的
+        内容（截断/空/混杂），即判失败。
+        """
+        from code_tools import atomic_write_text
+
+        target = self.tmp / "big.txt"
+        a, b = "A" * 400_000, "B" * 400_000
+        target.write_text(a, encoding="utf-8")
+
+        corrupt: list[str] = []
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    c = target.read_text(encoding="utf-8")
+                except OSError:
+                    corrupt.append("read-error")
+                    continue
+                if c not in (a, b):
+                    corrupt.append(f"len={len(c)}")
+
+        r = threading.Thread(target=reader, daemon=True)
+        r.start()
+        try:
+            for i in range(40):
+                atomic_write_text(target, b if i % 2 else a)
+        finally:
+            stop.set()
+            r.join(timeout=2)
+
+        self.assertEqual(corrupt, [], f"读方看到了非完整内容 {corrupt[:3]}")
+
+    def test_write_failure_leaves_original_intact_and_no_tmp(self):
+        """写失败（磁盘满/权限）时：原文件原封不动、不留 .tmp 垃圾。
+
+        对照旧实现：write_text 会在失败前就把文件截断，用户直接丢内容。
+        """
+        from code_tools import atomic_write_text
+
+        target = self.tmp / "keep.txt"
+        target.write_text("ORIGINAL", encoding="utf-8")
+        self.tmp.chmod(0o555)              # 目录不可写 → tmp 建不出来
+        self.addCleanup(self.tmp.chmod, 0o755)
+        with self.assertRaises(OSError):
+            atomic_write_text(target, "SHOULD_NOT_APPEAR")
+        self.tmp.chmod(0o755)
+        self.assertEqual(target.read_text(encoding="utf-8"), "ORIGINAL",
+                         "写失败后原文件被破坏——这正是原子写要防的")
+        self.assertEqual([p.name for p in self.tmp.iterdir() if ".tmp" in p.name], [],
+                         "写失败留下了 .tmp 垃圾")
+
 
 # ---------------------------------------------------------------------------
 # 三、命令解析端到端（mock LLM 完整回合）
