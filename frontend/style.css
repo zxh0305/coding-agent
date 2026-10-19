@@ -809,6 +809,22 @@ body.side-resizing .sidebar { transition: none; }
 /* 上下文行（未改动）：中性灰，用来给红绿行定位 */
 .diff-line.ctx { color: var(--text-3); background: var(--panel-soft); }
 .diff-line.ctx .diff-sign { color: var(--border-strong); }
+/* 本回合文件改动（turn_changes）：与 trace 同款折叠条，默认收起 */
+.changes {
+  align-self: flex-start; max-width: 76%;
+  font-size: 11.5px; color: var(--text-4);
+  border-bottom: 1px solid var(--border);
+  padding: 2px 0 6px;
+}
+.changes summary { cursor: pointer; user-select: none; font-weight: 500; list-style: none; }
+.changes summary::before { content: "›"; display: inline-block; margin-right: 6px; transition: transform .15s; }
+.changes[open] summary::before { transform: rotate(90deg); }
+.changes-diff {
+  margin-top: 4px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel); max-height: 320px; overflow: auto;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px; line-height: 1.5; padding: 6px 8px; white-space: pre-wrap;
+}
 /* 回答尾部的耗时 / token 统计 */
 /* 弱化：统计是次要信息，默认很浅，鼠标移到回答上才明显——不与正文争注意力 */
 .meta {

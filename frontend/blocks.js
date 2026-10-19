@@ -316,6 +316,14 @@
         }
         answer = null;
         lastTool = null;
+      } else if (t === "turn_changes") {
+        // 本回合的文件改动（后端 snapshot.diff，回合收尾前发出）。只有真有
+        // 改动时后端才发，空 diff 不会到这里。它排在 done 之后、turn_end
+        // 之前，不影响 answer 游标。重放路径不复现它：diff 是"该回合的增量"，
+        // 需要当时的快照基线，历史接口不存快照 hash——回放时以 trace 里的
+        // 写入步骤为准（同一批改动的工具级视图）。
+        blocks.push({ kind: "changes", stat: evt.stat || "", diff: evt.diff || "",
+                      truncated: !!evt.truncated });
       } else if (t === "compacted") {
         blocks.push({ kind: "compact", summary: evt.summary || "" });
         process = null;

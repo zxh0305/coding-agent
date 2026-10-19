@@ -4251,6 +4251,14 @@ function applyEvent(evt, seq) {
                  context: evt.context, cache_hit_rate: null };
     updateCtxChip();
     toast("早期对话已压缩为摘要，上下文占用已下降");
+  } else if (t === "turn_changes") {
+    // 本回合改了哪些文件（后端 snapshot.diff，turn_end 之前到达）。与历史
+    // 回放走同一个渲染器：折叠条样式与「执行过程」一致，默认收起。
+    chatEl.appendChild(blocksRenderer.renderBlock({
+      kind: "changes", stat: evt.stat || "", diff: evt.diff || "",
+      truncated: !!evt.truncated,
+    }));
+    scrollBottom();
   } else if (t === "turn_end") {
     // 回合结束（服务端已落盘）：驱动排队队列推进的唯一信号——原来靠 POST
     // 收尾推进，现在 POST 立即返回，队列只能跟着回合生命周期走

@@ -300,6 +300,24 @@
 
       if (block.kind === "compact") return deps.compactCard(block.summary);
 
+      if (block.kind === "changes") {
+        // 本回合改了哪些文件：折叠条，展开看完整 diff。默认收起——正文区
+        // 优先给回答，"它到底改了什么"是按需查阅的第二层信息。
+        // textContent 而非 innerHTML：diff 内容来自用户仓库，含 <、& 等字符。
+        const d = doc.createElement("details");
+        d.className = "changes";
+        const s = doc.createElement("summary");
+        const files = (block.stat || "").trim().split("\n").filter(Boolean);
+        const tail = files.length ? files[files.length - 1] : "";
+        s.textContent = `📝 本回合改动 ${tail || "（见展开）"}`;
+        d.appendChild(s);
+        const pre = doc.createElement("pre");
+        pre.className = "changes-diff";
+        pre.textContent = (block.diff || "") + (block.truncated ? "\n…（diff 过长，已截断）" : "");
+        d.appendChild(pre);
+        return d;
+      }
+
       if (block.kind === "meta") {
         const div = doc.createElement("div");
         div.className = "meta";

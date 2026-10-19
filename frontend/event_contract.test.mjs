@@ -245,3 +245,27 @@ test("契约：done 带 timing 汇总（模型用时/工具用时/TTFT/TPS），
   // timing 是给状态条/浮卡的旁路字段，不改 meta 块的既有结构
   assert.equal(meta.elapsed, 12.5);
 });
+
+test("契约：turn_changes 产出 changes 块（本回合文件改动，位于 done 与 turn_end 之间）", () => {
+  // 后端 services/turn.py 在 turn_end 前发布 {type:"turn_changes",
+  // user_mid, base, stat, diff, truncated}（snapshot.diff 的输出）。
+  const events = [
+    { type: "turn_start", input: "改 a.py", atts: [] },
+    { type: "round", round: 1, mid: "seg1" },
+    { type: "done", mid: "seg1", answer: "改好了", elapsed_s: 1,
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } },
+    { type: "turn_changes", user_mid: "useruuid", base: "abc",
+      stat: " a.py | 2 +-", diff: "--- a/a.py\n+++ b/a.py\n-old\n+new\n",
+      truncated: false },
+    { type: "turn_end", user_mid: "useruuid" },
+  ];
+  const blocks = blocksFromEvents(events);
+  const ch = blocks.find((b) => b.kind === "changes");
+  assert.ok(ch, "turn_changes 应产 changes 块");
+  assert.equal(ch.truncated, false);
+  assert.match(ch.diff, /\+new/);
+  assert.match(ch.stat, /a\.py/);
+  // 不打扰 answer 游标：回答块仍只有一个且在 changes 之前
+  const idxAnswer = blocks.findIndex((b) => b.kind === "answer");
+  assert.ok(idxAnswer >= 0 && idxAnswer < blocks.indexOf(ch));
+});

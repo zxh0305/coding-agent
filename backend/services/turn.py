@@ -26,10 +26,14 @@ reasoning_delta 是例外：它【不带 mid】。推理不是回答，带 mid �
 import json
 import time
 import uuid
+from pathlib import Path
 
 from agent import Agent
 
 import db
+import snapshot
+import verify
+from executor import default_executor
 from llm_client import ApiConnectionError, ApiHTTPError, _RETRYABLE_STATUS
 from services.browser import _push_browser_screenshot
 from services.trace import SNAPSHOT_INTERVAL, _persist_trace, _snapshot_trace
@@ -91,6 +95,14 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                          # 去重补画（落库提前后，历史接口与补发都会带它）。
                          "user_mid": user_mid})
             log.info("[会话 %s] 用户提问: %s", sid, plain)
+            # 回合开始拍一张 git 快照（snapshot.py）：回合结束时用它算出
+            # "这一回合 Agent 到底改了哪些文件"，前端据此展示差异。
+            # 非 git 工作区返回 None，后面整段跳过。
+            snap_base = None
+            try:
+                snap_base = snapshot.create(Path(agent.ctx.workspace))
+            except Exception:
+                log.exception("[会话 %s] 回合快照创建失败（忽略）", sid)
             seg_mid = None  # 当前回答段落的 SSE 气泡 mid（每个 round 事件换一段，仅事件流用）
             error = None
             retryable = False  # 出错时是否值得引导用户重试（见下面的归因逻辑）
@@ -185,6 +197,28 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 # 消息）都由各自渲染层加 "❌ "，此处 content 存纯文本。
                 agent.history.append({"role": "assistant", "content": str(error),
                                       "error": True, "retryable": bool(retryable)})
+            # ── 自动验证闭环（verify.py）──────────────────────────────────
+            # 只在【git 工作区】且有实际文件改动时跑：
+            #   * 有快照基线才知道这回合动没动文件（diff 为空 = 纯问答，不白烧）；
+            #   * 验证命令来自工作区的 AGENTS.md / package.json / pyproject /
+            #     Makefile，发现不到就不验证（不猜命令）；
+            #   * 结果作为一条 system 消息留在 history：下一轮模型能看到"上次
+            #     验证红在哪"，用户也能在轨迹里看到证据，而不是只有模型自述。
+            # 失败只记日志——验证是增强证据，不能反过来让回合失败。
+            if error is None and snap_base:
+                try:
+                    cmds = verify.discover(Path(agent.ctx.workspace))
+                    if cmds and snapshot.diff(Path(agent.ctx.workspace),
+                                              snap_base).get("diff"):
+                        executor = (getattr(agent.ctx, "executor", None)
+                                    or default_executor())
+                        report = verify.run(Path(agent.ctx.workspace), executor, cmds)
+                        agent.history.append(verify.as_message(report))
+                        log.info("[会话 %s] 自动验证：%s", sid, ", ".join(
+                            f"{r['cmd']}={'PASS' if r['ok'] else 'FAIL'}"
+                            for r in report["results"]))
+                except Exception:
+                    log.exception("[会话 %s] 自动验证执行失败（忽略）", sid)
             # 收尾（正常/停止/出错共用）：增量落盘 → 重编号信号 → turn_end。
             # 落盘在前、turn_end 在后——turn_end 里的 user_mid 是"这回合已可
             # 从时间线读到"的承诺，顺序反了前端去重会误判。
@@ -240,6 +274,18 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             # 去重会把这回合误判成"不在时间线里"而重复渲染。
             user_mid = next((m.get("_mid") for m in reversed(agent.history)
                              if m.get("role") == "user" and not m.get("_synthetic")), None)
+            # 本回合的文件改动（快照 → 当前工作树）。在 turn_end 【之前】发布：
+            # 前端把 turn_end 当回合结束的唯一信号，改动摘要必须已经到达，
+            # 否则收尾后折叠条要等下一次事件才补上。计算失败只记日志——
+            # 差分是观测面，绝不能让"没有 diff"变成"回合失败"。
+            if snap_base:
+                try:
+                    changes = snapshot.diff(Path(agent.ctx.workspace), snap_base)
+                    if changes.get("stat") or changes.get("diff"):
+                        bus.publish({"type": "turn_changes", "user_mid": user_mid,
+                                     **changes})
+                except Exception:
+                    log.exception("[会话 %s] 回合 diff 计算失败（忽略）", sid)
             bus.publish({"type": "turn_end", "user_mid": user_mid})
             # 回合结束关掉本会话的浏览器：Chromium 进程不常驻；profile 目录
             # 保留在磁盘，下次 browser_* 工具再用时登录态还在。
