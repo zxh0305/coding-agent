@@ -782,6 +782,37 @@ def set_trace(sid: str, mid: str, trace_json: str) -> None:
                      (sid, mid, trace_json))
 
 
+# 同一 (session_id, mid) 行里除轨迹数组外还可能带的对象字段（如
+# {"changes": {...}} 这样的回合增量）。两个写入方——收尾轨迹（answer_mid）
+# 与回合改动（user_mid）——各占一个键，merge_trace_field 只改自己的键，
+# 不碰对方的；否则后写的整体覆盖会清掉先写的。
+_EXTRA_TRACE_KEYS = ("changes",)
+
+
+def merge_trace_field(sid: str, mid: str, key: str, value) -> None:
+    """给 (sid, mid) 的轨迹行写入/替换一个附加字段，保留轨迹数组与其它附加键。
+
+    行的存储形状：轨迹本身是 JSON 数组（历史回放直接吃）；有附加字段时
+    整体变成 {"trace": [...], "<key>": ...}——get_trace 负责拆回来。
+    """
+    if key not in _EXTRA_TRACE_KEYS:
+        raise ValueError(f"不支持的轨迹附加键：{key}")
+    with _conn() as conn:
+        row = conn.execute("SELECT trace_json FROM session_traces "
+                           "WHERE session_id=? AND mid=?", (sid, mid)).fetchone()
+        obj: dict = {}
+        if row is not None:
+            try:
+                cur = json.loads(row["trace_json"])
+            except (ValueError, TypeError):
+                cur = []
+            obj = cur if isinstance(cur, dict) else {"trace": cur}
+        obj[key] = value
+        conn.execute("INSERT INTO session_traces(session_id, mid, trace_json) VALUES(?,?,?) "
+                     "ON CONFLICT(session_id, mid) DO UPDATE SET trace_json=excluded.trace_json",
+                     (sid, mid, json.dumps(obj, ensure_ascii=False)))
+
+
 def get_traces(sid: str, mids: list[str]) -> dict:
     """批量取本页消息的轨迹，返回 {mid: [entry, ...]}；没有轨迹的 mid 不在结果里。"""
     if not mids:
@@ -793,9 +824,45 @@ def get_traces(sid: str, mids: list[str]) -> dict:
     out = {}
     for r in rows:
         try:
-            out[r["mid"]] = json.loads(r["trace_json"])
+            val = json.loads(r["trace_json"])
         except (ValueError, TypeError):
             continue  # 损坏的行当没有轨迹，不影响其余
+        # 带附加字段的行是 {"trace": [...], "changes": {...}}；只取轨迹数组，
+        # 附加字段由 get_trace_extras 单独取（历史接口把 changes 挂在用户消息上）。
+        # 只有附加字段、没有轨迹的行走这里要跳过：前端按"mid 在不在结果里"
+        # 决定画不画「执行过程」折叠条，返回空数组会画出一张空的折叠条。
+        if isinstance(val, dict):
+            if not val.get("trace"):
+                continue
+            out[r["mid"]] = val["trace"]
+        else:
+            out[r["mid"]] = val
+    return out
+
+
+def get_trace_extras(sid: str, mids: list[str]) -> dict:
+    """批量取轨迹行里的附加字段，返回 {mid: {"changes": {...}, ...}}。
+
+    与 get_traces 分开：轨迹数组挂在回答消息上回放，changes 要挂在【同一回合
+    的用户消息】旁的改动画布上，前端按 user_mid 认领。
+    """
+    if not mids:
+        return {}
+    marks = ",".join("?" * len(mids))
+    with _conn() as conn:
+        rows = conn.execute(f"SELECT mid, trace_json FROM session_traces "
+                            f"WHERE session_id=? AND mid IN ({marks})", (sid, *mids)).fetchall()
+    out = {}
+    for r in rows:
+        try:
+            val = json.loads(r["trace_json"])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(val, dict):
+            continue
+        extra = {k: val[k] for k in _EXTRA_TRACE_KEYS if k in val}
+        if extra:
+            out[r["mid"]] = extra
     return out
 
 
@@ -807,9 +874,10 @@ def get_trace(sid: str, mid: str) -> list | None:
     if row is None:
         return None
     try:
-        return json.loads(row["trace_json"])
+        val = json.loads(row["trace_json"])
     except (ValueError, TypeError):
         return None
+    return val.get("trace", []) if isinstance(val, dict) else val
 
 
 def delete_trace(sid: str, mid: str) -> None:

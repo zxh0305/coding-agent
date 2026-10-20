@@ -282,6 +282,10 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 try:
                     changes = snapshot.diff(Path(agent.ctx.workspace), snap_base)
                     if changes.get("stat") or changes.get("diff"):
+                        # 落库键 = 本回合的 user_mid：刷新/切回会话时历史接口按它
+                        # 带回 changes（answer_mid 要到 save_messages 之后才有，
+                        # 而 user_mid 此刻已定）。与轨迹同表共存，互不冲突。
+                        db.merge_trace_field(sid, user_mid, "changes", changes)
                         bus.publish({"type": "turn_changes", "user_mid": user_mid,
                                      **changes})
                 except Exception:

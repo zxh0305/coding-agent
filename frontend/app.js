@@ -935,6 +935,7 @@ function insertHistoryBefore(messages) {
   for (const m of messages) {
     if (m.mid) historyMids.add(m.mid);
     frag.appendChild(historyNode(m));
+    frag.appendChild(changesNode(m));
   }
   const btn = $("load-older");
   const prevHeight = chatEl.scrollHeight, prevTop = chatEl.scrollTop;
@@ -1126,6 +1127,7 @@ async function loadHistoryPage() {
       // 其余本来完好的消息全部丢失。
       try {
         frag.appendChild(historyNode(m));
+        frag.appendChild(changesNode(m));  // 本回合改动（附在它自己的消息后）
       } catch (e) {
         console.error("单条历史消息渲染失败，已跳过", m && m.mid, e);
       }
@@ -1220,6 +1222,23 @@ const blocksRenderer = window.CodingAgentRenderBlocks.createRenderer({
     return btn;
   },
 });
+
+// 历史回放：消息自带的本回合文件改动（后端以【用户消息的 mid】为键存，
+// 随历史接口带回来）。返回改动画布节点；没有改动返回空 DocumentFragment
+// （appendChild 无副作用）。位置：紧跟在这条消息后面——用户消息在回合开头，
+// 画布落在该回合内容之前，与实时路径（回合末尾）不同；回放的首要目标是
+// "能查到改了什么"，位置让位于实现成本。
+function changesNode(m) {
+  const frag = document.createDocumentFragment();
+  if (!m.changes) return frag;
+  frag.appendChild(blocksRenderer.renderBlock({
+    kind: "changes",
+    stat: m.changes.stat || "",
+    diff: m.changes.diff || "",
+    truncated: !!m.changes.truncated,
+  }));
+  return frag;
+}
 
 // 历史回放：单条存储消息 → DOM 节点。
 // 二期起改为「消息 → Block → 统一渲染器」两步走：Block 由 blocks.js 归一化

@@ -273,6 +273,14 @@ class SessionRoutes:
         for it in items:
             if it["mid"] in traces:
                 it["trace"] = traces[it["mid"]]
+        # 本回合的文件改动（turn.py 以 user_mid 为键写在轨迹行的附加字段里）：
+        # 随用户消息带回，前端回放时在对应回合画改动画布。与 trace 分开取，
+        # 因为二者挂在不同的消息上（answer_mid vs user_mid）。
+        user_mids = [it["mid"] for it in items if it["role"] == "user" and it["mid"]]
+        extras = db.get_trace_extras(sid, user_mids)
+        for it in items:
+            if it["mid"] in extras:
+                it["changes"] = extras[it["mid"]].get("changes")
         # has_more：本页【抓取范围】的最小 ord 之前还有更早的消息
         # （向上翻页入口的显隐依据）。
         #
