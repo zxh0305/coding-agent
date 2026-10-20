@@ -438,6 +438,10 @@ function stateBadge(state) {
     // 上次进程退出时这一轮还没跑完：与绿/红点同为"结果未查看"徽标，
     // 但从库里恢复（重启后依然在，直到用户点进去看过）。
     interrupted: { cls: "interrupted", text: "◐", title: "上次运行被中断" },
+    // 已请求停止、回合还在退：通常卡在正在执行的那个工具上（模型请求、
+    // 权限等待、轮间检查点都是毫秒级响应停止）。报 running 会让用户
+    // 以为"点了停止没反应"。
+    stopping: { cls: "stopping", text: "◌ 停止中", title: "已请求停止，正在结束当前步骤" },
   }[state];
   if (!meta) return null;
   const el = document.createElement("span");
@@ -4545,7 +4549,15 @@ async function stopGeneration() {
     toast("刚发出，稍等一下再点停止", "info");
     return;
   }
-  $("send").textContent = "停止中…";
+  // 按钮文案说清"在等什么"：模型请求/权限等待/轮间检查点都在毫秒级退出，
+  // 还停不下来通常是有个工具在跑（npm install、长测试、浏览器导航）。
+  // 从正在跑的工具行里取名字，用户就知道停止不是没生效，而是在等它收尾。
+  // 正在跑的工具：liveTracker 的记账是权威（补发/刷新后 DOM 不一定有对应行）
+  const st = liveTracker.state();
+  const running = st ? [...st.items].reverse().find(
+    (it) => it.kind === "tool" && it.status === "running") : null;
+  const toolName = running ? (running.name || "") : "";
+  $("send").textContent = toolName ? `停止中（等待 ${toolName}）…` : "停止中…";
   try {
     await api("/api/chat/stop", { method: "POST", body: JSON.stringify({ session_id: currentSession }) });
   } catch (e) {

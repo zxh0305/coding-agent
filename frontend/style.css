@@ -322,8 +322,10 @@ body.side-resizing .sidebar { transition: none; }
 .t-state.error { color: var(--danger); }
 /* 上次被中断：不是错误也不是成功，用中性警示色 + 半实心标记 */
 .t-state.interrupted { color: var(--warning); }
+/* 停止中：与 running 同色系但更弱，表达"正在退出"而不是"在干活" */
+.t-state.stopping { color: var(--text-3); animation: t-pulse 1.4s ease-in-out infinite; }
 @keyframes t-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
-@media (prefers-reduced-motion: reduce) { .t-state.running { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .t-state.running, .t-state.stopping { animation: none; } }
 .t-del {
   border: none; background: none; cursor: pointer;
   font-size: 11px; opacity: 0; flex-shrink: 0; padding: 2px;

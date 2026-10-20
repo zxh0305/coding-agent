@@ -347,6 +347,13 @@ class Agent:
             from browser_tools import manager_for
             self.ctx.browser = manager_for(session_id)
         self.cancel_event: threading.Event | None = None  # 本轮生成的停止开关（stop() 置位）
+        # 正在执行的工具名（当前轮）。stop() 置位 cancel_event 之后，模型请求、
+        # 权限等待、轮间检查点都会在毫秒级退出；唯一可能长时间不退的是【正在
+        # 跑的那一个工具】（run_bash 一条 30s 命令、browser_* 导航）。这里记下
+        # 它，让"停止"能区分"请求已发出"与"工具也退了"（见 _tool_notice /
+        # app._session_state 的 stopping）。只在回合线程 + 并行工具工作线程
+        # 写（同一时刻至多一个串行组），读在 HTTP 线程——字典的原子替换足够。
+        self.active_tool: str | None = None
         # 权限闸门（permissions.py）：挂实例而非模块级——规则里的工作区边界、
         # 会话内记住的 ask 决定都按会话隔离，两个会话并发各判各的。
         self.permissions = permission_gate or PermissionGate(self.ctx.workspace, ask_timeout=0.0)
@@ -599,6 +606,7 @@ class Agent:
         # 停止开关：每次提问配一个新 Event，stop() 置位后循环尽快带部分结果收尾；
         # 结束（或生成器被关闭）时也置位，让 llm_client 里的看护线程退出。
         self.cancel_event = threading.Event()
+        self.ctx.cancel_event = self.cancel_event  # run_bash 经 ctx 把它交给 Executor
         stopped = False
         try:
             for kind, payload in self._run(user_input, user_message):
@@ -1146,6 +1154,7 @@ class Agent:
         finally 里 set——那是父回合自有的开关，子代理照抄会把父回合一起杀掉；
         附属模式共享父开关，用户点「停止」时父子同时收场，且谁都不替谁置位。"""
         self.cancel_event = cancel_event
+        self.ctx.cancel_event = cancel_event  # 同上：工具层的取消通道与回合同源
         yield from self._run(user_input)
 
     def _spawn_subagent(self, tasks: list[str]) -> str:
@@ -2025,11 +2034,17 @@ class Agent:
         except json.JSONDecodeError as e:
             result = args_error(f"arguments 不是合法 JSON: {e}；原文开头: {raw_args[:200]}")
         if result is None:
+            # 登记"正在跑哪个工具"（停止按钮据此区分"请求已发"与"工具已退"）。
+            # 同组并行时最后提交者会覆盖前面的名字——只用于展示与超时提示，
+            # 精确到"某一个"不重要；重要的是【有工具在跑】这个事实。
+            self.active_tool = name
             try:
                 result = execute_tool(name, arguments, self.ctx)
                 executed_args = arguments
             except Exception as e:  # execute_tool 已兜底一次；这里再兜一层，守住"绝不抛"的承诺
                 result = error_result(f"{type(e).__name__}: {e}", "工具内部异常，可换用其它工具或稍后重试")
+            finally:
+                self.active_tool = None
         if executed_args is not None:
             # ── post 钩子：链式改写工具结果（None = 保持原样）────────────
             for hook in self.post_tool_hooks:

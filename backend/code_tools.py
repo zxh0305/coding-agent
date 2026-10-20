@@ -18,6 +18,7 @@ Coding 工具集
 真正的生产环境应把执行隔离进 Docker（见 docs/coding-agent-selection.md）。
 """
 
+import inspect
 import json
 import os
 import re
@@ -510,7 +511,21 @@ def run_bash(command: str, ctx=None, timeout: int = 0) -> str:
         limit = 0
     limit = BASH_TIMEOUT if limit <= 0 else min(limit, BASH_TIMEOUT_MAX)
     executor = getattr(ctx, "executor", None) or default_executor()
-    res = executor.run(command, cwd=_ws(ctx), timeout=limit)
+    # cancel 交给执行器：用户点停止时进程组立即被杀，不必等命令自己跑完。
+    # 旧写法只在 run 返回之后才查 cancel_event，一条 30 秒的命令会让"停止"
+    # 等满 30 秒。注入的 Executor 若实现了 cancel 形参就传（Docker 实现同样
+    # 需要）；没实现的旧提供者按原样调用，行为不变。
+    cancel = getattr(ctx, "cancel_event", None)
+    try:
+        if cancel is not None and "cancel" in inspect.signature(executor.run).parameters:
+            res = executor.run(command, cwd=_ws(ctx), timeout=limit, cancel=cancel)
+        else:
+            res = executor.run(command, cwd=_ws(ctx), timeout=limit)
+    except TypeError:  # 提供者用 *args 之类的签名导致探针失准：退回旧调用
+        res = executor.run(command, cwd=_ws(ctx), timeout=limit)
+    if getattr(res, "cancelled", False):
+        return _err("命令被用户停止",
+                    "用户主动停止了本回合，不要重试这条命令；如仍需执行，等他再次提出")
     if res.timed_out:
         return _err(f"命令执行超过 {limit} 秒被终止",
                     f"确认这是慢命令（安装/构建/测试）就把 timeout 参数放宽到 ≤{BASH_TIMEOUT_MAX} 后重试；"

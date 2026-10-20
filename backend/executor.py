@@ -28,6 +28,7 @@ default_executor()。权限闸门先于执行判定，且只认工作区边界�
 import os
 import signal
 import subprocess
+import time
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
@@ -51,6 +52,10 @@ _SPAWN_NEW_GROUP: dict = (
 # 正常情况下毫秒级返回；留这个上界只为防不可中断睡眠（D 状态）把 worker
 # 线程钉死——有界失败好过无限挂起。
 _KILL_DRAIN_TIMEOUT = 5.0
+
+# 带 cancel 时的轮询粒度：0.15s 足够让"停止"在感知上即时，又不会把
+# communicate 切成太碎的片段（每片都要进一次 select）。
+_CANCEL_SLICE_S = 0.15
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -83,13 +88,36 @@ class ExecResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    cancelled: bool = False   # 用户点"停止"掐断的（区别于自然超时：不是命令的错）
+
+
+def _kill_and_drain(proc: subprocess.Popen, *, cancelled: bool) -> ExecResult:
+    """杀进程组后把管道抽干并回收子进程。
+
+    必须再 communicate 一次：既拿到已产生的部分输出（模型能看到超时前跑出了
+    什么），也回收子进程（否则留僵尸）。SIGKILL 下管道立即关闭，正常很快；
+    _KILL_DRAIN_TIMEOUT 是有界兜底，绝不无限等。
+    """
+    _kill_process_group(proc)
+    try:
+        out, err = proc.communicate(timeout=_KILL_DRAIN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        out, err = "", ""
+    return ExecResult(exit_code=-1, stdout=out or "", stderr=err or "",
+                      timed_out=not cancelled, cancelled=cancelled)
 
 
 class LocalExecutor:
     """本机子进程执行（默认提供者，与旧 run_bash 内联实现行为一致）。"""
 
-    def run(self, command: str, cwd, timeout: int) -> ExecResult:
-        """跑一条 shell 命令。超时杀【整个进程组】并以 timed_out=True 返回。
+    def run(self, command: str, cwd, timeout: int, cancel=None) -> ExecResult:
+        """跑一条 shell 命令。超时/取消都杀【整个进程组】。
+
+        cancel：threading.Event | None。用户点「停止」时置位，进程组立即被
+        杀掉并以 cancelled=True 返回——此前 run_bash 只有在返回之后才检查
+        cancel_event，一条 30 秒的 npm install 会让"停止"实际等满 30 秒，
+        用户观感是"点了没反应"。分片轮询（0.15s）而不是阻塞 wait，是为了
+        让 communicate 的管道读取能正常收尾。
 
         与 subprocess.run(timeout=) 的差别有两点，都是有意的：
         1. 超时杀的是进程组（见模块头注释），不留孤儿孙进程；
@@ -103,22 +131,20 @@ class LocalExecutor:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             **_SPAWN_NEW_GROUP,
         )
-        try:
-            out, err = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _kill_process_group(proc)
-            # 杀组后必须再 communicate 一次：既抽干管道（拿到部分输出），
-            # 也回收子进程（否则留僵尸）。SIGKILL 下管道立即关闭，正常很快；
-            # _KILL_DRAIN_TIMEOUT 是有界兜底，绝不无限等。
+        deadline = time.monotonic() + timeout
+        while True:
+            slice_s = _CANCEL_SLICE_S   # 0.15s
+            if cancel is None:
+                slice_s = max(0.0, deadline - time.monotonic())
             try:
-                out, err = proc.communicate(timeout=_KILL_DRAIN_TIMEOUT)
+                out, err = proc.communicate(timeout=slice_s)
+                return ExecResult(exit_code=proc.returncode,
+                                  stdout=out or "", stderr=err or "")
             except subprocess.TimeoutExpired:
-                out, err = "", ""
-            return ExecResult(exit_code=-1,
-                              stdout=out or "", stderr=err or "",
-                              timed_out=True)
-        return ExecResult(exit_code=proc.returncode,
-                          stdout=out or "", stderr=err or "")
+                if cancel is not None and cancel.is_set():
+                    return _kill_and_drain(proc, cancelled=True)
+                if time.monotonic() >= deadline:
+                    return _kill_and_drain(proc, cancelled=False)
 
 
 class DockerExecutor:

@@ -126,6 +126,9 @@ class ToolContext:
                                                 # （attachments/、.agent-memory/，物理上
                                                 # 在数据区）。Agent 构造时自装配；文件
                                                 # 工具经 code_tools._resolve 放行这些前缀
+    cancel_event: object = None                 # threading.Event | None：本轮停止开关。
+                                                # run_bash 把它交给 Executor，用户点停止
+                                                # 时长命令的进程组立即被杀，而不是等它跑完
 
 TOOL_REGISTRY = {
     "todo_write": todo_write,

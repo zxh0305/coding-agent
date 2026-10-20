@@ -184,6 +184,30 @@ class SessionStateTest(unittest.TestCase):
     def test_idle_session_is_none(self):
         self.assertEqual(self.app._session_state("s1"), "none")
 
+    def test_stopping_beats_running_and_waiting(self):
+        """停止请求已发出：报 stopping 而不是 running/waiting——用户关心的是
+        "为什么还没停"，不是"它还在等权限"（那一侧会按取消收场）。"""
+        import threading
+        from types import SimpleNamespace
+
+        class Bus:
+            running = True
+
+        bus = Bus()
+        self._buses["s1"] = bus
+        cancel = threading.Event()
+        agent = SimpleNamespace(
+            cancel_event=cancel,
+            permissions=SimpleNamespace(pending_count=1),  # 本来会报 waiting
+        )
+        import app as app_mod
+        with app_mod._lock:
+            app_mod._agents["s1"] = agent
+        self.addCleanup(app_mod._agents.pop, "s1", None)
+        self.assertEqual(self.app._session_state("s1"), "waiting")
+        cancel.set()
+        self.assertEqual(self.app._session_state("s1"), "stopping")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

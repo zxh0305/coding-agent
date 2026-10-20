@@ -191,6 +191,11 @@ def _session_state(sid: str) -> str:
 
       running      回合进行中（turn_start 已发、turn_end 未到）
       waiting      回合进行中且卡在权限闸门等用户确认（比 running 更该提醒）
+      stopping     用户已点停止、但回合还没退（通常是有个工具正在跑）
+                   ——真正卡住的来源：模型请求、权限等待、轮间检查点都在
+                   毫秒级响应 cancel_event，只有【正在执行的工具】可能拖到
+                   它的超时（run_bash 默认 30s，browser_* 更长）。报 running
+                   会让用户以为"点了没反应"，所以单独给一个状态。
       done         跑过且最近一轮正常结束、"你还没看过这次结果"（绿点）
       error        最近一轮出错、"你还没看过这次结果"（红点）
       interrupted  上次进程退出时这一轮还没跑完（重启后靠它说明白）
@@ -212,6 +217,11 @@ def _session_state(sid: str) -> str:
         agent = _agents.get(sid)
         last = _turn_status.get(sid)
     if bus is not None and bus.running:
+        # stopping 判定在最前：停止请求已发出时，"还在等权限确认"已经没有
+        # 意义（那一侧会按取消收场），用户关心的是"为什么还没停"。
+        if agent is not None and agent.cancel_event is not None \
+                and agent.cancel_event.is_set():
+            return "stopping"
         if agent is not None and agent.permissions.pending_count > 0:
             return "waiting"
         return "running"
