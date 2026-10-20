@@ -271,6 +271,30 @@ MIGRATIONS: list[tuple[int, str | None]] = [
     #     旧身份是工作区绝对路径哈希——改个目录名 74 条记忆当场失忆。
     #     走 procedural 分支（_migrate_memory_layout），与迁移 6 同形。
     (26, None),
+    # 27：回合状态机（session_turns）。动机：回合的生命周期此前只存在于内存
+    #     （bus.running / _running_agents / _turn_status），进程退出后前端列表
+    #     要么显示"运行中"（其实是死的），要么什么都不显示——用户无从判断
+    #     "上一轮是跑完了还是被打断了"。落库后：
+    #       * 启动时把残留的 running 一律改判 interrupted（进程死了，跑着的
+    #         回合不可能还在跑）；
+    #       * 列表/历史接口据此展示"◐ 上次被中断"与已跑轮数；
+    #       * 结果徽标（绿/红点）的 seen 标记也随行持久化，重启后不再凭空消失。
+    #     主键 = (session_id, user_mid)：回合身份就是它的用户消息，不另造 id。
+    #     与 message_usage 一样不设外键——孤儿行无害，删会话时一并清。
+    (27, "CREATE TABLE IF NOT EXISTS session_turns(\n"
+         "    session_id TEXT NOT NULL,\n"
+         "    user_mid TEXT NOT NULL,\n"
+         "    state TEXT NOT NULL,\n"
+         "    started REAL NOT NULL,\n"
+         "    ended REAL,\n"
+         "    rounds INTEGER DEFAULT 0,\n"
+         "    error TEXT,\n"
+         "    seen INTEGER DEFAULT 0,\n"
+         "    PRIMARY KEY(session_id, user_mid)\n"
+         ")"),
+    # 状态索引：列表按会话查"最近一条"，历史接口按 session_id 过滤。
+    (28, "CREATE INDEX IF NOT EXISTS idx_session_turns_session "
+         "ON session_turns(session_id, started)"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -329,6 +353,10 @@ def _migration_applied(conn: sqlite3.Connection, version: int) -> bool:
         return "reasoning_replay" in _table_columns(conn, "providers")
     if version == 25:          # message_usage.kind（用量归账：turn/subagent/compact…）
         return "kind" in _table_columns(conn, "message_usage")
+    if version == 27:          # session_turns 表（回合状态机）
+        return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                 "AND name='session_turns'").fetchone())
+    # 28（索引）不写探针：CREATE INDEX IF NOT EXISTS 编写幂等，重放无害
     if version == 26:
         # 记忆 v2 布局：探针 = 数据区里 projects/ 是否已存在。
         # 数据区不存在（全新安装 / 测试临时库）视为"无需迁移"——返回 True 让
@@ -744,6 +772,11 @@ def truncate_from(sid: str, mid: str) -> dict:
                     conn.execute(
                         f"DELETE FROM {table} WHERE session_id=? AND mid IN ({q})",
                         (sid, *chunk))
+                # 回合状态按主键 user_mid 删（回退到某轮起点 = 该轮及之后的
+                # 回合状态也一起作废；回退后重发会拿到新的 user_mid 重新开账）
+                conn.execute(
+                    f"DELETE FROM session_turns WHERE session_id=? AND user_mid IN ({q})",
+                    (sid, *chunk))
     _usage_cache_invalidate()  # 删了 usage 行，聚合缓存一并作废
     return {"removed": len(mids), "ord": target_ord}
 
@@ -886,6 +919,120 @@ def delete_trace(sid: str, mid: str) -> None:
         conn.execute("DELETE FROM session_traces WHERE session_id=? AND mid=?", (sid, mid))
 
 
+# ---------------------------------------------------------------------------
+# 回合状态机（session_turns）：进程重启后仍能说清"上一轮跑完了没有"
+#
+# 状态取值与迁移语义（见 MIGRATIONS 的 27 条）：
+#   running     回合进行中（进程活着时唯一可信的"在跑"证据）
+#   done        正常结束
+#   error       回合出错收场
+#   interrupted 【只在启动时写入】进程退出时还挂在 running 的回合
+#
+# 不存心跳：单进程 + 会话锁下，服务活着 state 就是真的；服务死了，
+# 所有 running 一律改判 interrupted——这才是"中断"的定义。
+# ---------------------------------------------------------------------------
+
+TURN_STATES = ("running", "done", "error", "interrupted")
+
+
+def turn_started(sid: str, user_mid: str, started: float | None = None) -> None:
+    """回合开始：登记 running。重复登记（同 user_mid 重放）幂等覆盖。"""
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO session_turns(session_id, user_mid, state, started) "
+            "VALUES(?,?, 'running', ?) "
+            "ON CONFLICT(session_id, user_mid) DO UPDATE SET "
+            "state='running', started=excluded.started, ended=NULL, error=NULL",
+            (sid, user_mid, started if started is not None else time.time()))
+
+
+def turn_round(sid: str, user_mid: str, rounds: int) -> None:
+    """记下本回合已跑到的轮号（每轮一次小写；中断后能说明"跑到第几轮"）。"""
+    with _conn() as conn:
+        conn.execute("UPDATE session_turns SET rounds=? WHERE session_id=? AND user_mid=?",
+                     (int(rounds), sid, user_mid))
+
+
+def turn_finished(sid: str, user_mid: str, state: str, error: str | None = None) -> None:
+    """回合收尾：写终态与结束时刻（seconds 精度够用，列表只做展示）。"""
+    if state not in ("done", "error"):
+        raise ValueError(f"回合终态只能是 done / error，收到 {state}")
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE session_turns SET state=?, ended=?, error=? "
+            "WHERE session_id=? AND user_mid=?",
+            (state, time.time(), (error or None), sid, user_mid))
+
+
+def turn_seen(sid: str, user_mid: str) -> None:
+    """把回合结果标记为已查看（清列表绿/红点）。"""
+    with _conn() as conn:
+        conn.execute("UPDATE session_turns SET seen=1 WHERE session_id=? AND user_mid=?",
+                     (sid, user_mid))
+
+
+def mark_running_turns_interrupted() -> int:
+    """启动时调用：把所有残留的 running 改判 interrupted，返回改了几条。
+
+    这是"进程死了"的唯一证据来源——服务刚启动时内存里不可能有正在跑的回合，
+    而库里还挂着的 running 只可能是上次进程退出时没来得及收尾的回合。
+    """
+    now = time.time()
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE session_turns SET state='interrupted', ended=? WHERE state='running'",
+            (now,))
+        n = cur.rowcount or 0
+    if n:
+        log.warning("发现 %d 个上次进程退出时仍在运行的回合，已标记为 interrupted", n)
+    return n
+
+
+def get_turn(sid: str, user_mid: str) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT state, started, ended, rounds, error, seen FROM session_turns "
+            "WHERE session_id=? AND user_mid=?", (sid, user_mid)).fetchone()
+    return dict(row) if row else None
+
+
+def get_turns(sid: str, user_mids: list[str]) -> dict[str, dict]:
+    """批量取回合状态（历史接口用），返回 {user_mid: {...}}。"""
+    if not user_mids:
+        return {}
+    marks = ",".join("?" * len(user_mids))
+    with _conn() as conn:
+        rows = conn.execute(
+            f"SELECT user_mid, state, started, ended, rounds, error, seen FROM session_turns "
+            f"WHERE session_id=? AND user_mid IN ({marks})", (sid, *user_mids)).fetchall()
+    return {r["user_mid"]: {k: r[k] for k in
+                            ("state", "started", "ended", "rounds", "error", "seen")}
+            for r in rows}
+
+
+def latest_turns(sids: list[str]) -> dict[str, dict]:
+    """每个会话最近一条回合状态（列表徽标用），返回 {sid: {...}}。
+
+    一条 SQL 批量取（与 last_message_previews 同一思路），不逐会话查。
+    """
+    if not sids:
+        return {}
+    marks = ",".join("?" * len(sids))
+    with _conn() as conn:
+        rows = conn.execute(
+            f"SELECT session_id, user_mid, state, started, ended, rounds, error, seen "
+            f"FROM session_turns WHERE session_id IN ({marks}) "
+            f"ORDER BY started DESC", sids).fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:  # 按 started 降序，每个会话第一次出现的即最新
+        if r["session_id"] in out:
+            continue
+        out[r["session_id"]] = {k: r[k] for k in
+                                ("user_mid", "state", "started", "ended",
+                                 "rounds", "error", "seen")}
+    return out
+
+
 def list_sessions(user_id: int, archived: int = 0) -> list[dict]:
     """archived=0 任务栏列表 / archived=1 归档区列表（按归档时间倒序）。"""
     order = "archived_at DESC" if archived else "updated DESC"
@@ -965,13 +1112,14 @@ def session_archived(sid: str) -> int:
 
 
 def delete_session(sid: str) -> None:
-    """删除任务：消息行、统计行、外置正文文件一起清理。"""
+    """删除任务：消息行、统计行、回合状态、外置正文文件一起清理。"""
     # 工作区路径必须在删 sessions 行之前取——删了就查不到了（记忆提取的
     # 兜底文件读取可能需要它，附件清理已不需要：附件恒在数据区）。
     ws = get_session_workspace(sid)
     with _conn() as conn:
         conn.execute("DELETE FROM messages WHERE session_id=?", (sid,))
         conn.execute("DELETE FROM message_usage WHERE session_id=?", (sid,))
+        conn.execute("DELETE FROM session_turns WHERE session_id=?", (sid,))
         conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
     _usage_cache_invalidate()  # 会话整删，usage 行随之清空
     # artifacts/<sid>/ 整棵删掉（该任务全部外置正文，随会话一起消失）

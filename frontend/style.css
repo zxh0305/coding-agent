@@ -320,6 +320,8 @@ body.side-resizing .sidebar { transition: none; }
 .t-state.waiting { color: var(--warning); }
 .t-state.done { color: var(--success); }
 .t-state.error { color: var(--danger); }
+/* 上次被中断：不是错误也不是成功，用中性警示色 + 半实心标记 */
+.t-state.interrupted { color: var(--warning); }
 @keyframes t-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 @media (prefers-reduced-motion: reduce) { .t-state.running { animation: none; } }
 .t-del {

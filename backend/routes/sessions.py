@@ -281,6 +281,12 @@ class SessionRoutes:
         for it in items:
             if it["mid"] in extras:
                 it["changes"] = extras[it["mid"]].get("changes")
+        # 回合状态（session_turns）随用户消息带回：前端据此在时间线上画出
+        # "◐ 上次被中断 · 跑到第 N 轮"，而不是让用户面对一个永远转圈的空回合。
+        turns = db.get_turns(sid, user_mids)
+        for it in items:
+            if it["mid"] in turns:
+                it["turn"] = turns[it["mid"]]
         # has_more：本页【抓取范围】的最小 ord 之前还有更早的消息
         # （向上翻页入口的显隐依据）。
         #
@@ -476,11 +482,16 @@ class SessionRoutes:
 
         未读标记语义：回合在"用户不在这个会话里"时跑完才亮绿/红点，用户切进去
         看过就清掉。前端在 switchSession 与前台跑完的 turn_end 处调用本接口。
-        只改内存态：进程重启后标记本就该归零。"""
+
+        内存态与库双写：内存是当前进程的即时态；库里的 session_turns.seen
+        负责跨重启——否则重启后上一轮的绿点/「被中断」会再次亮起来。"""
         with busref._lock:
             st = busref._turn_status.get(sid)
             if st is not None:
                 st["seen"] = True
+        latest = db.latest_turns([sid]).get(sid)
+        if latest:
+            db.turn_seen(sid, latest["user_mid"])
         self._json({"ok": True})
 
     def _handle_truncate(self, sid: str):

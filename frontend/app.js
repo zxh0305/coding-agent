@@ -435,6 +435,9 @@ function stateBadge(state) {
     waiting: { cls: "waiting", text: "● 等待确认", title: "等待你确认权限" },
     done: { cls: "done", text: "●", title: "已完成" },
     error: { cls: "error", text: "●", title: "上一轮出错" },
+    // 上次进程退出时这一轮还没跑完：与绿/红点同为"结果未查看"徽标，
+    // 但从库里恢复（重启后依然在，直到用户点进去看过）。
+    interrupted: { cls: "interrupted", text: "◐", title: "上次运行被中断" },
   }[state];
   if (!meta) return null;
   const el = document.createElement("span");
@@ -1230,14 +1233,37 @@ const blocksRenderer = window.CodingAgentRenderBlocks.createRenderer({
 // "能查到改了什么"，位置让位于实现成本。
 function changesNode(m) {
   const frag = document.createDocumentFragment();
-  if (!m.changes) return frag;
-  frag.appendChild(blocksRenderer.renderBlock({
-    kind: "changes",
-    stat: m.changes.stat || "",
-    diff: m.changes.diff || "",
-    truncated: !!m.changes.truncated,
-  }));
+  if (m.changes) {
+    frag.appendChild(blocksRenderer.renderBlock({
+      kind: "changes",
+      stat: m.changes.stat || "",
+      diff: m.changes.diff || "",
+      truncated: !!m.changes.truncated,
+    }));
+  }
+  // 回合状态（后端 session_turns 随用户消息带回）。只画需要用户知道的异常
+  // 终态：正常结束/成功不画卡（时间线上本来就有回答）；中断要说清楚——否则
+  // 这一轮在时间线上只有一个用户气泡、助手那边空空如也，看起来像"卡死了"。
+  const turn = m.turn;
+  if (turn && turn.state === "interrupted") {
+    frag.appendChild(interruptedCard(turn));
+  }
   return frag;
+}
+
+// 「上次运行被中断」卡：说明断在哪、跑到了多久/几轮，并给一个继续的入口。
+function interruptedCard(turn) {
+  const el = document.createElement("div");
+  el.className = "bubble error interrupted-card";
+  const rounds = Number(turn.rounds) || 0;
+  const mins = turn.started
+    ? Math.max(1, Math.round(((turn.ended || Date.now() / 1000) - turn.started) / 60))
+    : 0;
+  const detail = [rounds ? `跑到第 ${rounds} 轮` : "", mins ? `持续约 ${mins} 分钟` : ""]
+    .filter(Boolean).join(" · ");
+  el.textContent = `◐ 这次运行被中断（服务重启或进程退出）${detail ? "：" + detail : ""}。` +
+    "已完成的工具调用与文件修改都还在；发送任意消息即可让 Agent 接着做。";
+  return el;
 }
 
 // 历史回放：单条存储消息 → DOM 节点。

@@ -77,6 +77,14 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             # 早已发完，带不了 mid）。
             user_mid = uuid.uuid4().hex
             user_message["_mid"] = user_mid
+            # 回合状态机落库（session_turns）：进程若在这一回合中途退出，
+            # 下次启动会把这条 running 改判 interrupted，列表能显示"上次被
+            # 中断"而不是假装还在跑。失败只记日志——状态账是观测面，
+            # 不能因为它写不进去就让回合开不了工。
+            try:
+                db.turn_started(sid, user_mid)
+            except Exception:
+                log.exception("[会话 %s] 回合状态登记失败（忽略）", sid)
             # 必须传浅拷贝：save_messages 对超过 MAX_INLINE_BYTES 的消息会【就地】
             # 替换成 _artifact 摘要桩（db.py 里 m.clear()+m.update(stub)）。带图片的
             # 用户消息 base64 普遍超 64KB，若把原 dict 直接交过去，它会在这一瞬间
@@ -145,6 +153,12 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 for kind, payload in agent.run(plain, user_message):
                     if kind == "round":
                         seg_mid = uuid.uuid4().hex[:12]
+                        # 轮号落库：中断后能告诉用户"跑到第几轮"（每轮一次小写，
+                        # 不是每次工具调用）。失败不打断回合。
+                        try:
+                            db.turn_round(sid, user_mid, payload.get("round") or 0)
+                        except Exception:
+                            log.exception("[会话 %s] 回合轮号落库失败（忽略）", sid)
                         bus.publish({"type": "round", "mid": seg_mid, **payload})
                     elif kind in ("answer_delta", "done"):
                         bus.publish({"type": kind, "mid": seg_mid, **payload})
@@ -290,6 +304,14 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                                      **changes})
                 except Exception:
                     log.exception("[会话 %s] 回合 diff 计算失败（忽略）", sid)
+            # 回合终态落库：先写库再发 turn_end——订阅者收到 turn_end 时若
+            # 立刻去拉列表，库里必须已经是终态（否则会看到自己这一轮还是
+            # running）。写失败只记日志：前端仍靠 turn_end 复位。
+            try:
+                db.turn_finished(sid, user_mid,
+                                 "error" if error is not None else "done", error)
+            except Exception:
+                log.exception("[会话 %s] 回合终态落库失败（忽略）", sid)
             bus.publish({"type": "turn_end", "user_mid": user_mid})
             # 回合结束关掉本会话的浏览器：Chromium 进程不常驻；profile 目录
             # 保留在磁盘，下次 browser_* 工具再用时登录态还在。
@@ -321,6 +343,15 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
         except Exception:
             # 最后一道兜底：连收尾都炸了也要把回合关掉，绝不挂起订阅页
             log.exception("[会话 %s] 回合线程收尾异常", sid)
+            # 状态账也要跟着关：否则这条回合永远停在 running，下次启动会
+            # 被误判成"被中断"（其实是本回合自己炸在收尾），错误归因失真。
+            # 此刻 user_mid 可能还没分配（异常发生在开跑前），那就无从记账。
+            try:
+                if "user_mid" in locals():
+                    db.turn_finished(sid, user_mid, "error",
+                                     "回合线程收尾异常，详情见 backend 日志")
+            except Exception:
+                pass
             try:
                 bus.publish({"type": "error", "message": "回合执行异常，详情见 backend 日志"})
                 bus.publish({"type": "turn_end", "user_mid": None})

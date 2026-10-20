@@ -187,14 +187,22 @@ def _event_bus(sid: str) -> SessionEvents:
 
 
 def _session_state(sid: str) -> str:
-    """任务的运行状态（供列表展示），动态算、不落库——它是内存态事实，
-    进程重启后所有回合都已不存在，本就该归零。
+    """任务的运行状态（供列表展示）。内存优先，库里兜底。
 
-      running  回合进行中（turn_start 已发、turn_end 未到）
-      waiting  回合进行中且卡在权限闸门等用户确认（比 running 更该提醒）
-      done     跑过且最近一轮正常结束、"你还没看过这次结果"（列表显示绿点）
-      error    最近一轮出错、"你还没看过这次结果"（列表显示红点）
-      none     从没跑过，或最近一轮的结果已被查看过（不显示状态）
+      running      回合进行中（turn_start 已发、turn_end 未到）
+      waiting      回合进行中且卡在权限闸门等用户确认（比 running 更该提醒）
+      done         跑过且最近一轮正常结束、"你还没看过这次结果"（绿点）
+      error        最近一轮出错、"你还没看过这次结果"（红点）
+      interrupted  上次进程退出时这一轮还没跑完（重启后靠它说明白）
+      none         从没跑过，或最近一轮的结果已被查看过（不显示状态）
+
+    **内存态优先**：回合在跑时 bus.running 是唯一可信的"在跑"证据；内存里的
+    _turn_status 是新收尾结果，比库里刚写的行更即时（同一台账，内存先到）。
+
+    **库里兜底**：进程重启后内存是空的，但 session_turns 里还留着上一轮——
+    这时不能一律报 none（用户看不出"上次被中断"和"从没跑过"的区别）。
+    只有内存里没有这条会话的任何状态时才查库，列表多会话时是一次批量调用
+    （latest_turns），不是逐会话查。
 
     没有 bus 的会话必然没在跑：bus 惰性创建，此处只读不建——为列表展示
     凭空造 bus 会白占内存、还会把 last_seq 从库里读出来。
@@ -209,9 +217,21 @@ def _session_state(sid: str) -> str:
         return "running"
     # 不在跑：绿/红点只在"结果未被查看过"时亮（未读标记语义）；看过或从没
     # 跑过都退化成无状态，不画点。
-    if last and not last.get("seen"):
-        return last.get("outcome") or "none"
-    return "none"
+    if last:
+        return (last.get("outcome") or "none") if not last.get("seen") else "none"
+    row = db.latest_turns([sid]).get(sid)
+    if not row:
+        return "none"
+    state = row.get("state") or "none"
+    if state == "interrupted":
+        # 中断是"需要用户知道"的结果，与未读徽标同语义：看过一次就回到 none。
+        return "none" if row.get("seen") else "interrupted"
+    if state in ("done", "error"):
+        return "none" if row.get("seen") else state
+    # 库里还是 running：服务活着时内存必然有 bus.running=True（上面已返回），
+    # 走到这里说明是刚重启但还没执行启动改判的边缘窗口——按中断处理，
+    # 绝不谎报"运行中"。
+    return "none" if row.get("seen") else "interrupted"
 
 
 # ask 等待用户决定的上限（秒）。超时不是安全边界——超时按拒绝处理，本来就
@@ -398,6 +418,11 @@ def _lan_ips() -> list[str]:
 def main():
     load_env_file(str(ENV_FILE))   # 读 .env（首库播种 / 默认供应商 / 默认工作区用）
     db.init_db()                   # 建表 + 播种（已初始化则跳过）
+    # 回合状态机：此刻内存里没有任何回合在跑，库里还挂着 running 的只可能是
+    # 上次进程退出时没来得及收尾的——改判 interrupted，列表不再谎报"运行中"。
+    n_ints = db.mark_running_turns_interrupted()
+    if n_ints:
+        print(f"⚠️ {n_ints} 个回合在进程退出时仍在运行，已标记为中断", flush=True)
     n_legacy = db.migrate_legacy_workspace_files_all()
     if n_legacy:
         print(f"🧹 已把工作区里的遗留附件/记忆收回数据区（{n_legacy} 个文件）", flush=True)
