@@ -52,6 +52,7 @@ function setWho(name) {
 }
 
 function showLogin() {
+  if (window.ExperimentsUI) window.ExperimentsUI.close();
   authToken = "";
   who = "";
   currentSession = null;      // 下一个登录者不能沿用上一个用户的任务 id
@@ -5619,6 +5620,7 @@ function boot() {  // 登录成功（或刷新后 token 仍有效）后的页面
   bindAttachResizer();      // 附件浮窗左下角的拖拽把手
   bindAttachListControls(); // 附件浮窗：列表宽度拖拽 + 列表收起/展开
   bindGitResizer();         // Git 浮窗左下角的拖拽把手
+  if (window.ExperimentsUI) window.ExperimentsUI.route();
 }
 
 (async () => {

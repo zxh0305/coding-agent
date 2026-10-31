@@ -68,6 +68,8 @@ class DispatchMixin:
         if not self._require_auth():
             return
         path = urllib.parse.urlparse(self.path).path  # 剥掉 ?query 后的纯路径
+        if path == "/api/experiments" or path.startswith("/api/experiments/"):
+            return self._handle_experiments(path, "GET")
         if path == "/api/auth/me":
             user = self._auth_user()   # auth 路径不走 _require_auth，这里自己解析
             if user is None:
@@ -203,6 +205,8 @@ class DispatchMixin:
             if not self._require_auth():
                 return
             path = urllib.parse.urlparse(self.path).path  # 剥掉 ?query 再匹配
+            if path == "/api/experiments" or path.startswith("/api/experiments/"):
+                return self._handle_experiments(path, "POST")
             if path == "/api/chat/stop":
                 self._handle_chat_stop()
             elif path == "/api/sessions":

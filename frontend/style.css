@@ -2556,3 +2556,24 @@ body.docs-resizing .docs-panel { transition: none; }
   font-family: inherit; font-size: 10px; font-weight: 400;
   border-radius: 4px; background: var(--warning-weak, #fdf3e3); color: var(--warning, #b45309);
 }
+
+/* 独立实验页面：聊天保持挂载，离开时仅停止页面轮询。 */
+.experiment-page {position:fixed;inset:0;z-index:80;background:var(--bg);color:var(--text);overflow:auto;padding:24px max(16px,calc((100vw - 1100px)/2));font-size:14px;}
+.experiment-page[hidden],.experiment-page [hidden] {display:none!important;}
+.exp-header {display:flex;align-items:center;gap:12px;flex-wrap:wrap;border-bottom:1px solid var(--border);padding-bottom:16px;}
+.exp-header h1 {flex:1;font-size:22px;margin:0;}
+.experiment-page h2 {font-size:18px;margin:24px 0 12px;overflow-wrap:anywhere;}
+.experiment-page button,.experiment-page select,.experiment-page input {border:1px solid var(--border);border-radius:8px;background:var(--bg-card,#fff);color:inherit;padding:8px 12px;margin:4px;min-height:38px;}
+.experiment-page button {cursor:pointer;}
+.experiment-page button:disabled {opacity:.55;cursor:default;}
+.experiment-page p {line-height:1.6;overflow-wrap:anywhere;}
+.experiment-page pre {white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg-card,#fff);padding:12px;max-height:450px;overflow:auto;}
+.exp-card,.exp-node, #exp-new,.exp-preview {border:1px solid var(--border);border-radius:12px;background:var(--bg-card,#fff);padding:16px;margin:12px 0;overflow-wrap:anywhere;}
+.exp-graph {display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-areas:'. B .' 'A . D' '. C .';gap:4px 16px;}
+.node-A{grid-area:A}.node-B{grid-area:B}.node-C{grid-area:C}.node-D{grid-area:D}
+.exp-node h3{margin:0;font-size:15px}.exp-node.contract{border-color:#426b9b}.experiment-page .warning{color:#9c4313}.exp-log-row{padding:10px 0;border-bottom:1px solid var(--border);overflow-wrap:anywhere;}
+.experiment-page fieldset{border:1px solid var(--border);border-radius:8px;margin:12px 0;}
+.experiment-page label{display:inline-flex;align-items:center;flex-wrap:wrap;gap:4px;}
+.experiment-page input{width:100px;}.experiment-page select{max-width:100%;}
+#exp-open-mobile{display:none}
+@media(max-width:700px){.experiment-page{padding:14px}.exp-graph{grid-template-columns:1fr;grid-template-areas:'A' 'B' 'C' 'D';}.exp-header{gap:4px}.exp-header h1{flex-basis:100%;order:-1}#exp-open-mobile{display:inline-block}.experiment-page label{display:flex;}.experiment-page select{width:100%;}}

@@ -1,0 +1,13 @@
+order_id,channel,amount
+O001,web,10.005
+O002,store,20
+,web,3
+O004, ,8
+O005,web,nope
+O006,store,-1
+O007,web,0
+O008,store,2.345
+O009,web,NaN
+O010,web,Infinity
+ O011 , web ,1.234
+O001,web,5

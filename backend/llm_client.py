@@ -284,7 +284,7 @@ def _sleep_cancellable(seconds: float, cancel) -> bool:
 
 
 def post_json_with_retry(url: str, headers: dict, payload: dict, timeout: int,
-                         cancel=None, attempts: int = 3, on_retry=None):
+                         cancel=None, attempts: int = 3, on_retry=None, request_observer=None):
     """带退避重试的 JSON POST（两个 client 的 _post 共用）。
 
     可重试 = HTTP 429/500/502/503/504、连接失败、读超时——都发生在【请求发出
@@ -298,17 +298,39 @@ def post_json_with_retry(url: str, headers: dict, payload: dict, timeout: int,
     取舍：此刻请求没发出去，回合由 worker 的错误路径收尾（error + turn_end），
     与"请求没发出去就取消"的既有行为一致。
     """
+    # Optional strict transport observer: start/error/response per actual attempt.
+    # It may wrap the response to observe raw usage; recording failures propagate.
     attempts = max(1, attempts)
     for attempt in range(1, attempts + 1):
+        if request_observer:
+            request_observer("start", {"attempt": attempt, "payload": payload})
         try:
-            return _http_post_json(url, headers, payload, timeout)
+            response = _http_post_json(url, headers, payload, timeout)
         except ApiHTTPError as e:
             if e.status not in _RETRYABLE_STATUS:
+                if request_observer:
+                    request_observer("error", {"error_type": type(e).__name__, "http_status": e.status})
                 raise
             error: RuntimeError = e
             wait = min(e.retry_after, _MAX_RETRY_WAIT) if e.retry_after else None
         except ApiConnectionError as e:
             error, wait = e, None
+        except BaseException as e:
+            if request_observer:
+                request_observer("error", {"error_type": type(e).__name__})
+            raise
+        else:
+            if request_observer:
+                try:
+                    replacement = request_observer("response", {"response": response})
+                except BaseException:
+                    response.close()
+                    raise
+                return replacement if replacement is not None else response
+            return response
+        if request_observer:
+            request_observer("error", {"error_type": type(error).__name__,
+                                       "http_status": getattr(error, "status", None)})
         if attempt >= attempts:
             raise error
         if wait is None:
@@ -378,6 +400,8 @@ class OpenAIChatClient:
             self.timeout,
             cancel=cancel,
             on_retry=self.on_retry,
+            **({"request_observer": self.request_observer}
+               if getattr(self, "request_observer", None) is not None else {}),
         )
 
     def chat(self, messages: list, tools: list | None = None,
@@ -728,6 +752,8 @@ class AnthropicMessagesClient:
             self.timeout,
             cancel=cancel,
             on_retry=self.on_retry,
+            **({"request_observer": self.request_observer}
+               if getattr(self, "request_observer", None) is not None else {}),
         )
 
     @staticmethod

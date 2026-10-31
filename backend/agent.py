@@ -574,7 +574,7 @@ class Agent:
 
     # ------------------------------------------------------------------
 
-    def run(self, user_input: str, user_message: dict | None = None):
+    def run(self, user_input: str, user_message: dict | None = None, *, cancel_event=None):
         """生成器版核心循环：边跑边产出事件，供 Web 流式接口实时推给前端。
 
         user_message：完整的用户消息（OpenAI 格式，content 可以是带图片/文件的
@@ -605,7 +605,7 @@ class Agent:
         事件——它们只进历史与下一轮的模型请求，前端零感知。        """
         # 停止开关：每次提问配一个新 Event，stop() 置位后循环尽快带部分结果收尾；
         # 结束（或生成器被关闭）时也置位，让 llm_client 里的看护线程退出。
-        self.cancel_event = threading.Event()
+        self.cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self.ctx.cancel_event = self.cancel_event  # run_bash 经 ctx 把它交给 Executor
         stopped = False
         try:
@@ -623,7 +623,8 @@ class Agent:
                 if compacted:
                     yield "compacted", compacted
         finally:
-            self.cancel_event.set()
+            if cancel_event is None:
+                self.cancel_event.set()
 
     def stop(self) -> None:
         """请求停止当前这轮生成（Web「停止」按钮 → /api/chat/stop 调到这里）。"""

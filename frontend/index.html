@@ -49,6 +49,7 @@
         <button id="new-task" class="new-task" title="新建任务">＋ 新任务</button>
         <button id="side-collapse" class="side-collapse" title="收起侧栏">⇤</button>
       </div>
+      <button id="exp-open" class="new-task" type="button">实验</button>
       <div class="task-label">
         任务
         <button id="archive-btn" class="archive-btn" title="归档区">
@@ -78,6 +79,7 @@
       <div class="top-bar">
         <!-- 手机端唤出侧栏抽屉（任务列表）；桌面隐藏 -->
         <button id="nav-toggle" class="nav-toggle" title="任务列表" aria-label="任务列表">☰</button>
+        <button id="exp-open-mobile" class="chip" type="button">实验</button>
         <button id="git-chip" class="git-chip" title="查看当前项目文件夹的 Git 提交记录">
           <span class="git-chip-icon">🌿</span>
           <span id="git-chip-branch" class="git-chip-branch mono">Git</span>
@@ -502,6 +504,35 @@
     <div id="git-branch-list" class="gbp-list"></div>
   </div>
 
+  <section id="experiment-page" class="experiment-page hidden" aria-label="智序实验管理" hidden>
+    <header class="exp-header">
+      <button id="exp-chat" type="button">返回聊天</button>
+      <button id="exp-home" type="button">实验列表</button>
+      <h1>智序 · 实验</h1>
+      <button id="exp-refresh" type="button">刷新</button>
+    </header>
+    <p id="exp-message" class="warning" role="status" aria-live="polite"></p>
+    <div id="exp-list-area">
+      <button id="exp-create" type="button">新建实验</button>
+      <form id="exp-new" hidden></form>
+      <div id="exp-list">正在加载实验…</div>
+    </div>
+    <div id="exp-detail-area" hidden>
+      <h2 id="exp-title"></h2><p id="exp-status" aria-live="polite"></p>
+      <button id="exp-stop" type="button">停止实验</button>
+      <p>依赖：A → B、C → D；第一阶段按 A、B、C、D 串行执行。产物契约通过不等于业务评价通过。</p>
+      <div id="exp-graph" class="exp-graph"></div>
+      <h2>验收</h2><div id="exp-checks"></div>
+      <h2>成员与模型用量</h2><p>仅展示已报告字段的小计；缺失项为未知，暂不计算货币费用。</p><div id="exp-usage"></div>
+      <h2>输入来源与产物</h2><div id="exp-artifacts"></div>
+      <section id="exp-preview" class="exp-preview" hidden aria-label="产物预览"></section>
+      <h2>错误</h2><div id="exp-errors"></div>
+      <h2>执行时间线</h2>
+      <label>记录类型 <select id="exp-stream"><option value="events">节点与工具</option><option value="requests">模型请求与重试</option></select></label>
+      <p>页面保留最近150条摘要，可展开原始记录；完整记录持续保存在运行目录。</p>
+      <div id="exp-log"></div><button id="exp-more" type="button" hidden>加载更多新增记录</button>
+    </div>
+  </section>
   <div id="toast" class="toast hidden" role="status"></div>
   <!-- 消息语义块：先把「实时事件 / 历史回放」归一化成同构 Block，再统一渲染。
        放在 app.js 之前，app.js 里直接用全局 CodingAgentBlocks / CodingAgentRenderBlocks。 -->
@@ -519,5 +550,7 @@
   <script src="queue_state.js"></script>
   <script src="memory_view.js"></script>
   <script src="app.js"></script>
+  <script src="experiments_view.js"></script>
+  <script src="experiments.js"></script>
 </body>
 </html>

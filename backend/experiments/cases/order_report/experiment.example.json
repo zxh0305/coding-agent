@@ -1,0 +1,22 @@
+{
+  "agents": [
+    {
+      "id": "data_worker",
+      "provider_id": "REPLACE_WITH_ENABLED_PROVIDER_ID",
+      "model": "REPLACE_WITH_EXPLICIT_MODEL_NAME",
+      "prompt_file": "prompts/data_worker.md",
+      "allowed_tools": ["read_file", "write_file", "list_dir"],
+      "max_rounds": 12,
+      "timeout": 60
+    },
+    {
+      "id": "report_worker",
+      "provider_id": "REPLACE_WITH_ENABLED_PROVIDER_ID",
+      "model": "REPLACE_WITH_EXPLICIT_MODEL_NAME",
+      "prompt_file": "prompts/report_worker.md",
+      "allowed_tools": ["read_file", "write_file", "list_dir"],
+      "max_rounds": 12,
+      "timeout": 60
+    }
+  ]
+}

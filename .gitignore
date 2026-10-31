@@ -22,3 +22,7 @@ backend/manual/seed_render_fixtures.py
 
 # 会话绑定"未命名工作区"时 agent 的落盘目录（压测/试验产物，运行时生成）
 workspace/
+
+# 智序实验输出与本机成员配置
+/runs/
+backend/experiments/cases/*/experiment.local.json
