@@ -268,6 +268,22 @@ class ApiTestBase(SessionModelBase):
             return e.code, json.loads(e.read() or b"{}")
 
 
+class TestWorkspaceSubmit(ApiTestBase):
+
+    def test_invalid_workspace_does_not_create_session(self):
+        sessions = db.list_sessions(self.uid)
+        status, _ = self.call("POST", "/api/sessions", {"message": "test", "workspace": "/"})
+        self.assertEqual(status, 400)
+        self.assertEqual(db.list_sessions(self.uid), sessions)
+
+    def test_submit_refuses_outdated_workspace(self):
+        self.set_global("p1", "a-small")
+        status, _ = self.call("POST", "/api/sessions/s1/messages",
+                              {"message": "test", "expected_workspace": "/outdated"})
+        self.assertEqual(status, 409)
+        self.assertEqual(db.count_messages("s1"), 0)
+
+
 class TestActiveModelApi(ApiTestBase):
 
     def test_config_without_sid_is_global_default(self):

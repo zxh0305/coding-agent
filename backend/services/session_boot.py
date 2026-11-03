@@ -28,7 +28,7 @@ _build_permission_gate = None
 _vision_backend_for = None
 
 
-def get_session(session_id, user_id: int) -> tuple[str, Agent]:
+def get_session(session_id, user_id: int, *, initial_workspace: str | None = None) -> tuple[str, Agent]:
     """取回（或创建）一个任务会话，返回 (id, Agent)。历史缺失时从数据库恢复。
 
     任务归属校验：传入的 session_id 必须存在且属于该用户，否则一律开新任务
@@ -56,7 +56,7 @@ def get_session(session_id, user_id: int) -> tuple[str, Agent]:
     client.on_retry = (lambda info, _sid=sid:
                        _event_bus(_sid).publish({"type": "api_retry", **info}))
     if not db.session_owner(sid):
-        db.create_session(sid, user_id)
+        db.create_session(sid, user_id, workspace=initial_workspace)
     workspace = _resolve_workspace(user_id, sid)
     if workspace is None:
         # 未绑定项目的会话（用户选了"不绑定项目"）：工具沙箱用系统默认目录，

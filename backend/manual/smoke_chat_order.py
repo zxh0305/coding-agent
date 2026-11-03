@@ -89,6 +89,22 @@ try:
         if page.locator('#chat .bubble.user').count()!=1:failures.append('saved input duplicated on replay')
         if '稍后完成的回答' not in page.locator('#chat').inner_text():failures.append('saved input incorrectly suppresses completed answer')
         page.close()
+        # A slow workspace response cannot enable sending or relabel another project.
+        page = new_page()
+        held = []
+        page.route('**/api/workspace?session_id=s1', lambda route: held.append(route))
+        page.route('**/api/workspace?session_id=s2', lambda route: route.fulfill(
+            json={'custom': True, 'path': '/project/B'}))
+        page.evaluate('void (window.navA = switchSession("s1"))')
+        page.wait_for_function('workspacePending && !chatLoading')
+        expect(page.locator('#send')).to_be_disabled()
+        page.locator('#input').fill('A 的草稿')
+        page.evaluate('switchSession("s2")')
+        expect(page.locator('#ws-short')).to_have_text('B')
+        held[0].fulfill(json={'custom': True, 'path': '/project/A'})
+        page.evaluate('window.navA')
+        expect(page.locator('#ws-short')).to_have_text('B')
+        page.close()
         # A slow history request must not overwrite B or reopen A's event source.
         page=new_page();held=[]
         def history(route):

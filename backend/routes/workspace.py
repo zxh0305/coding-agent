@@ -7,6 +7,7 @@
 from pathlib import Path
 
 import db
+from services.workspace import selected_directory
 
 from routes import busref
 
@@ -22,12 +23,10 @@ class WorkspaceRoutes:
         b = self._body()
         path = str(b.get("path") or "").strip()
         sid = str(b.get("session_id") or "").strip()
-        target = Path(path).expanduser() if path else None
-        if target is None or not target.is_dir():
-            return self._json({"error": "目录不存在或不可用"}, 400)
-        target = target.resolve()
-        if target == Path(target.root):  # Path 与 str 比较为 False，必须同类型比较——
-            return self._json({"error": "不能选择文件系统根目录"}, 400)  # 此前这里用 target.root 裸比，从未拦住过
+        try:
+            target = selected_directory(path)
+        except (ValueError, RuntimeError, OSError) as e:
+            return self._json({"error": str(e)}, 400)
         if sid:
             if db.session_owner(sid) != self.user["id"]:
                 return self._json({"error": "任务不存在或不属于当前用户"}, 404)

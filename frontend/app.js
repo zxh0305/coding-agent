@@ -35,6 +35,7 @@ document.addEventListener("modechange", applyPlaceholder);
 
 let messageSkillRequest = 0, messageSkillTrigger = null, messageSkillBody = "";
 let messageSkillRetry = null;
+let workspacePending = false, workspaceGeneration = 0;
 let chatLoading = false, connectionState = "idle";
 let sessionViewVersion = 0; // Invalidates asynchronous work when the chat view changes.
 let currentSession = null;   // 当前任务（会话）id；null = 将开新任务
@@ -730,6 +731,7 @@ async function newTask(presetProject = null) {
   historyMids = new Set();
   // presetProject = 项目组头「＋」传入的绝对路径：新建即绑定该项目
   saveDraft(currentSession);   // 离开当前会话前存草稿
+  closePicker();
   currentSession = null;
   setComposerArchived(false);
   confirmingDelete = null;
@@ -762,6 +764,7 @@ async function newTask(presetProject = null) {
   usageNow = null;
   updateCtxChip();
   resetStatBar();      // 新任务态：上一会话的统计数字清零并隐藏状态条
+  setWorkspacePending(false);
   if (presetProject) {
     // 直接绑定项目的新任务：工具栏立刻显示项目名（绑定发生在首条消息建会话时）
     wsCustom = true;
@@ -1050,7 +1053,7 @@ function setHistoryLoading(loading) {
   chatLoading = loading;
   document.querySelector(".composer").dataset.loading = String(loading);
   chatEl.setAttribute("aria-busy", String(loading));
-  $("send").disabled = !streaming && (chatLoading || currentSessionArchived);
+  $("send").disabled = !streaming && (chatLoading || workspacePending || currentSessionArchived);
   applyPlaceholder(); refreshConversationHeader();
 }
 
@@ -1058,7 +1061,7 @@ function setComposerArchived(archived) {
   currentSessionArchived = archived;
   const input = $("input"), send = $("send");
   input.disabled = archived;
-  send.disabled = archived || chatLoading;
+  send.disabled = archived || chatLoading || workspacePending;
   // 注意 $() 只按 id 查（getElementById），不能传 ".composer" 这类选择器：
   // 那样必然得到 null，紧接着的 .classList 会抛异常并中断 switchSession 的后续初始化。
   document.querySelector(".composer").classList.toggle("archived-locked", archived);
@@ -1093,6 +1096,7 @@ async function doSwitchSession(id) {
   // 之后，于是整个历史加载期间旧流都是活的。resetStreamState 的注释写着
   // "旧会话的事件流已断"，但那时其实还没断——注释与事实不符。
   closeEvents();
+  closePicker();
   currentSession = id;
   markSessionSeen(id);            // 进入即视为已读：清掉该任务的未读徽标
   resetStreamState();  // 流式状态随旧会话一起复位（事件流已在上一步断开）
@@ -1114,6 +1118,7 @@ async function doSwitchSession(id) {
   // 上下文占用与历史并行拉取、不 await：否则状态条段3 要排在 loadHistoryPage、
   // loadSessions、loadConfig 一串 await 之后，比对话框内容慢半拍才出现。
   // 它自带 currentSession 快照守卫，切走后回来会自行丢弃结果。
+  const workspaceLoaded = loadWorkspace();
   refreshCtx();
   await loadHistoryPage();        // 时间线先行：补发定性（finishBoot）要拿它比对
   if (!isCurrentView()) return;
@@ -1136,7 +1141,8 @@ async function doSwitchSession(id) {
   }
   await loadConfig(id);  // 模型随任务走：切换后工具栏标签跟着换成该任务的模型
   if (!isCurrentView()) return;
-  loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换（内部顺带拉权限模式）
+  await workspaceLoaded;
+  if (!isCurrentView()) return;
   closeGitPop();    // 工作区变了，旧的提交列表不再对应当前项目
   refreshGitChip(); // 按钮上的分支名随任务的工作区更新
   // 恢复本会话上次未发完的排队消息（刷新/关标签页前排队的内容，见 persistQueue）。
@@ -2496,25 +2502,47 @@ async function loadUsage() {
 }
 
 // ---------- 工作区（按任务隔离：带 session_id 查/改该任务的；不带 = 用户默认） ----------
+let confirmedWorkspace;
 let wsCustom = false;  // 新任务视图 = 是否已预绑项目；会话视图 = 该会话是否绑定项目
 
+function setWorkspacePending(pending) {
+  workspacePending = pending;
+  $("send").disabled = !streaming && (pending || chatLoading || currentSessionArchived);
+}
+
+function workspaceGuard() {
+  const generation = ++workspaceGeneration, view = sessionViewVersion, sid = currentSession;
+  return () => generation === workspaceGeneration && view === sessionViewVersion && sid === currentSession;
+}
+
 async function loadWorkspace() {
-  // 新任务视图：不拉用户默认（新任务不预绑任何目录）——显示「选择项目」，
-  // 已通过组头「＋」/chip 预选的显示项目名
+  const isCurrent = workspaceGuard();
   if (!currentSession) {
+    setWorkspacePending(false);
     wsCustom = !!pendingProjectPath;
     setWsLabel(pendingProjectPath || "");
     renderWsChip();
     return;
   }
+  setWorkspacePending(true);
+  wsCustom = false;
+  setWsLabel("");
+  $("ws-short").textContent = "确认项目中…";
   try {
     const w = await api("/api/workspace" + `?session_id=${encodeURIComponent(currentSession)}`);
+    if (!isCurrent()) return;
+    confirmedWorkspace = w.execution_path ?? w.path;
     wsCustom = !!w.custom;
     setWsLabel(w.path);
     renderWsChip();
-    refreshGitChip();  // 工作区变了，分支徽章立刻跟着换（不等下一次切会话）
-    loadPermMode();  // 工作区变了，权限模式跟着工作区走
-  } catch (e) { /* 忽略 */ }
+    setWorkspacePending(false);
+    refreshGitChip();
+    loadPermMode();
+  } catch (e) {
+    if (!isCurrent()) return;
+    $("ws-short").textContent = "重新选择项目";
+    toast("无法确认工作目录：" + e.message);
+  }
 }
 
 function setWsLabel(path) {
@@ -2530,11 +2558,15 @@ function renderWsChip() {
   $("ws-pick").classList.toggle("ws-unset", !wsCustom);
 }
 
+let directoryRequest = 0;
 let mCwd = "", mParent = null, mHome = "";
 
 async function navTo(path) {
+  const request = ++directoryRequest;
   const qs = path ? `?path=${encodeURIComponent(path)}` : "";
+  mCwd = "";
   const info = await api("/api/fs/dirs" + qs);
+  if (request !== directoryRequest) return;
   mCwd = info.path;
   mParent = info.parent;
   mHome = info.home;
@@ -2566,6 +2598,7 @@ async function navTo(path) {
 }
 
 async function openPicker() {
+  $("m-skip").hidden = !!currentSession;
   $("modal").classList.remove("hidden");
   try {
     const cur = $("ws-pick").title;
@@ -2578,11 +2611,13 @@ async function openPicker() {
 
 // 关闭选择弹窗：✕ / 取消 / Esc / 点遮罩空白处都走这里
 function closePicker() {
+  directoryRequest++;
   $("modal").classList.add("hidden");
 }
 
 async function chooseWorkspace() {
   const path = mCwd;
+  if (!path || $("m-choose").disabled) return;
   // 新任务还没有会话：选择=预绑到这个任务的首次发送（建会话时原子绑定）
   if (!currentSession) {
     pendingProjectPath = path;
@@ -2594,17 +2629,31 @@ async function chooseWorkspace() {
     toast(`已选择项目 ${path.split("/").pop()}，发送消息时绑定`);
     return;
   }
+  const isCurrent = workspaceGuard();
+  setWorkspacePending(true);
+  $("m-choose").disabled = true;
   try {
     const w = await api("/api/workspace", {
       method: "POST", body: JSON.stringify({ path, session_id: currentSession }),
     });
+    if (!isCurrent()) return;
+    setWorkspacePending(false);
     wsCustom = true;
+    confirmedWorkspace = w.path;
     setWsLabel(w.path);
     renderWsChip();
+    renderQueueBar();
+    dispatchNextQueued();
     $("modal").classList.add("hidden");
+    refreshGitChip();
+    loadPermMode();
     bubble("note", `（本任务已绑定项目 ${w.path}，之后我的文件操作和命令都在这个目录里进行；其他任务不受影响）`);
   } catch (e) {
+    if (!isCurrent()) return;
     $("m-path").textContent = "切换失败：" + e.message;
+    await loadWorkspace();
+  } finally {
+    $("m-choose").disabled = false;
   }
 }
 
@@ -2614,8 +2663,10 @@ let permMode = "confirm";
 
 async function loadPermMode() {
   if (!currentSession) return;  // 新任务没有会话级模式，保持全局选择
+  const generation = workspaceGeneration, view = sessionViewVersion;
   try {
     const r = await api(`/api/sessions/${encodeURIComponent(currentSession)}/perm_mode`);
+    if (generation !== workspaceGeneration || view !== sessionViewVersion) return;
     permMode = r.mode || "confirm";
     renderPermChip();
   } catch (e) { /* 拉取失败保留当前显示 */ }
@@ -4613,7 +4664,7 @@ function applyEvent(evt, seq) {
 // 重试上一条：与 send() 同一条路径（重画用户气泡 + performSend）。排队中
 // 则进队列；不手动清输入框——输入框在出错时早已是空的。
 function retryLast() {
-  if (!lastSent) return;
+  if (!lastSent || workspacePending) return;
   if (streaming) { queueMessage(lastSent.text, lastSent.payloadAtts, lastSent.skills || []); return; }
   userBubble(lastSent.text, lastSent.outAtts, null, lastSent.skills || []);
   performSend({ text: lastSent.text, payloadAtts: lastSent.payloadAtts, skills: lastSent.skills || [] });
@@ -4626,7 +4677,7 @@ function setStreaming(on) {
   const btn = $("send");
   // 生成中保持可点（此时点 = 停止）；但归档会话例外——只读态不允许被流式
   // 状态变化解锁（真实 bug：归档任务里点停止/回合结束，发送按钮被这里重新点亮）
-  btn.disabled = !on && (currentSessionArchived || chatLoading);
+  btn.disabled = !on && (currentSessionArchived || chatLoading || workspacePending);
   document.querySelector(".composer").dataset.streaming = String(on);
   btn.textContent = on ? "■ 停止" : "发送";
   btn.classList.toggle("stop", on);
@@ -4815,7 +4866,7 @@ function persistQueue() {
       payloadAtts = atts;
       dropped = true;
     }
-    (bySid[it.sessionId] ||= []).push({ text: it.text, payloadAtts, skills: it.skills || [], dropped });
+    (bySid[it.sessionId] ||= []).push({ text: it.text, payloadAtts, skills: it.skills || [], expectedWorkspace: it.expectedWorkspace, dropped });
   }
   try {
     for (const sid of Object.keys(bySid)) {
@@ -4851,9 +4902,9 @@ function restoreQueue(sid) {
     if (!Array.isArray(items)) return 0;
     let n = 0;
     for (const it of items) {
-      if (!it || !it.text) continue;
+      if (!it || (!it.text && !it.payloadAtts?.length)) continue;
       pendingQueue.push({ text: it.text, skills: it.skills || [], payloadAtts: it.payloadAtts || [],
-                          sessionId: sid, immediate: false });
+                          sessionId: sid, expectedWorkspace: it.expectedWorkspace, immediate: false });
       n++;
     }
     return n;
@@ -4882,6 +4933,7 @@ async function runManualCompact() {
 let pendingProjectPath = null;  // 项目组头「＋」/chip 预选的项目：首条消息建会话时绑定
 
 function send() {
+  if (workspacePending) { toast("请先确认工作目录"); return; }
   if (chatLoading) { toast("对话正在加载，请稍后发送", "info"); return; }
   if (currentSessionArchived) return;  // 归档任务只读：兜底拦截（正常情况下输入框已禁用）
   const text = inputEl.value.trim();
@@ -4960,7 +5012,7 @@ function send() {
 }
 
 function queueMessage(text, payloadAtts, skills = []) {
-  pendingQueue.push({ text, payloadAtts, skills, sessionId: currentSession, immediate: false });
+  pendingQueue.push({ text, payloadAtts, skills, sessionId: currentSession, expectedWorkspace: currentSession ? confirmedWorkspace : undefined, immediate: false });
   persistQueue();
   renderQueueBar();
 }
@@ -4986,6 +5038,10 @@ function renderQueueBar() {
     const t = document.createElement("div");
     t.className = "q-text";
     t.textContent = (item.skills?.length ? "✦ " + item.skills.map(s => s.name || s.id).join("、") + " · " : "") + (item.text || "（仅附件）");
+    if (item.expectedWorkspace !== undefined && item.expectedWorkspace !== confirmedWorkspace) {
+      t.textContent = "项目已变更，切回原项目或编辑后发送 · " + t.textContent;
+      row.title = item.expectedWorkspace;
+    }
     row.appendChild(t);
     for (const a of item.payloadAtts) {
       if (a.kind !== "image") continue;
@@ -5036,12 +5092,14 @@ function renderQueueBar() {
 }
 
 function dispatchNextQueued() {
+  if (workspacePending || chatLoading || currentSessionArchived || bootBuffer !== null) return;
   // 派发判据交给 queue_state.nextDispatch（纯函数，有单测）：没在生成、
   // 队首恰好属于当前会话才发。队首属于别的会话时【不跳过】——跳过会破坏
   // FIFO，也会把消息渲染进错误的对话视图（见该函数注释与单测）。
   const d = nextDispatch(refreshTurnState(), currentSession);
   if (!d.ready) return;
   const item = d.item;
+  if (item.expectedWorkspace !== undefined && item.expectedWorkspace !== confirmedWorkspace) return;
   pendingQueue.shift();
   persistQueue();
   renderQueueBar();   // 队列条上的卡片退场，换成正式的已发送气泡
@@ -5117,6 +5175,7 @@ async function performSend(item) {
     skills: item.skills || [],
     // 创建即绑定项目（原子——回合启动前落库）
     workspace: (creating && bindPath) || undefined,
+    expected_workspace: creating ? undefined : (item.expectedWorkspace ?? confirmedWorkspace),
   });
   try {
     if (target) {
@@ -5277,6 +5336,8 @@ document.addEventListener("keydown", (e) => {
 // 之后再想绑定，点工具栏项目 chip 选一次即可
 bind("m-skip", "click", () => {
   closePicker();
+  if (currentSession) return;
+  setWsLabel("");
   pendingProjectPath = null;
   wsCustom = false;
   renderWsChip();
@@ -5438,6 +5499,8 @@ function setGitChipBranch(branch) {
 // 后台轻量刷新按钮上的分支名：不需要打开浮窗也能看到"我在哪个分支"。
 // 只在已绑定项目时发请求；失败静默（不是仓库属正常状态，不该弹错）。
 async function refreshGitChip() {
+  const generation = workspaceGeneration, view = sessionViewVersion, project = pendingProjectPath;
+  const isCurrent = () => generation === workspaceGeneration && view === sessionViewVersion && project === pendingProjectPath;
   if (!currentSession) {
     // 新任务态：会话未创建。预选了项目（组头「＋」/chip）时也立刻显示该项目
     // 的分支名——后端支持 workspace 直传（仅预览，不用等首条消息建会话）。
@@ -5450,18 +5513,22 @@ async function refreshGitChip() {
     }
     try {
       const d = await api("/api/git/summary?" + qs.toString());
+      if (!isCurrent()) return;
       setGitChipBranch(d.ok ? d.branch : "");
       $("git-chip").classList.toggle("warn", !d.ok);
     } catch (e) {
+      if (!isCurrent()) return;
       setGitChipBranch("");
     }
     return;
   }
   try {
     const d = await api("/api/git/summary?" + gitQs());
+    if (!isCurrent()) return;
     setGitChipBranch(d.ok ? d.branch : "");
     $("git-chip").classList.toggle("warn", !d.ok);
   } catch (e) {
+    if (!isCurrent()) return;
     setGitChipBranch("");
   }
 }
@@ -5838,6 +5905,7 @@ document.addEventListener("click", (e) => {
 
 // ---------- 启动 ----------
 function boot() {  // 登录成功（或刷新后 token 仍有效）后的页面初始化；切用户时先清现场
+  closePicker();
   currentSession = null;
   setComposerArchived(false);
   chatEl.innerHTML = "";

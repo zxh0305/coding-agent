@@ -26,6 +26,7 @@ import events
 from events import SSE_HEARTBEAT, sse_frame
 from services.messages import _build_user_message
 from services.session_boot import get_session
+from services.workspace import selected_directory
 
 from routes import busref
 
@@ -73,6 +74,13 @@ class SessionRoutes:
                 continue
         if not _text and not _has_att:
             return self._json({"error": "输入不能为空"}, 400)
+        ws_req = str(body.get("workspace") or "").strip()
+        if sid_or_none and ws_req:
+            return self._json({"error": "请通过工作区选择器修改现有任务的项目"}, 400)
+        try:
+            initial_workspace = str(selected_directory(ws_req)) if ws_req else None
+        except (ValueError, RuntimeError, OSError) as e:
+            return self._json({"error": str(e)}, 400)
         # 技能选择先于建会话校验（resolve 失败返回 400）：坏选择不能留下孤儿会话。
         # 版本钉死——磁盘上的技能若在选择之后被改过，version 对不上就拒发。
         try:
@@ -82,31 +90,16 @@ class SessionRoutes:
         # 会话 id 要先拿到：文本附件需要按会话落盘（data/attachments/<sid>/）。
         # get_session 内部只短持锁（见其注释）；本接口本身毫秒级返回，回合不在
         # 本请求内执行，这里提前取不会拉长锁窗口。
-        sid, agent = get_session(sid_or_none, self.user["id"])
+        sid, agent = get_session(sid_or_none, self.user["id"], initial_workspace=initial_workspace)
+        if sid_or_none and "expected_workspace" in body and body["expected_workspace"] != str(agent.ctx.workspace):
+            return self._json({"error": "工作目录已变更，请重新确认项目后发送"}, 409)
+        if initial_workspace:
+            db.migrate_legacy_workspace_files(sid)
         plain, user_message = _build_user_message(body, sid)
         if user_message is not None and selected_skills:
             user_message["_skills"] = selected_skills
         if not plain:
             return self._json({"error": "输入不能为空"}, 400)
-        # 新任务可随请求携带 workspace：创建即绑定项目。先校验目录再建会话，
-        # 绑定（set_session_workspace）发生在 get_session 构建回合 Agent 之前
-        # ——原子性由"绑定落库 → 构建 Agent → 启动回合线程"的顺序保证。
-        ws_req = str(body.get("workspace") or "").strip()
-        ws_target = None
-        if ws_req:
-            ws_target = Path(ws_req).expanduser().resolve()
-            if not ws_target.is_dir() or ws_target == Path(ws_target.root):
-                return self._json({"error": "工作目录不存在或不可用"}, 400)
-            if sid_or_none:
-                return self._json({"error": "已存在的任务不支持随消息改绑目录，请用 /api/workspace"}, 400)
-        if ws_target is not None:
-            db.set_session_workspace(sid, str(ws_target))
-            # 绑定工作区时顺带兜底：把这个工作区里旧布局遗留的附件/记忆收回到
-            # 数据区（2026-10-12 前的版本曾把它们落进工作区，会污染 git 变动区）。
-            db.migrate_legacy_workspace_files(sid)
-            with busref._lock:
-                busref._agents.pop(sid, None)  # 丢弃无目录时构建的占位实例，下一回合按绑定目录重建
-            agent = get_session(sid, self.user["id"])[1]
         title = next((s["title"] for s in db.list_sessions(self.user["id"]) if s["id"] == sid), "")
         if not title:
             db.set_session_title(sid, plain[:24])

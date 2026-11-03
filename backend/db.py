@@ -631,11 +631,11 @@ def claim_orphan_sessions(user_id: int) -> int:
 # 任务（会话）与消息
 # ---------------------------------------------------------------------------
 
-def create_session(sid: str, user_id: int, title: str = "") -> None:
+def create_session(sid: str, user_id: int, title: str = "", *, workspace: str | None = None) -> None:
     now = time.time()
     with _conn() as conn:
-        conn.execute("INSERT OR IGNORE INTO sessions(id, title, user_id, created, updated) "
-                     "VALUES(?,?,?,?,?)", (sid, title, user_id, now, now))
+        conn.execute("INSERT OR IGNORE INTO sessions(id, title, user_id, created, updated, workspace) "
+                     "VALUES(?,?,?,?,?,?)", (sid, title, user_id, now, now, workspace))
 
 
 def session_owner(sid: str) -> int | None:

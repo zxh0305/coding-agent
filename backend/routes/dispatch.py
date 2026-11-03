@@ -18,6 +18,8 @@ import urllib.parse
 
 import db
 from routes.base import _BodyTooLarge
+from services.workspace import project_directory
+from code_tools import DEFAULT_WORKSPACE
 from services.messages import MAX_BODY_BYTES
 from services.model_resolve import _active_window, _mask, _resolve_active
 
@@ -118,7 +120,9 @@ class DispatchMixin:
             if sid and db.session_owner(sid) != self.user["id"]:
                 return self._json({"error": "任务不存在或不属于当前用户"}, 404)
             if sid:
-                ws, custom = db.get_session_workspace(sid), bool(db.get_session_workspace(sid))
+                ws = project_directory(self.user["id"], sid)
+                return self._json({"path": str(ws or ""), "custom": bool(ws),
+                                   "execution_path": str(ws or DEFAULT_WORKSPACE.resolve())})
             else:
                 ws = db.get_setting(f"default_workspace:{self.user['id']}")
                 custom = bool(ws)
