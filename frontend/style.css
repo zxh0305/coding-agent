@@ -541,18 +541,16 @@ body.side-resizing .sidebar { transition: none; }
    （切会话/刷新回来）默认展开、可手动收起——回来看的正是"进行到哪了"。
    与正文拉开层级：正文 14px/--text，这里 11.5px/更浅的灰。 */
 .trace {
-  align-self: flex-start; max-width: 76%;
-  font-size: 11.5px; color: var(--text-4);
+  align-self: stretch; width: 100%; max-width: 100%; min-width: 0;
+  font-size: 12px; color: var(--text-4);
   background: transparent; border: none;
-  border-bottom: 1px solid var(--border);
-  padding: 2px 0 6px;
-  /* 列向 flex：让思考窗（order:1）恒在说明卡（order:2）之上，与 DOM 顺序
-     解耦——接管快照卡时 noteBox 可能先于 thinkBox 存在，视觉层级不能跟着乱。 */
-  display: flex; flex-direction: column;
+  padding: 2px 0;
+  /* Native details disclosure; content order is maintained in the DOM by both renderers. */
+  display: block;
 }
-.trace summary { cursor: pointer; user-select: none; font-weight: 500; list-style: none; }
-.trace summary::before { content: "›"; display: inline-block; margin-right: 6px; transition: transform .15s; }
-.trace[open] summary::before { transform: rotate(90deg); }
+.trace > summary { cursor: pointer; user-select: none; font-weight: 500; list-style: none; }
+.trace > summary::before { content: "›"; display: inline-block; margin-right: 6px; transition: transform .15s; }
+.trace[open] > summary::before { transform: rotate(90deg); }
 .trace[open] { color: var(--text-3); }
 .trace-line {
   font-family: ui-monospace, Menlo, Consolas, monospace;
@@ -562,10 +560,7 @@ body.side-resizing .sidebar { transition: none; }
   color: var(--text-4);
 }
 
-/* 思考模型的推理流：固定高度的"小监视窗"——软底圆角块，文字只在窗内流动
-   （内部滚动 + 流式贴底），窗子从出现起就占定 140px，页面不随思考变长往下刷。
-   历史回放同一副面孔：每轮思考一个等大的窗，扫读有节奏。
-   子代理嵌套卡里退回内容自适应：嵌套卡本来就折叠/多层，等大窗会把卡撑爆。 */
+/* Legacy reasoning snapshots use content-sized height with bounded inner scrolling. */
 .think-line {
   font-family: ui-monospace, Menlo, Consolas, monospace;
   font-size: 10.5px; line-height: 1.55;
@@ -575,9 +570,8 @@ body.side-resizing .sidebar { transition: none; }
   background: var(--think-bg);
   border: 1px solid var(--think-border);
   border-radius: 8px;
-  /* 固定小窗：思考只在窗内滚动贴底，绝不推页面（收敛不刷屏）。120px 足够
-     放下几行"当前在推什么"，又不至于把过程面板撑成信息墙。 */
-  height: 120px; overflow-y: auto;
+  /* Short content stays compact; long content scrolls inside the bounded viewport. */
+  height: auto; max-height: 180px; overflow-y: auto;
   scrollbar-width: thin; overscroll-behavior: contain;
 }
 
@@ -586,17 +580,14 @@ body.side-resizing .sidebar { transition: none; }
    视觉。用户终态要求：过程（思考+命令）全收进上面这一个框里滚，说明卡沉底
    ——工具行平铺面板会把说明卡顶到页面中间，过程内容铺满全屏。 */
 .proc-line {
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 10.5px; line-height: 1.55;
-  padding: 8px 10px; margin: 6px 0 0 2px;
-  color: var(--text-4);
-  background: var(--think-bg);
-  border: 1px solid var(--think-border);
-  border-radius: 8px;
-  height: 200px; overflow-y: auto;          /* 比纯思考窗高：还要装下工具行 */
+  font-family: inherit; font-size: 12px; line-height: 1.7;
+  width: 100%; min-width: 0; padding: 10px 12px; margin: 8px 0 0;
+  color: var(--text-2); background: var(--panel-soft);
+  border: 1px solid var(--border); border-radius: 8px;
+  height: auto; max-height: 180px; overflow-y: auto;
   scrollbar-width: thin; overscroll-behavior: contain;
-  display: flex; flex-direction: column;    /* 子元素按 order 排：思考段在内容流里 */
 }
+
 .proc-line::-webkit-scrollbar { width: 6px; }
 .proc-line::-webkit-scrollbar-thumb { background: var(--think-border); border-radius: 999px; }
 /* 窗内条目压缩：工具行/结果行/子代理容器在窗内去掉自带的纵向 margin，
@@ -612,25 +603,19 @@ body.side-resizing .sidebar { transition: none; }
 
 /* 窗内分段：整回合所有轮次的思考共居一窗，轮次标题降为窗内小节头 */
 .think-seg-head {
-  font-size: 9.5px; letter-spacing: .05em;
-  color: var(--text-4); opacity: .75;
+  font-size: 11px; letter-spacing: 0;
+  color: var(--text-3);
   margin: 8px 0 2px;
 }
 .think-seg-head:first-child { margin-top: 0; }
-.think-seg-body { white-space: pre-wrap; word-break: break-all; }
+.think-seg-body { white-space: pre-wrap; overflow-wrap: anywhere; }
 /* 进行中快照的末段思考：光标提示还在流（随 running 类一起熄灭） */
 .trace.running .think-seg-body.live::after {
   content: "▍"; color: var(--accent);
   animation: blink 0.9s steps(2) infinite;
 }
-/* 回合定稿后思考窗塌缩成内容高：短思考不留大片空白，长思考仍限高滚动。
-   流式中的窗保持固定高度——思考只在恒定小窗里流动，页面不往下刷。 */
-.trace:not(.running) .think-line {
-  /* 定稿后只需锁住上限：写 height:auto 会把流式期间"内容在窗内向上流动"的
-     滚动位置一并清掉——思考窗会缩回内容高、内容整体回弹到顶部。height 保持
-     流式期间算定的 120px 时，滚动位置保住，收起时停在末段（正在看的那行）。 */
-  max-height: 120px;
-}
+/* Finalized legacy snapshots retain the same content-height bounds. */
+.trace:not(.running) .think-line { height: auto; max-height: 180px; }
 
 /* 过程性正文：中间轮次模型输出的说明文字（不是最终答案）。比正文小一号、
    浅灰，缩进带左边线——与工具行/思考流同属"过程"，展开面板才看得到。
@@ -873,7 +858,7 @@ body.side-resizing .sidebar { transition: none; }
   display: flex; flex-direction: column; max-width: 76%;
 }
 .msg-group.is-user { align-self: flex-end; align-items: flex-end; }
-.msg-group:not(.is-user) { align-self: flex-start; align-items: flex-start; }
+.msg-group:not(.is-user) { align-self: flex-start; align-items: flex-start; width: 100%; }
 .msg-group .bubble { max-width: 100%; }  /* 76% 上限移到组上，气泡在组内铺满 */
 
 /* 动作条本体：一排小幽灵按钮 */
@@ -2600,13 +2585,13 @@ body.docs-resizing .docs-panel { transition: none; }
 #sk-empty {padding:45px 15px;}#sk-empty h3 {font-size:19px;}#sk-empty p {color:var(--text-3);font-size:13px;line-height:1.9;max-width:380px;}.sk-foot {border-top:1px solid var(--border);padding:12px 24px;font-size:11px;color:var(--text-3);}
 @media(max-width:640px){.sk-layout{grid-template-columns:1fr;}.sk-side{max-height:180px;border-right:0;border-bottom:1px solid var(--border);}.sk-editor{max-height:45vh;}.sk-head{padding:16px;}.sk-foot{padding:10px 16px;}}
 
-.ub-skill{font-size:12px;margin-top:8px;}.ub-skill summary{cursor:pointer;opacity:.8;}.ub-skill pre{white-space:pre-wrap;font:inherit;line-height:1.7;max-height:260px;overflow:auto;padding:10px;border:1px solid var(--border);border-radius:8px;}
+
 
 /* Fast selection stays near the composer; editing remains in the full manager. */
 .skill-favorites {display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin:0 0 8px;font-size:11px;color:var(--text-3);}
 .skill-favorites button {border:1px solid var(--border);border-radius:15px;background:transparent;color:var(--text-2);padding:5px 10px;font-size:11px;cursor:pointer;}
 .skill-favorites button[aria-pressed="true"] {background:var(--accent-weak);border-color:var(--accent);color:var(--text);}
-.skill-picker {position:fixed;inset:auto;margin:0;box-sizing:border-box;padding:14px;border:1px solid var(--border);border-radius:14px;background:var(--bg);color:var(--text);box-shadow:0 12px 40px #0002;overflow:auto;font-size:13px;}
+.skill-picker {position:fixed;inset:auto;margin:0;box-sizing:border-box;padding:14px;border:1px solid var(--border);border-radius:14px;background:var(--panel);color:var(--text);box-shadow:var(--shadow-md);overflow:auto;font-size:13px;}
 .skill-picker::backdrop {background:transparent;}
 .skill-picker header,.skill-picker footer {display:flex;align-items:center;justify-content:space-between;gap:10px;}
 .skill-picker header {margin-bottom:12px;}.skill-picker footer {border-top:1px solid var(--border);padding-top:10px;margin-top:10px;}
@@ -2621,6 +2606,179 @@ body.docs-resizing .docs-panel { transition: none; }
 #sp-detail label {display:inline-flex;align-items:center;margin:5px 9px 3px 0;gap:5px;font-size:12px;}#sp-detail details {margin:12px 0;}
 #sp-detail pre {white-space:pre-wrap;overflow-wrap:anywhere;max-height:160px;overflow:auto;font:inherit;font-size:12px;line-height:1.7;}
 #sp-status:empty {display:none;}#sp-status {font-size:12px;line-height:1.6;color:var(--text-3);}
-.sk-manage-row {display:flex;align-items:center;gap:4px;}.sk-manage-row .sk-row {flex:1;min-width:0;}.sk-manage-row > button:last-child {padding:6px;}
+.sk-manage-row { display: flex; align-items: flex-start; gap: 0; border-radius: 8px; margin-bottom: 3px; }
+.sk-manage-row:hover { background: var(--hover-soft); }
+.sk-manage-row.active { background: var(--accent-weak); box-shadow: inset 2px 0 0 var(--accent); }
+.skills-dialog .sk-manage-row .sk-row { flex: 1; min-width: 0; width: auto; margin: 0; padding: 10px 10px 11px 12px; border: 0; border-radius: 0; background: transparent; }
+.sk-manage-row .sk-row strong { font-size: 13px; font-weight: 500; line-height: 1.6; }
+.sk-manage-row .sk-row span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font-size: 11px; line-height: 1.6; margin-top: 3px; }
+.skills-dialog .sk-favorite, .skill-picker .sk-favorite { display: grid; place-items: center; flex: 0 0 28px; width: 28px; height: 28px; border: 0; padding: 6px; border-radius: 6px; background: transparent; color: var(--text-3); }
+.sk-manage-row > .sk-favorite { margin: 8px 5px 0 0; }
+.sk-favorite svg { display: block; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linejoin: round; }
+.skills-dialog .sk-favorite:hover, .skill-picker .sk-favorite:hover { background: var(--accent-weak); color: var(--link); }
+.skills-dialog .sk-favorite[aria-pressed="true"], .skill-picker .sk-favorite[aria-pressed="true"] { color: var(--accent); }
+.sk-favorite[aria-pressed="true"] svg { fill: currentColor; }
+[data-mode="mobile"] .skills-dialog .sk-favorite, [data-mode="mobile"] .skill-picker .sk-favorite { width: 34px; height: 34px; flex-basis: 34px; }
+
 #sk-advanced {font-size:12px;color:var(--text-3);margin:0 0 14px;}#sk-advanced summary {cursor:pointer;margin-bottom:8px;}
 @media(max-width:640px){.skill-picker{font-size:14px;}#sp-list{max-height:220px;}.skill-picker button{min-height:36px;}.skill-favorites button{padding:7px 10px;}}
+
+/* Personal-use layout: quieter surfaces, bounded reading width, stable controls. */
+body, .layout { height: 100dvh; }
+.main { min-height: 0; }
+.sidebar { min-height: 0; }
+.side-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; padding: 16px 12px 10px; }
+.side-head .brand { font-size: 14px; letter-spacing: -.3px; white-space: nowrap; }
+#side-collapse { grid-column: 2; grid-row: 1; }
+#new-task { grid-column: 1 / -1; grid-row: 2; text-align: left; padding: 10px 12px; border-radius: 9px; font-weight: 500; color: var(--text); box-shadow: var(--shadow-sm); }
+#exp-open { margin: 4px 12px 0; padding: 8px 12px; text-align: left; background: transparent; border-color: transparent; }
+.task-label { padding: 6px 16px; font-size: 11px; }
+.task-list { padding: 0 10px 12px; }
+.task { padding: 10px 11px; border: 1px solid transparent; margin-bottom: 4px; border-radius: 9px; }
+.task.active { border-color: var(--accent-weak-border); background: var(--accent-weak); }
+.t-title.has-prev { gap: 4px; }
+.user-btn { margin: 10px; border-radius: 10px; }
+.top-bar { position: relative; inset: auto; flex: 0 0 64px; width: 100%; height: 64px; display: flex; align-items: center; gap: 8px; padding: 0 24px; border-bottom: 1px solid var(--border); background: var(--bg-alt); z-index: 10; }
+.top-bar .git-chip { position: static; flex: 0 0 auto; box-shadow: none; background: var(--panel); padding: 6px 10px; font-size: 11px; }
+.conversation-heading { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 4px; }
+#conversation-title { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conversation-status { font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conversation-status::before { content: ''; display: inline-block; width: 5px; height: 5px; border-radius: 50%; background: var(--border-strong); margin: 0 6px 1px 0; }
+.conversation-status[data-state="connected"]::before { background: var(--success); }
+.conversation-status[data-state="running"]::before { background: var(--accent); }
+.conversation-status[data-state="reconnecting"] { color: var(--warning-strong); }
+.conversation-status[data-state="reconnecting"]::before { background: var(--warning); }
+.chat { min-height: 0; padding: 28px max(24px, calc((100% - 800px) / 2)); gap: 14px; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.empty-hint { align-self: center; margin: auto 0; padding: 40px 0; width: min(100%, 440px); color: var(--text-2); }
+.empty-mark { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; margin-bottom: 22px; border: 1px solid var(--accent-weak-border); border-radius: 13px; background: var(--accent-weak); color: var(--accent); font-size: 22px; }
+.empty-hint h1 { color: var(--text); font-size: 26px; letter-spacing: -.7px; font-weight: 600; margin-bottom: 12px; }
+.empty-hint p { font-size: 13px; line-height: 1.9; max-width: 390px; }
+.empty-shortcuts { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 26px; font-size: 11px; color: var(--text-3); }
+kbd { font: inherit; font-size: 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel); padding: 2px 5px; }
+.msg-group { max-width: 100%; }
+.msg-group.is-user { max-width: 76%; }
+.bubble { font-size: 14px; line-height: 1.75; padding: 13px 16px; }
+.bubble.user { background: var(--accent-weak); color: var(--text); border: 1px solid var(--accent-weak-border); border-radius: 14px 14px 4px 14px; }
+.bubble.assistant { width: 100%; padding: 16px 18px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow-sm); }
+
+.composer { flex-shrink: 0; margin: 0 max(24px, calc((100% - 800px) / 2)) 20px; padding: 14px 16px 10px; border-color: var(--border-input); border-radius: 16px; box-shadow: 0 3px 14px rgba(20, 25, 40, .035); }
+.composer:focus-within { border-color: var(--accent-weak-border); box-shadow: 0 0 0 2px var(--accent-weak); }
+.composer textarea { min-height: 64px; line-height: 1.7; padding: 3px 1px 12px; }
+.toolbar { display: flex; flex-wrap: nowrap; align-items: flex-end; gap: 10px; overflow: visible; padding: 0; }
+.toolbar-tools { display: flex; flex: 1; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
+.toolbar .chip { border-radius: 8px; padding: 6px 9px; font-size: 11px; min-height: 30px; }
+.toolbar #send { position: static; flex: 0 0 auto; min-width: 72px; min-height: 34px; padding: 7px 15px; border-radius: 9px; }
+button:disabled { cursor: not-allowed; }
+.toolbar #send:disabled { opacity: .45; }
+button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.stat-bar { margin-top: 8px; }
+.skill-favorites { padding-bottom: 6px; margin-bottom: 6px; }
+.skill-tag { border-radius: 8px; }
+.skill-tag button { padding: 6px 8px; }
+.queue-item { border-radius: 8px; }
+.trace { border-radius: 10px; }
+@container (max-width: 640px) {
+  .chat { padding-inline: 18px; }
+  .composer { margin-inline: 16px; }
+  .msg-group { max-width: 96%; }
+}
+[data-mode="mobile"] .top-bar { position: relative; flex-basis: 60px; height: 60px; min-height: 60px; padding: 7px 12px; pointer-events: auto; background: var(--bg-alt); }
+[data-mode="mobile"] .top-bar #git-chip { margin-left: 0; }
+[data-mode="mobile"] .conversation-heading { min-width: 50px; }
+[data-mode="mobile"] #conversation-title { font-size: 12px; }
+[data-mode="mobile"] .conversation-status { font-size: 10px; }
+[data-mode="mobile"] .top-bar .git-chip { padding: 6px 8px; }
+[data-mode="mobile"] .chat { padding: 18px 16px; }
+[data-mode="mobile"] .empty-hint { margin: auto 0; padding: 24px 8px; text-align: left; }
+[data-mode="mobile"] .empty-hint h1 { font-size: 23px; }
+[data-mode="mobile"] .empty-shortcuts { display: none; }
+[data-mode="mobile"] .composer { margin: 0 10px calc(10px + env(safe-area-inset-bottom, 0px)); padding: 12px 12px 9px; }
+[data-mode="mobile"] .toolbar { overflow: visible; padding: 0; gap: 8px; }
+[data-mode="mobile"] .toolbar-tools { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; padding: 3px 1px; -webkit-overflow-scrolling: touch; }
+[data-mode="mobile"] .toolbar .chip { padding: 6px 9px; }
+[data-mode="mobile"] .toolbar #send { min-width: 64px; min-height: 36px; padding: 7px 12px; }
+[data-mode="mobile"] .msg-group { max-width: 100%; }
+[data-mode="mobile"] .msg-group.is-user { max-width: 90%; }
+@media (prefers-reduced-motion: reduce) {
+  .t-state.running, .status-dot.running { animation: none; }
+  .sidebar, .chip, .msg-actions { transition: none; }
+}
+/* Experiment controls remain available in the drawer; keep the mobile header uncluttered. */
+[data-mode="mobile"] #exp-open-mobile { display: none; }
+[data-mode="mobile"] .conversation-heading { min-width: 0; }
+[data-mode="mobile"] #git-chip-branch { max-width: 48px; }
+@media (max-width: 380px) {
+  [data-mode="mobile"] #git-chip-branch { display: none; }
+}
+
+/* Stable disclosure geometry: collapsed process content must reserve no space. */
+.trace:not([open]) > :not(summary) { display: none; }
+.trace > summary { padding: 4px 0; line-height: 1.6; }
+.trace[open] > summary { margin-bottom: 2px; }
+.trace .proc-line > :first-child { margin-top: 0; }
+.trace .proc-line > :last-child { margin-bottom: 0; }
+.task-standard { position: relative; align-items: flex-start; }
+.task-standard .t-title { min-width: 0; }
+.t-heading { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.t-heading .t-name { flex: 1; min-width: 0; font-weight: 500; }
+.t-heading .t-time { flex: 0 0 auto; min-width: 46px; font-size: 10px; text-align: right; }
+.task-standard .t-prev { line-height: 1.5; }
+.task-standard .t-state { margin-top: 2px; }
+.task-actions { display: flex; gap: 2px; position: absolute; top: 7px; right: 8px; opacity: 0; pointer-events: none; background: inherit; border-radius: 6px; }
+.task-actions .t-del { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 2px; opacity: 1; }
+.task-standard:hover .task-actions, .task-standard:focus-within .task-actions { opacity: 1; pointer-events: auto; }
+.task-standard:hover .t-time, .task-standard:focus-within .t-time { visibility: hidden; }
+.group-head { font-size: 11px; line-height: 1.5; padding: 12px 10px 5px; }
+.gh-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+[data-mode="mobile"] .task-standard { min-height: 62px; }
+[data-mode="mobile"] .task-actions { opacity: 1; pointer-events: auto; top: auto; bottom: 6px; }
+[data-mode="mobile"] .task-standard .t-prev { padding-right: 48px; }
+[data-mode="mobile"] .task-standard:hover .t-time { visibility: visible; }
+
+/* Historical skill snapshots live in the top layer, never in message flow. */
+button.ub-skill { display: inline-flex; align-items: center; max-width: 100%; margin: 8px 4px 0 0; padding: 4px 9px;
+  border: 1px solid var(--accent-weak-border); border-radius: 7px; background: var(--panel); color: var(--text-2);
+  font: inherit; font-size: 11px; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+button.ub-skill:hover, button.ub-skill[aria-expanded="true"] { color: var(--link); background: var(--accent-weak); }
+button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.message-skill-popover { position: fixed; inset: auto; margin: 0; padding: 16px; border: 1px solid var(--border);
+  border-radius: 12px; background: var(--panel); color: var(--text); box-shadow: var(--shadow-md); overflow-y: auto; }
+.message-skill-popover::backdrop { background: transparent; }
+.message-skill-popover:popover-open { animation: skill-snapshot-in .12s ease-out; }
+.message-skill-popover header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.message-skill-popover header p { font-size: 11px; color: var(--text-3); margin-bottom: 5px; }
+.message-skill-popover h3 { font-size: 14px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
+.message-skill-popover button { border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px; background: transparent; color: var(--text-2); cursor: pointer; font-size: 11px; }
+.message-skill-popover button:hover { background: var(--hover-soft); }
+.message-skill-meta { margin-top: 10px; font-size: 11px; color: var(--text-3); }
+.message-skill-meta code { font: inherit; font-family: ui-monospace, monospace; margin-left: 5px; }
+#message-skill-body { margin: 12px 0; padding: 12px; min-height: 64px; max-height: min(250px, 40dvh); overflow-y: auto;
+  white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 12px; line-height: 1.8;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel-soft); overscroll-behavior: contain; }
+.message-skill-popover footer { display: flex; align-items: center; gap: 8px; }
+#message-skill-status { flex: 1; font-size: 11px; color: var(--text-3); }
+@keyframes skill-snapshot-in { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .message-skill-popover:popover-open { animation: none; } }
+[data-mode="mobile"] .message-skill-popover button { min-height: 34px; }
+
+/* Skill settings: scope, bounded instruction card, then explicit actions. */
+#sp-detail .sp-back { padding: 4px 0; font-size: 11px; color: var(--text-3); }
+#sp-detail h3 { margin: 10px 0 14px; font-size: 16px; line-height: 1.5; }
+#sp-detail fieldset { margin: 0; padding: 9px 12px 10px; background: var(--panel-soft); }
+#sp-detail legend { padding: 0 4px; color: var(--text-2); font-size: 11px; }
+#sp-detail fieldset label { margin: 3px 12px 0 0; gap: 6px; line-height: 1.7; }
+#sp-detail input[type="radio"] { accent-color: var(--accent); }
+#sp-detail .sp-scope-help { margin: 8px 0 14px; font-size: 11px; line-height: 1.7; }
+.sp-instruction { margin: 12px 0 14px; }
+.sp-instruction-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
+.sp-instruction-heading strong { font-size: 12px; font-weight: 500; }
+.sp-instruction-heading span { font-size: 10px; color: var(--text-3); }
+#sp-detail .sp-instruction pre { margin: 0; padding: 11px 12px; max-height: 180px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-soft); font-size: 12px; line-height: 1.8; overscroll-behavior: contain; }
+#sp-detail .sp-instruction pre:focus-visible { outline: 2px solid var(--accent-weak-border); outline-offset: 1px; }
+.sp-detail-actions { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 12px; border-top: 1px solid var(--border); }
+#sp-detail .sp-detail-actions button { flex: 1; min-width: 76px; border: 1px solid var(--border); padding: 7px 8px; font-size: 11px; background: var(--panel); }
+#sp-detail .sp-detail-actions button:hover { background: var(--hover-soft); }
+.skill-picker footer { padding-top: 12px; margin-top: 14px; }
+.skill-picker footer button { font-size: 11px; color: var(--text-2); }
+[data-mode="mobile"] .bubble.assistant { padding: 14px 15px; }
+@media (max-height: 650px) { #sp-detail .sp-instruction pre { max-height: 120px; } }

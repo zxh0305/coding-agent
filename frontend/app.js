@@ -21,11 +21,22 @@ const INPUT_PLACEHOLDER = {
 };
 function applyPlaceholder() {
   if (!inputEl) return;
-  inputEl.placeholder = INPUT_PLACEHOLDER[isMobileMode() ? "mobile" : "desktop"];
+  const composer = document.querySelector(".composer");
+  inputEl.placeholder = composer?.classList.contains("archived-locked")
+    ? "该任务已归档（只读），恢复后可继续对话"
+    : composer?.dataset.loading === "true"
+      ? "正在加载对话，可以先输入，加载完成后发送"
+      : composer?.dataset.streaming === "true"
+        ? "继续输入以排队后续修改"
+        : INPUT_PLACEHOLDER[isMobileMode() ? "mobile" : "desktop"];
 }
 applyPlaceholder();
 document.addEventListener("modechange", applyPlaceholder);
 
+let messageSkillRequest = 0, messageSkillTrigger = null, messageSkillBody = "";
+let messageSkillRetry = null;
+let chatLoading = false, connectionState = "idle";
+let sessionViewVersion = 0; // Invalidates asynchronous work when the chat view changes.
 let currentSession = null;   // 当前任务（会话）id；null = 将开新任务
 let streaming = false;       // 正在生成回答：此时发送按钮变身停止按钮（由 turn_start/turn_end 事件驱动）
 let contextWindow = 262144;  // 上下文容量显示上限（/api/config 提供）
@@ -53,6 +64,7 @@ function setWho(name) {
 }
 
 function showLogin() {
+  sessionViewVersion++;
   if (window.ExperimentsUI) window.ExperimentsUI.close();
   if (window.SkillUI) SkillUI.reset();
   authToken = "";
@@ -144,6 +156,7 @@ const msgRawText = new WeakMap();
 // 回答气泡：assistant 走 Markdown 渲染，user/error/note 保持纯文本。
 // 纯文本路径用 textContent —— 与旧行为逐字节一致，不引入任何回归。
 function buildBubble(className, text) {
+  if (text) hideWelcome();
   const div = document.createElement("div");
   div.className = `bubble ${className}`;
   if (className === "assistant") {
@@ -379,6 +392,7 @@ async function loadSessions() {
     sessionsLoadFailed = false;
     sessionsLoadError = "";
     sessionsCache = Array.isArray(list) ? list : [];
+    refreshConversationHeader();
   } catch (e) {
     // 拉取失败必须显式说出来：接口 500 时列表区原先只剩"还没有任务，发一条消息
     // 即创建"，用户读到的结论是"任务数据丢了"，而真因只在 backend 日志里
@@ -537,7 +551,9 @@ function taskRow(s, list) {
   if (s.preview) {  // 预览行：最后一条消息的一句话摘要（无消息的会话不占位）
     const prev = document.createElement("span");
     prev.className = "t-prev";
-    prev.textContent = s.preview;
+    prev.textContent = String(s.preview).replace(/\*\*|__|`/g, "")
+      .replace(/^\s{0,3}#{1,6}\s+/, "").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+      .replace(/\s+/g, " ").trim();
     title.appendChild(prev);
     title.classList.add("has-prev");
   }
@@ -571,7 +587,12 @@ function taskRow(s, list) {
   });
   // 注意 state 可能是 null（idle 无徽标）：appendChild(null) 会插入字面量
   // "null"，必须过滤掉空值再 append。
-  li.append(...[title, state, time, rename, del].filter(Boolean));
+  li.classList.add("task-standard");
+  const heading = document.createElement("div"); heading.className = "t-heading";
+  heading.append(name, time); title.prepend(heading);
+  const actions = document.createElement("span"); actions.className = "task-actions";
+  actions.append(rename, del);
+  li.append(...[title, state, actions].filter(Boolean));
   li.title = s.title || "";
   li.addEventListener("click", () => {
     confirmingDelete = null;
@@ -696,6 +717,7 @@ async function doDeleteSession(id) {
     rebuildRail();  // 当前任务被删：导航条收起
     refreshCtx();
     closeEvents();
+    historyCompletedMids = new Set();
     historyMids = new Set();
     loadConfig();  // 任务没了：标签回到全局默认（新任务的初始模型）
   }
@@ -703,9 +725,13 @@ async function doDeleteSession(id) {
 }
 
 async function newTask(presetProject = null) {
+  sessionViewVersion++;
+  historyCompletedMids = new Set();
+  historyMids = new Set();
   // presetProject = 项目组头「＋」传入的绝对路径：新建即绑定该项目
   saveDraft(currentSession);   // 离开当前会话前存草稿
   currentSession = null;
+  setComposerArchived(false);
   confirmingDelete = null;
   pendingProjectPath = presetProject;
   // 【权限模式必须复位】permMode 是全局变量，进会话时由 loadPermMode() 刷成
@@ -897,15 +923,19 @@ async function jumpToItem(item) {
 // 取回的是窗口内 mid/ord/role 索引，正文仍由常规分页接口提供——这里按窗口
 // 下界做一次 before_ord 分页，把整页拉回来（复用手头已有的渲染路径）。
 async function loadWindowAround(ord) {
+  const sid = currentSession, viewVersion = sessionViewVersion;
+  const isCurrentView = () => currentSession === sid && sessionViewVersion === viewVersion;
   try {
     const qs = new URLSearchParams({ around_ord: String(ord), limit: "50" });
-    const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?` + qs);
+    const data = await api(`/api/sessions/${encodeURIComponent(sid)}/messages?` + qs);
+    if (!isCurrentView()) return;
     const win = data.window || [];
     if (!win.length) return;
     // 窗口下界之前的一页：保证目标条之前的上下文连续（向上翻页入口也能用）
     const lower = win[0].ord;
-    const page = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?` +
+    const page = await api(`/api/sessions/${encodeURIComponent(sid)}/messages?` +
       new URLSearchParams({ before_ord: String(lower), limit: "100" }));
+    if (!isCurrentView()) return;
     // 目标所在的那一段必须也进 DOM，否则 railFindNode 永远找不到目标 mid。
     // 注意：around_ord 返回的 window 每条只有 {mid, ord, role}——【没有正文、
     // tool_calls、stats、trace】，它只是用来定位窗口边界的索引。绝不能把 win 直接
@@ -914,8 +944,9 @@ async function loadWindowAround(ord) {
     // 「点定位条冒出一堆空白方块」的根因。
     // 正确做法：拿窗口上界再走一次常规分页，由后端完成与首屏一致的过滤与字段组装。
     const upper = win[win.length - 1].ord;
-    const page2 = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?` +
+    const page2 = await api(`/api/sessions/${encodeURIComponent(sid)}/messages?` +
       new URLSearchParams({ before_ord: String(upper + 1), limit: "100" }));
+    if (!isCurrentView()) return;
     // 合并两段、按 ord 升序、按 mid 去重（避免与已加载区间重叠重复渲染）。
     const merged = [...(page.messages || []), ...(page2.messages || [])];
     const seen = new Set();
@@ -958,8 +989,10 @@ function insertHistoryBefore(messages) {
 // 拉取最新的全量用户提问索引（回合结束后调用：本轮提问此刻才落库）。
 async function refreshUserIndex() {
   if (!currentSession) return;
+  const sid = currentSession, viewVersion = sessionViewVersion;
   try {
-    const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?limit=1`);
+    const data = await api(`/api/sessions/${encodeURIComponent(sid)}/messages?limit=1`);
+    if (currentSession !== sid || viewVersion !== sessionViewVersion) return;
     if (Array.isArray(data.user_index)) { railItems = data.user_index; scheduleRail(); }
   } catch (e) { /* 静默：导航条不是关键路径，失败不影响对话 */ }
 }
@@ -982,6 +1015,7 @@ function tagLastUntaggedUser(mid) {
 chatEl.addEventListener("scroll", syncRailActive, { passive: true });
 
 // ---------- 历史消息回放（分页加载 + 外置归档） ----------
+const historyLoads = new Set();
 let histOldestOrd = null;  // 已加载最旧一条消息的 ord（向上翻页游标）
 let histHasMore = false;   // 其上是否还有更早的消息
 
@@ -996,17 +1030,42 @@ function markSessionSeen(id) {
 // 当前会话是否处于归档态（切会话/归档/恢复后更新）：归档任务只读——输入框置灰
 let currentSessionArchived = false;
 
+function refreshConversationHeader() {
+  const title = $("conversation-title"), status = $("conversation-status");
+  if (!title || !status) return;
+  const session = sessionsCache.find(s => s.id === currentSession);
+  title.textContent = currentSession ? (session?.title || "当前任务") : "新任务";
+  title.title = title.textContent;
+  let label = "准备就绪", state = "idle";
+  if (currentSessionArchived) { label = "已归档 · 只读"; state = "archived"; }
+  else if (chatLoading) { label = "正在加载对话"; state = "loading"; }
+  else if (connectionState === "reconnecting") { label = "连接中断 · 正在重连"; state = "reconnecting"; }
+  else if (streaming) { label = "正在处理 · 可继续输入排队"; state = "running"; }
+  else if (connectionState === "connecting") { label = "正在连接"; state = "connecting"; }
+  else if (currentSession && connectionState === "connected") { label = "已连接"; state = "connected"; }
+  status.textContent = label; status.dataset.state = state;
+}
+
+function setHistoryLoading(loading) {
+  chatLoading = loading;
+  document.querySelector(".composer").dataset.loading = String(loading);
+  chatEl.setAttribute("aria-busy", String(loading));
+  $("send").disabled = !streaming && (chatLoading || currentSessionArchived);
+  applyPlaceholder(); refreshConversationHeader();
+}
+
 function setComposerArchived(archived) {
   currentSessionArchived = archived;
   const input = $("input"), send = $("send");
   input.disabled = archived;
-  send.disabled = archived;
+  send.disabled = archived || chatLoading;
   // 注意 $() 只按 id 查（getElementById），不能传 ".composer" 这类选择器：
   // 那样必然得到 null，紧接着的 .classList 会抛异常并中断 switchSession 的后续初始化。
   document.querySelector(".composer").classList.toggle("archived-locked", archived);
   input.placeholder = archived
     ? "该任务已归档（只读），↩ 恢复后可继续对话"
-    : "输入问题或任务，Enter 发送（Shift+Enter 换行）";
+    : INPUT_PLACEHOLDER[isMobileMode() ? "mobile" : "desktop"];
+  applyPlaceholder(); refreshConversationHeader();
 }
 
 // 切会话的对外入口：只负责兜住异常，实现在 doSwitchSession。
@@ -1023,6 +1082,8 @@ async function switchSession(id) {
 
 async function doSwitchSession(id) {
   if (id === currentSession) return;
+  const viewVersion = ++sessionViewVersion;
+  const isCurrentView = () => currentSession === id && sessionViewVersion === viewVersion;
   saveDraft(currentSession);     // 离开前：把输入框内容存进旧会话的草稿
   // 【必须先关旧流，再清界面】下面 loadHistoryPage() 是 await（一次历史请求），
   // 期间如果旧会话的 es 还活着，它推来的 answer_delta 会被 applyEvent 直接画进
@@ -1048,15 +1109,18 @@ async function doSwitchSession(id) {
   restoreDraft(id);              // 进入后：载入该会话自己的草稿（不串到别的会话）
   histOldestOrd = null;
   histHasMore = false;
+  historyCompletedMids = new Set();
   historyMids = new Set();        // 补发去重基准随任务重建
   // 上下文占用与历史并行拉取、不 await：否则状态条段3 要排在 loadHistoryPage、
   // loadSessions、loadConfig 一串 await 之后，比对话框内容慢半拍才出现。
   // 它自带 currentSession 快照守卫，切走后回来会自行丢弃结果。
   refreshCtx();
   await loadHistoryPage();        // 时间线先行：补发定性（finishBoot）要拿它比对
+  if (!isCurrentView()) return;
   loadTodos();                    // 本会话的任务清单（若有）：驱动右上角 📋 入口
   openEvents(id);                 // 再接事件流：断线/刷新期间的回合靠 since 补发接上
   await loadSessions();
+  if (!isCurrentView()) return;
   // 归档任务可查看不可输入：按服务端最新状态精调（上面已用旧 cache 预设过）。
   // sessionsCache 只装未归档列表：从归档区点进来的会话在这里查不到（meta=undefined），
   // 保持"归档"兜底加锁（宁可误锁不可误放），再异步向归档列表确认真实状态。
@@ -1071,6 +1135,7 @@ async function doSwitchSession(id) {
     }).catch(() => {});  // 确认失败维持加锁态：只读比可写安全
   }
   await loadConfig(id);  // 模型随任务走：切换后工具栏标签跟着换成该任务的模型
+  if (!isCurrentView()) return;
   loadWorkspace();  // 每个任务有自己的工作区：切换后工具栏跟着换（内部顺带拉权限模式）
   closeGitPop();    // 工作区变了，旧的提交列表不再对应当前项目
   refreshGitChip(); // 按钮上的分支名随任务的工作区更新
@@ -1106,11 +1171,20 @@ function closeGitPop() {
 
 async function loadHistoryPage() {
   if (!currentSession) return;
+  const sid = currentSession, viewVersion = sessionViewVersion;
+  const cursor = histOldestOrd;
+  const requestKey = `${viewVersion}:${sid}:${cursor}`;
+  if (historyLoads.has(requestKey)) return;
+  historyLoads.add(requestKey);
+  const initialLoad = cursor == null;
+  if (initialLoad) setHistoryLoading(true);
+  const isCurrentView = () => currentSession === sid && sessionViewVersion === viewVersion;
   try {
     // 默认最近 100 条；向上翻页带 before_ord（已加载最旧一条的 ord）
     const qs = new URLSearchParams({ limit: "100" });
     if (histOldestOrd != null) qs.set("before_ord", histOldestOrd);
-    const data = await api(`/api/sessions/${encodeURIComponent(currentSession)}/messages?` + qs);
+    const data = await api(`/api/sessions/${encodeURIComponent(sid)}/messages?` + qs);
+    if (!isCurrentView()) return;
     histHasMore = !!data.has_more;
     // 全量用户提问索引：导航条据此一次性画出整个会话的提问（含尚未加载的）
     if (Array.isArray(data.user_index)) {
@@ -1132,6 +1206,8 @@ async function loadHistoryPage() {
         }
       }
     }
+    hideWelcome();
+    recordCompletedHistory(data.messages);
     for (const m of data.messages) {
       if (m.mid) historyMids.add(m.mid);  // 事件流补发去重的比对基准
       // 逐条隔离：单条消息渲染异常（脏数据）不应连累其后整批消息不渲染——
@@ -1172,6 +1248,7 @@ async function loadHistoryPage() {
     updateLoadOlder();
     scheduleRail();  // 历史装载完毕：导航条按新消息重建
   } catch (e) {
+    if (!isCurrentView()) return;
     // 历史拉取失败不能静默：以前这里是空 catch，任何渲染/接口异常都被吞掉，
     // 表现成"点进会话一片空白且控制台无痕"，排查代价极高。现在至少留痕 + 给
     // 用户一条可见提示，不再让故障隐形。
@@ -1180,6 +1257,9 @@ async function loadHistoryPage() {
     err.className = "bubble error";
     err.textContent = "历史消息加载失败：" + (e && e.message ? e.message : e);
     chatEl.appendChild(err);
+  } finally {
+    historyLoads.delete(requestKey);
+    if (initialLoad && isCurrentView()) setHistoryLoading(false);
   }
 }
 
@@ -1398,11 +1478,17 @@ function artifactCard(m) {
 }
 
 // 空会话占位：居中的浅色提示（不是气泡——没有"AI 先开口"的对话假象）
+function hideWelcome() {
+  chatEl.querySelector(".empty-hint")?.classList.add("hidden");
+}
 function welcome() {
-  const div = document.createElement("div");
-  div.className = "empty-hint";
-  div.textContent = "发一条消息开始对话；可附图片或文件，让助手读代码、写代码、跑命令。";
-  chatEl.appendChild(div);
+  const div = document.createElement("div"); div.className = "empty-hint";
+  const mark = document.createElement("span"); mark.className = "empty-mark"; mark.textContent = "✦"; mark.setAttribute("aria-hidden", "true");
+  const heading = document.createElement("h1"); heading.textContent = "开始一个任务";
+  const description = document.createElement("p"); description.textContent = "描述要做的事，或附上文件。常用的工作方法可以保存为技能，随时选择使用。";
+  const tip = document.createElement("div"); tip.className = "empty-shortcuts";
+  tip.innerHTML = '<span><kbd>Enter</kbd> 发送</span><span><kbd>Shift + Enter</kbd> 换行</span><span><kbd>$</kbd> 选择技能</span>';
+  div.append(mark, heading, description, tip); chatEl.appendChild(div);
 }
 
 // ---------- 附件（图片 / 文本文件）----------
@@ -1736,9 +1822,65 @@ function msgImage(src, gallery) {
 
 // 带附件的用户气泡：文字 + 图片缩略图（多图走 2 列网格）/文件名。
 // 返回「气泡 + 下方动作条」的 msg-group（📋 复制 / ✏️ 回退编辑）。
-// skills 条目：列表/事件里只有 {id,name,version} 元数据（后端 skills.slim）；
-// 带 body 的（本地刚选的、artifact 取回的全文）直接渲染。只有元数据时，展开
-// 徽章才按 mid 懒取全文——正文不随事件补发与会话翻页重传。
+// Historical skill chips open a read-only snapshot outside the message layout.
+// Bodies are loaded lazily by message id; opening a chip never changes chat geometry.
+function closeMessageSkill(restoreFocus = false) {
+  const popover = $("message-skill-popover"), trigger = messageSkillTrigger;
+  messageSkillRequest++; messageSkillBody = ""; messageSkillRetry = null;
+  if (trigger) trigger.setAttribute("aria-expanded", "false");
+  messageSkillTrigger = null;
+  if (popover?.matches(":popover-open")) popover.hidePopover();
+  if (restoreFocus && trigger?.isConnected) trigger.focus({preventScroll:true});
+}
+
+function positionMessageSkill() {
+  const popover = $("message-skill-popover");
+  if (!messageSkillTrigger?.isConnected || !popover.matches(":popover-open")) return;
+  const anchor = messageSkillTrigger.getBoundingClientRect();
+  const width = Math.min(440, innerWidth - 24);
+  popover.style.width = `${width}px`;
+  popover.style.maxHeight = `${Math.min(440, innerHeight - 24)}px`;
+  const height = popover.getBoundingClientRect().height;
+  const below = anchor.bottom + 8;
+  const top = below + height <= innerHeight - 12 ? below : Math.max(12, anchor.top - height - 8);
+  popover.style.left = `${Math.max(12, Math.min(anchor.right - width, innerWidth - width - 12))}px`;
+  popover.style.top = `${Math.min(top, Math.max(12, innerHeight - height - 12))}px`;
+}
+
+async function openMessageSkill(trigger, skill, loadBody) {
+  const popover = $("message-skill-popover");
+  if (messageSkillTrigger === trigger && popover.matches(":popover-open")) { closeMessageSkill(true); return; }
+  if (messageSkillTrigger) messageSkillTrigger.setAttribute("aria-expanded", "false");
+  const request = ++messageSkillRequest, sid = currentSession;
+  messageSkillTrigger = trigger; messageSkillBody = "";
+  trigger.setAttribute("aria-expanded", "true");
+  $("message-skill-name").textContent = skill.name || skill.id;
+  $("message-skill-version").textContent = (skill.version || "").slice(0, 8) || "未记录";
+  $("message-skill-body").textContent = "正在加载发送时的指令…";
+  $("message-skill-body").scrollTop = 0;
+  $("message-skill-status").textContent = "正在加载";
+  $("message-skill-copy").disabled = true; $("message-skill-retry").hidden = true;
+  messageSkillRetry = null;
+  if (!popover.matches(":popover-open")) popover.showPopover();
+  positionMessageSkill();
+  try {
+    const body = await loadBody();
+    if (request !== messageSkillRequest || sid !== currentSession || !trigger.isConnected || !popover.matches(":popover-open")) return;
+    messageSkillBody = body;
+    $("message-skill-body").textContent = body || "（空指令）";
+    $("message-skill-copy").disabled = !body;
+    $("message-skill-status").textContent = "只读快照";
+    positionMessageSkill();
+  } catch(e) {
+    if (request !== messageSkillRequest || sid !== currentSession || !popover.matches(":popover-open")) return;
+    $("message-skill-body").textContent = e.message || "指令加载失败";
+    $("message-skill-status").textContent = "加载失败";
+    $("message-skill-retry").hidden = false;
+    messageSkillRetry = () => { closeMessageSkill(); openMessageSkill(trigger, skill, loadBody); };
+    positionMessageSkill();
+  }
+}
+
 function buildUserBubble(text, atts, skills = [], mid = null) {
   const div = document.createElement("div");
   div.className = "bubble user";
@@ -1749,29 +1891,29 @@ function buildUserBubble(text, atts, skills = [], mid = null) {
     div.appendChild(t);
   }
   for (const skill of skills) {
-    const details = document.createElement("details"); details.className = "ub-skill";
-    const summary = document.createElement("summary"); summary.textContent = "✦ " + (skill.name || skill.id) + " · " + (skill.version || "").slice(0, 8);
-    const body = document.createElement("pre");
-    if (skill.body) {
-      body.textContent = skill.body;
-    } else {
-      body.textContent = "点开加载当时使用的指令…";
-      details.addEventListener("toggle", async () => {
-        if (!details.open || details.dataset.loaded) return;
-        details.dataset.loaded = "1";
-        if (!mid || !currentSession) { body.textContent = "所用技能的指令已不可回放。"; return; }
-        try {
-          const r = await api(`/api/skills?mid=${encodeURIComponent(mid)}` +
-                              `&session_id=${encodeURIComponent(currentSession)}`);
-          const hit = (r.skills || []).find(s => s.id === skill.id);
-          body.textContent = hit ? (hit.body || "（空指令）") : "所用技能的指令已不可回放。";
-        } catch (e) {
-          details.dataset.loaded = "";  // 允许再点开重试一次
-          body.textContent = "指令回放失败：" + e.message;
-        }
-      });
-    }
-    details.append(summary, body); div.append(details);
+    const badge = document.createElement("button"); badge.type = "button"; badge.className = "ub-skill";
+    badge.textContent = "✦ " + (skill.name || skill.id);
+    badge.title = "查看这条消息发送时使用的技能指令";
+    badge.setAttribute("aria-haspopup", "dialog"); badge.setAttribute("aria-expanded", "false");
+    badge.setAttribute("aria-controls", "message-skill-popover");
+    badge.setAttribute("popovertarget", "message-skill-popover");
+    let cachedBody = typeof skill.body === "string" ? skill.body : null, pendingBody = null;
+    const loadBody = async () => {
+      if (cachedBody !== null) return cachedBody;
+      if (pendingBody) return pendingBody;
+      const messageId = mid || badge.closest('[data-role="user"]')?.dataset.mid;
+      const sid = currentSession;
+      if (!messageId || !sid) throw new Error("这条消息未记录可查看的技能指令。");
+      pendingBody = api(`/api/skills?mid=${encodeURIComponent(messageId)}&session_id=${encodeURIComponent(sid)}`)
+        .then(r => {
+          const hit = (r.skills || []).find(s => s.id === skill.id && (!skill.version || s.version === skill.version));
+          if (!hit) throw new Error("这条消息未记录可查看的技能指令。");
+          cachedBody = hit.body || ""; return cachedBody;
+        }).finally(() => { pendingBody = null; });
+      return pendingBody;
+    };
+    badge.addEventListener("click", e => { e.preventDefault(); e.stopPropagation(); openMessageSkill(badge, skill, loadBody); });
+    div.appendChild(badge);
   }
   // 附件部分与旧实现一致：图片进灯箱、文件名点开附件浮窗
   const imgs = (atts || []).filter(a => a.kind === "image" && a.preview);
@@ -1819,6 +1961,7 @@ function buildUserBubble(text, atts, skills = [], mid = null) {
 }
 
 function userBubble(text, atts, mid, skills = []) {
+  hideWelcome();
   chatEl.appendChild(railTag(buildUserBubble(text, atts, skills, mid), mid, "user"));
   // 自己发消息=明确要看底部：显式恢复跟随（全局统一规则的合法恢复入口之一）
   stickBottom = true;
@@ -2665,6 +2808,8 @@ function renderCtxPop() {
 //     回合会从 turn_start 起整段补发），按 seq 跳过——这是"不丢字不重复"的关键。
 let es = null;               // 当前任务的 EventSource（每任务一条，切换任务时换）
 let lastSeq = null;          // 本页已应用（渲染过）的最大事件 seq；null = 全新观看者
+let eventViewVersion = -1, eventSession = null;
+let finishingBoot = false, activeTurnMid = null;
 let bootBuffer = null;       // 补发段缓冲：caught_up 到达前无法判定回合完整性，先攒着
 let myNonce = null;          // 本 tab 发出的当前回合 nonce：turn_start 不重复画自己的气泡
 
@@ -2730,15 +2875,20 @@ function closeEvents(resetBackoff = true) {
 function openEvents(sid, keepBackoff = false) {
   // keepBackoff：本次是"失败后重连"，不清退避（否则永远从 MIN 重来）。
   // 用户主动切会话/首次打开则清空，从最短间隔起步。
+  if (!sid || sid !== currentSession) return;
+  connectionState = "connecting"; refreshConversationHeader();
+  const sameView = eventViewVersion === sessionViewVersion && eventSession === sid;
   closeEvents(!keepBackoff);
-  if (!sid) return;
-  lastSeq = null;          // 新连接的 DOM 可能刚重建过：闸门清零，补发全量应用
+  eventViewVersion = sessionViewVersion; eventSession = sid;
+  if (!sameView) lastSeq = null; // Only a rebuilt view needs a fresh replay cursor.
   bootBuffer = [];         // 补发段先缓冲，caught_up 后一次性定性（见 finishBoot）
   const qs = [`token=${encodeURIComponent(authToken)}`];  // EventSource 带不了 Authorization 头
   const stored = localStorage.getItem(seqKey(sid));
   if (stored != null) qs.push(`since=${stored}`);
   es = new EventSource(`/api/sessions/${encodeURIComponent(sid)}/events?` + qs.join("&"));
-  es.onmessage = onSSEEvent;
+  const source = es, viewVersion = sessionViewVersion;
+  const isCurrentSource = () => es === source && sid === currentSession && viewVersion === sessionViewVersion;
+  es.onmessage = e => { if (isCurrentSource()) onSSEEvent(e); };
   // onerror 默认交给 EventSource 自动重连（携带 Last-Event-ID 头），缺口太大/
   // 服务重启由服务端 resync 事件驱动。两个例外：
   //  1) 已登出：无限重连没意义，直接停。
@@ -2748,15 +2898,17 @@ function openEvents(sid, keepBackoff = false) {
   //     （3s→6s→12s…封顶 30s）错开，并给各标签页加随机抖动，让它们不要同时
   //     回来。成功连上（收到任何事件）后退避计时清零。
   es.onerror = () => {
+    if (!isCurrentSource()) return;
     if (!authToken) { closeEvents(); return; }
     // 任何 onerror 都接管重连（不再依赖 readyState===CLOSED 判断）：
     // 实测服务端返回 4xx 时 readyState 未必是 CLOSED，照那个条件判断会导致
     // 永远不重连——静默失联比紧密重连更糟。这里统一走退避重连；而正常的
     // 瞬断也由同一路径覆盖，行为一致。
+    connectionState = "reconnecting"; refreshConversationHeader();
     scheduleReconnect(sid);
   };
   // 收到任何一条事件都算连上了：退避计时归零，下次断开从最短间隔重试
-  es.addEventListener("open", () => { reconnectDelay = RECONNECT_MIN_MS; });
+  es.addEventListener("open", () => { if (isCurrentSource()) reconnectDelay = RECONNECT_MIN_MS; });
 }
 
 let reconnectDelay = 3000;      // 当前退避间隔（ms）
@@ -2792,6 +2944,7 @@ function onSSEEvent(e) {
     // ——逐 token 事件下逐条同步 setItem 会明显卡主线程。
     noteSeq(currentSession, seq);
   }
+  if (connectionState !== "connected") { connectionState = "connected"; refreshConversationHeader(); }
   if (evt.type === "caught_up") return finishBoot(evt);
   if (evt.type === "resync") return handleResync(evt);
   // seq 闸门：跳过本页已应用过的事件（服务端为覆盖"刷新接上正在输出的回合"
@@ -2802,72 +2955,65 @@ function onSSEEvent(e) {
 }
 
 // 补发段定性：把缓冲里的事件按回合分组，逐组决定渲染与否。
-//  * 完整回合（…turn_end 俱全）且 turn_end.user_mid 已在时间线 → 该回合其实
+//  * 完整回合（…turn_end 俱全）且提问及完成的回答都已在时间线 → 该回合其实
 //    早已落库（断线期间完成、刷新页面时历史已含它），跳过渲染，否则与时间线重复；
 //  * 其余（时间线里没有的完整回合、以及没有 turn_end 的"进行中"尾巴）→ 渲染。
 // 回合开头之前的孤立尾巴（补发从回合中段起）也按"隐式完整回合"处理：它必然
 // 跟着一个 turn_end——进行中回合的 turn_start 一定被服务端一并补发（见
 // 后端 replay_plan），不会出现悬空尾巴；turn_end.user_mid 同样能判定去留。
 function finishBoot(caughtUp) {
+  connectionState = "connected"; refreshConversationHeader();
+  const viewVersion = sessionViewVersion;
   const buf = bootBuffer || [];
   bootBuffer = null;
-  // 服务端说回合还在跑：把它的真起点交给本 tab 当计时基准。切会话/刷新回来的
-  // 页面没有本地 qStart，不这么做摘要行就会从 0 重新数（秒数跳回 0.x 的由来）。
-  // 本 tab 自己发的回合 qStart 更早、更准，保留它（只在不早于服务端起点时覆盖，
-  // 避免服务端起点更早导致已显示的秒数倒退）。
-  const srvStart = Number(caughtUp && caughtUp.started_at) * 1000;
-  if (srvStart > 0 && (!qStart || srvStart > qStart)) qStart = srvStart;
-  // 服务端说回合仍在跑：强制进入"生成中"。不能依赖补发段里的 turn_start 来
-  // 置位——超长回合（事件量 > 环形缓冲 500）会把 turn_start 挤出缓冲，
-  // replay_plan 退化为"尽力补尾巴"（events.py），补发段没有 turn_start，
-  // streaming 就永远丢了：按钮停在"发送"态，点击变成再发一条消息进队列，
-  // 而不是停止。running===true 时提前置位是幂等的（turn_start 正常到达时
-  // 再置一次无副作用），只覆盖"丢了 turn_start"的退化路径。
-  if (caughtUp && caughtUp.running === true) setStreaming(true);
-  if (caughtUp && caughtUp.running === false && streaming) {
-    // 连上时服务端已无进行中回合，而本页还挂在"生成中"：回合在断线/服务
-    // 重启之间死掉了（未落盘）。手动收尾不挂起——手测②"刷新接上进行中
-    // 回合"的正常路径不会走到这里（running=true）。
-    finalizeInterruptedRound();
-  }
-  const segments = [];  // 每段 = { events: [{seq,evt}...], userMid, closed }
+  const segments = [];
   let cur = { events: [], userMid: null, closed: false };
   for (const item of buf) {
     if (item.evt.type === "turn_start") {
-      segments.push(cur);           // 之前的孤立尾巴（若有）先封段
-      cur = { events: [item], userMid: null, closed: false };
+      segments.push(cur);
+      cur = {events:[item], userMid:null, closed:false};
     } else {
       cur.events.push(item);
       if (item.evt.type === "turn_end") {
-        cur.closed = true;
-        cur.userMid = item.evt.user_mid;
-        segments.push(cur);
-        cur = { events: [], userMid: null, closed: false };
+        cur.closed = true; cur.userMid = item.evt.user_mid;
+        segments.push(cur); cur = {events:[], userMid:null, closed:false};
       }
     }
   }
   segments.push(cur);
-  // 补发段里若有"已闭合且 user_mid 已在时间线"的回合，说明那个回合在离开
-  // 期间其实正常完成了（历史里已经有它）——这不是中断，不能报"输入未保存"。
-  const anyRecovered = segments.some(seg => seg.closed && seg.userMid && historyMids.has(seg.userMid));
-  if (caughtUp && caughtUp.running === false && streaming && !anyRecovered) {
-    // 连上时服务端已无进行中回合，而本页还挂在"生成中"：回合在断线/服务
-    // 重启之间死掉了（未落盘）。手动收尾不挂起——手测②"刷新接上进行中
-    // 回合"的正常路径不会走到这里（running=true）。anyRecovered 时段内
-    // 该回合其实已正常落盘（历史里已有），保持静默，只走收尾。
-    finalizeInterruptedRound();
-  }
-  for (const seg of segments) {
-    if (!seg.events.length) continue;
-    if (seg.closed && seg.userMid && historyMids.has(seg.userMid)) continue;  // 已在时间线
-    for (const { seq: s, evt } of seg.events) {
-      // 与实时路径同一条 seq 闸门：补发段会故意从 turn_start 起整段重发
-      // 与本页已渲染部分重叠的事件，不跳过的话 turn_start 被重复应用——
-      // traceEl/思考窗被强制清空重建（秒数闪跳回 0、思考流凭空消失）。
-      if (s != null && lastSeq != null && s <= lastSeq) continue;
-      applyEvent(evt, s);
+  // Replay must finish before a queued message can mutate nonce, trace and DOM.
+  finishingBoot = true;
+  try {
+    for (const seg of segments) {
+      if (viewVersion !== sessionViewVersion) return;
+      if (seg.closed && seg.userMid && historyCompletedMids.has(seg.userMid)) {
+        for (const {seq} of seg.events) {
+          if (seq != null && (lastSeq == null || seq > lastSeq)) lastSeq = seq;
+        }
+        continue;
+      }
+      for (const {seq, evt} of seg.events) {
+        if (viewVersion !== sessionViewVersion) return;
+        if (seq != null && lastSeq != null && seq <= lastSeq) continue;
+        applyEvent(evt, seq);
+      }
     }
+    const srvStart = Number(caughtUp && caughtUp.started_at) * 1000;
+    if (caughtUp && caughtUp.running === true) {
+      if (srvStart > 0 && !qStart) qStart = srvStart;
+      setStreaming(true);
+    } else if (caughtUp && caughtUp.running === false && streaming) {
+      if (activeTurnMid && historyCompletedMids.has(activeTurnMid)) {
+        applyRoundEndActions(endRound(refreshTurnState(), "normal"));
+      } else if (activeTurnMid || !myNonce) {
+        // A local optimistic submission with no turn_start is still awaiting acceptance.
+        finalizeInterruptedRound();
+      }
+    }
+  } finally {
+    finishingBoot = false;
   }
+  if (viewVersion === sessionViewVersion) dispatchNextQueued();
 }
 
 // 回合收尾的【公共半边】：两条"回合结束"路径都必须走的清理与推进。
@@ -2887,7 +3033,7 @@ function applyRoundEndActions(actions) {
       case "clearMetaTimer": clearInterval(metaTimer); break;
       case "setStreaming:false": setStreaming(false); break;
       case "clearNonce": myNonce = null; break;
-      case "advanceQueue": dispatchNextQueued(); break;
+      case "advanceQueue": if (!finishingBoot) dispatchNextQueued(); break;
       case "clearTraceRunning":
         if (traceEl) traceEl.classList.remove("running");
         break;
@@ -2975,6 +3121,17 @@ let curMid = null;         // 当前回答段落的 mid（round 事件切换）
 // 实时工具记账：与历史回放共用 blocks.js 的配对/状态逻辑（见 createLiveTracker），
 // 避免"哪些工具在跑、配到哪个结果"两路径各写一份而不同步。
 let liveTracker = createLiveTracker();
+let historyCompletedMids = new Set();
+function recordCompletedHistory(messages) {
+  let user = null;
+  for (const m of messages) {
+    if (m.role === "user") user = m;
+    else if (m.role === "assistant" && user && user.mid && m.content && !m.tool_calls &&
+             (!user.turn || ["done", "error", "interrupted"].includes(user.turn.state))) {
+      historyCompletedMids.add(user.mid);
+    }
+  }
+}
 let historyMids = new Set();  // 已从分页接口加载进时间线的消息 mid（补发去重基准）
 
 const TOOL_ICONS = {
@@ -4121,13 +4278,16 @@ function applyEvent(evt, seq) {
   if (seq != null) lastSeq = seq;
   const t = evt.type;
   if (t === "turn_start") {
+    activeTurnMid = evt.user_mid || null;
+    if (evt.nonce && evt.nonce === myNonce && evt.user_mid) tagLastUntaggedUser(evt.user_mid);
     // 回合开始。本 tab 自己发的消息（nonce 相同）不重复画气泡——发起方在
     // send/dispatch 时已带缩略图画过；其他标签页/刷新后的页面靠事件里的
     // 原文补画（附件只带名字：图片 base64 不该进环形缓冲占容量）。
     // 另一种不补画的情况：输入消息已随回合开始提前落库、且刚加载的历史里
     // 已有它（user_mid 在 historyMids）——切会话回来的页面时间线已含这条
     // 输入，再画一次就重复了。
-    const alreadyShown = evt.user_mid && historyMids.has(evt.user_mid);
+    const alreadyShown = evt.user_mid && (historyMids.has(evt.user_mid) ||
+      [...chatEl.querySelectorAll('[data-role="user"]')].some(node => node.dataset.mid === evt.user_mid));
     if ((!evt.nonce || evt.nonce !== myNonce) && !alreadyShown) {
       userBubble(evt.input || "（仅附件）",
         (evt.atts || []).map(a => ({ kind: a.kind, name: a.name, preview: "" })),
@@ -4267,6 +4427,7 @@ function applyEvent(evt, seq) {
     updateStatBar();
     if (metaEl) metaEl.textContent = metaText(evt.elapsed_s, usageNow);
   } else if (t === "done") {
+    flushStreamBuffers(); // Preserve same-frame reasoning before the authoritative answer is finalized.
     pendingDeltas = new Map(); pendingThink = "";  // 完整回答直接覆盖，丢弃未刷的增量，防止 rAF 晚到追加旧文本
     const b = ensureLiveMsg(evt.mid);
     b.el.classList.remove("streaming");
@@ -4346,7 +4507,7 @@ function applyEvent(evt, seq) {
   } else if (t === "turn_end") {
     // 回合结束（服务端已落盘）：驱动排队队列推进的唯一信号——原来靠 POST
     // 收尾推进，现在 POST 立即返回，队列只能跟着回合生命周期走
-    if (evt.user_mid) historyMids.add(evt.user_mid);
+    if (evt.user_mid) { historyMids.add(evt.user_mid); historyCompletedMids.add(evt.user_mid); }
     // 本 tab 自己发消息时画的气泡当时还没有 mid（服务端此刻才落定）：回填锚点，
     // 否则这条用户消息在导航条里永远缺席（其他标签页/刷新路径在 turn_start 已带上）
     if (evt.user_mid) tagLastUntaggedUser(evt.user_mid);
@@ -4465,7 +4626,8 @@ function setStreaming(on) {
   const btn = $("send");
   // 生成中保持可点（此时点 = 停止）；但归档会话例外——只读态不允许被流式
   // 状态变化解锁（真实 bug：归档任务里点停止/回合结束，发送按钮被这里重新点亮）
-  btn.disabled = !on && currentSessionArchived;
+  btn.disabled = !on && (currentSessionArchived || chatLoading);
+  document.querySelector(".composer").dataset.streaming = String(on);
   btn.textContent = on ? "■ 停止" : "发送";
   btn.classList.toggle("stop", on);
   // placeholder 不能无条件重置：归档会话锁定时显示"已归档（只读）"提示，
@@ -4475,6 +4637,7 @@ function setStreaming(on) {
     : on
       ? "继续输入以排队后续修改"
       : "输入问题或任务，Enter 发送（Shift+Enter 换行）";
+  applyPlaceholder(); refreshConversationHeader();
   // 任务清单跟随任务状态：生成中自动展开常驻（清单随 todo_update 实时刷新）。
   if (on) {
     todoAutoOpened = true;
@@ -4497,6 +4660,12 @@ function setStreaming(on) {
 // 会被静默排队且永不派发，停止按钮也把停止请求发给错误的会话。
 // 回合真身不丢：切回旧会话时由历史分页 + 补发定性（finishBoot）重建。
 function resetStreamState() {
+  closeMessageSkill();
+  connectionState = "idle";
+  chatLoading = false;
+  document.querySelector(".composer").dataset.loading = "false";
+  chatEl.setAttribute("aria-busy", "false");
+  activeTurnMid = null;
   clearInterval(metaTimer);
   todoAutoOpened = false;              // 新会话/新视图重新允许"任务中自动展开"
   todoDoneAnnounced = false;           // 完成展示边沿随会话一起作废
@@ -4713,6 +4882,7 @@ async function runManualCompact() {
 let pendingProjectPath = null;  // 项目组头「＋」/chip 预选的项目：首条消息建会话时绑定
 
 function send() {
+  if (chatLoading) { toast("对话正在加载，请稍后发送", "info"); return; }
   if (currentSessionArchived) return;  // 归档任务只读：兜底拦截（正常情况下输入框已禁用）
   const text = inputEl.value.trim();
   if (!text && !attachments.length) return;
@@ -4749,7 +4919,6 @@ function send() {
     // 回退编辑的发送：先截断（服务端删该轮及其后），重拉时间线，再走常规发送。
     // 队列里有积压时拒绝——那些消息的语境随回退一起失效，自动清掉太越权。
     const target = editTarget;
-    if (pendingQueue.length) { toast("有排队消息待处理，请先清理再发送回退编辑"); return; }
     editTarget = null;
     $("edit-banner").classList.add("hidden");
     const sid0 = currentSession;
@@ -4885,6 +5054,8 @@ function dispatchNextQueued() {
 }
 
 async function performSend(item) {
+  const sendViewVersion = sessionViewVersion, sendSession = currentSession, sendToken = authToken;
+  const isSendView = () => sessionViewVersion === sendViewVersion && currentSession === sendSession && authToken === sendToken;
   // 命令接口：POST 立即返回，过程事件走常驻事件流。「生成中」状态在这里
   // 乐观置位（防连点双发——turn_start 事件到达前有一小段窗口），回合的真
   // 正结束由事件流的 turn_end 驱动（那里统一复位并推进队列）。
@@ -4901,6 +5072,13 @@ async function performSend(item) {
   // 让用户点了发送立刻有视觉回执。turn_start 到达后走 ensureTrace() 原地接管
   // 这张卡（找到 traceEl 直接复用，不会出现两张卡），秒数基准也会校正成服务端
   // 的真实起点。失败回滚时 resetStreamState() 会清掉它。
+  // A new optimistic turn must not reopen or append into the previous turn's card.
+  activeTurnMid = null;
+  if (traceEl && !traceEl.classList.contains("running")) {
+    traceEl = null; procBox = null; editBox = null; noteBox = null;
+    thinkBox = null; thinkSeg = null; liveBubble = null; metaEl = null;
+    liveMsgs = new Map(); liveTracker.reset(); qStart = 0;
+  }
   qStart = qStart || Date.now();
   if (!traceEl) {
     tracePhase = "正在思考…";  // 占位阶段文案：turn_start 到达后会校正为"正在理解问题…"
@@ -4947,6 +5125,7 @@ async function performSend(item) {
     } else {
       // 新任务的第一次发送：创建任务 + 入队一步完成
       const data = await api(`/api/sessions`, { method: "POST", body });
+      if (!isSendView()) { if (authToken === sendToken) loadSessions(); return; }
       currentSession = data.session_id;
       if (window.SkillUI) SkillUI.adoptSession(currentSession);
       localStorage.removeItem(draftKey(null));  // 新任务已实体化：清掉 __new__ 草稿位
@@ -4959,9 +5138,11 @@ async function performSend(item) {
           { method: "POST", body: JSON.stringify({ mode: permMode }) }).catch(() => {});
       }
     }
+    if (sessionViewVersion !== sendViewVersion || authToken !== sendToken) return;
     // 附件落盘发生在后端组装消息时，这里补刷一次计数（新建/追问都适用）
     if (item.payloadAtts && item.payloadAtts.some(a => a.kind !== "image")) loadAttachments();
   } catch (e) {
+    if (!isSendView()) { console.warn("[send] 已离开的会话发送失败", {sessionId: target, error: e.message}); return; }
     // 命令没送出去（后端不可达/登录失效）：回合不会开始，本地复位。
     // 已发出的消息不放回队列（与旧行为一致：旧版 finally 里也是直接结束）
     bubble("assistant error", "❌ " + e.message);
@@ -4973,6 +5154,20 @@ async function performSend(item) {
     resetStreamState();
   }
 }
+
+// A skill snapshot never expands a message or changes scrollTop.
+bind("message-skill-close", "click", () => closeMessageSkill(true));
+bind("message-skill-retry", "click", () => messageSkillRetry?.());
+bind("message-skill-copy", "click", async () => {
+  const request = messageSkillRequest;
+  const copied = await copyText(messageSkillBody);
+  if (request === messageSkillRequest) $("message-skill-status").textContent = copied ? "已复制指令" : "复制失败，请选择文字后复制";
+});
+$("message-skill-popover").addEventListener("toggle", e => {
+  if (e.newState === "closed" && !$("message-skill-popover").matches(":popover-open")) closeMessageSkill();
+});
+chatEl.addEventListener("scroll", () => { if (messageSkillTrigger) closeMessageSkill(); }, {passive:true});
+window.addEventListener("resize", positionMessageSkill);
 
 // ---------- 事件绑定 ----------
 // bind 带防崩保护：某个元素缺失（比如浏览器缓存了旧页面）只报一条 console 错误，
@@ -5644,7 +5839,9 @@ document.addEventListener("click", (e) => {
 // ---------- 启动 ----------
 function boot() {  // 登录成功（或刷新后 token 仍有效）后的页面初始化；切用户时先清现场
   currentSession = null;
+  setComposerArchived(false);
   chatEl.innerHTML = "";
+  historyCompletedMids = new Set();
   historyMids = new Set();  // 上一个用户/任务的去重基准作废
   railItems = [];
   rebuildRail();            // 现场已清：导航条收起

@@ -16,6 +16,17 @@
     if (label) b.setAttribute('aria-label', label);
     b.onclick = action; return b;
   };
+  function favoriteButton(skill) {
+    const saved = favorites.includes(skill.id);
+    const b = button('', () => favorite(skill.id), `${saved ? '取消收藏' : '收藏'} ${skill.name}`);
+    b.className = 'sk-favorite'; b.setAttribute('aria-pressed', String(saved));
+    b.title = saved ? '取消收藏' : '收藏到常用技能';
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', 'm12 3 2.78 5.63L21 9.54l-4.5 4.39 1.06 6.2L12 17.2l-5.56 2.93 1.06-6.2L3 9.54l6.22-.91Z');
+    svg.append(path); b.append(svg); return b;
+  }
   function saveDraft(sid) { persist(key(sid), selected); }
   function restoreDraft(sid) {
     selected = state.normalize(readJSON(key(sid), []));
@@ -99,6 +110,7 @@
   }
   function renderPicker() {
     const list = el('sp-list'), detail = el('sp-detail');
+    picker.querySelector('header strong').textContent = detailId ? '技能设置' : '选择技能';
     list.replaceChildren(); detail.replaceChildren(); detail.hidden = !detailId; list.hidden = !!detailId;
     el('sp-search').hidden = !!detailId;
     if (detailId) { renderDetail(); return; }
@@ -115,8 +127,7 @@
       const pick = button('', () => toggle(s)); pick.className = 'sp-pick'; pick.setAttribute('aria-pressed', String(chosen));
       const title = document.createElement('strong'); title.textContent = `${chosen ? '✓' : '○'} ${s.name}`;
       const desc = document.createElement('span'); desc.textContent = s.description || s.id; pick.append(title, desc);
-      const star = button(favorites.includes(s.id) ? '★' : '☆', () => favorite(s.id), `${favorites.includes(s.id) ? '取消收藏' : '收藏'} ${s.name}`);
-      star.className = 'sp-star'; star.setAttribute('aria-pressed', String(favorites.includes(s.id)));
+      const star = favoriteButton(s); star.classList.add('sp-star');
       row.append(pick, star, button('⋯', () => openDetail(s.id), `查看 ${s.name} 的选项`)); list.append(row);
     });
     positionPicker();
@@ -125,7 +136,8 @@
     const box = el('sp-detail');
     const chosen = selected.find(s => s.id === detailId), fresh = catalog.find(s => s.id === detailId), s = chosen || fresh;
     if (!s) { detailId = null; renderPicker(); return; }
-    box.append(button('← 全部技能', () => { detailId = null; renderPicker(); el('sp-search').focus(); }));
+    const back = button('← 全部技能', () => { detailId = null; renderPicker(); el('sp-search').focus(); });
+    back.className = 'sp-back'; box.append(back);
     const title = document.createElement('h3'); title.textContent = s.name || s.id; box.append(title);
     const field = document.createElement('fieldset'), legend = document.createElement('legend'); legend.textContent = '作用范围'; field.append(legend);
     for (const [scope, text] of [['once','仅下一条消息'], ['session','当前会话']]) {
@@ -139,16 +151,20 @@
     }
     box.append(field);
     if (!chosen) box.append(button('选择此技能', () => choose(s)));
-    const notice = document.createElement('p'); notice.className = 'sk-muted';
+    const notice = document.createElement('p'); notice.className = 'sk-muted sp-scope-help';
     if (!fresh) notice.textContent = '技能已删除，请取消选择或重新创建。';
     else if (chosen && chosen.version !== fresh.version) {
       notice.textContent = '技能库有新版本。当前选择仍保留旧版本，发送前请应用新版。';
       box.append(button('应用新版本', () => { setSelection(state.update(selected, fresh)); note('已应用新版本'); }));
-    } else notice.textContent = '本次使用发送后清空；本会话使用会保留到你取消选择。';
+    } else notice.textContent = chosen?.scope === 'session' ? '本会话后续消息持续使用，直到取消选择。' : '仅用于下一条消息，发送后自动清空。';
     box.append(notice);
-    const content = document.createElement('details'), summary = document.createElement('summary'), pre = document.createElement('pre');
-    summary.textContent = '查看当前指令'; pre.textContent = s.body || '请在管理技能中查看指令。'; content.append(summary, pre); box.append(content);
-    const actions = document.createElement('div'); actions.className = 'sk-actions';
+    const content = document.createElement('section'); content.className = 'sp-instruction';
+    const heading = document.createElement('div'); heading.className = 'sp-instruction-heading';
+    const label = document.createElement('strong'); label.textContent = '技能指令';
+    const source = document.createElement('span'); source.textContent = chosen ? '当前选择的版本' : '技能库版本'; heading.append(label, source);
+    const pre = document.createElement('pre'); pre.tabIndex = 0; pre.setAttribute('aria-label', '技能指令');
+    pre.textContent = s.body || '请在管理技能中查看指令。'; content.append(heading, pre); box.append(content);
+    const actions = document.createElement('div'); actions.className = 'sp-detail-actions';
     if (fresh) actions.append(button('编辑技能', () => openManager(fresh.id)), button('复制技能', () => { openManager(null, {...fresh, id:'', name:fresh.name + ' 副本'}); }));
     if (chosen) actions.append(button('取消选择', () => { setSelection(selected.filter(x => x.id !== s.id)); closePicker(); }));
     box.append(actions); positionPicker();
@@ -171,10 +187,11 @@
     const items = catalog.filter(s => `${s.name} ${s.description} ${s.id}`.toLowerCase().includes(query));
     if (!items.length) { const p = document.createElement('p'); p.className = 'sk-muted'; p.textContent = catalog.length ? '没有匹配的技能' : '还没有技能，点击上方新建。'; list.append(p); }
     for (const s of items) {
-      const row = document.createElement('div'); row.className = 'sk-manage-row';
+      const row = document.createElement('div'); row.className = 'sk-manage-row' + (editing === s.id ? ' active' : '');
       const item = button('', () => { if (canLeave()) edit(s); }); item.className = 'sk-row' + (editing === s.id ? ' active' : '');
       const name = document.createElement('strong'), desc = document.createElement('span'); name.textContent = s.name; desc.textContent = s.description || s.id;
-      item.append(name, desc); row.append(item, button(favorites.includes(s.id) ? '★' : '☆', () => favorite(s.id), `收藏 ${s.name}`)); list.append(row);
+      item.title = s.description || s.name;
+      item.append(name, desc); row.append(item, favoriteButton(s)); list.append(row);
     }
   }
   async function openManager(id, draft) {

@@ -29,6 +29,8 @@ try:
         expect(page.locator('#skills-dialog')).not_to_be_visible()
         # Configure a session scope from the selected tag and favorite from the picker.
         page.locator('#skill-tray button').first.click()
+        expect(page.locator('#sp-detail .sp-instruction pre')).to_be_visible()
+        assert page.locator('#sp-detail details').count() == 0, 'skill instruction should have one bounded card, not an expanding disclosure'
         page.get_by_label('当前会话', exact=True).check()
         expect(page.locator('#skill-tray')).to_contain_text('本会话')
         page.get_by_role('button', name='← 全部技能').click()
@@ -111,6 +113,8 @@ try:
         assert len(requests) == 1
         # Screenshot the scope settings.
         page.locator('#skill-tray button').first.click()
+        expect(page.locator('#sp-detail .sp-instruction pre')).to_be_visible()
+        assert page.locator('#sp-detail .sp-instruction pre').evaluate('(e)=>e.clientHeight<=180'), 'instruction card exceeds height bound'
         page.screenshot(path='/tmp/skills-scope.png')
         page.set_viewport_size({'width':390,'height':844})
         expect(page.locator('#skill-picker')).to_be_visible()
