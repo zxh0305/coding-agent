@@ -112,6 +112,9 @@ class DispatchMixin:
             for p in db.list_providers():
                 provs.append({**p, "api_key": None, "api_key_masked": _mask(p["api_key"])})
             self._json(provs)
+        elif path == "/api/submissions":
+            nonce = (self._query().get("nonce") or [""])[0]
+            self._json(db.submission_status(self.user["id"], nonce))
         elif self.path.startswith("/api/workspace"):
             # 带当前任务 id 时返回该任务的绑定目录；不带 = 用户默认（仅展示用）。
             # custom = 该会话是否已绑定项目（新任务未选目录时为 false：前端

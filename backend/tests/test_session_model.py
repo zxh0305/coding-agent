@@ -268,6 +268,50 @@ class ApiTestBase(SessionModelBase):
             return e.code, json.loads(e.read() or b"{}")
 
 
+class TestSubmissionReceipt(ApiTestBase):
+
+    def test_concurrent_first_send_and_lost_reply(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest.mock import patch
+        from routes import busref
+        self.set_global("p1", "a-small")
+        entered = threading.Event()
+        body = {"message": "test", "nonce": "same-first-request"}
+        with patch.object(busref, "_run_round", side_effect=lambda *args: entered.set()) as run:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda _: self.call("POST", "/api/sessions", body), range(2)))
+            self.assertTrue(entered.wait(2))
+            self.assertEqual([code for code, _ in results], [200, 200])
+            self.assertEqual(len({r["session_id"] for _, r in results}), 1)
+            self.assertEqual(len({r["mid"] for _, r in results}), 1)
+            self.assertEqual(len(db.list_sessions(self.uid)), 3)
+            code, replay = self.call("POST", "/api/sessions", body)
+            self.assertEqual(code, 200)
+            self.assertTrue(replay["replayed"])
+            _, status = self.call("GET", "/api/submissions?nonce=same-first-request")
+            self.assertTrue(status["accepted"])
+            self.assertEqual(status["mid"], replay["mid"])
+            self.assertEqual(self.call("POST", "/api/sessions", dict(body, message="changed"))[0], 409)
+            run.assert_called_once()
+
+    def test_restart_resumes_only_unclaimed_payload(self):
+        from unittest.mock import patch
+        from routes import busref
+        from routes.sessions import resume_submissions
+        self.set_global("p1", "a-small")
+        body = {"message": "retained", "nonce": "before-start"}
+        with patch("routes.sessions._start_submission"):
+            code, receipt = self.call("POST", "/api/sessions/s1/messages", body)
+        self.assertEqual(code, 200)
+        entered = threading.Event()
+        with patch.object(busref, "_run_round", side_effect=lambda *args: entered.set()) as run:
+            resume_submissions()
+            self.assertTrue(entered.wait(2))
+            resume_submissions()
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[3]["_mid"], receipt["mid"])
+
+
 class TestWorkspaceSubmit(ApiTestBase):
 
     def test_invalid_workspace_does_not_create_session(self):

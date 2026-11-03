@@ -468,6 +468,8 @@ def main():
     #    P50 曾达 3.1s，正是 backlog 打满 + 逐条 accept 的排队现象）；
     # 3) block_on_close=False：连接关闭不在 shutdown 时阻塞 join。
     server.daemon_threads = True
+    from routes.sessions import resume_submissions
+    resume_submissions()
     server.request_queue_size = 256
     server.block_on_close = False
     log.info("Web 服务启动 0.0.0.0:%d（数据文件 %s）", port, db.DB_PATH)

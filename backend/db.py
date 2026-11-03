@@ -295,6 +295,11 @@ MIGRATIONS: list[tuple[int, str | None]] = [
     # 状态索引：列表按会话查"最近一条"，历史接口按 session_id 过滤。
     (28, "CREATE INDEX IF NOT EXISTS idx_session_turns_session "
          "ON session_turns(session_id, started)"),
+    (29, "CREATE TABLE IF NOT EXISTS submission_receipts("
+         "user_id INTEGER NOT NULL, nonce TEXT NOT NULL, digest TEXT NOT NULL, "
+         "session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, "
+         "mid TEXT NOT NULL, workspace TEXT NOT NULL, payload TEXT, worker TEXT, "
+         "PRIMARY KEY(user_id, nonce))"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -933,6 +938,54 @@ def delete_trace(sid: str, mid: str) -> None:
 # ---------------------------------------------------------------------------
 
 TURN_STATES = ("running", "done", "error", "interrupted")
+
+
+def unclaimed_submissions():
+    with _conn() as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM submission_receipts WHERE worker IS NULL ORDER BY rowid")]
+
+
+def submission_receipt(uid, nonce):
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM submission_receipts WHERE user_id=? AND nonce=?",
+                           (uid, nonce)).fetchone()
+    return dict(row) if row else None
+
+
+def submission_status(uid, nonce):
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT r.session_id, r.mid, t.state FROM submission_receipts r "
+            "LEFT JOIN session_turns t ON t.session_id=r.session_id AND t.user_mid=r.mid "
+            "WHERE r.user_id=? AND r.nonce=?", (uid, nonce)).fetchone()
+    return {"accepted": True, **dict(row)} if row else {"accepted": False}
+
+
+def record_submission(uid, nonce, digest, sid, mid, workspace, payload, *, new_session=False,
+                      initial_workspace=None):
+    with _conn() as conn:
+        if new_session:
+            now = time.time()
+            conn.execute("INSERT INTO sessions(id,title,user_id,created,updated,workspace) VALUES(?,?,?,?,?,?)",
+                         (sid, payload[0][:24], uid, now, now, initial_workspace))
+        conn.execute("INSERT INTO submission_receipts "
+                     "(user_id,nonce,digest,session_id,mid,workspace,payload) VALUES(?,?,?,?,?,?,?)",
+                     (uid, nonce, digest, sid, mid, str(workspace), json.dumps(payload)))
+
+
+def claim_submission(uid, nonce, worker):
+    with _conn() as conn:
+        claimed = conn.execute("UPDATE submission_receipts SET worker=?, payload=NULL "
+                               "WHERE user_id=? AND nonce=? AND worker IS NULL",
+                               (worker, uid, nonce)).rowcount
+        if claimed:
+            # A crash between claiming and entering the agent loop must also appear
+            # as interrupted to the normal startup recovery and history UI.
+            conn.execute("INSERT INTO session_turns(session_id,user_mid,state,started) "
+                         "SELECT session_id,mid,'running',? FROM submission_receipts "
+                         "WHERE user_id=? AND nonce=?", (time.time(), uid, nonce))
+        return bool(claimed)
 
 
 def turn_started(sid: str, user_mid: str, started: float | None = None) -> None:

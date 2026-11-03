@@ -13,6 +13,7 @@
 routes.busref 访问（属性取值，注入发生在 import 之后也能生效）。
 """
 
+import hashlib
 import base64
 import json
 import threading
@@ -26,9 +27,39 @@ import events
 from events import SSE_HEARTBEAT, sse_frame
 from services.messages import _build_user_message
 from services.session_boot import get_session
-from services.workspace import selected_directory
+from services.workspace import selected_directory, project_directory
+from services.model_resolve import _resolve_client
+from code_tools import DEFAULT_WORKSPACE
 
 from routes import busref
+
+
+# Only serialize submissions sharing a bucket while preparing the receipt.
+# The model runs outside the lock. A durable claim also protects replay after restart.
+_submit_locks = [threading.Lock() for _ in range(64)]
+_worker_id = uuid.uuid4().hex
+
+
+def _start_submission(uid, nonce, sid, agent, payload):
+    def run():
+        if db.claim_submission(uid, nonce, _worker_id):
+            plain, message, atts = payload
+            busref._run_round(sid, agent, plain, message, nonce, atts)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def resume_submissions():
+    """Restart only work whose payload has never been claimed by a worker."""
+    for entry in db.unclaimed_submissions():
+        try:
+            sid, agent = get_session(entry["session_id"], entry["user_id"])
+            if str(agent.ctx.workspace) == entry["workspace"]:
+                _start_submission(entry["user_id"], entry["nonce"], sid, agent,
+                                  json.loads(entry["payload"]))
+            else:
+                busref.log.warning("工作目录已变更，暂停恢复会话 %s 的提交", sid)
+        except Exception:
+            busref.log.exception("恢复提交失败，会话 %s", entry["session_id"])
 
 
 class SessionRoutes:
@@ -45,6 +76,30 @@ class SessionRoutes:
         nonce，会按事件里的原文补画）。
         """
         body = self._body()
+        uid = self.user["id"]
+        nonce = body.get("nonce") or uuid.uuid4().hex
+        if not isinstance(nonce, str) or len(nonce) > 128:
+            return self._json({"error": "无效的消息标识"}, 400)
+        digest = hashlib.sha256(json.dumps([sid_or_none, body], sort_keys=True,
+                                           separators=(",", ":")).encode()).hexdigest()
+        with _submit_locks[hash((uid, nonce)) % len(_submit_locks)]:
+            receipt = db.submission_receipt(uid, nonce)
+            if receipt:
+                if receipt["digest"] != digest:
+                    return self._json({"error": "消息标识已被不同内容使用"}, 409)
+                sid = receipt["session_id"]
+                if receipt["payload"]:
+                    _, agent = get_session(sid, uid)
+                    if str(agent.ctx.workspace) != receipt["workspace"]:
+                        return self._json({"error": "工作目录已变更，无法恢复发送"}, 409)
+                    _start_submission(uid, nonce, sid, agent, json.loads(receipt["payload"]))
+                turn = db.get_turn(sid, receipt["mid"]) or {}
+                interrupted = turn.get("state") == "interrupted"
+                return self._json({"session_id": sid, "nonce": nonce, "mid": receipt["mid"],
+                                   "replayed": True, "interrupted": interrupted})
+            return self._submit_new(sid_or_none, body, nonce, digest)
+
+    def _submit_new(self, sid_or_none, body, nonce, digest):
         # 【先验校验，再建会话】空输入必须在调用 get_session 之前拦掉：
         # get_session 会在解析模型客户端后【落库创建会话行】；若等到
         # _build_user_message 之后再判空，每个被拒绝的空请求都会在库里留下
@@ -87,30 +142,42 @@ class SessionRoutes:
             selected_skills = skills.resolve(self.user["id"], body.get("skills", []))
         except ValueError as e:
             return self._json({"error": str(e)}, 400)
-        # 会话 id 要先拿到：文本附件需要按会话落盘（data/attachments/<sid>/）。
-        # get_session 内部只短持锁（见其注释）；本接口本身毫秒级返回，回合不在
-        # 本请求内执行，这里提前取不会拉长锁窗口。
-        sid, agent = get_session(sid_or_none, self.user["id"], initial_workspace=initial_workspace)
-        if sid_or_none and "expected_workspace" in body and body["expected_workspace"] != str(agent.ctx.workspace):
-            return self._json({"error": "工作目录已变更，请重新确认项目后发送"}, 409)
-        if initial_workspace:
-            db.migrate_legacy_workspace_files(sid)
+        if sid_or_none:
+            sid, agent = get_session(sid_or_none, self.user["id"])
+            workspace = str(agent.ctx.workspace)
+            if "expected_workspace" in body and body["expected_workspace"] != workspace:
+                return self._json({"error": "工作目录已变更，请重新确认项目后发送"}, 409)
+        else:
+            # Allocate the attachment namespace first. Create the session and its receipt
+            # together after validation so an interrupted first POST cannot create two tasks.
+            sid = uuid.uuid4().hex
+            _resolve_client(sid)
+            workspace = str(initial_workspace or project_directory(self.user["id"], sid)
+                            or DEFAULT_WORKSPACE.resolve())
         plain, user_message = _build_user_message(body, sid)
         if user_message is not None and selected_skills:
             user_message["_skills"] = selected_skills
         if not plain:
             return self._json({"error": "输入不能为空"}, 400)
-        title = next((s["title"] for s in db.list_sessions(self.user["id"]) if s["id"] == sid), "")
-        if not title:
+        if sid_or_none and not next((s["title"] for s in db.list_sessions(self.user["id"]) if s["id"] == sid), ""):
             db.set_session_title(sid, plain[:24])
         # 附件只带 kind/name 进 turn_start 事件（原文/图片数据太大，不该进
         # 环形缓冲占 500 个格子里的一个——完整内容在消息存储里）
         atts = [{"kind": a.get("kind"), "name": str(a.get("name") or "")[:80]}
                 for a in (body.get("attachments") or [])[:6]]
-        nonce = str(body.get("nonce") or uuid.uuid4().hex[:12])
-        threading.Thread(target=busref._run_round, daemon=True,
-                         args=(sid, agent, plain, user_message, nonce, atts)).start()
-        self._json({"session_id": sid, "nonce": nonce})
+        mid = uuid.uuid4().hex
+        user_message["_mid"] = mid
+        payload = [plain, user_message, atts]
+        db.record_submission(self.user["id"], nonce, digest, sid, mid, workspace, payload,
+                             new_session=not sid_or_none, initial_workspace=initial_workspace)
+        if not sid_or_none:
+            if initial_workspace:
+                db.migrate_legacy_workspace_files(sid)
+            _, agent = get_session(sid, self.user["id"])
+            if str(agent.ctx.workspace) != workspace:
+                return self._json({"error": "工作目录已变更，已暂停发送"}, 409)
+        _start_submission(self.user["id"], nonce, sid, agent, payload)
+        self._json({"session_id": sid, "nonce": nonce, "mid": mid})
 
     def _handle_session_events(self, sid: str):
         """常驻事件流（SSE）。每连接占一个线程（ThreadingHTTPServer 每请求

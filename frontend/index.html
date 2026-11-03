@@ -575,6 +575,7 @@
   <!-- 回合状态机与排队队列的纯逻辑（有单测：queue_state.test.mjs）。
        与 blocks.js / render_blocks.js 同属"纯模块 + 单测"三层：数据→结构、
        结构→DOM、状态→动作。必须排在 app.js 之前。 -->
+  <script src="outbox.js"></script>
   <script src="queue_state.js"></script>
   <script src="memory_view.js"></script>
   <script src="app.js"></script>

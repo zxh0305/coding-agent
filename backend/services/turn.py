@@ -76,7 +76,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             # 对象追加进 history，收尾整段落盘、turn_end 提取的 user_mid 都与
             # 此处一致（原逻辑等收尾时才由 save_messages 分配，那时 turn_start
             # 早已发完，带不了 mid）。
-            user_mid = uuid.uuid4().hex
+            user_mid = user_message.get("_mid") or uuid.uuid4().hex
             user_message["_mid"] = user_mid
             # 回合状态机落库（session_turns）：进程若在这一回合中途退出，
             # 下次启动会把这条 running 改判 interrupted，列表能显示"上次被

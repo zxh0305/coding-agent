@@ -141,7 +141,7 @@ async function api(path, options = {}) {
     throw new Error("未登录或登录已失效");
   }
   const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+  if (!resp.ok) throw Object.assign(new Error(data.error || `HTTP ${resp.status}`), {status: resp.status});
   return data;
 }
 
@@ -707,8 +707,7 @@ async function doDeleteSession(id) {
   if (currentSession === id) {
     // 删的是当前打开的任务：清空对话区，回到待新建状态；事件流随任务一起
     // 消失（其他标签页的连接由 session_deleted 事件收摊）
-    pendingQueue = pendingQueue.filter(it => it.sessionId !== id);  // 任务没了：排队的消息一起作废
-    persistQueue();
+    discardSessionQueue(id);
     renderQueueBar();
     currentSession = null;
     resetStreamState();
@@ -756,6 +755,7 @@ async function newTask(presetProject = null) {
   railItems = [];
   rebuildRail();       // 新任务时间线为空：导航条收起
   renderQueueBar();    // 队列条属于上一个任务：这里隐藏（消息保持排队，切回时接着发）
+  restoreQueue(null);
   restoreDraft(null);  // 新任务自己的草稿位（__new__）
   resetDocsPanel();    // 新任务态：收起文档栏并清空内容
   loadDocsList();      // 新任务态：文档计数清零
@@ -1075,16 +1075,16 @@ function setComposerArchived(archived) {
 // 之前切换逻辑里一处 .classList 拿到 null 就抛出，整个切换被中断（后续草稿恢复、
 // 历史加载、事件流全没执行），而调用方既没 await 也没 catch，错误淹死在
 // unhandledrejection 里很难发现——这里显式打日志，保证失败可见、可定位。
-async function switchSession(id) {
+async function switchSession(id, forceReload = false) {
   try {
-    await doSwitchSession(id);
+    await doSwitchSession(id, forceReload);
   } catch (err) {
     console.error("[switchSession] 切换会话失败:", id, err);
   }
 }
 
-async function doSwitchSession(id) {
-  if (id === currentSession) return;
+async function doSwitchSession(id, forceReload) {
+  if (id === currentSession && !forceReload) return;
   const viewVersion = ++sessionViewVersion;
   const isCurrentView = () => currentSession === id && sessionViewVersion === viewVersion;
   saveDraft(currentSession);     // 离开前：把输入框内容存进旧会话的草稿
@@ -1146,11 +1146,9 @@ async function doSwitchSession(id) {
   closeGitPop();    // 工作区变了，旧的提交列表不再对应当前项目
   refreshGitChip(); // 按钮上的分支名随任务的工作区更新
   // 恢复本会话上次未发完的排队消息（刷新/关标签页前排队的内容，见 persistQueue）。
-  // 只在内存里没有该会话的排队项时恢复，避免与当前内存队列重复。
-  if (id && !pendingQueue.some(it => it.sessionId === id)) {
-    const restored = restoreQueue(id);
-    if (restored) toast(`已恢复 ${restored} 条未发出的排队消息`);
-  }
+  // 按消息标识合并本地记录和当前标签页的队列。
+  await restoreQueue(id);
+  if (!isCurrentView()) return;
   renderQueueBar(); // 队列条不随会话流清空：按新会话重画（旧卡片的 DOM 属于上一个任务）
   dispatchNextQueued();  // 切回有排队消息的任务时，接着把排队的发出去
   resetDocsPanel();      // 上一个会话的文档栏不留给新会话：收起并清空
@@ -4329,6 +4327,14 @@ function applyEvent(evt, seq) {
   if (seq != null) lastSeq = seq;
   const t = evt.type;
   if (t === "turn_start") {
+    const submission = inFlight.get(evt.nonce);
+    if (submission) submission.confirmed = true;
+    const recovered = pendingQueue.find(entry => entry.nonce === evt.nonce && entry.owner === who);
+    if (recovered) {
+      pendingQueue.splice(pendingQueue.indexOf(recovered), 1);
+      Outbox.remove(recovered).catch(() => {});
+      renderQueueBar();
+    }
     activeTurnMid = evt.user_mid || null;
     if (evt.nonce && evt.nonce === myNonce && evt.user_mid) tagLastUntaggedUser(evt.user_mid);
     // 回合开始。本 tab 自己发的消息（nonce 相同）不重复画气泡——发起方在
@@ -4604,8 +4610,7 @@ function applyEvent(evt, seq) {
   } else if (t === "session_deleted") {
     // 其他标签页删掉了这个任务：收摊回到新建态
     closeEvents();
-    pendingQueue = pendingQueue.filter(it => it.sessionId !== currentSession);  // 任务没了：排队消息作废
-    persistQueue();
+    discardSessionQueue(currentSession);
     renderQueueBar();
     currentSession = null;
     resetStreamState();
@@ -4664,7 +4669,7 @@ function applyEvent(evt, seq) {
 // 重试上一条：与 send() 同一条路径（重画用户气泡 + performSend）。排队中
 // 则进队列；不手动清输入框——输入框在出错时早已是空的。
 function retryLast() {
-  if (!lastSent || workspacePending) return;
+  if (!lastSent || workspacePending || lastSent.owner !== who || lastSent.sessionId !== currentSession) return;
   if (streaming) { queueMessage(lastSent.text, lastSent.payloadAtts, lastSent.skills || []); return; }
   userBubble(lastSent.text, lastSent.outAtts, null, lastSent.skills || []);
   performSend({ text: lastSent.text, payloadAtts: lastSent.payloadAtts, skills: lastSent.skills || [] });
@@ -4842,77 +4847,60 @@ function refreshTurnState() {
 }
 
 // ---------------------------------------------------------------------------
-// 排队队列的持久化
-// ---------------------------------------------------------------------------
-// 为什么需要：pendingQueue 原本是纯内存数组，刷新/关标签页/浏览器崩溃就整队
-// 消失——用户排了三条修改意见，一个误刷新全没了，而且没有任何提示（最伤的
-// 是它静默：用户以为发了）。这里按会话存进 localStorage，启动时恢复。
-//
-// 只存文本与附件元数据，不存 sessionId（键里已经带了）；附件 base64 可能很大，
-// 超出配额时退化为"只存文本"并提示，绝不因为存不下而丢掉整条消息。
+// 旧版队列按任务导入；新记录按用户和 nonce 单独保存在 IndexedDB。
 const QUEUE_KEY = (sid) => `pending_queue_${sid}`;
-const QUEUE_MAX_ATT_BYTES = 2 * 1024 * 1024;   // 单条排队的附件总量上限（超出不入盘）
-
-function persistQueue() {
-  const bySid = {};
-  for (const it of pendingQueue) {
-    if (!it.sessionId) continue;
-    const atts = (it.payloadAtts || []).filter(a => a.kind !== "image");
-    const size = (it.payloadAtts || []).reduce((n, a) => n + ((a.data || "").length || 0), 0);
-    let payloadAtts = it.payloadAtts || [];
-    let dropped = false;
-    if (size > QUEUE_MAX_ATT_BYTES) {
-      // 图片 base64 太占配额：只留文本，避免整条消息因写不下而丢失
-      payloadAtts = atts;
-      dropped = true;
-    }
-    (bySid[it.sessionId] ||= []).push({ text: it.text, payloadAtts, skills: it.skills || [], expectedWorkspace: it.expectedWorkspace, dropped });
-  }
-  try {
-    for (const sid of Object.keys(bySid)) {
-      localStorage.setItem(QUEUE_KEY(sid), JSON.stringify(bySid[sid]));
-    }
-    // 清掉已经空了的会话键（队列跑完/被清空后不留垃圾）
-    for (let i = localStorage.length - 1; i >= 0; i--) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith("pending_queue_")) {
-        const sid = k.slice("pending_queue_".length);
-        if (!bySid[sid]) localStorage.removeItem(k);
-      }
-    }
-  } catch (e) {
-    // 配额满：清理最旧的队列存档后重试一次；再失败就只留内存（不影响本次使用）
-    try {
-      for (let i = localStorage.length - 1; i >= 0; i--) {
-        const k = localStorage.key(i);
-        if (k && k.startsWith("pending_queue_")) localStorage.removeItem(k);
-      }
-      for (const sid of Object.keys(bySid)) {
-        localStorage.setItem(QUEUE_KEY(sid), JSON.stringify(bySid[sid]));
-      }
-    } catch { /* 放弃持久化：内存队列照常工作 */ }
-  }
+function outgoingItem(text, payloadAtts, skills) {
+  return {text, payloadAtts, skills, owner: who, sessionId: currentSession,
+    expectedWorkspace: currentSession ? confirmedWorkspace : undefined,
+    chosenPath: currentSession ? undefined : pendingProjectPath,
+    nonce: crypto.randomUUID?.() || Date.now().toString(16) + Math.random().toString(16).slice(2),
+    created: Date.now(), state: "queued"};
 }
 
-function restoreQueue(sid) {
+async function discardSessionQueue(sid) {
+  const owner = who;
+  pendingQueue = pendingQueue.filter(it => it.sessionId !== sid);
   try {
-    const raw = localStorage.getItem(QUEUE_KEY(sid));
-    if (!raw) return 0;
-    const items = JSON.parse(raw);
-    if (!Array.isArray(items)) return 0;
-    let n = 0;
-    for (const it of items) {
-      if (!it || (!it.text && !it.payloadAtts?.length)) continue;
-      pendingQueue.push({ text: it.text, skills: it.skills || [], payloadAtts: it.payloadAtts || [],
-                          sessionId: sid, expectedWorkspace: it.expectedWorkspace, immediate: false });
-      n++;
+    for (const item of await Outbox.list(owner)) {
+      if (item.sessionId === sid) await Outbox.remove(item);
     }
-    return n;
-  } catch {
-    return 0;
-  }
+  } catch (e) { toast("无法清理待发消息：" + e.message); }
 }
 
+async function restoreQueue(sid) {
+  const owner = who, view = sessionViewVersion;
+  const key = sid && QUEUE_KEY(sid);
+  try {
+    if (key && localStorage.getItem(key)) {
+      const legacy = JSON.parse(localStorage.getItem(key));
+      for (const [index, entry] of legacy.entries()) {
+        await Outbox.put({...entry, owner, sessionId: sid, nonce: "legacy-" + sid + "-" + index,
+          state: "queued", created: index});
+      }
+      localStorage.removeItem(key);
+    }
+    const records = await Outbox.list(owner);
+    if (owner !== who || view !== sessionViewVersion || sid !== currentSession) return;
+    for (const entry of records.sort((a,b) => a.created - b.created)) {
+      if (entry.sessionId !== sid || inFlight.has(entry.nonce) ||
+          pendingQueue.some(item => item.nonce === entry.nonce)) continue;
+      if (entry.state === "sending") entry.state = "uncertain";
+      if (entry.state === "uncertain") {
+        let receipt;
+        try { receipt = await api("/api/submissions?nonce=" + encodeURIComponent(entry.nonce)); }
+        catch { /* Keep the original request available while offline. */ }
+        if (owner !== who || view !== sessionViewVersion || sid !== currentSession) return;
+        if (receipt?.accepted) {
+          if (sid) { await Outbox.remove(entry); continue; }
+          entry.receivedSession = receipt.session_id;
+        }
+      }
+      if (owner !== who || view !== sessionViewVersion || sid !== currentSession) return;
+      pendingQueue.push(entry);
+    }
+    renderQueueBar();
+  } catch (e) { toast("无法读取本地待发消息：" + e.message); }
+}
 
 // /compact：手动触发上下文压缩。压缩成功后服务端会推 compacted 事件——
 // 分隔卡片、容量徽章、提示 toast 都由那条事件的既有处理完成，这里只在
@@ -4932,7 +4920,12 @@ async function runManualCompact() {
 
 let pendingProjectPath = null;  // 项目组头「＋」/chip 预选的项目：首条消息建会话时绑定
 
-function send() {
+let savingMessage = false;
+const inFlight = new Map();
+
+async function send() {
+  if (savingMessage) return;
+  if (!currentSession && streaming) { toast("正在创建任务，可以先写下一条"); return; }
   if (workspacePending) { toast("请先确认工作目录"); return; }
   if (chatLoading) { toast("对话正在加载，请稍后发送", "info"); return; }
   if (currentSessionArchived) return;  // 归档任务只读：兜底拦截（正常情况下输入框已禁用）
@@ -4959,6 +4952,24 @@ function send() {
     ? { kind: a.kind, name: a.name, mime: a.mime, data: "" }
     : { kind: a.kind, name: a.name, mime: a.mime, data: a.data });
   const outAtts = attachments.map(a => ({ kind: a.kind, name: a.name, preview: a.preview }));
+  const item = outgoingItem(text, payloadAtts, selectedSkills);
+  if (!editTarget) {
+    const view = sessionViewVersion;
+    savingMessage = true;
+    try { await Outbox.put(item); }
+    catch (err) { toast("无法保存待发消息，草稿已保留：" + err.message); return; }
+    finally { savingMessage = false; }
+    if (view !== sessionViewVersion) {
+      // Navigation already saved the original draft. Cancel staging before dispatch.
+      await Outbox.remove(item);
+      return;
+    }
+    if (inputEl.value.trim() !== text || attachments.length !== payloadAtts.length) {
+      await Outbox.remove(item);
+      toast("草稿有变更，请确认后再发送");
+      return;
+    }
+  }
   inputEl.value = "";
   if (window.SkillUI) SkillUI.afterSend();
   attachments = [];              // 附件必须先清再存草稿：saveDraft 会把托盘快照
@@ -4998,22 +5009,24 @@ function send() {
   // 卡住。这条规则的单测见 queue_state.test.mjs 的 decideSend 用例组。
   if (decideSend(refreshTurnState(), currentSession).action === "queue") {
     // 排队：只显示输入框上方的队列条，正式气泡等派发执行时再渲染（否则会出现两条重复消息）
-    queueMessage(text, payloadAtts, selectedSkills);
+    pendingQueue.push(item);
+    renderQueueBar();
     // 队列里有货但当前没在跑（上面的断线场景）：立刻推一次，别等下一个 turn_end
     // ——那个信号可能永远不会再来，队列会一直干等。
     dispatchNextQueued();
     return;
   }
-  lastSent = { text, payloadAtts, outAtts, skills: selectedSkills };  // 出错重试的素材
   userBubble(text, outAtts, null, selectedSkills);
-  performSend({ text, payloadAtts, skills: selectedSkills, sessionId: currentSession,
-                chosenPath: pendingProjectPath || undefined });
+  performSend(item);
   pendingProjectPath = null;
 }
 
-function queueMessage(text, payloadAtts, skills = []) {
-  pendingQueue.push({ text, payloadAtts, skills, sessionId: currentSession, expectedWorkspace: currentSession ? confirmedWorkspace : undefined, immediate: false });
-  persistQueue();
+async function queueMessage(text, payloadAtts, skills = []) {
+  const item = outgoingItem(text, payloadAtts, skills);
+  try { await Outbox.put(item); }
+  catch (e) { toast("无法保存待发消息：" + e.message); return; }
+  if (item.owner !== who) return;
+  pendingQueue.push(item);
   renderQueueBar();
 }
 
@@ -5042,6 +5055,10 @@ function renderQueueBar() {
       t.textContent = "项目已变更，切回原项目或编辑后发送 · " + t.textContent;
       row.title = item.expectedWorkspace;
     }
+    if (item.state === "failed" || item.state === "uncertain") {
+      t.textContent = (item.state === "uncertain" ? "待确认" : "发送失败") + " · " + t.textContent;
+      row.title = item.error || row.title;
+    }
     row.appendChild(t);
     for (const a of item.payloadAtts) {
       if (a.kind !== "image") continue;
@@ -5060,31 +5077,61 @@ function renderQueueBar() {
       b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
       actions.appendChild(b);
     };
-    mk("⬆ 立即", "停止当前生成，马上执行这一条", () => {
+    if (item.receivedSession) {
+      t.textContent = "已接收 · " + (item.text || "附件");
+      mk("查看任务", "打开已创建的任务", async () => {
+        await Outbox.remove(item);
+        pendingQueue = pendingQueue.filter(entry => entry !== item);
+        await switchSession(item.receivedSession);
+      });
+      row.appendChild(actions);
+      bar.appendChild(row);
+      continue;
+    }
+    if (item.state === "failed" || item.state === "uncertain") {
+      mk("重试", "用原消息标识核对并重试", () => {
+        if (item.expectedWorkspace !== undefined && item.expectedWorkspace !== confirmedWorkspace && item.state !== "uncertain") {
+          toast("请切回原项目或编辑消息"); return;
+        }
+        item.checkReceipt = item.state === "uncertain";
+        item.state = "queued";
+        dispatchNextQueued();
+        renderQueueBar();
+      });
+    } else mk("⬆ 立即", "优先执行这一条", async () => {
       item.immediate = true;
       const i = pendingQueue.indexOf(item);
-      if (i > 0) { pendingQueue.splice(i, 1); pendingQueue.unshift(item); }  // 提到队首
-      persistQueue();
+      item.created = Math.min(...pendingQueue.map(entry => entry.created)) - 1;
+      if (i > 0) { pendingQueue.splice(i, 1); pendingQueue.unshift(item); }
+      await Outbox.put(item);
       renderQueueBar();
-      stopGeneration();  // 停掉当前生成；流结束后队列自动从队首开始发
+      if (streaming) stopGeneration();
+      else dispatchNextQueued();
     }, "q-immediate");
-    mk("✏", "编辑", () => {
+    mk("✏", "编辑", async () => {
+      if (inputEl.value || attachments.length) { toast("请先处理输入框里的草稿"); return; }
+      if (item.state === "uncertain") { toast("请先重试以确认原消息是否已接收"); return; }
       pendingQueue.splice(pendingQueue.indexOf(item), 1);
-      persistQueue();
       renderQueueBar();
       inputEl.value = item.text;
       if (window.SkillUI) SkillUI.setSelection(item.skills || []);
       for (const a of item.payloadAtts) {
-        attachments.push({ kind: a.kind, name: a.name, mime: a.mime, data: a.data,
+        attachments.push({ kind: a.kind, name: a.name, mime: a.mime, data: a.data, uploaded: !a.data && !!a.name,
                            preview: a.kind === "image" ? `data:${a.mime};base64,${a.data}` : "" });
       }
       renderAttachTray();
+      if (!currentSession) { pendingProjectPath = item.chosenPath || null; loadWorkspace(); }
+      saveDraft(currentSession);
+      await Outbox.remove(item);
       inputEl.focus();
+      dispatchNextQueued();
     });
-    mk("🗑", "删除", () => {
-      pendingQueue.splice(pendingQueue.indexOf(item), 1);
-      persistQueue();
+    mk("🗑", "删除", async () => {
+      await Outbox.remove(item);
+      const index = pendingQueue.indexOf(item);
+      if (index >= 0) pendingQueue.splice(index, 1);
       renderQueueBar();
+      dispatchNextQueued();
     });
     row.appendChild(actions);
     bar.appendChild(row);
@@ -5096,12 +5143,13 @@ function dispatchNextQueued() {
   // 派发判据交给 queue_state.nextDispatch（纯函数，有单测）：没在生成、
   // 队首恰好属于当前会话才发。队首属于别的会话时【不跳过】——跳过会破坏
   // FIFO，也会把消息渲染进错误的对话视图（见该函数注释与单测）。
-  const d = nextDispatch(refreshTurnState(), currentSession);
+  const state = refreshTurnState();
+  const d = nextDispatch({...state, pendingQueue: pendingQueue.filter(it => it.sessionId === currentSession)}, currentSession);
   if (!d.ready) return;
   const item = d.item;
-  if (item.expectedWorkspace !== undefined && item.expectedWorkspace !== confirmedWorkspace) return;
-  pendingQueue.shift();
-  persistQueue();
+  if (item.state && item.state !== "queued") return;
+  if (!item.checkReceipt && item.expectedWorkspace !== undefined && item.expectedWorkspace !== confirmedWorkspace) return;
+  pendingQueue.splice(pendingQueue.indexOf(item), 1);
   renderQueueBar();   // 队列条上的卡片退场，换成正式的已发送气泡
   const outAtts = item.payloadAtts.map(a => ({
     kind: a.kind, name: a.name,
@@ -5112,6 +5160,10 @@ function dispatchNextQueued() {
 }
 
 async function performSend(item) {
+  if (!item.owner) item = {...outgoingItem(item.text, item.payloadAtts, item.skills || []), ...item};
+  inFlight.set(item.nonce, item);
+  lastSent = {...item, outAtts: item.payloadAtts.map(a => ({...a,
+    preview: a.kind === "image" ? `data:${a.mime};base64,${a.data}` : ""}))};
   const sendViewVersion = sessionViewVersion, sendSession = currentSession, sendToken = authToken;
   const isSendView = () => sessionViewVersion === sendViewVersion && currentSession === sendSession && authToken === sendToken;
   // 命令接口：POST 立即返回，过程事件走常驻事件流。「生成中」状态在这里
@@ -5151,11 +5203,6 @@ async function performSend(item) {
   }
   traceTick();
   // 回令：服务端会在 turn_start 里原样带回，本 tab 据此不重复画自己的气泡。
-  // crypto.randomUUID 只在安全上下文可用（本机 http OK，局域网 http 不一定），
-  // 手写兜底保证任何环境都能生成足够唯一的 nonce。
-  item.nonce = item.nonce ||
-    ((crypto.randomUUID ? crypto.randomUUID() : "") ||
-     `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`);
   myNonce = item.nonce;
   const target = item.sessionId ?? currentSession;
   // 绑定目录只发生在【创建任务】的那次请求（创建即绑定，原子）：选目录挂起
@@ -5165,7 +5212,7 @@ async function performSend(item) {
   // 以"已存在的任务不支持随消息改绑目录"拒绝，消息发不出去（真实踩过的坑）。
   const creating = !target;
   const bindPath = creating
-    ? (item.chosenPath || pendingProjectPath || null)
+    ? (item.chosenPath || null)
     : null;
   pendingProjectPath = null;
   const body = JSON.stringify({
@@ -5178,14 +5225,21 @@ async function performSend(item) {
     expected_workspace: creating ? undefined : (item.expectedWorkspace ?? confirmedWorkspace),
   });
   try {
-    if (target) {
-      // 追问：REST 路径（任务已存在）
-      await api(`/api/sessions/${encodeURIComponent(target)}/messages`, { method: "POST", body });
-    } else {
-      // 新任务的第一次发送：创建任务 + 入队一步完成
-      const data = await api(`/api/sessions`, { method: "POST", body });
+    item.state = "sending";
+    await Outbox.put(item);
+    const data = await api(target ? `/api/sessions/${encodeURIComponent(target)}/messages` : "/api/sessions",
+      {method: "POST", body});
+    if (!data.session_id) throw new Error("未收到任务回执");
+    await Outbox.remove(item);
+    if (data.replayed && isSendView()) {
+      if (data.interrupted) toast("服务重启时执行中断，请检查项目后再决定是否重新执行");
+      await switchSession(data.session_id, true);
+      return;
+    }
+    if (!target) {
       if (!isSendView()) { if (authToken === sendToken) loadSessions(); return; }
       currentSession = data.session_id;
+      if (lastSent?.nonce === item.nonce) lastSent.sessionId = currentSession;
       if (window.SkillUI) SkillUI.adoptSession(currentSession);
       localStorage.removeItem(draftKey(null));  // 新任务已实体化：清掉 __new__ 草稿位
       openEvents(currentSession);  // 立刻接事件流：turn_start 可能已在缓冲里等着补发
@@ -5201,16 +5255,24 @@ async function performSend(item) {
     // 附件落盘发生在后端组装消息时，这里补刷一次计数（新建/追问都适用）
     if (item.payloadAtts && item.payloadAtts.some(a => a.kind !== "image")) loadAttachments();
   } catch (e) {
-    if (!isSendView()) { console.warn("[send] 已离开的会话发送失败", {sessionId: target, error: e.message}); return; }
-    // 命令没送出去（后端不可达/登录失效）：回合不会开始，本地复位。
-    // 已发出的消息不放回队列（与旧行为一致：旧版 finally 里也是直接结束）
-    bubble("assistant error", "❌ " + e.message);
-    if ((!target || target === currentSession) && !inputEl.value) {
-      inputEl.value = item.text;
-      if (window.SkillUI) SkillUI.setSelection(item.skills || []);
-      saveDraft(currentSession);
+    if (item.confirmed) {
+      await Outbox.remove(item).catch(() => {});
+      return;
     }
-    resetStreamState();
+    item.state = e.status >= 400 && e.status < 500 ? "failed" : "uncertain";
+    item.error = e.message;
+    await Outbox.put(item).catch(() => {});
+    if (who === item.owner && !pendingQueue.some(entry => entry.nonce === item.nonce)) pendingQueue.unshift(item);
+    if (isSendView() && myNonce === item.nonce && !activeTurnMid) {
+      traceEl?.remove();
+      const optimistic = [...chatEl.querySelectorAll('[data-role="user"]')].at(-1);
+      if (optimistic && !optimistic.dataset.mid) (optimistic.closest(".msg-group") || optimistic).remove();
+      resetStreamState();
+      toast(item.error);
+    }
+    renderQueueBar();
+  } finally {
+    inFlight.delete(item.nonce);
   }
 }
 
@@ -5920,6 +5982,7 @@ function boot() {  // 登录成功（或刷新后 token 仍有效）后的页面
   loadConfig();
   loadWorkspace();
   loadSessions();
+  restoreQueue(null);
   startStatePolling();  // 列表状态徽标的低频刷新（见 startStatePolling）
   restoreDocsWidth();       // 恢复上次的文档栏宽度
   restoreDocsListState();   // 恢复文档列表的折叠态

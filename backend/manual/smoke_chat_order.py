@@ -27,7 +27,7 @@ try:
             pg.add_init_script(FAKE_SSE)
             pg.add_init_script('localStorage.setItem("auth_token", '+repr(case.token)+');localStorage.setItem("auth_username","tester");')
             pg.goto(case.base)
-            pg.wait_for_function('typeof SkillUI !== "undefined"')
+            pg.wait_for_function('typeof SkillUI !== "undefined" && !document.querySelector("#layout").classList.contains("hidden")')
             return pg
         def emit(pg, evt, seq): pg.evaluate('([e,s])=>window.emit(e,s)',[evt,seq])
         failures = []
@@ -61,6 +61,41 @@ try:
         if order!=['提问A','回答A','提问B']: failures.append('queued B rendered before recovered A answer')
         if '连接中断，本回合未完成' in page.locator('#chat').inner_text(): failures.append('false interruption displayed for completed turn')
         if page.locator('#chat details.trace').count()!=2: failures.append('reconnect creates duplicate trace cards')
+        page.close()
+        # A lost reply must retain the entire queued submission and leave the next draft alone.
+        page = new_page()
+        page.evaluate('switchSession("s1")')
+        page.wait_for_function('bootBuffer === null && !workspacePending')
+        page.evaluate("""async () => {
+          await queueMessage('队列中的消息', [{kind:'file', name:'a.txt', data:'YWJj'}],
+                             [{id:'review', version:'original'}]);
+        }""")
+        page.locator('#input').fill('新草稿')
+        requests = []
+        def lose_reply(route):
+            requests.append(route.request.post_data_json)
+            route.abort()
+        page.route('**/api/sessions/s1/messages', lose_reply)
+        page.evaluate('dispatchNextQueued()')
+        expect(page.locator('#queue-bar')).to_contain_text('待确认')
+        expect(page.locator('#input')).to_have_value('新草稿')
+        page.evaluate('saveDraft(currentSession)')
+        page.reload()
+        page.wait_for_function('!document.querySelector("#layout").classList.contains("hidden")')
+        page.evaluate('switchSession("s1")')
+        expect(page.locator('#queue-bar')).to_contain_text('待确认')
+        expect(page.locator('#input')).to_have_value('新草稿')
+        page.unroute('**/api/sessions/s1/messages', lose_reply)
+        def acknowledge(route):
+            requests.append(route.request.post_data_json)
+            route.fulfill(json={'session_id':'s1', 'replayed':True})
+        page.route('**/api/sessions/s1/messages', acknowledge)
+        page.locator('#queue-bar').get_by_text('重试').click()
+        page.wait_for_function('inFlight.size === 0 && pendingQueue.length === 0')
+        assert len(requests) == 2 and requests[0] == requests[1]
+        assert requests[1]['attachments'][0]['data'] == 'YWJj'
+        assert requests[1]['skills'][0]['version'] == 'original'
+        expect(page.locator('#input')).to_have_value('新草稿')
         page.close()
         # A running reconnect must retain already displayed deltas and append only new ones.
         page=new_page();page.evaluate('switchSession("s1")');page.wait_for_function('bootBuffer === null');sent=[]
@@ -141,7 +176,8 @@ try:
         held_posts=[]
         page.route('**/api/sessions/s1/messages', lambda route: held_posts.append(route))
         page.locator('#input').fill('旧会话正在发送')
-        page.locator('#input').press('Enter')
+        with page.expect_request(lambda r: r.method == 'POST' and '/s1/messages' in r.url):
+            page.locator('#input').press('Enter')
         page.evaluate('switchSession("s2")')
         assert held_posts
         with page.expect_response(lambda r:r.request.method=='POST' and '/s1/messages' in r.url):
@@ -158,7 +194,9 @@ try:
             if route.request.method=='POST': held_create.append(route)
             else: route.continue_()
         page.route('**/api/sessions',create)
-        page.locator('#input').fill('创建中的提问');page.locator('#input').press('Enter')
+        page.locator('#input').fill('创建中的提问')
+        with page.expect_request(lambda r: r.method == 'POST' and r.url.endswith('/api/sessions')):
+            page.locator('#input').press('Enter')
         page.evaluate('switchSession("s2")');assert held_create
         with page.expect_response(lambda r:r.request.method=='POST' and r.url.endswith('/api/sessions')):
             held_create[0].fulfill(json={'session_id':'s1'})
