@@ -5,6 +5,34 @@
   const state = window.SkillState;
   let catalog = [], selected = [], favorites = [], editing = null, dirty = false;
   let owner = who, epoch = 0, detailId = null, completion = null, activeIndex = -1;
+  let context = null, request = 0, editVersion = null;
+  const projectPath = () => wsCustom ? el('ws-pick').title : '';
+  function skillUrl(extra = {}) {
+    const q = new URLSearchParams(extra);
+    if (currentSession) q.set('session_id', currentSession);
+    if (projectPath()) q.set('workspace', projectPath());
+    return '/api/skills?' + q;
+  }
+  function changeContext() {
+    const next = JSON.stringify([who, currentSession, projectPath(), workspacePending]);
+    if (next === context) return;
+    context = next; epoch++; catalog = []; detailId = null; editing = null;
+    closePicker(); dialog.close(); dirty = false;
+    el('sk-form').hidden = true; el('sk-empty').hidden = false;
+    renderSelection(); renderList();
+    if (!workspacePending) refresh();
+  }
+  async function withBody(skill, action) {
+    const stamp = epoch;
+    try {
+      if (skill.body === undefined) {
+        const {skill: full} = await api(skillUrl({id:skill.id}));
+        if (stamp !== epoch) return;
+        Object.assign(skill, full);
+      }
+      if (stamp === epoch) action(skill);
+    } catch(e) { if (stamp === epoch) toast(e.message, 'error'); }
+  }
   const key = sid => `skill_draft_${who || 'user'}_${sid || 'new'}`;
   const favoriteKey = () => `skill_favorites_${who || 'user'}`;
   const status = text => { el('sk-status').textContent = text; };
@@ -63,12 +91,15 @@
     if (items.length > 3) box.append(button(`更多 ${items.length - 3} →`, () => openPicker()));
   }
   async function refresh() {
-    const stamp = epoch, user = who;
-    if (!authToken || !user) return false;
+    const stamp = epoch, user = who, seq = ++request;
+    if (!authToken || !user || workspacePending) return false;
     try {
-      const data = await api('/api/skills');
-      if (stamp !== epoch || user !== who) return false;
-      catalog = data.skills;
+      const data = await api(skillUrl({summary:'1'}));
+      if (stamp !== epoch || user !== who || seq !== request) return false;
+      note((data.diagnostics || []).join('；'));
+      catalog = data.skills.map(s => catalog.find(old => old.id === s.id && old.version === s.version && old.body !== undefined) || s);
+      const compatible = selected.filter(s => !s.id.startsWith('project:') || (data.project_prefix && s.id.startsWith(data.project_prefix)));
+      if (compatible.length !== selected.length) { selected = compatible; saveDraft(currentSession); }
       favorites = readJSON(favoriteKey(), []);
       if (!Array.isArray(favorites)) favorites = [];
       if (owner !== who) { owner = who; restoreDraft(currentSession); }
@@ -85,6 +116,13 @@
     return true;
   }
   function toggle(skill) {
+    if (skill.body === undefined) {
+      const completing = completion;
+      const input = inputEl.value;
+      return withBody(skill, full => {
+        if (completion === completing && (!completing || inputEl.value === input)) toggle(full);
+      });
+    }
     if (completion) { if (!choose(skill)) return; }
     else if (selected.some(s => s.id === skill.id)) setSelection(selected.filter(s => s.id !== skill.id));
     else if (!choose(skill)) return;
@@ -106,7 +144,7 @@
     detailId = null; activeIndex = -1; el('sp-search').value = query; note('');
     positionPicker(); if (!picker.matches(':popover-open')) picker.showPopover(); renderPicker();
     if (!keepInput) el('sp-search').focus();
-    if (!await refresh()) note('未能加载技能，请检查连接后重试。');
+    if (!keepInput || !catalog.length) await refresh();
   }
   function renderPicker() {
     const list = el('sp-list'), detail = el('sp-detail');
@@ -116,17 +154,24 @@
     if (detailId) { renderDetail(); return; }
     const query = el('sp-search').value.trim().toLowerCase();
     const items = catalog.filter(s => `${s.name} ${s.description} ${s.id}`.toLowerCase().includes(query));
-    const sorted = [...items].sort((a,b) => Number(favorites.includes(b.id)) - Number(favorites.includes(a.id)));
+    const sorted = [...items].sort((a,b) => Number(b.source === "project") - Number(a.source === "project") || Number(favorites.includes(b.id)) - Number(favorites.includes(a.id)));
     if (!sorted.length) {
       const empty = document.createElement('p'); empty.className = 'sk-muted';
       empty.textContent = catalog.length ? '没有匹配的技能。可以创建一个新技能。' : '还没有技能，点击下方“新建技能”开始。'; list.append(empty);
     }
+    let group;
     sorted.forEach(s => {
+      if (s.source !== group) {
+        group = s.source;
+        const label = document.createElement('small');
+        label.className = 'sk-muted'; label.textContent = group === 'project' ? '当前项目' : '个人通用';
+        list.append(label);
+      }
       const row = document.createElement('div'); row.className = 'sp-row';
       const chosen = selected.some(x => x.id === s.id);
       const pick = button('', () => toggle(s)); pick.className = 'sp-pick'; pick.setAttribute('aria-pressed', String(chosen));
       const title = document.createElement('strong'); title.textContent = `${chosen ? '✓' : '○'} ${s.name}`;
-      const desc = document.createElement('span'); desc.textContent = s.description || s.id; pick.append(title, desc);
+      const desc = document.createElement('span'); desc.textContent = s.description || s.slug; pick.append(title, desc);
       const star = favoriteButton(s); star.classList.add('sp-star');
       row.append(pick, star, button('⋯', () => openDetail(s.id), `查看 ${s.name} 的选项`)); list.append(row);
     });
@@ -143,19 +188,19 @@
     for (const [scope, text] of [['once','仅下一条消息'], ['session','当前会话']]) {
       const label = document.createElement('label'), radio = document.createElement('input');
       radio.type = 'radio'; radio.name = 'skill-scope'; radio.value = scope; radio.checked = (chosen?.scope || 'once') === scope;
-      radio.onchange = () => {
-        if (!chosen && !choose(s)) return;
+      radio.onchange = () => withBody(s, full => {
+        if (!chosen && !choose(full)) return;
         setSelection(selected.map(x => x.id === s.id ? {...x, scope} : x));
-      };
+      });
       label.append(radio, document.createTextNode(text)); field.append(label);
     }
     box.append(field);
-    if (!chosen) box.append(button('选择此技能', () => choose(s)));
+    if (!chosen) box.append(button('选择此技能', () => withBody(s, choose)));
     const notice = document.createElement('p'); notice.className = 'sk-muted sp-scope-help';
     if (!fresh) notice.textContent = '技能已删除，请取消选择或重新创建。';
     else if (chosen && chosen.version !== fresh.version) {
       notice.textContent = '技能库有新版本。当前选择仍保留旧版本，发送前请应用新版。';
-      box.append(button('应用新版本', () => { setSelection(state.update(selected, fresh)); note('已应用新版本'); }));
+      box.append(button('应用新版本', () => { withBody(fresh, full => { setSelection(state.update(selected, full)); note('已应用新版本'); }); }));
     } else notice.textContent = chosen?.scope === 'session' ? '本会话后续消息持续使用，直到取消选择。' : '仅用于下一条消息，发送后自动清空。';
     box.append(notice);
     const content = document.createElement('section'); content.className = 'sp-instruction';
@@ -165,22 +210,29 @@
     const pre = document.createElement('pre'); pre.tabIndex = 0; pre.setAttribute('aria-label', '技能指令');
     pre.textContent = s.body || '请在管理技能中查看指令。'; content.append(heading, pre); box.append(content);
     const actions = document.createElement('div'); actions.className = 'sp-detail-actions';
-    if (fresh) actions.append(button('编辑技能', () => openManager(fresh.id)), button('复制技能', () => { openManager(null, {...fresh, id:'', name:fresh.name + ' 副本'}); }));
+    if (fresh) actions.append(button('编辑技能', () => openManager(fresh.id)), button('复制技能', () => withBody(fresh, full => openManager(null, {...full, id:'', name:full.name + ' 副本'}))));
     if (chosen) actions.append(button('取消选择', () => { setSelection(selected.filter(x => x.id !== s.id)); closePicker(); }));
     box.append(actions); positionPicker();
   }
   async function openDetail(id) {
     completion = null; detailId = id; note(''); positionPicker();
-    if (!picker.matches(':popover-open')) picker.showPopover(); renderPicker(); await refresh();
+    if (!picker.matches(':popover-open')) picker.showPopover();
+    renderPicker();
+    await refresh();
+    const fresh = catalog.find(s => s.id === id);
+    if (detailId === id && fresh) await withBody(fresh, () => { if (detailId === id) renderPicker(); });
   }
   function canLeave() { return !dirty || confirm('有未保存的技能修改，放弃这些修改吗？'); }
   function edit(skill, isNew = false) {
     editing = !isNew && skill && catalog.some(s => s.id === skill.id) ? skill.id : null;
     el('sk-empty').hidden = true; el('sk-form').hidden = false;
-    el('sk-id').value = isNew ? '' : skill?.id || ''; el('sk-id').readOnly = !!editing;
+    editVersion = editing ? skill.version : '';
+    el('sk-source').value = editing ? skill.source : (projectPath() ? 'project' : 'personal');
+    el('sk-source').disabled = !!editing || !projectPath();
+    el('sk-id').value = isNew ? '' : skill?.slug || skill?.id || ''; el('sk-id').readOnly = !!editing;
     el('sk-name').value = skill?.name || ''; el('sk-desc').value = skill?.description || ''; el('sk-body').value = skill?.body || '';
     el('sk-advanced').open = false; el('sk-delete').hidden = !editing; el('sk-select').disabled = false;
-    dirty = !!skill && !editing; status(''); renderList();
+    dirty = !!skill && !editing; status(skill?.editable === false ? '此技能有扩展元数据，请在项目原文件中编辑。' : ''); renderList();
   }
   function renderList() {
     const list = el('sk-list'); list.replaceChildren(); const query = el('sk-search').value.toLowerCase();
@@ -188,8 +240,8 @@
     if (!items.length) { const p = document.createElement('p'); p.className = 'sk-muted'; p.textContent = catalog.length ? '没有匹配的技能' : '还没有技能，点击上方新建。'; list.append(p); }
     for (const s of items) {
       const row = document.createElement('div'); row.className = 'sk-manage-row' + (editing === s.id ? ' active' : '');
-      const item = button('', () => { if (canLeave()) edit(s); }); item.className = 'sk-row' + (editing === s.id ? ' active' : '');
-      const name = document.createElement('strong'), desc = document.createElement('span'); name.textContent = s.name; desc.textContent = s.description || s.id;
+      const item = button('', () => { if (canLeave()) withBody(s, edit); }); item.className = 'sk-row' + (editing === s.id ? ' active' : '');
+      const name = document.createElement('strong'), desc = document.createElement('span'); name.textContent = s.name; desc.textContent = (s.source === 'project' ? '当前项目' : '个人通用') + (s.description ? ' · ' + s.description : '');
       item.title = s.description || s.name;
       item.append(name, desc); row.append(item, favoriteButton(s)); list.append(row);
     }
@@ -201,26 +253,29 @@
     if (!await refresh() || stamp !== epoch) { if (stamp === epoch) toast('加载失败，请重试。', 'error'); return; }
     if ((draft || id !== undefined) && !canLeave()) return;
     if (draft) edit(draft, true);
-    else if (id) { const s = catalog.find(s => s.id === id); if (s) edit(s); }
+    else if (id) { const s = catalog.find(s => s.id === id); if (s) await withBody(s, edit); }
     else if (id === null) edit(null);
-    if (!dialog.open) dialog.showModal();
+    if (stamp === epoch && !dialog.open) dialog.showModal();
   }
   async function save(use) {
     if (!el('sk-form').reportValidity()) return;
     const stamp = epoch;
     el('sk-select').disabled = true;
     try {
-      const id = el('sk-id').value.trim() || state.autoId(el('sk-name').value, catalog.map(s => s.id));
-      if (!editing && catalog.some(s => s.id === id)) throw new Error('这个标识已经存在，请更换标识或从列表打开它进行编辑');
-      const data = await api('/api/skills', {method:'POST', body:JSON.stringify({id,name:el('sk-name').value,description:el('sk-desc').value,body:el('sk-body').value})});
+      const source = el('sk-source').value;
+      const slugs = catalog.filter(s => s.source === source).map(s => s.slug);
+      const id = el('sk-id').value.trim() || state.autoId(el('sk-name').value, slugs);
+      if (!editing && slugs.includes(id)) throw new Error('这个标识已经存在，请更换标识或从列表打开它进行编辑');
+      const data = await api(skillUrl(), {method:'POST', body:JSON.stringify({id:editing || id,source,expected_version:editVersion,name:el('sk-name').value,description:el('sk-desc').value,body:el('sk-body').value})});
       if (stamp !== epoch) return;
+      request++;
       catalog = catalog.filter(s => s.id !== data.skill.id).concat(data.skill);
       edit(data.skill); renderSelection();
-      const old = selected.find(s => s.id === id);
+      const old = selected.find(s => s.id === data.skill.id);
       status(old && old.version !== data.skill.version ? '已保存到技能库。当前选择保持原版本，可在技能标签中应用新版。' : '已保存到技能库');
       if (use && choose(data.skill)) { dialog.close(); inputEl.focus(); }
-    } catch(e) { status(e.message); }
-    finally { el('sk-select').disabled = false; }
+    } catch(e) { if (stamp === epoch) status(e.message); }
+    finally { if (stamp === epoch) el('sk-select').disabled = false; }
   }
   el('skills-chip').onclick = () => picker.matches(':popover-open') ? closePicker() : openPicker();
   el('sp-close').onclick = closePicker;
@@ -242,7 +297,9 @@
   el('sk-delete').onclick = async () => {
     if (!editing || !confirm('删除这个技能？历史消息中保存的版本仍会保留。')) return;
     try {
-      const id = editing; await api('/api/skills?id=' + encodeURIComponent(id), {method:'DELETE'});
+      const id = editing, stamp = epoch; await api(skillUrl({id,expected_version:editVersion}), {method:'DELETE'});
+      if (stamp !== epoch) return;
+      request++;
       catalog = catalog.filter(s => s.id !== id); favorites = favorites.filter(x => x !== id); persist(favoriteKey(), favorites);
       setSelection(selected.filter(s => s.id !== id)); editing = null; dirty = false;
       el('sk-form').hidden = true; el('sk-empty').hidden = false; status('已删除'); renderList();
@@ -287,7 +344,7 @@
   inputEl.addEventListener('keydown', navigation, true); el('sp-search').addEventListener('keydown', navigation);
   window.addEventListener('resize', () => { if (picker.matches(':popover-open')) positionPicker(); });
   window.SkillUI = {
-    selection, setSelection, saveDraft, restoreDraft, refresh,
+    selection, setSelection, saveDraft, restoreDraft, refresh, changeContext,
     afterSend() { setSelection(state.afterSend(selected)); closePicker(); },
     adoptSession(sid) { saveDraft(sid); try { localStorage.removeItem(key(null)); } catch {} },
     reset() {
@@ -295,5 +352,5 @@
       closePicker(); dialog.close(); el('sk-form').reset(); el('sk-form').hidden = true; el('sk-empty').hidden = false; renderSelection();
     }
   };
-  restoreDraft(currentSession); refresh();
+  restoreDraft(currentSession); changeContext();
 })();

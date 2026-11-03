@@ -7,6 +7,7 @@ DELETE /api/skills?id=                    删除
 """
 import db
 import skills
+from services.workspace import project_directory, selected_directory
 
 class SkillRoutes:
     def _message_skill_bodies(self, mid: str) -> list:
@@ -25,16 +26,34 @@ class SkillRoutes:
     def _handle_skills(self):
         uid = self.user["id"]
         try:
+            query = self._query()
+            param = lambda key: (query.get(key) or [""])[0]
+            if self.command == "GET" and param("mid"):
+                return self._json({"skills": self._message_skill_bodies(param("mid"))})
+            sid, workspace = param("session_id"), param("workspace")
+            if sid:
+                if db.session_owner(sid) != uid:
+                    return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+                project = project_directory(uid, sid)
+                if workspace and str(project) != workspace:
+                    raise skills.SkillConflict("任务的工作目录已改变，请重新选择项目")
+            else:
+                project = selected_directory(workspace) if workspace else None
             if self.command == "GET":
-                mid = (self._query().get("mid") or [""])[0]
-                if mid:
-                    return self._json({"skills": self._message_skill_bodies(mid)})
-                return self._json({"skills": skills.listing(uid)})
+                if param("id"):
+                    return self._json({"skill": skills.read(uid, param("id"), project)})
+                diagnostics = []
+                catalog = skills.listing(uid, project, summary=param("summary") == "1", diagnostics=diagnostics)
+                return self._json({"skills": catalog, "diagnostics": diagnostics,
+                                   "project_prefix": skills.project_prefix(project) if project else None})
             if self.command == "POST":
-                return self._json({"ok": True, "skill": skills.save(uid, self._body())})
-            ident = (self._query().get("id") or [""])[0]
-            skills.delete(uid, ident)
+                return self._json({"ok": True, "skill": skills.save(uid, self._body(), project)})
+            skills.delete(uid, param("id"), project, param("expected_version") or None)
             return self._json({"ok": True})
+        except skills.SkillConflict as e:
+            return self._json({"error": str(e)}, 409)
+        except FileNotFoundError:
+            return self._json({"error": "技能文件不存在"}, 404)
         except (ValueError, UnicodeError) as e:
             return self._json({"error": str(e)}, 400)
         except OSError as e:  # 磁盘权限/IO 失败不是调用方的参数错，别回 400

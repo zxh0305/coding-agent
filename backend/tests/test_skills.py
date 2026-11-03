@@ -72,6 +72,55 @@ class SkillStorageTest(unittest.TestCase):
 
 
 class SkillApiTest(ApiTestBase):
+    def test_project_catalog_submission_and_conflicts(self):
+        from routes import busref
+        from threading import Event
+        from urllib.parse import urlencode
+        self.set_global("p1", "a-small")
+        project = Path(self.tmp) / "a"
+        other = Path(self.tmp) / "b"
+        project.mkdir()
+        other.mkdir()
+        db.set_session_workspace("s1", str(project.resolve()))
+        db.set_session_workspace("s2", str(other.resolve()))
+        base = {"id": "review", "name": "代码审查", "expected_version": ""}
+        personal = self.call("POST", "/api/skills", dict(base, body="通用"))[1]["skill"]
+        def create(sid, body):
+            code, result = self.call("POST", "/api/skills?session_id=" + sid,
+                                     dict(base, source="project", body=body))
+            self.assertEqual(code, 200, result)
+            return result["skill"]
+        a, b = create("s1", "审查 A"), create("s2", "审查 B")
+        self.assertNotEqual(a["id"], b["id"])
+        self.assertTrue((project / ".agents/skills/review/SKILL.md").is_file())
+        for sid, skill in (("s1", a), ("s2", b)):
+            catalog = self.call("GET", "/api/skills?summary=1&session_id=" + sid)[1]["skills"]
+            self.assertEqual([s["id"] for s in catalog], [skill["id"], personal["id"]])
+            self.assertTrue(all("body" not in s for s in catalog))
+            self.assertEqual(self.call("GET", "/api/skills?" + urlencode(
+                {"id": skill["id"], "session_id": sid}))[1]["skill"]["body"], skill["body"])
+        self.assertEqual(self.call("POST", "/api/sessions/s2/messages",
+                                   {"message": "go", "skills": [a]})[0], 400)
+        event = Event()
+        with patch.object(busref, "_run_round", side_effect=lambda *args: event.set()) as run:
+            code, _ = self.call("POST", "/api/sessions", {"message": "go", "workspace": str(project),
+                                                           "skills": [a, personal]})
+            self.assertEqual(code, 200)
+            self.assertTrue(event.wait(2))
+            self.assertEqual([s["body"] for s in run.call_args.args[3]["_skills"]], ["审查 A", "通用"])
+        self.assertEqual(self.call("POST", "/api/skills?session_id=s1",
+                                   dict(base, id=a["id"], body="changed"))[0], 409)
+        self.assertEqual(self.call("DELETE", "/api/skills?" + urlencode(
+            {"session_id": "s2", "id": a["id"]}))[0], 400)
+
+    def test_project_root_symlink_cannot_redirect_writes(self):
+        project = Path(self.tmp) / "project"
+        project.mkdir()
+        (project / ".agents").symlink_to(self.tmp, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            skills.save(self.uid, {"id": "test", "body": "x", "source": "project"}, project)
+        self.assertFalse((Path(self.tmp) / "skills/test/SKILL.md").exists())
+
     def test_crud_and_auth(self):
         self.assertEqual(self.call('GET', '/api/skills', token=False)[0], 401)
         data = dict(id='review',name='代码审查',body='检查边界条件')

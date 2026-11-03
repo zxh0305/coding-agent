@@ -139,12 +139,15 @@ class SessionRoutes:
         # 技能选择先于建会话校验（resolve 失败返回 400）：坏选择不能留下孤儿会话。
         # 版本钉死——磁盘上的技能若在选择之后被改过，version 对不上就拒发。
         try:
-            selected_skills = skills.resolve(self.user["id"], body.get("skills", []))
+            skill_project = project_directory(self.user["id"], sid_or_none) if sid_or_none else initial_workspace
+            selected_skills = skills.resolve(self.user["id"], body.get("skills", []), skill_project)
         except ValueError as e:
             return self._json({"error": str(e)}, 400)
         if sid_or_none:
             sid, agent = get_session(sid_or_none, self.user["id"])
             workspace = str(agent.ctx.workspace)
+            if selected_skills and skill_project and workspace != str(skill_project):
+                return self._json({"error": "工作目录已变更，请重新确认技能"}, 409)
             if "expected_workspace" in body and body["expected_workspace"] != workspace:
                 return self._json({"error": "工作目录已变更，请重新确认项目后发送"}, 409)
         else:

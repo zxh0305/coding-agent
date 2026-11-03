@@ -120,6 +120,27 @@ try:
         expect(page.locator('#skill-picker')).to_be_visible()
         page.wait_for_function('''() => {const r=document.querySelector('#skill-picker').getBoundingClientRect(); return r.left>=0 && r.right<=innerWidth && r.top>=0 && r.bottom<=innerHeight;}''')
         page.screenshot(path='/tmp/skills-quick-mobile.png')
+        # New-task project preview, scoped creation, and same-name resolution in the picker.
+        project = Path(case.tmp) / 'one'
+        other = Path(case.tmp) / 'two'
+        project.mkdir()
+        other.mkdir()
+        page.set_viewport_size({'width':1400,'height':1000})
+        page.evaluate('(path) => newTask(path)', str(project.resolve()))
+        page.locator('#skills-chip').click()
+        page.locator('#sp-new').click()
+        expect(page.locator('#sk-source')).to_have_value('project')
+        page.locator('#sk-name').fill('代码审查')
+        page.locator('#sk-body').fill('只检查项目 one')
+        page.locator('#sk-select').click()
+        expect(page.locator('#skills-dialog')).not_to_be_visible()
+        assert (project / '.agents/skills/skill/SKILL.md').is_file()
+        page.locator('#skills-chip').click()
+        expect(page.locator('#sp-list .sp-pick').filter(has_text='代码审查')).to_have_count(2)
+        page.evaluate('(path) => newTask(path)', str(other.resolve()))
+        page.locator('#skills-chip').click()
+        expect(page.locator('#sp-list .sp-pick').filter(has_text='代码审查')).to_have_count(1)
+        assert not any(s['id'].startswith('project:') for s in page.evaluate('SkillUI.selection()'))
         assert not errors, errors
         browser.close()
         print('PASS: picker, favorites, scopes, version application, session isolation, send, queue snapshot, $ completion, mobile; no page errors.')

@@ -2526,6 +2526,7 @@ async function loadWorkspace() {
   wsCustom = false;
   setWsLabel("");
   $("ws-short").textContent = "确认项目中…";
+  window.SkillUI?.changeContext();
   try {
     const w = await api("/api/workspace" + `?session_id=${encodeURIComponent(currentSession)}`);
     if (!isCurrent()) return;
@@ -2534,6 +2535,7 @@ async function loadWorkspace() {
     setWsLabel(w.path);
     renderWsChip();
     setWorkspacePending(false);
+    window.SkillUI?.changeContext();
     refreshGitChip();
     loadPermMode();
   } catch (e) {
@@ -2554,6 +2556,7 @@ function renderWsChip() {
   $("ws-short").textContent = wsCustom ? (($("ws-pick").title || "").replace(/\/+$/, "").split("/").pop() || "工作区")
                                         : "选择项目";
   $("ws-pick").classList.toggle("ws-unset", !wsCustom);
+  window.SkillUI?.changeContext();
 }
 
 let directoryRequest = 0;
