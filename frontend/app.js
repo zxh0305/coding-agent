@@ -44,6 +44,7 @@ function authHeaders() {
 function setWho(name) {
   // 左下角头像取用户名首字符；设置面板同步
   who = name || "";
+  if (window.SkillUI && who) SkillUI.refresh();
   const initial = (who || "牛").slice(0, 1);
   $("user-avatar").textContent = initial;
   $("user-name").textContent = who || "—";
@@ -4730,13 +4731,14 @@ function send() {
   }
   // 已分块上传的大附件：只带 name（不带 data），服务端已落盘；
   // 小附件：沿用内联 data，由服务端落盘。
+  if (editTarget && pendingQueue.length) { toast("有排队消息待处理，请先清理再发送回退编辑"); return; }
   const selectedSkills = window.SkillUI ? SkillUI.selection() : [];
   const payloadAtts = attachments.map(a => a.uploaded
     ? { kind: a.kind, name: a.name, mime: a.mime, data: "" }
     : { kind: a.kind, name: a.name, mime: a.mime, data: a.data });
   const outAtts = attachments.map(a => ({ kind: a.kind, name: a.name, preview: a.preview }));
   inputEl.value = "";
-  if (window.SkillUI) SkillUI.setSelection([]);
+  if (window.SkillUI) SkillUI.afterSend();
   attachments = [];              // 附件必须先清再存草稿：saveDraft 会把托盘快照
   renderAttachTray();            // 写回会话槽，若带着刚发出的附件存，它们会留在
                                  // __new__ 槽里，之后开任何新会话都会被恢复出来
@@ -4946,6 +4948,7 @@ async function performSend(item) {
       // 新任务的第一次发送：创建任务 + 入队一步完成
       const data = await api(`/api/sessions`, { method: "POST", body });
       currentSession = data.session_id;
+      if (window.SkillUI) SkillUI.adoptSession(currentSession);
       localStorage.removeItem(draftKey(null));  // 新任务已实体化：清掉 __new__ 草稿位
       openEvents(currentSession);  // 立刻接事件流：turn_start 可能已在缓冲里等着补发
       loadWorkspace();             // 新任务按用户默认解析了自己的工作区，工具栏对齐

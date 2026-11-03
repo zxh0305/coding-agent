@@ -116,6 +116,7 @@
         <!-- 排队消息条：生成期间的后续消息挂在这里（不进会话流），回合结束自动派发 -->
         <div id="queue-bar" class="queue-bar hidden"></div>
         <textarea id="input" rows="2" placeholder="输入问题或任务，Enter 发送（Shift+Enter 换行）"></textarea>
+        <div id="skill-favorites" class="skill-favorites hidden" aria-label="收藏的技能"></div>
         <div class="toolbar">
           <button id="attach-btn" class="chip" title="添加图片或文本文件">📎</button>
           <input type="file" id="file-input" multiple hidden
@@ -123,7 +124,7 @@
           <button id="perm-chip" class="chip" title="权限模式：只读 = 写入和命令逐次确认；确认 = 高危操作才确认；完全访问 = 全部放行">🛡 <span id="perm-label">确认</span></button>
           <button id="ws-pick" class="chip" title="选择工作区文件夹">📁 <span id="ws-short">工作区</span></button>
           <button id="docs-chip" class="chip" title="查看本会话生成的文档">📄 文档 <span id="docs-count">0</span></button>
-          <button id="skills-chip" class="chip" type="button">✦ 技能 <span id="skills-count"></span></button>
+          <button id="skills-chip" class="chip" type="button" aria-haspopup="dialog" aria-expanded="false">✦ 技能 <span id="skills-count"></span></button>
           <button id="memory-chip" class="chip" title="查看与管理记忆（个人 / 项目两层）">🧠 记忆</button>
           <button id="browser-chip" class="chip hidden" title="查看 agent 的内置浏览器画面">🌐 浏览器</button>
           <button id="bell-chip" class="chip" title="桌面通知：关">🔕</button>
@@ -535,15 +536,22 @@
       <div id="exp-log"></div><button id="exp-more" type="button" hidden>加载更多新增记录</button>
     </div>
   </section>
+  <div id="skill-picker" class="skill-picker" popover="auto" role="dialog" aria-label="选择技能">
+    <header><strong>选择技能</strong><button id="sp-close" type="button" aria-label="关闭技能选择">✕</button></header>
+    <input id="sp-search" placeholder="搜索技能…（也可在输入框输入 $）" aria-label="搜索技能">
+    <div id="sp-list"></div><div id="sp-detail" hidden></div>
+    <footer><button id="sp-new" type="button">＋ 新建技能</button><button id="sp-manage" type="button">管理技能 →</button></footer>
+    <p id="sp-status" role="status"></p>
+  </div>
   <dialog id="skills-dialog" class="skills-dialog" aria-labelledby="skills-title">
     <header class="sk-head"><div><h2 id="skills-title">✦ 我的技能</h2><p>把常用的工作方法保存下来，选择后随下一条消息使用。</p></div><button id="sk-close" type="button" aria-label="关闭">✕</button></header>
     <div class="sk-layout">
       <aside class="sk-side"><div class="sk-actions"><button id="sk-new" type="button">＋ 新建</button><button id="sk-import" type="button">导入 .md</button><input id="sk-file" type="file" accept=".md,text/markdown,text/plain" hidden></div><input id="sk-search" placeholder="搜索技能…" aria-label="搜索技能"><div id="sk-list"></div></aside>
       <section class="sk-editor"><div id="sk-empty"><h3>让常用方法随手可用</h3><p>新建一个技能，写下希望助手遵循的步骤、输出格式和注意事项。也可以导入已有的 SKILL.md。</p><button id="sk-example" type="button">从“代码审查”示例开始</button></div>
-        <form id="sk-form" hidden><label>标识 <input id="sk-id" required maxlength="64" placeholder="例如 code-review" pattern="[a-z0-9][a-z0-9-]{0,63}"></label><label>名称 <input id="sk-name" required maxlength="100" placeholder="例如 代码审查"></label><label>简介 <input id="sk-desc" maxlength="500" placeholder="什么时候使用这个技能"></label><label class="sk-body-label">技能指令 <textarea id="sk-body" required spellcheck="false" placeholder="描述执行步骤、输出要求和注意事项…"></textarea></label><div class="sk-actions"><button type="submit" class="primary">保存</button><button id="sk-select" type="button">用于下一条消息</button><span class="grow"></span><button id="sk-delete" type="button">删除</button></div></form>
+        <form id="sk-form" hidden><label>名称 <input id="sk-name" required maxlength="100" placeholder="例如 代码审查"></label><label>简介 <input id="sk-desc" maxlength="500" placeholder="什么时候使用这个技能"></label><details id="sk-advanced"><summary>高级选项</summary><label>标识（留空自动生成）<input id="sk-id" maxlength="64" placeholder="自动生成" pattern="[a-z0-9][a-z0-9-]{0,63}"></label></details><label class="sk-body-label">技能指令 <textarea id="sk-body" required spellcheck="false" placeholder="描述执行步骤、输出要求和注意事项…"></textarea></label><div class="sk-actions"><button type="submit" class="primary">保存</button><button id="sk-select" type="button">保存并使用</button><span class="grow"></span><button id="sk-delete" type="button">删除</button></div></form>
         <p id="sk-status" role="status"></p>
       </section>
-    </div><footer class="sk-foot">个人技能 · 跨项目可用 · 最多选择 6 个 · 发送后清空选择，历史记录保留所用版本</footer>
+    </div><footer class="sk-foot">个人技能 · 跨项目可用 · 最多选择 6 个 · 可仅用于本次或固定到本会话，历史记录保留所用版本</footer>
   </dialog>
   <div id="toast" class="toast hidden" role="status"></div>
   <!-- 消息语义块：先把「实时事件 / 历史回放」归一化成同构 Block，再统一渲染。
@@ -562,6 +570,7 @@
   <script src="queue_state.js"></script>
   <script src="memory_view.js"></script>
   <script src="app.js"></script>
+  <script src="skills_state.js"></script>
   <script src="skills_view.js"></script>
   <script src="experiments_view.js"></script>
   <script src="experiments.js"></script>
