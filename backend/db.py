@@ -2348,6 +2348,25 @@ def get_messages(sid: str, since_ord: int | None = None,
     return msgs
 
 
+def message_skills(sid: str, mid: str) -> list:
+    """取一条消息上记录的技能全文（前端徽章点开时的懒取通道）。
+
+    只从 CONTENT JSON 里挑 _skills 键，不整条取回——用户消息可能连着几 MB 的
+    附件外置引用，懒取的意义就是把传输面钉在技能本身。mid 必须落在 sid 名下
+    （WHERE 同时约束两者），拿别人的消息 id 解析不出内容。
+    """
+    with _conn() as conn:
+        row = conn.execute("SELECT content FROM messages WHERE session_id=? AND mid=?",
+                           (sid, mid)).fetchone()
+    if row is None:
+        raise ValueError("消息不存在")
+    try:
+        msg = json.loads(row["content"])
+    except (ValueError, TypeError):
+        return []
+    return msg.get("_skills", []) if isinstance(msg, dict) else []
+
+
 def latest_context_tokens(sid: str) -> int | None:
     """该会话最近一次真实请求的 prompt_tokens（/api/context 的持久化兜底）。
 

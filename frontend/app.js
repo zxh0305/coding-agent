@@ -1353,7 +1353,9 @@ function artifactCard(m) {
         .map(p => p.text || "").join("\n");
       const imgs = parts.filter(p => p.type === "image_url")
         .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
-      const full = buildUserBubble(text, imgs, m.skills || []);  // data URI 进 <img>，可点放大
+      // 归档全文里带落库快照的 _skills（含正文），直接渲染，无需再懒取；
+      // 列表行上的 m.skills 只是元数据且外置 stub 本就不带
+      const full = buildUserBubble(text, imgs, msg._skills || msg.skills || [], m.mid);  // data URI 进 <img>，可点放大
       holder.replaceChildren(full);              // 原位替换占位气泡
       scrollBottom();                            // 图片加载会撑高；贴底才跟随
     }).catch(() => { /* 取回失败：保留 head 预览占位，不打扰 */ });
@@ -1383,7 +1385,7 @@ function artifactCard(m) {
         const imgs = parts.filter(p => p.type === "image_url")
           .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
         box.innerHTML = "";
-        box.appendChild(buildUserBubble(text, imgs, msg.skills || []));
+        box.appendChild(buildUserBubble(text, imgs, msg._skills || msg.skills || [], m.mid));
       } else {
         pre.textContent = prettyJson(JSON.stringify(msg));
       }
@@ -1733,7 +1735,10 @@ function msgImage(src, gallery) {
 
 // 带附件的用户气泡：文字 + 图片缩略图（多图走 2 列网格）/文件名。
 // 返回「气泡 + 下方动作条」的 msg-group（📋 复制 / ✏️ 回退编辑）。
-function buildUserBubble(text, atts, skills = []) {
+// skills 条目：列表/事件里只有 {id,name,version} 元数据（后端 skills.slim）；
+// 带 body 的（本地刚选的、artifact 取回的全文）直接渲染。只有元数据时，展开
+// 徽章才按 mid 懒取全文——正文不随事件补发与会话翻页重传。
+function buildUserBubble(text, atts, skills = [], mid = null) {
   const div = document.createElement("div");
   div.className = "bubble user";
   if (text) {
@@ -1745,7 +1750,26 @@ function buildUserBubble(text, atts, skills = []) {
   for (const skill of skills) {
     const details = document.createElement("details"); details.className = "ub-skill";
     const summary = document.createElement("summary"); summary.textContent = "✦ " + (skill.name || skill.id) + " · " + (skill.version || "").slice(0, 8);
-    const body = document.createElement("pre"); body.textContent = skill.body || "所用技能版本已记录。刷新后可查看保存的指令。";
+    const body = document.createElement("pre");
+    if (skill.body) {
+      body.textContent = skill.body;
+    } else {
+      body.textContent = "点开加载当时使用的指令…";
+      details.addEventListener("toggle", async () => {
+        if (!details.open || details.dataset.loaded) return;
+        details.dataset.loaded = "1";
+        if (!mid || !currentSession) { body.textContent = "所用技能的指令已不可回放。"; return; }
+        try {
+          const r = await api(`/api/skills?mid=${encodeURIComponent(mid)}` +
+                              `&session_id=${encodeURIComponent(currentSession)}`);
+          const hit = (r.skills || []).find(s => s.id === skill.id);
+          body.textContent = hit ? (hit.body || "（空指令）") : "所用技能的指令已不可回放。";
+        } catch (e) {
+          details.dataset.loaded = "";  // 允许再点开重试一次
+          body.textContent = "指令回放失败：" + e.message;
+        }
+      });
+    }
     details.append(summary, body); div.append(details);
   }
   // 附件部分与旧实现一致：图片进灯箱、文件名点开附件浮窗
@@ -1794,7 +1818,7 @@ function buildUserBubble(text, atts, skills = []) {
 }
 
 function userBubble(text, atts, mid, skills = []) {
-  chatEl.appendChild(railTag(buildUserBubble(text, atts, skills), mid, "user"));
+  chatEl.appendChild(railTag(buildUserBubble(text, atts, skills, mid), mid, "user"));
   // 自己发消息=明确要看底部：显式恢复跟随（全局统一规则的合法恢复入口之一）
   stickBottom = true;
   scrollBottom();

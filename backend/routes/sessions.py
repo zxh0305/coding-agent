@@ -21,6 +21,7 @@ from pathlib import Path
 
 import db
 import memory
+import skills
 import events
 from events import SSE_HEARTBEAT, sse_frame
 from services.messages import _build_user_message
@@ -72,7 +73,8 @@ class SessionRoutes:
                 continue
         if not _text and not _has_att:
             return self._json({"error": "输入不能为空"}, 400)
-        import skills
+        # 技能选择先于建会话校验（resolve 失败返回 400）：坏选择不能留下孤儿会话。
+        # 版本钉死——磁盘上的技能若在选择之后被改过，version 对不上就拒发。
         try:
             selected_skills = skills.resolve(self.user["id"], body.get("skills", []))
         except ValueError as e:
@@ -259,11 +261,13 @@ class SessionRoutes:
                 items.append({"role": role, "content": "", "ord": m["_ord"], "mid": m["_mid"],
                               "artifact": True, "path": m.get("path"),
                               "bytes": m.get("bytes"), "head": m.get("head"),
-                              "stats": m.get("_stats"), "skills": m.get("_skills", [])})
+                              "stats": m.get("_stats"), "skills": skills.slim(m.get("_skills"))})
             elif m.get("content"):
                 # 助手消息带回耗时/token 统计（回放渲染用，来自 message_usage 表）
+                # 技能只带元数据（skills.slim）：列表随会话翻页整段重传，全文跟
+                # 着走会让刷新一次拖回几十 MB；展开徽章时按 mid 懒取。
                 item = {"role": role, "content": m["content"], "ord": m["_ord"],
-                        "mid": m["_mid"], "stats": m.get("_stats"), "skills": m.get("_skills", [])}
+                        "mid": m["_mid"], "stats": m.get("_stats"), "skills": skills.slim(m.get("_skills"))}
                 # 带 tool_calls 的中间 assistant 消息必须把这个字段带出去：它的
                 # 正文只是"过程说明"（如"现在开始改"），已随最终回答的 trace 落库
                 # （type=process_text），前端 historyNode 靠 tool_calls 判断"这条

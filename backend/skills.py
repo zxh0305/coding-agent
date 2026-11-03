@@ -68,6 +68,28 @@ def save(uid, data):
         if os.path.exists(tmp): os.unlink(tmp)
     return read(uid, ident)
 
+def slim(selected):
+    """传输面瘦身：SSE 事件与消息列表只带徽章需要的元数据。
+
+    正文（body）不进这两条通道——turn_start 会被环形缓冲反复补发，消息列表随
+    会话翻页整段重传，全文跟着走的话最坏每条用户消息几 MB。落库消息里的全文
+    不动（回放保真的根），前端点开徽章时按 mid 走 /api/skills?mid= 懒取。
+    """
+    return [{"id": s["id"], "name": s["name"], "version": s["version"]}
+            for s in (selected or [])]
+
+def delete(uid, ident):
+    """删除技能文件，顺手清掉空目录（SKILL.md 没了留个空壳目录会积灰）。"""
+    target = path_for(uid, ident)
+    existed = target.exists()
+    if existed:
+        target.unlink()
+    try:
+        target.parent.rmdir()  # 仅当目录已空；还有别的文件就让它待着
+    except OSError:
+        pass
+    return existed
+
 def resolve(uid, selected):
     if not isinstance(selected, list) or len(selected) > 6:
         raise ValueError("每条消息最多选择6个技能")
