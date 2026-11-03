@@ -438,7 +438,7 @@ class Agent:
             self._time_block = (
                 f"\n\n【当前时间】{now:%Y-%m-%d %H:%M} 周{'一二三四五六日'[now.weekday()]}"
                 "（会话开始时间；此后经过的时长请按对话推进自行估算）")
-        return self.system_prompt + block + self._time_block
+        return self.system_prompt + block + self._time_block + getattr(self, "_skill_context", "")
 
     def _visible_history(self) -> list[dict]:
         """模型视图的"该看哪些消息"——压缩的唯一生效点（纯函数，测试覆盖）。
@@ -643,6 +643,8 @@ class Agent:
 
     def _run(self, user_input: str, user_message: dict | None = None):
         """run() 的实际循环体（run 只负责停止开关的生命周期）。"""
+        from skills import context as skill_context
+        self._skill_context = skill_context((user_message or {}).get("_skills", []))
         self.trace = []  # 每次提问重新记录过程轨迹
         self.reasoning_live = {}  # 进行中快照的推理缓冲同步重置（见 __init__ 注释）
         self.history.append(user_message or {"role": "user", "content": user_input})

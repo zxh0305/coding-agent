@@ -53,6 +53,7 @@ function setWho(name) {
 
 function showLogin() {
   if (window.ExperimentsUI) window.ExperimentsUI.close();
+  if (window.SkillUI) SkillUI.reset();
   authToken = "";
   who = "";
   currentSession = null;      // 下一个登录者不能沿用上一个用户的任务 id
@@ -761,11 +762,13 @@ function saveDraft(sid) {
   const text = inputEl.value;
   if (text) localStorage.setItem(draftKey(sid), text);
   else localStorage.removeItem(draftKey(sid));  // 空草稿不留残留，避免下次误恢复
+  if (window.SkillUI) SkillUI.saveDraft(sid);
   saveAttachDraft(sid);                          // 附件与文本同一归属，一起存
 }
 
 function restoreDraft(sid) {
   inputEl.value = localStorage.getItem(draftKey(sid)) || "";
+  if (window.SkillUI) SkillUI.restoreDraft(sid);
   restoreAttachDraft(sid);                       // 并恢复该会话自己的附件托盘
 }
 
@@ -1350,7 +1353,7 @@ function artifactCard(m) {
         .map(p => p.text || "").join("\n");
       const imgs = parts.filter(p => p.type === "image_url")
         .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
-      const full = buildUserBubble(text, imgs);  // data URI 进 <img>，可点放大
+      const full = buildUserBubble(text, imgs, m.skills || []);  // data URI 进 <img>，可点放大
       holder.replaceChildren(full);              // 原位替换占位气泡
       scrollBottom();                            // 图片加载会撑高；贴底才跟随
     }).catch(() => { /* 取回失败：保留 head 预览占位，不打扰 */ });
@@ -1380,7 +1383,7 @@ function artifactCard(m) {
         const imgs = parts.filter(p => p.type === "image_url")
           .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
         box.innerHTML = "";
-        box.appendChild(buildUserBubble(text, imgs));
+        box.appendChild(buildUserBubble(text, imgs, msg.skills || []));
       } else {
         pre.textContent = prettyJson(JSON.stringify(msg));
       }
@@ -1730,7 +1733,7 @@ function msgImage(src, gallery) {
 
 // 带附件的用户气泡：文字 + 图片缩略图（多图走 2 列网格）/文件名。
 // 返回「气泡 + 下方动作条」的 msg-group（📋 复制 / ✏️ 回退编辑）。
-function buildUserBubble(text, atts) {
+function buildUserBubble(text, atts, skills = []) {
   const div = document.createElement("div");
   div.className = "bubble user";
   if (text) {
@@ -1738,6 +1741,12 @@ function buildUserBubble(text, atts) {
     t.className = "ub-text";  // 回退编辑时按类名取原文（不碰附件节点）
     t.textContent = text;
     div.appendChild(t);
+  }
+  for (const skill of skills) {
+    const details = document.createElement("details"); details.className = "ub-skill";
+    const summary = document.createElement("summary"); summary.textContent = "✦ " + (skill.name || skill.id) + " · " + (skill.version || "").slice(0, 8);
+    const body = document.createElement("pre"); body.textContent = skill.body || "所用技能版本已记录。刷新后可查看保存的指令。";
+    details.append(summary, body); div.append(details);
   }
   // 附件部分与旧实现一致：图片进灯箱、文件名点开附件浮窗
   const imgs = (atts || []).filter(a => a.kind === "image" && a.preview);
@@ -1784,8 +1793,8 @@ function buildUserBubble(text, atts) {
   return wrapWithActions(div, actions);
 }
 
-function userBubble(text, atts, mid) {
-  chatEl.appendChild(railTag(buildUserBubble(text, atts), mid, "user"));
+function userBubble(text, atts, mid, skills = []) {
+  chatEl.appendChild(railTag(buildUserBubble(text, atts, skills), mid, "user"));
   // 自己发消息=明确要看底部：显式恢复跟随（全局统一规则的合法恢复入口之一）
   stickBottom = true;
   scrollBottom();
@@ -4097,7 +4106,7 @@ function applyEvent(evt, seq) {
     if ((!evt.nonce || evt.nonce !== myNonce) && !alreadyShown) {
       userBubble(evt.input || "（仅附件）",
         (evt.atts || []).map(a => ({ kind: a.kind, name: a.name, preview: "" })),
-        evt.user_mid);
+        evt.user_mid, evt.skills || []);
       scheduleRail();  // 补画的用户消息也要进导航条
     }
     // 回合级状态复位（原在 performSend 里；改为事件驱动后，刷新页面接上
@@ -4419,9 +4428,9 @@ function applyEvent(evt, seq) {
 // 则进队列；不手动清输入框——输入框在出错时早已是空的。
 function retryLast() {
   if (!lastSent) return;
-  if (streaming) { queueMessage(lastSent.text, lastSent.payloadAtts); return; }
-  userBubble(lastSent.text, lastSent.outAtts);
-  performSend({ text: lastSent.text, payloadAtts: lastSent.payloadAtts });
+  if (streaming) { queueMessage(lastSent.text, lastSent.payloadAtts, lastSent.skills || []); return; }
+  userBubble(lastSent.text, lastSent.outAtts, null, lastSent.skills || []);
+  performSend({ text: lastSent.text, payloadAtts: lastSent.payloadAtts, skills: lastSent.skills || [] });
 }
 
 // 生成期间「发送」变身「停止」：点它请求服务端掐断当前生成。
@@ -4612,7 +4621,7 @@ function persistQueue() {
       payloadAtts = atts;
       dropped = true;
     }
-    (bySid[it.sessionId] ||= []).push({ text: it.text, payloadAtts, dropped });
+    (bySid[it.sessionId] ||= []).push({ text: it.text, payloadAtts, skills: it.skills || [], dropped });
   }
   try {
     for (const sid of Object.keys(bySid)) {
@@ -4649,7 +4658,7 @@ function restoreQueue(sid) {
     let n = 0;
     for (const it of items) {
       if (!it || !it.text) continue;
-      pendingQueue.push({ text: it.text, payloadAtts: it.payloadAtts || [],
+      pendingQueue.push({ text: it.text, skills: it.skills || [], payloadAtts: it.payloadAtts || [],
                           sessionId: sid, immediate: false });
       n++;
     }
@@ -4697,11 +4706,13 @@ function send() {
   }
   // 已分块上传的大附件：只带 name（不带 data），服务端已落盘；
   // 小附件：沿用内联 data，由服务端落盘。
+  const selectedSkills = window.SkillUI ? SkillUI.selection() : [];
   const payloadAtts = attachments.map(a => a.uploaded
     ? { kind: a.kind, name: a.name, mime: a.mime, data: "" }
     : { kind: a.kind, name: a.name, mime: a.mime, data: a.data });
   const outAtts = attachments.map(a => ({ kind: a.kind, name: a.name, preview: a.preview }));
   inputEl.value = "";
+  if (window.SkillUI) SkillUI.setSelection([]);
   attachments = [];              // 附件必须先清再存草稿：saveDraft 会把托盘快照
   renderAttachTray();            // 写回会话槽，若带着刚发出的附件存，它们会留在
                                  // __new__ 槽里，之后开任何新会话都会被恢复出来
@@ -4723,8 +4734,8 @@ function send() {
         lastTruncateAt = Date.now();
         currentSession = null;        // 绕过 switchSession 的同 id 早退：全量重拉
         await switchSession(sid0);    // 被回退的段从时间线消失 + 重开事件流
-        userBubble(text, outAtts);    // 新的一轮：自己画气泡（turn_start 是自己的 nonce，不重复画）
-        performSend({ text, payloadAtts, sessionId: sid0 });
+        userBubble(text, outAtts, null, selectedSkills);    // 新的一轮：自己画气泡（turn_start 是自己的 nonce，不重复画）
+        performSend({ text, payloadAtts, skills: selectedSkills, sessionId: sid0 });
       } catch (err) {
         toast("回退失败：" + err.message);
         inputEl.value = text;         // 字还给用户，别丢
@@ -4740,21 +4751,21 @@ function send() {
   // 卡住。这条规则的单测见 queue_state.test.mjs 的 decideSend 用例组。
   if (decideSend(refreshTurnState(), currentSession).action === "queue") {
     // 排队：只显示输入框上方的队列条，正式气泡等派发执行时再渲染（否则会出现两条重复消息）
-    queueMessage(text, payloadAtts);
+    queueMessage(text, payloadAtts, selectedSkills);
     // 队列里有货但当前没在跑（上面的断线场景）：立刻推一次，别等下一个 turn_end
     // ——那个信号可能永远不会再来，队列会一直干等。
     dispatchNextQueued();
     return;
   }
-  lastSent = { text, payloadAtts, outAtts };  // 出错重试的素材
-  userBubble(text, outAtts);
-  performSend({ text, payloadAtts, sessionId: currentSession,
+  lastSent = { text, payloadAtts, outAtts, skills: selectedSkills };  // 出错重试的素材
+  userBubble(text, outAtts, null, selectedSkills);
+  performSend({ text, payloadAtts, skills: selectedSkills, sessionId: currentSession,
                 chosenPath: pendingProjectPath || undefined });
   pendingProjectPath = null;
 }
 
-function queueMessage(text, payloadAtts) {
-  pendingQueue.push({ text, payloadAtts, sessionId: currentSession, immediate: false });
+function queueMessage(text, payloadAtts, skills = []) {
+  pendingQueue.push({ text, payloadAtts, skills, sessionId: currentSession, immediate: false });
   persistQueue();
   renderQueueBar();
 }
@@ -4779,7 +4790,7 @@ function renderQueueBar() {
     row.appendChild(handle);
     const t = document.createElement("div");
     t.className = "q-text";
-    t.textContent = item.text || "（仅附件）";
+    t.textContent = (item.skills?.length ? "✦ " + item.skills.map(s => s.name || s.id).join("、") + " · " : "") + (item.text || "（仅附件）");
     row.appendChild(t);
     for (const a of item.payloadAtts) {
       if (a.kind !== "image") continue;
@@ -4811,6 +4822,7 @@ function renderQueueBar() {
       persistQueue();
       renderQueueBar();
       inputEl.value = item.text;
+      if (window.SkillUI) SkillUI.setSelection(item.skills || []);
       for (const a of item.payloadAtts) {
         attachments.push({ kind: a.kind, name: a.name, mime: a.mime, data: a.data,
                            preview: a.kind === "image" ? `data:${a.mime};base64,${a.data}` : "" });
@@ -4842,7 +4854,7 @@ function dispatchNextQueued() {
     kind: a.kind, name: a.name,
     preview: a.kind === "image" ? `data:${a.mime};base64,${a.data}` : "",
   }));
-  userBubble(item.text, outAtts);  // buildUserBubble 内部走 msgImage：可点放大
+  userBubble(item.text, outAtts, null, item.skills || []);  // buildUserBubble 内部走 msgImage：可点放大
   performSend(item);
 }
 
@@ -4898,6 +4910,7 @@ async function performSend(item) {
     message: item.text,
     nonce: item.nonce,
     attachments: item.payloadAtts,
+    skills: item.skills || [],
     // 创建即绑定项目（原子——回合启动前落库）
     workspace: (creating && bindPath) || undefined,
   });
@@ -4925,6 +4938,11 @@ async function performSend(item) {
     // 命令没送出去（后端不可达/登录失效）：回合不会开始，本地复位。
     // 已发出的消息不放回队列（与旧行为一致：旧版 finally 里也是直接结束）
     bubble("assistant error", "❌ " + e.message);
+    if ((!target || target === currentSession) && !inputEl.value) {
+      inputEl.value = item.text;
+      if (window.SkillUI) SkillUI.setSelection(item.skills || []);
+      saveDraft(currentSession);
+    }
     resetStreamState();
   }
 }

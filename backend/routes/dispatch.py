@@ -68,6 +68,8 @@ class DispatchMixin:
         if not self._require_auth():
             return
         path = urllib.parse.urlparse(self.path).path  # 剥掉 ?query 后的纯路径
+        if path == "/api/skills":
+            return self._handle_skills()
         if path == "/api/experiments" or path.startswith("/api/experiments/"):
             return self._handle_experiments(path, "GET")
         if path == "/api/auth/me":
@@ -205,6 +207,8 @@ class DispatchMixin:
             if not self._require_auth():
                 return
             path = urllib.parse.urlparse(self.path).path  # 剥掉 ?query 再匹配
+            if path == "/api/skills":
+                return self._handle_skills()
             if path == "/api/experiments" or path.startswith("/api/experiments/"):
                 return self._handle_experiments(path, "POST")
             if path == "/api/chat/stop":
@@ -383,6 +387,8 @@ class DispatchMixin:
                 pass  # 幂等：已不存在视为删除成功
             return self._json({"ok": True})
         # 记忆：删除一条（?layer=personal|project&session_id= 指定层）
+        if urllib.parse.urlparse(self.path).path == "/api/skills":
+            return self._handle_skills()
         m = re.fullmatch(r"/api/memory/([^/]+)",
                          urllib.parse.urlparse(self.path).path)
         if m:

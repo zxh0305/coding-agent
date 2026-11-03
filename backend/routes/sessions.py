@@ -72,11 +72,18 @@ class SessionRoutes:
                 continue
         if not _text and not _has_att:
             return self._json({"error": "输入不能为空"}, 400)
+        import skills
+        try:
+            selected_skills = skills.resolve(self.user["id"], body.get("skills", []))
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
         # 会话 id 要先拿到：文本附件需要按会话落盘（data/attachments/<sid>/）。
         # get_session 内部只短持锁（见其注释）；本接口本身毫秒级返回，回合不在
         # 本请求内执行，这里提前取不会拉长锁窗口。
         sid, agent = get_session(sid_or_none, self.user["id"])
         plain, user_message = _build_user_message(body, sid)
+        if user_message is not None and selected_skills:
+            user_message["_skills"] = selected_skills
         if not plain:
             return self._json({"error": "输入不能为空"}, 400)
         # 新任务可随请求携带 workspace：创建即绑定项目。先校验目录再建会话，
@@ -252,11 +259,11 @@ class SessionRoutes:
                 items.append({"role": role, "content": "", "ord": m["_ord"], "mid": m["_mid"],
                               "artifact": True, "path": m.get("path"),
                               "bytes": m.get("bytes"), "head": m.get("head"),
-                              "stats": m.get("_stats")})
+                              "stats": m.get("_stats"), "skills": m.get("_skills", [])})
             elif m.get("content"):
                 # 助手消息带回耗时/token 统计（回放渲染用，来自 message_usage 表）
                 item = {"role": role, "content": m["content"], "ord": m["_ord"],
-                        "mid": m["_mid"], "stats": m.get("_stats")}
+                        "mid": m["_mid"], "stats": m.get("_stats"), "skills": m.get("_skills", [])}
                 # 带 tool_calls 的中间 assistant 消息必须把这个字段带出去：它的
                 # 正文只是"过程说明"（如"现在开始改"），已随最终回答的 trace 落库
                 # （type=process_text），前端 historyNode 靠 tool_calls 判断"这条

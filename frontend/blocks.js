@@ -196,6 +196,7 @@
           kind: "user",
           text: evt.input || "",
           atts: Array.isArray(evt.atts) ? evt.atts : [],
+          skills: evt.skills || [],
           mid: evt.user_mid || null,
         });
       } else if (t === "round") {
@@ -473,7 +474,7 @@
         } else {
           text = typeof m.content === "string" ? m.content : "";
         }
-        blocks.push({ kind: "user", text: text, atts: atts, mid: m.mid || null });
+        blocks.push({ kind: "user", text: text, atts: atts, skills: m.skills || [], mid: m.mid || null });
         // 进行中回合的快照（app.js 注入的 _runningTrace）挂在这条 user 消息上：
         // 回合尚未结束，assistant 行还不存在，紧跟用户气泡画 running 过程块
         const live = runningTraceBlock(m);

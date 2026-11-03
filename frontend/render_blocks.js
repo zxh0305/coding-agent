@@ -239,7 +239,7 @@
 
     function renderBlock(block) {
       if (block.kind === "user") {
-        return deps.railTag(deps.buildUserBubble(block.text, block.atts || []), block.mid, "user");
+        return deps.railTag(deps.buildUserBubble(block.text, block.atts || [], block.skills || []), block.mid, "user");
       }
 
       if (block.kind === "answer") {

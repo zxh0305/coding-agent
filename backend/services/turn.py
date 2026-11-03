@@ -96,6 +96,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             import browser_tools
             browser_tools.screenshot_pusher = _push_browser_screenshot
             bus.publish({"type": "turn_start", "nonce": nonce, "input": plain, "atts": atts,
+                         "skills": user_message.get("_skills", []),
                          # 回合真起点（秒）。补发/多标签页/刷新后的页面没有本地
                          # 计时起点，靠它把「已工作 N 秒」接上，而不是从 0 重数。
                          "started_at": time.time(),
