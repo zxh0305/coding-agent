@@ -240,7 +240,7 @@
     function renderBlock(block) {
       if (block.kind === "user") {
         // mid 一并传入：skills 只有元数据（skills.slim）时，展开徽章靠它懒取全文
-        return deps.railTag(deps.buildUserBubble(block.text, block.atts || [], block.skills || [], block.mid || null), block.mid, "user");
+        return deps.railTag(deps.buildUserBubble(block.text, block.atts || [], block.skills || [], block.mid || null, block.instruction), block.mid, "user");
       }
 
       if (block.kind === "answer") {

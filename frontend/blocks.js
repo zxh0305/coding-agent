@@ -444,7 +444,7 @@
       }
 
       if (m.role === "user") {
-        let text = "";
+        let text = "", instruction;
         let atts = [];
         if (Array.isArray(m.content)) {
           // 文件附件在存储消息里是后端 _build_user_message 注入的一段文本
@@ -461,12 +461,12 @@
             })
             .filter((name) => name)
             .map((name) => ({ kind: "file", name: name, preview: "" }));
-          text = m.content
+          const paragraphs = m.content
             .filter((p) => isObj(p) && p.type === "text")
             .map((p) => p.text || "")
-            .filter((t) => !isAttachNote(t))  // 注入的附件说明不进正文
-            .map((p) => (typeof p === "string" && p.length > 600 ? p.slice(0, 600) + "…[附件内容已折叠]" : p))
-            .join("\n");
+            .filter((t) => !isAttachNote(t));
+          instruction = paragraphs.join("\n");
+          text = paragraphs.map(p => p.length > 600 ? p.slice(0, 600) + "…[附件内容已折叠]" : p).join("\n");
           atts = m.content
             .filter((p) => isObj(p) && p.type === "image_url")
             .map((p) => ({ kind: "image", name: "", preview: ((p.image_url || {}).url) || "" }));
@@ -474,7 +474,7 @@
         } else {
           text = typeof m.content === "string" ? m.content : "";
         }
-        blocks.push({ kind: "user", text: text, atts: atts, skills: m.skills || [], mid: m.mid || null });
+        blocks.push({ kind: "user", text: text, ...(instruction !== undefined && instruction !== text ? {instruction} : {}), atts: atts, skills: m.skills || [], mid: m.mid || null });
         // 进行中回合的快照（app.js 注入的 _runningTrace）挂在这条 user 消息上：
         // 回合尚未结束，assistant 行还不存在，紧跟用户气泡画 running 过程块
         const live = runningTraceBlock(m);

@@ -6,6 +6,31 @@
   let catalog = [], selected = [], favorites = [], editing = null, dirty = false;
   let owner = who, epoch = 0, detailId = null, completion = null, activeIndex = -1;
   let context = null, request = 0, editVersion = null;
+  let defaultIds = [], draftProject = '', defaultsReady = true;
+  const tabDraftKey = () => 'skill_project_draft_' + who;
+  function rememberProjectDraft() {
+    if (!who || currentSession) return;
+    try {
+      if (draftProject) sessionStorage.setItem(tabDraftKey(), JSON.stringify({project:draftProject, ready:defaultsReady, selected}));
+      else sessionStorage.removeItem(tabDraftKey());
+    } catch { toast('当前标签页无法保存项目草稿'); }
+  }
+  function startProject(project) {
+    context = null;
+    draftProject = project || '';
+    defaultsReady = !draftProject;
+    selected = selected.filter(s => !s.fromDefault && !s.id.startsWith('project:'));
+    saveDraft(null);
+  }
+  function resumeProject() {
+    restoreDraft(null);
+    let draft;
+    try { draft = JSON.parse(sessionStorage.getItem(tabDraftKey())); } catch {}
+    draftProject = draft?.project || '';
+    defaultsReady = !draftProject || !!draft.ready;
+    if (draftProject) selected = state.normalize(draft.selected);
+    return draftProject || null;
+  }
   const projectPath = () => wsCustom ? el('ws-pick').title : '';
   function skillUrl(extra = {}) {
     const q = new URLSearchParams(extra);
@@ -14,6 +39,7 @@
     return '/api/skills?' + q;
   }
   function changeContext() {
+    if (!currentSession && draftProject !== projectPath()) startProject(projectPath());
     const next = JSON.stringify([who, currentSession, projectPath(), workspacePending]);
     if (next === context) return;
     context = next; epoch++; catalog = []; detailId = null; editing = null;
@@ -55,7 +81,7 @@
     path.setAttribute('d', 'm12 3 2.78 5.63L21 9.54l-4.5 4.39 1.06 6.2L12 17.2l-5.56 2.93 1.06-6.2L3 9.54l6.22-.91Z');
     svg.append(path); b.append(svg); return b;
   }
-  function saveDraft(sid) { persist(key(sid), selected); }
+  function saveDraft(sid) { persist(key(sid), selected); if (!sid) rememberProjectDraft(); }
   function restoreDraft(sid) {
     selected = state.normalize(readJSON(key(sid), []));
     renderSelection();
@@ -70,7 +96,7 @@
       const tag = document.createElement('span'); tag.className = 'skill-tag';
       const fresh = catalog.find(x => x.id === s.id);
       const changed = fresh && fresh.version !== s.version;
-      tag.append(button(`✦ ${s.name || s.id}${s.scope === 'session' ? ' · 本会话' : ' · 本次'}${changed ? ' · 有更新' : ''}`, () => openDetail(s.id)),
+      tag.append(button(`✦ ${s.name || s.id}${s.fromDefault ? ' · 项目默认' : s.scope === 'session' ? ' · 本会话' : ' · 本次'}${changed ? ' · 有更新' : ''}`, () => openDetail(s.id)),
         button('×', () => setSelection(selected.filter(x => x.id !== s.id)), `取消选择 ${s.name || s.id}`));
       tray.append(tag);
     }
@@ -94,12 +120,20 @@
     const stamp = epoch, user = who, seq = ++request;
     if (!authToken || !user || workspacePending) return false;
     try {
-      const data = await api(skillUrl({summary:'1'}));
+      const initialize = !currentSession && !defaultsReady && draftProject === projectPath();
+      const data = await api(skillUrl({summary:'1', ...(initialize ? {initialize:'1'} : {})}));
       if (stamp !== epoch || user !== who || seq !== request) return false;
       note((data.diagnostics || []).join('；'));
       catalog = data.skills.map(s => catalog.find(old => old.id === s.id && old.version === s.version && old.body !== undefined) || s);
+      defaultIds = data.defaults || [];
       const compatible = selected.filter(s => !s.id.startsWith('project:') || (data.project_prefix && s.id.startsWith(data.project_prefix)));
       if (compatible.length !== selected.length) { selected = compatible; saveDraft(currentSession); }
+      if (initialize && !defaultsReady) {
+        const defaults = defaultIds.map(id => catalog.find(s => s.id === id)).filter(Boolean)
+          .map(s => ({...s, scope:'session', fromDefault:true}));
+        defaultsReady = true;
+        setSelection([...compatible, ...defaults]);
+      }
       favorites = readJSON(favoriteKey(), []);
       if (!Array.isArray(favorites)) favorites = [];
       if (owner !== who) { owner = who; restoreDraft(currentSession); }
@@ -159,6 +193,10 @@
       const empty = document.createElement('p'); empty.className = 'sk-muted';
       empty.textContent = catalog.length ? '没有匹配的技能。可以创建一个新技能。' : '还没有技能，点击下方“新建技能”开始。'; list.append(empty);
     }
+    for (const id of defaultIds.filter(id => !catalog.some(s => s.id === id))) {
+      const remove = button('移除失效的默认技能 · ' + id.split(':').pop(), () => changeDefault(id, false, remove));
+      list.append(remove);
+    }
     let group;
     sorted.forEach(s => {
       if (s.source !== group) {
@@ -177,6 +215,18 @@
     });
     positionPicker();
   }
+  async function changeDefault(id, enabled, control) {
+    const stamp = epoch;
+    control.disabled = true;
+    try {
+      const data = await api(skillUrl({defaults:'1'}), {method:'POST', body:JSON.stringify({id, enabled})});
+      if (stamp !== epoch) return;
+      request++; defaultIds = data.defaults; renderPicker();
+      note(enabled ? '已设为此项目新任务的默认技能' : '已取消项目默认');
+    } catch(e) {
+      if (stamp === epoch) { renderPicker(); note(e.message); }
+    }
+  }
   function renderDetail() {
     const box = el('sp-detail');
     const chosen = selected.find(s => s.id === detailId), fresh = catalog.find(s => s.id === detailId), s = chosen || fresh;
@@ -190,11 +240,18 @@
       radio.type = 'radio'; radio.name = 'skill-scope'; radio.value = scope; radio.checked = (chosen?.scope || 'once') === scope;
       radio.onchange = () => withBody(s, full => {
         if (!chosen && !choose(full)) return;
-        setSelection(selected.map(x => x.id === s.id ? {...x, scope} : x));
+        setSelection(selected.map(x => x.id === s.id ? {...x, scope, fromDefault:false} : x));
       });
       label.append(radio, document.createTextNode(text)); field.append(label);
     }
     box.append(field);
+    if (fresh && projectPath()) {
+      const label = document.createElement('label'), check = document.createElement('input');
+      check.type = 'checkbox'; check.checked = defaultIds.includes(s.id);
+      check.onchange = () => changeDefault(s.id, check.checked, check);
+      label.append(check, document.createTextNode(' 在此项目的新任务中默认使用'));
+      box.append(label);
+    }
     if (!chosen) box.append(button('选择此技能', () => withBody(s, choose)));
     const notice = document.createElement('p'); notice.className = 'sk-muted sp-scope-help';
     if (!fresh) notice.textContent = '技能已删除，请取消选择或重新创建。';
@@ -344,13 +401,21 @@
   inputEl.addEventListener('keydown', navigation, true); el('sp-search').addEventListener('keydown', navigation);
   window.addEventListener('resize', () => { if (picker.matches(':popover-open')) positionPicker(); });
   window.SkillUI = {
-    selection, setSelection, saveDraft, restoreDraft, refresh, changeContext,
+    selection, setSelection, saveDraft, restoreDraft, refresh, changeContext, startProject, resumeProject,
+    readyToSend() {
+      if (currentSession || defaultsReady) return true;
+      toast('正在确认项目默认技能，请稍后发送');
+      refresh();
+      return false;
+    },
+    fromMessage(body) { return openManager(null, {body}); },
     afterSend() { setSelection(state.afterSend(selected)); closePicker(); },
-    adoptSession(sid) { saveDraft(sid); try { localStorage.removeItem(key(null)); } catch {} },
+    adoptSession(sid) { saveDraft(sid); draftProject = ''; defaultsReady = true; try { localStorage.removeItem(key(null)); sessionStorage.removeItem(tabDraftKey()); } catch {} },
     reset() {
-      epoch++; owner = ''; selected = []; catalog = []; favorites = []; editing = null; dirty = false;
+      epoch++; owner = ''; defaultIds = []; draftProject = ''; defaultsReady = true; selected = []; catalog = []; favorites = []; editing = null; dirty = false;
       closePicker(); dialog.close(); el('sk-form').reset(); el('sk-form').hidden = true; el('sk-empty').hidden = false; renderSelection();
     }
   };
-  restoreDraft(currentSession); changeContext();
+  if (!currentSession) pendingProjectPath = resumeProject();
+  if (!el('layout').classList.contains('hidden')) loadWorkspace();
 })();

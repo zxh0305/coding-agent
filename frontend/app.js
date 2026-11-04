@@ -757,6 +757,7 @@ async function newTask(presetProject = null) {
   renderQueueBar();    // 队列条属于上一个任务：这里隐藏（消息保持排队，切回时接着发）
   restoreQueue(null);
   restoreDraft(null);  // 新任务自己的草稿位（__new__）
+  window.SkillUI?.startProject(presetProject);
   resetDocsPanel();    // 新任务态：收起文档栏并清空内容
   loadDocsList();      // 新任务态：文档计数清零
   resetAttachPop();    // 新任务态：附件浮窗收起、计数清零
@@ -1433,14 +1434,8 @@ function artifactCard(m) {
     api(`/api/sessions/${encodeURIComponent(currentSession)}` +
         `/artifact?path=${encodeURIComponent(m.path)}`).then((r) => {
       const msg = r.message;
-      const parts = Array.isArray(msg.content) ? msg.content : [];
-      const text = parts.filter(p => p.type === "text")
-        .map(p => p.text || "").join("\n");
-      const imgs = parts.filter(p => p.type === "image_url")
-        .map(p => ({ kind: "image", name: "", preview: (p.image_url || {}).url || "" }));
-      // 归档全文里带落库快照的 _skills（含正文），直接渲染，无需再懒取；
-      // 列表行上的 m.skills 只是元数据且外置 stub 本就不带
-      const full = buildUserBubble(text, imgs, msg._skills || msg.skills || [], m.mid);  // data URI 进 <img>，可点放大
+      const [user] = blocksFromHistory([{...msg, role:"user"}]);
+      const full = buildUserBubble(user.text, user.atts, msg._skills || msg.skills || [], m.mid, user.instruction);
       holder.replaceChildren(full);              // 原位替换占位气泡
       scrollBottom();                            // 图片加载会撑高；贴底才跟随
     }).catch(() => { /* 取回失败：保留 head 预览占位，不打扰 */ });
@@ -1885,7 +1880,7 @@ async function openMessageSkill(trigger, skill, loadBody) {
   }
 }
 
-function buildUserBubble(text, atts, skills = [], mid = null) {
+function buildUserBubble(text, atts, skills = [], mid = null, instruction = text) {
   const div = document.createElement("div");
   div.className = "bubble user";
   if (text) {
@@ -1956,6 +1951,13 @@ function buildUserBubble(text, atts, skills = [], mid = null) {
   const actions = document.createElement("div");
   actions.className = "msg-actions";
   actions.appendChild(makeCopyBtn(text || ""));
+  if (instruction?.trim() && instruction !== "（仅附件）" && !(atts?.length && instruction.startsWith("[附件] ")) && !instruction.startsWith("用户附带了以下文件：\n\n### 附件文件：")) {
+    const saveSkill = document.createElement("button");
+    saveSkill.type = "button";
+    saveSkill.textContent = "存为技能";
+    saveSkill.onclick = () => window.SkillUI?.fromMessage(instruction);
+    actions.appendChild(saveSkill);
+  }
   const edit = document.createElement("button");
   edit.className = "ub-edit";
   edit.textContent = "✏️";
@@ -2621,6 +2623,7 @@ async function chooseWorkspace() {
   if (!path || $("m-choose").disabled) return;
   // 新任务还没有会话：选择=预绑到这个任务的首次发送（建会话时原子绑定）
   if (!currentSession) {
+    if (pendingProjectPath !== path) window.SkillUI?.startProject(path);
     pendingProjectPath = path;
     wsCustom = true;
     setWsLabel(path);
@@ -4950,6 +4953,7 @@ async function send() {
   // 已分块上传的大附件：只带 name（不带 data），服务端已落盘；
   // 小附件：沿用内联 data，由服务端落盘。
   if (editTarget && pendingQueue.length) { toast("有排队消息待处理，请先清理再发送回退编辑"); return; }
+  if (window.SkillUI && !SkillUI.readyToSend()) return;
   const selectedSkills = window.SkillUI ? SkillUI.selection() : [];
   const payloadAtts = attachments.map(a => a.uploaded
     ? { kind: a.kind, name: a.name, mime: a.mime, data: "" }
@@ -5403,6 +5407,7 @@ bind("m-skip", "click", () => {
   closePicker();
   if (currentSession) return;
   setWsLabel("");
+  window.SkillUI?.startProject(null);
   pendingProjectPath = null;
   wsCustom = false;
   renderWsChip();
@@ -5980,6 +5985,7 @@ function boot() {  // 登录成功（或刷新后 token 仍有效）后的页面
   rebuildRail();            // 现场已清：导航条收起
   $("login-page").classList.add("hidden");   // 离开登录页
   $("layout").classList.remove("hidden");    // 进入对话页
+  if (window.SkillUI) pendingProjectPath = SkillUI.resumeProject();
   setWho(who);
   welcome();
   loadConfig();

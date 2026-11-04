@@ -121,6 +121,22 @@ class SkillApiTest(ApiTestBase):
             skills.save(self.uid, {"id": "test", "body": "x", "source": "project"}, project)
         self.assertFalse((Path(self.tmp) / "skills/test/SKILL.md").exists())
 
+    def test_project_defaults_are_user_preferences(self):
+        from urllib.parse import urlencode
+        path = Path(self.tmp).resolve()
+        url = "/api/skills?" + urlencode({"workspace": str(path)})
+        skill = self.call("POST", url, {"id":"workflow", "source":"project", "body":"中文提交"})[1]["skill"]
+        toggle = {"id":skill["id"], "enabled":True}
+        self.assertEqual(self.call("POST", url + "&defaults=1", toggle)[1]["defaults"], [skill["id"]])
+        self.assertNotIn("body", self.call("GET", url + "&summary=1")[1]["skills"][0])
+        self.assertEqual(self.call("GET", url + "&summary=1&initialize=1")[1]["skills"][0]["body"], "中文提交")
+        self.assertEqual(self.call("GET", "/api/skills")[1]["defaults"], [])
+        self.assertEqual(self.call("POST", "/api/skills?defaults=1", toggle)[0], 400)
+        self.assertEqual(self.call("POST", url + "&defaults=1", dict(toggle, enabled=False))[1]["defaults"], [])
+        other = db.create_user("other-defaults", "pw")["id"]
+        skills.set_default(self.uid, path, skill["id"], True)
+        self.assertEqual(skills.default_ids(other, path), [])
+
     def test_crud_and_auth(self):
         self.assertEqual(self.call('GET', '/api/skills', token=False)[0], 401)
         data = dict(id='review',name='代码审查',body='检查边界条件')

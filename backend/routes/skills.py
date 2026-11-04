@@ -43,11 +43,21 @@ class SkillRoutes:
                 if param("id"):
                     return self._json({"skill": skills.read(uid, param("id"), project)})
                 diagnostics = []
-                catalog = skills.listing(uid, project, summary=param("summary") == "1", diagnostics=diagnostics)
-                return self._json({"skills": catalog, "diagnostics": diagnostics,
+                catalog = skills.listing(uid, project, diagnostics=diagnostics)
+                defaults = skills.default_ids(uid, project)
+                if param("summary") == "1":
+                    initialize = param("initialize") == "1"
+                    for skill in catalog:
+                        if not initialize or skill["id"] not in defaults:
+                            skill.pop("body")
+                return self._json({"skills": catalog, "defaults": defaults, "diagnostics": diagnostics,
                                    "project_prefix": skills.project_prefix(project) if project else None})
             if self.command == "POST":
-                return self._json({"ok": True, "skill": skills.save(uid, self._body(), project)})
+                body = self._body()
+                if param("defaults") == "1":
+                    return self._json({"defaults": skills.set_default(uid, project, body.get("id"),
+                                                                      body.get("enabled"))})
+                return self._json({"ok": True, "skill": skills.save(uid, body, project)})
             skills.delete(uid, param("id"), project, param("expected_version") or None)
             return self._json({"ok": True})
         except skills.SkillConflict as e:

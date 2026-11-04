@@ -408,3 +408,13 @@ test("嵌套：多任务并行各归各卡", () => {
   assert.equal(st[0].items.at(-1).text, "✅ 完成 · 1 轮");
   assert.equal(st[1].items.at(-1).text, "❌ boom");
 });
+
+test("从历史消息提取技能保留完整正文并排除附件说明", () => {
+  const original = "检查边界条件。".repeat(120);
+  const [block] = blocksFromHistory([{role:"user", content:[
+    {type:"text", text:original},
+    {type:"text", text:"用户附带了以下文件：\n\n### 附件文件：notes.txt（已存入附件区）"},
+  ]}]);
+  assert.notEqual(block.text, original);
+  assert.equal(block.instruction, original);
+});

@@ -35,6 +35,30 @@ def project_prefix(project):
     return f"project:{key}:"
 
 
+def default_ids(uid, project):
+    if not project:
+        return []
+    return db.get_setting(f"skill_defaults:{uid}:{project_prefix(project)}", [])
+
+
+def set_default(uid, project, ident, enabled):
+    if not project or not isinstance(enabled, bool):
+        raise ValueError("请选择项目并指定是否默认使用")
+    path_for(uid, ident, project)
+    with _write_lock:
+        ids = default_ids(uid, project)
+        if enabled:
+            read(uid, ident, project)
+            if ident not in ids:
+                if len(ids) >= 6:
+                    raise ValueError("每个项目最多默认使用6个技能")
+                ids.append(ident)
+        elif ident in ids:
+            ids.remove(ident)
+        db.set_setting(f"skill_defaults:{uid}:{project_prefix(project)}", ids)
+        return ids
+
+
 def path_for(uid, ident, project=None):
     base = root(uid).resolve()
     if isinstance(ident, str) and ident.startswith("project:"):
