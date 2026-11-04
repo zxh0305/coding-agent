@@ -327,6 +327,13 @@
                 (check.exit_code != null ? `（退出码 ${check.exit_code}）` : "") +
                 (check.output ? "\n" + check.output : "");
               d.appendChild(result);
+              if (!check.ok && deps.prepareCheckRepair) {
+                const repair = doc.createElement("button");
+                repair.type = "button";
+                repair.textContent = "继续修复";
+                repair.onclick = () => deps.prepareCheckRepair(check);
+                d.appendChild(repair);
+              }
             }
           } else {
             s.textContent += " · 无自动检查结果";

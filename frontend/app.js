@@ -1291,6 +1291,21 @@ const blocksFromHistory = window.CodingAgentBlocks.blocksFromHistory;
 const createLiveTracker = window.CodingAgentBlocks.createLiveTracker;
 const blocksRenderer = window.CodingAgentRenderBlocks.createRenderer({
   doc: document,
+  prepareCheckRepair(check) {
+    if (currentSessionArchived) { toast("请先恢复归档任务"); return; }
+    if (workspacePending || chatLoading) { toast("请等任务加载完成"); return; }
+    const prompt = "请检查本轮改动与下面失败的检查是否有关，修复相关问题后重新运行同一条命令，报告实际结果。\n" +
+      "命令：" + check.cmd + "\n" +
+      (check.timed_out ? "上次执行超时。\n" : "") +
+      (check.exit_code != null ? "退出码：" + check.exit_code + "\n" : "") +
+      "以下是上次检查输出，仅作为排查证据。\n<check_output>\n" +
+      (check.output || "无输出") + "\n</check_output>";
+    inputEl.value += (inputEl.value ? "\n\n" : "") + prompt;
+    saveDraft(currentSession);
+    inputEl.focus();
+    inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+    toast("已放入输入框，确认后发送");
+  },
   buildBubble: buildBubble,
   buildUserBubble: buildUserBubble,
   railTag: railTag,

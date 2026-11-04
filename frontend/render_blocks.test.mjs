@@ -369,3 +369,17 @@ test("回合改动卡展示实际检查结果，旧历史保留原展示", () =>
   assert.match(checked.children[2].textContent, /lint.*退出码 1.*\nbad <script>/);
   assert.equal(checked.children.at(-1).textContent, "+ changed");
 });
+
+test("失败检查可准备修复，通过项没有修复按钮", () => {
+  const deps = makeDeps();
+  let received;
+  deps.prepareCheckRepair = check => { received = check; };
+  const bad = {cmd:"make test", ok:false, output:"assertion failed"};
+  const node = createRenderer(deps).renderBlock({kind:"changes", verification:{results:[
+    {cmd:"lint",ok:true}, bad
+  ]}});
+  const buttons = node.children.filter(child => child.tagName === "BUTTON");
+  assert.equal(buttons.length, 1);
+  buttons[0].onclick();
+  assert.equal(received, bad);
+});

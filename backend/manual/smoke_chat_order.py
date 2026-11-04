@@ -108,6 +108,12 @@ try:
         expect(card.locator('summary')).to_contain_text('1 项失败')
         card.locator('summary').click()
         expect(card).to_contain_text('failed assertion')
+        page.locator('#input').fill('保留的草稿')
+        card.get_by_role('button', name='继续修复').click()
+        assert page.locator('#input').input_value().startswith('保留的草稿')
+        assert 'make test' in page.locator('#input').input_value()
+        assert 'failed assertion' in page.locator('#input').input_value()
+
         page.route('**/api/sessions/s1/messages?*', lambda route: route.fulfill(json={
             'messages':[{'role':'user','mid':'check1','ord':1024,'content':'修改','changes':changes}],
             'has_more':False,'user_index':[]}))
