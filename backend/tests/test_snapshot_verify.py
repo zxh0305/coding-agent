@@ -194,5 +194,41 @@ class TestVerifyRun(unittest.TestCase):
         self.assertTrue(out.endswith("TAIL"))
 
 
+class TurnCheckHistoryTest(unittest.TestCase):
+    def test_failed_check_reaches_event_and_saved_history(self):
+        import app
+        import db
+        from agent import Agent
+        from services import turn
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(db, "DB_PATH", Path(temp) / "test.db"):
+            db.init_db()
+            sid = "checks-test"
+            db.create_session(sid, 1)
+            agent = Agent(llm=Mock(), verbose=False, workspace=temp)
+            message = {"role":"user", "content":"改文件", "_mid":"input1"}
+            def run(plain, user_message):
+                agent.history.extend([user_message, {"role":"assistant", "content":"已修改"}])
+                yield "done", {"answer":"已修改"}
+            agent.run = run
+            report = {"results":[{"cmd":"make test","source":"Makefile","exit_code":1,
+                                  "ok":False,"timed_out":False,"output":"failed assertion"}],
+                      "all_ok":False}
+            bus = Mock()
+            with patch.object(turn, "_event_bus", return_value=bus), \
+                 patch.object(snapshot, "create", return_value="base"), \
+                 patch.object(snapshot, "diff", return_value={"diff":"+ changed"}), \
+                 patch.object(verify, "discover", return_value=[{"cmd":"make test"}]), \
+                 patch.object(verify, "run", return_value=report), \
+                 patch.object(turn, "_spawn_memory_extraction"), patch.object(turn, "_spawn_title_generation"):
+                app._run_round(sid, agent, "改文件", message, "nonce", [])
+            changes = db.get_trace_extras(sid, ["input1"])["input1"]["changes"]
+            event = next(call.args[0] for call in bus.publish.call_args_list
+                         if call.args[0]["type"] == "turn_changes")
+            self.assertEqual(changes["verification"], event["verification"])
+            self.assertEqual(changes["verification"]["results"], report["results"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

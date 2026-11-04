@@ -97,6 +97,26 @@ try:
         assert requests[1]['skills'][0]['version'] == 'original'
         expect(page.locator('#input')).to_have_value('新草稿')
         page.close()
+        # The same verification card is readable live and from paginated history.
+        page = new_page()
+        page.evaluate('switchSession("s1")')
+        page.wait_for_function('bootBuffer === null')
+        changes = {'stat':'1 file changed', 'diff':'+new', 'verification':{'results':[
+            {'cmd':'make test','ok':False,'exit_code':1,'output':'failed assertion'}]}}
+        emit(page, {'type':'turn_changes','user_mid':'check1', **changes}, 1)
+        card = page.locator('#chat details.changes')
+        expect(card.locator('summary')).to_contain_text('1 项失败')
+        card.locator('summary').click()
+        expect(card).to_contain_text('failed assertion')
+        page.route('**/api/sessions/s1/messages?*', lambda route: route.fulfill(json={
+            'messages':[{'role':'user','mid':'check1','ord':1024,'content':'修改','changes':changes}],
+            'has_more':False,'user_index':[]}))
+        page.evaluate('switchSession("s2")')
+        page.evaluate('switchSession("s1")')
+        expect(card).to_have_count(1)
+        expect(card.locator('summary')).to_contain_text('1 项失败')
+        assert not card.evaluate('(el) => el.open')
+        page.close()
         # A running reconnect must retain already displayed deltas and append only new ones.
         page=new_page();page.evaluate('switchSession("s1")');page.wait_for_function('bootBuffer === null');sent=[]
         page.route('**/api/sessions/s1/messages',submit)

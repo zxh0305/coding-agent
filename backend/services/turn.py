@@ -118,6 +118,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 log.exception("[会话 %s] 回合快照创建失败（忽略）", sid)
             seg_mid = None  # 当前回答段落的 SSE 气泡 mid（每个 round 事件换一段，仅事件流用）
             error = None
+            stopped = False
             retryable = False  # 出错时是否值得引导用户重试（见下面的归因逻辑）
             # 进行中快照（方案A核心）：回合事件实时推给在线订阅者，但切走再切回
             # 的页面靠的是「历史分页 + 环形缓冲补发」。环形缓冲只有 500 条，长回合
@@ -187,6 +188,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                     if kind in ("usage", "compacted"):  # 最新上下文容量，供 /api/context
                         _ctx[sid] = payload
                     if kind == "done":
+                        stopped = bool(payload.get("stopped"))
                         log.info("[会话 %s] 最终回答: %s", sid, str(payload.get("answer"))[:200])
             except RuntimeError as e:
                 log.exception("LLM 请求失败")
@@ -224,19 +226,29 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             #   * 结果作为一条 system 消息留在 history：下一轮模型能看到"上次
             #     验证红在哪"，用户也能在轨迹里看到证据，而不是只有模型自述。
             # 失败只记日志——验证是增强证据，不能反过来让回合失败。
-            if error is None and snap_base:
+            verification = {"reason": "回合出错，已跳过自动检查" if error else
+                                      "回合已停止，已跳过自动检查" if stopped else
+                                      "项目中未发现可用的自动检查命令"}
+            if error is None and not stopped and snap_base:
                 try:
                     cmds = verify.discover(Path(agent.ctx.workspace))
+                    if cmds:
+                        verification = {"reason": "检查前未检测到文件差异"}
                     if cmds and snapshot.diff(Path(agent.ctx.workspace),
                                               snap_base).get("diff"):
                         executor = (getattr(agent.ctx, "executor", None)
                                     or default_executor())
                         report = verify.run(Path(agent.ctx.workspace), executor, cmds)
+                        verification = {"results": [
+                            {**r, "output": r["output"] if not r["ok"] else ""}
+                            for r in report["results"]
+                        ]}
                         agent.history.append(verify.as_message(report))
                         log.info("[会话 %s] 自动验证：%s", sid, ", ".join(
                             f"{r['cmd']}={'PASS' if r['ok'] else 'FAIL'}"
                             for r in report["results"]))
                 except Exception:
+                    verification = {"reason": "自动检查记录异常，详情见运行日志"}
                     log.exception("[会话 %s] 自动验证执行失败（忽略）", sid)
             # 收尾（正常/停止/出错共用）：增量落盘 → 重编号信号 → turn_end。
             # 落盘在前、turn_end 在后——turn_end 里的 user_mid 是"这回合已可
@@ -287,12 +299,6 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 # 序号空间）全部失效，推事件让前端重拉时间线
                 db.renumbered_sessions.discard(sid)
                 bus.publish({"type": "history_renumbered"})
-            # user_mid = 本回合输入消息的 mid。必须跳过 _synthetic 合成消息
-            # （收尾指令/循环提醒也是 role=user 且排在最后，但永不落库、没有
-            # _mid）——否则收尾轮结束的回合会把去重键带成 None，前端的补发
-            # 去重会把这回合误判成"不在时间线里"而重复渲染。
-            user_mid = next((m.get("_mid") for m in reversed(agent.history)
-                             if m.get("role") == "user" and not m.get("_synthetic")), None)
             # 本回合的文件改动（快照 → 当前工作树）。在 turn_end 【之前】发布：
             # 前端把 turn_end 当回合结束的唯一信号，改动摘要必须已经到达，
             # 否则收尾后折叠条要等下一次事件才补上。计算失败只记日志——
@@ -304,6 +310,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                         # 落库键 = 本回合的 user_mid：刷新/切回会话时历史接口按它
                         # 带回 changes（answer_mid 要到 save_messages 之后才有，
                         # 而 user_mid 此刻已定）。与轨迹同表共存，互不冲突。
+                        changes["verification"] = verification
                         db.merge_trace_field(sid, user_mid, "changes", changes)
                         bus.publish({"type": "turn_changes", "user_mid": user_mid,
                                      **changes})

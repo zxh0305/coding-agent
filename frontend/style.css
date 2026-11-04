@@ -806,6 +806,7 @@ body.side-resizing .sidebar { transition: none; }
   padding: 2px 0 6px;
 }
 .changes summary { cursor: pointer; user-select: none; font-weight: 500; list-style: none; }
+.changes.has-failures summary { color: var(--danger); }
 .changes summary::before { content: "›"; display: inline-block; margin-right: 6px; transition: transform .15s; }
 .changes[open] summary::before { transform: rotate(90deg); }
 .changes-diff {

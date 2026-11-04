@@ -312,6 +312,29 @@
         const tail = files.length ? files[files.length - 1] : "";
         s.textContent = `📝 本回合改动 ${tail || "（见展开）"}`;
         d.appendChild(s);
+        const verification = block.verification;
+        if (verification) {
+          const checks = verification.results || [];
+          const failed = checks.filter(check => !check.ok).length;
+          if (checks.length) {
+            s.textContent += ` · 自动检查：${checks.length - failed} 项通过` + (failed ? `，${failed} 项失败` : "");
+            if (failed) d.classList.add("has-failures");
+            for (const check of checks) {
+              const result = doc.createElement("pre");
+              result.className = "changes-diff";
+              const status = check.ok ? "通过" : check.timed_out ? "超时" : "失败";
+              result.textContent = `${status}  ${check.cmd}` +
+                (check.exit_code != null ? `（退出码 ${check.exit_code}）` : "") +
+                (check.output ? "\n" + check.output : "");
+              d.appendChild(result);
+            }
+          } else {
+            s.textContent += " · 无自动检查结果";
+            const note = doc.createElement("p");
+            note.textContent = verification.reason;
+            d.appendChild(note);
+          }
+        }
         const pre = doc.createElement("pre");
         pre.className = "changes-diff";
         pre.textContent = (block.diff || "") + (block.truncated ? "\n…（diff 过长，已截断）" : "");

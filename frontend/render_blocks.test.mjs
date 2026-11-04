@@ -354,3 +354,18 @@ test("渲染：普通工具块没有 subtasks 不产生容器", () => {
   }, false);
   assert.equal(frag.children.find((n) => n.className === "subagent-cards"), undefined);
 });
+
+test("回合改动卡展示实际检查结果，旧历史保留原展示", () => {
+  const renderer = createRenderer(makeDeps());
+  const block = {kind:"changes", stat:"1 file changed", diff:"+ changed"};
+  const old = renderer.renderBlock(block);
+  assert.doesNotMatch(old.children[0].textContent, /检查/);
+  const skipped = renderer.renderBlock({...block, verification:{reason:"未配置命令"}});
+  assert.equal(skipped.children[1].textContent, "未配置命令");
+  const checked = renderer.renderBlock({...block, verification:{results:[
+    {cmd:"pytest", ok:true, exit_code:0}, {cmd:"lint", ok:false, exit_code:1, output:"bad <script>"}
+  ]}});
+  assert.match(checked.children[0].textContent, /1 项通过，1 项失败/);
+  assert.match(checked.children[2].textContent, /lint.*退出码 1.*\nbad <script>/);
+  assert.equal(checked.children.at(-1).textContent, "+ changed");
+});

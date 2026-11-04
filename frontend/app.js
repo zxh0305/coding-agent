@@ -1332,7 +1332,7 @@ function changesNode(m) {
       kind: "changes",
       stat: m.changes.stat || "",
       diff: m.changes.diff || "",
-      truncated: !!m.changes.truncated,
+      truncated: !!m.changes.truncated, verification: m.changes.verification,
     }));
   }
   // 回合状态（后端 session_turns 随用户消息带回）。只画需要用户知道的异常
@@ -4564,7 +4564,7 @@ function applyEvent(evt, seq) {
     // 回放走同一个渲染器：折叠条样式与「执行过程」一致，默认收起。
     chatEl.appendChild(blocksRenderer.renderBlock({
       kind: "changes", stat: evt.stat || "", diff: evt.diff || "",
-      truncated: !!evt.truncated,
+      truncated: !!evt.truncated, verification: evt.verification,
     }));
     scrollBottom();
   } else if (t === "turn_end") {

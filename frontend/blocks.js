@@ -324,7 +324,7 @@
         // 需要当时的快照基线，历史接口不存快照 hash——回放时以 trace 里的
         // 写入步骤为准（同一批改动的工具级视图）。
         blocks.push({ kind: "changes", stat: evt.stat || "", diff: evt.diff || "",
-                      truncated: !!evt.truncated });
+                      truncated: !!evt.truncated, verification: evt.verification });
       } else if (t === "compacted") {
         blocks.push({ kind: "compact", summary: evt.summary || "" });
         process = null;
