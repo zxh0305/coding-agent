@@ -864,7 +864,7 @@ body.side-resizing .sidebar { transition: none; }
 
 /* 动作条本体：一排小幽灵按钮 */
 .msg-actions {
-  display: flex; gap: 4px; margin-top: 5px;
+  display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px;
   opacity: 0; visibility: hidden; transform: translateY(-2px);
   transition: opacity .15s ease, visibility .15s, transform .15s ease;
 }
@@ -880,6 +880,7 @@ body.side-resizing .sidebar { transition: none; }
 }
 .msg-actions button:hover { background: var(--hover); color: var(--text); border-color: var(--border-strong); }
 .msg-actions button:active { transform: scale(.94); }
+.msg-group.is-user .msg-actions { justify-content: flex-end; }
 
 /* ✏️ 回退编辑（ZCode editUserQuery）：现在与 📋 同排在用户气泡下方的动作条里 */
 .ub-edit { border: none; background: transparent; padding: 3px 8px; }
@@ -2642,6 +2643,10 @@ body, .layout { height: 100dvh; }
 .top-bar { position: relative; inset: auto; flex: 0 0 64px; width: 100%; height: 64px; display: flex; align-items: center; gap: 8px; padding: 0 24px; border-bottom: 1px solid var(--border); background: var(--bg-alt); z-index: 10; }
 .top-bar .git-chip { position: static; flex: 0 0 auto; box-shadow: none; background: var(--panel); padding: 6px 10px; font-size: 11px; }
 .conversation-heading { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 4px; }
+.conversation-title-row { display: flex; align-items: center; min-width: 0; gap: 8px; }
+.copy-session-id { flex: 0 0 auto; padding: 2px 5px; border: 1px solid var(--border); border-radius: 5px; background: transparent; color: var(--text-3); font-size: 10px; cursor: pointer; }
+.copy-session-id:hover { color: var(--text); background: var(--hover); }
+.copy-session-id:disabled { opacity: .4; cursor: default; }
 #conversation-title { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .conversation-status { font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .conversation-status::before { content: ''; display: inline-block; width: 5px; height: 5px; border-radius: 50%; background: var(--border-strong); margin: 0 6px 1px 0; }

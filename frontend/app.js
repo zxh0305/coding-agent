@@ -217,6 +217,17 @@ async function copyText(text) {
   }
 }
 
+async function copyIdentifier(label, id) {
+  if (!id) { toast("这条需求尚未获得 ID，请在发送开始后重试"); return; }
+  const ok = await copyText(id);
+  toast(ok ? `已复制${label}` : "复制失败：浏览器拒绝了剪贴板访问", ok ? "success" : "error");
+}
+
+$("copy-session-id").addEventListener("click", () => {
+  const sid = currentSession;
+  if (sid) void copyIdentifier("会话 ID", sid);
+});
+
 // 📋 复制按钮：复制一条消息的原文（助手=Markdown 源码，用户=输入原文）。
 // 点击后短暂变 ✅/❌ 给个反馈，再弹 toast 兜底说明。
 function makeCopyBtn(rawText) {
@@ -1016,7 +1027,12 @@ function scheduleRail() {
 function tagLastUntaggedUser(mid) {
   const users = [...chatEl.querySelectorAll('[data-role="user"]')];
   const last = users[users.length - 1];
-  if (last && !last.dataset.mid) { last.dataset.mid = mid; scheduleRail(); }
+  if (last && !last.dataset.mid) {
+    last.dataset.mid = mid;
+    const copyId = last.closest(".msg-group")?.querySelector(".copy-requirement-id");
+    if (copyId) copyId.title = `复制需求 ID：${mid}`;
+    scheduleRail();
+  }
 }
 
 chatEl.addEventListener("scroll", syncRailActive, { passive: true });
@@ -1043,6 +1059,9 @@ function refreshConversationHeader() {
   const session = sessionsCache.find(s => s.id === currentSession);
   title.textContent = currentSession ? (session?.title || "当前任务") : "新任务";
   title.title = title.textContent;
+  const copyId = $("copy-session-id");
+  copyId.disabled = !currentSession;
+  copyId.title = currentSession ? `复制会话 ID：${currentSession}` : "创建会话后可复制 ID";
   let label = "准备就绪", state = "idle";
   if (currentSessionArchived) { label = "已归档 · 只读"; state = "archived"; }
   else if (chatLoading) { label = "正在加载对话"; state = "loading"; }
@@ -1974,6 +1993,17 @@ function buildUserBubble(text, atts, skills = [], mid = null, instruction = text
   const actions = document.createElement("div");
   actions.className = "msg-actions";
   actions.appendChild(makeCopyBtn(text || ""));
+  const copyId = document.createElement("button");
+  copyId.type = "button";
+  copyId.className = "copy-requirement-id";
+  copyId.textContent = "需求 ID";
+  copyId.title = mid ? `复制需求 ID：${mid}` : "复制需求 ID（发送开始后可用）";
+  copyId.setAttribute("aria-label", "复制需求 ID");
+  copyId.addEventListener("click", () => {
+    const id = copyId.closest(".msg-group")?.querySelector('[data-role="user"]')?.dataset.mid || mid;
+    void copyIdentifier("需求 ID", id);
+  });
+  actions.appendChild(copyId);
   if (instruction?.trim() && instruction !== "（仅附件）" && !(atts?.length && instruction.startsWith("[附件] ")) && !instruction.startsWith("用户附带了以下文件：\n\n### 附件文件：")) {
     const saveSkill = document.createElement("button");
     saveSkill.type = "button";
