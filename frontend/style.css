@@ -1485,31 +1485,24 @@ button.primary:hover { background: var(--accent-hover); }
 .msg-img.clickable { cursor: zoom-in; transition: filter .15s; }
 .msg-img.clickable:hover { filter: brightness(1.05); }
 
-/* ---------- 图片灯箱：点气泡里的缩略图 → 全屏查看 ---------- */
-/* 缩放走滚轮，复制走右键菜单；不设工具条 */
-.lightbox {
-  position: fixed; inset: 0; z-index: 300;
-  background: rgba(0, 0, 0, .78);
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 14px; padding: 24px;
-}
-/* 只作用于灯箱里的那张图：写成 .lightbox img 会命中灯箱内所有后代 img，
-   把 .att-card img / .msg-img 的尺寸规则一并覆盖掉。 */
-.lightbox > img {
-  max-width: 92vw; max-height: 78vh;
-  border-radius: 8px; box-shadow: 0 8px 40px rgba(0, 0, 0, .5);
-  cursor: zoom-out;  /* 点放大的图片本身即恢复原样 */
-  transition: transform .12s;
-}
-.lb-nav {
-  position: absolute; top: 50%; transform: translateY(-50%);
-  width: 44px; height: 44px; border: none; border-radius: 50%;
-  background: rgba(255, 255, 255, .14); color: var(--text-inverse); font-size: 26px;
-  cursor: pointer; line-height: 1;
-}
-.lb-nav:hover { background: rgba(255, 255, 255, .3); }
-.lb-nav:first-child { left: 18px; }
-.lb-nav:nth-child(3) { right: 18px; }  /* prev, img, next 固定次序 */
+/* ---------- 图片预览与右侧标注工具 ---------- */
+.lightbox.image-editor { position: fixed; inset: 0; z-index: 300; display: grid; grid-template-columns: minmax(0, 1fr) 58px; grid-template-rows: minmax(0, 1fr) 28px; gap: 8px 12px; padding: 16px; background: rgba(19, 23, 32, .82); }
+.lb-viewport { min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.lb-stage { display: grid; place-items: center; }
+.lb-canvas { display: block; flex: none; touch-action: none; background: white; border-radius: 6px; box-shadow: 0 8px 36px #0005; }
+.lb-canvas[hidden] { display: none; }
+.lb-toolbar { grid-column: 2; grid-row: 1 / 3; align-self: center; display: flex; flex-direction: column; align-items: center; gap: 3px; max-height: 100%; overflow-y: auto; padding: 7px 5px; border: 1px solid #dce0e8; border-radius: 13px; background: #fff; box-shadow: 0 4px 20px #0003; scrollbar-width: thin; }
+.lb-toolbar button { display: grid; place-items: center; flex: 0 0 32px; width: 36px; min-height: 32px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #394150; font: 20px/1 sans-serif; cursor: pointer; }
+.lb-toolbar button:hover, .lb-toolbar button[aria-pressed="true"] { background: #e9efff; color: #315edc; }
+.lb-toolbar button:disabled { opacity: .3; cursor: default; }
+.lb-toolbar button:focus-visible, .lb-toolbar input:focus-visible, .lb-toolbar select:focus-visible { outline: 2px solid #5278ff; outline-offset: 1px; }
+.lb-toolbar button[data-action="reset"] { font: 10px/1 sans-serif; }
+.lb-toolbar hr { flex: none; width: 26px; margin: 3px 0; border: 0; border-top: 1px solid #e5e7eb; }
+.lb-toolbar input[type="color"] { flex: 0 0 30px; width: 32px; height: 30px; padding: 2px; border: 1px solid #dce0e8; border-radius: 4px; background: transparent; cursor: pointer; }
+.lb-toolbar select { flex: none; max-width: 44px; height: 26px; padding: 0; font-size: 10px; border: 1px solid #dce0e8; border-radius: 4px; color: #394150; background: white; }
+.lb-status { align-self: center; min-width: 0; text-align: center; font-size: 11px; line-height: 1.5; color: #e9ecf4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lb-text-input { position: fixed; z-index: 1; width: 224px; padding: 8px; border: 2px solid #5278ff; border-radius: 6px; background: white; color: #202634; font-size: 14px; }
+@media (max-width: 600px) { .lightbox.image-editor { grid-template-columns: minmax(0, 1fr) 50px; gap: 6px; padding: 8px; } .lb-toolbar { padding: 4px 2px; } .lb-status { font-size: 10px; } }
 /* 用户气泡（品牌色底）里的文件名：白字 + 胶囊卡片（见 .att-file.clickable）。
    历史回放里 kind:"file" 的附件走同一 DOM 结构，同一套样式生效 */
 .bubble.user .att-file {

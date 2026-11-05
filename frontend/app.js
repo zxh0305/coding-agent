@@ -1776,69 +1776,15 @@ function compactCard(summary) {
   return d;
 }
 
-// ---------- 图片灯箱：点缩略图 → 全屏查看（多图左右切换 + 缩放 + 复制） ----------
-// 全局单例：任意消息（实时/历史/归档还原）里的 .msg-img 点击后都进这里。
-// openLightbox(src) 单图；openLightbox(src, gallery, idx) 传入同组图片数组
-// （整条消息的全部图片）后可左右切换。缩放：+/−/重置按钮、滚轮、键盘。
-let lbScale = 1;
-let lbKeysHandler = null;  // 当前灯箱的键盘处理器（closeLightbox 要摘掉它）
-
+// ---------- 图片预览：右侧标注、复制与下载工具栏 ----------
+let closeImageEditor = null;
 function openLightbox(src, gallery, idx) {
   closeLightbox();
-  lbScale = 1;
-  const list = Array.isArray(gallery) && gallery.length ? gallery : [src];
-  let cur = Math.max(0, idx || 0);
-
-  const box = document.createElement("div");
-  box.className = "lightbox";
-  const img = document.createElement("img");
-  img.className = "lb-img";
-
-  const apply = () => {
-    img.src = list[cur];
-    img.style.transform = `scale(${lbScale})`;
-  };
-  const setScale = (s) => { lbScale = Math.min(5, Math.max(0.2, s)); apply(); };
-  const step = (d) => { cur = (cur + d + list.length) % list.length; lbScale = 1; apply(); };
-
-  // 左右切换箭头（多图才显示）。缩放走滚轮，复制走右键菜单——不放工具条
-  const mkNav = (label, d) => {
-    const b = document.createElement("button");
-    b.className = "lb-nav";
-    b.textContent = label;
-    b.addEventListener("click", (e) => { e.stopPropagation(); step(d); });
-    return b;
-  };
-  const prev = mkNav("‹", -1), next = mkNav("›", 1);
-
-  box.append(prev, img, next);
-  // 点放大的图片本身恢复原样；空白处关闭；滚轮缩放
-  img.addEventListener("click", () => closeLightbox());
-  box.addEventListener("click", (e) => { if (e.target === box) closeLightbox(); });
-  box.addEventListener("wheel", (e) => {
-    e.preventDefault();
-    setScale(lbScale * (e.deltaY < 0 ? 1.12 : 0.89));
-  }, { passive: false });
-  document.addEventListener("keydown", lightboxKeys);
-  lbKeysHandler = lightboxKeys;
-  document.body.appendChild(box);
-  apply();
-
-  function lightboxKeys(e) {
-    if (e.key === "Escape") closeLightbox();
-    else if (e.key === "ArrowLeft") step(-1);
-    else if (e.key === "ArrowRight") step(1);
-    else if (e.key === "+" || e.key === "=") setScale(lbScale + 0.25);
-    else if (e.key === "-") setScale(lbScale - 0.25);
-    else if (e.key === "0") setScale(1);
-  }
+  closeImageEditor = ImageEditor.open({src, gallery, index:idx || 0, notify:toast});
 }
 function closeLightbox() {
-  document.querySelector(".lightbox")?.remove();
-  if (lbKeysHandler) {
-    document.removeEventListener("keydown", lbKeysHandler);
-    lbKeysHandler = null;
-  }
+  if (closeImageEditor) closeImageEditor();
+  closeImageEditor = null;
 }
 
 // 气泡里的消息图片统一走这里：带点击放大 + 复制。
