@@ -35,6 +35,7 @@ document.addEventListener("modechange", applyPlaceholder);
 
 let messageSkillRequest = 0, messageSkillTrigger = null, messageSkillBody = "";
 let messageSkillRetry = null;
+let executionPhase = "";
 let workspacePending = false, workspaceGeneration = 0;
 let chatLoading = false, connectionState = "idle";
 let sessionViewVersion = 0; // Invalidates asynchronous work when the chat view changes.
@@ -1046,7 +1047,7 @@ function refreshConversationHeader() {
   if (currentSessionArchived) { label = "已归档 · 只读"; state = "archived"; }
   else if (chatLoading) { label = "正在加载对话"; state = "loading"; }
   else if (connectionState === "reconnecting") { label = "连接中断 · 正在重连"; state = "reconnecting"; }
-  else if (streaming) { label = "正在处理 · 可继续输入排队"; state = "running"; }
+  else if (streaming) { label = ({verifying:"正在运行检查",repairing:"正在修复检查失败",finalizing:"正在整理验证结果"})[executionPhase] || "正在处理 · 可继续输入排队"; state = "running"; }
   else if (connectionState === "connecting") { label = "正在连接"; state = "connecting"; }
   else if (currentSession && connectionState === "connected") { label = "已连接"; state = "connected"; }
   status.textContent = label; status.dataset.state = state;
@@ -1294,6 +1295,7 @@ const blocksFromHistory = window.CodingAgentBlocks.blocksFromHistory;
 const createLiveTracker = window.CodingAgentBlocks.createLiveTracker;
 const blocksRenderer = window.CodingAgentRenderBlocks.createRenderer({
   doc: document,
+  loadCheckOutput: (...args) => window.TurnChecksUI?.loadOutput(...args),
   prepareCheckRepair(check) {
     if (currentSessionArchived) { toast("请先恢复归档任务"); return; }
     if (workspacePending || chatLoading) { toast("请等任务加载完成"); return; }
@@ -1345,12 +1347,14 @@ const blocksRenderer = window.CodingAgentRenderBlocks.createRenderer({
 // "能查到改了什么"，位置让位于实现成本。
 function changesNode(m) {
   const frag = document.createDocumentFragment();
+  if (m.assessment && ((m.assessment.assessment && m.assessment.assessment !== "not_applicable") ||
+      ["verifying","repairing","finalizing"].includes(m.assessment.phase))) frag.appendChild(TurnChecksUI.history(m));
   if (m.changes) {
     frag.appendChild(blocksRenderer.renderBlock({
       kind: "changes",
       stat: m.changes.stat || "",
       diff: m.changes.diff || "",
-      truncated: !!m.changes.truncated, verification: m.changes.verification,
+      truncated: !!m.changes.truncated, verification: m.assessment ? undefined : m.changes.verification,
     }));
   }
   // 回合状态（后端 session_turns 随用户消息带回）。只画需要用户知道的异常
@@ -1385,6 +1389,7 @@ function interruptedCard(turn) {
 // 仅两处留在本函数：外置归档消息（非 Block 语义）与带附件的用户消息（需先
 // 归一化，见下）。其余全部委托。
 function historyNode(m) {
+  if (m.candidate) return document.createDocumentFragment();
   // 外置归档消息：库行内只有 head 预览（超大正文存 artifacts 文件），
   // 展示"内容过大已归档"标记，点开按需拉取全文
   if (m.artifact) {
@@ -3199,7 +3204,7 @@ function recordCompletedHistory(messages) {
   let user = null;
   for (const m of messages) {
     if (m.role === "user") user = m;
-    else if (m.role === "assistant" && user && user.mid && m.content && !m.tool_calls &&
+    else if (m.role === "assistant" && user && user.mid && m.content && !m.tool_calls && !m.candidate &&
              (!user.turn || ["done", "error", "interrupted"].includes(user.turn.state))) {
       historyCompletedMids.add(user.mid);
     }
@@ -4577,12 +4582,18 @@ function applyEvent(evt, seq) {
                  context: evt.context, cache_hit_rate: null };
     updateCtxChip();
     toast("早期对话已压缩为摘要，上下文占用已下降");
+  } else if (t === "turn_phase") {
+    executionPhase = evt.phase === "finished" ? "" : evt.phase;
+    refreshConversationHeader();
+    TurnChecksUI.phase(evt);
+  } else if (t === "check_update") {
+    TurnChecksUI.update(evt);
   } else if (t === "turn_changes") {
     // 本回合改了哪些文件（后端 snapshot.diff，turn_end 之前到达）。与历史
     // 回放走同一个渲染器：折叠条样式与「执行过程」一致，默认收起。
     chatEl.appendChild(blocksRenderer.renderBlock({
       kind: "changes", stat: evt.stat || "", diff: evt.diff || "",
-      truncated: !!evt.truncated, verification: evt.verification,
+      truncated: !!evt.truncated, verification: TurnChecksUI.has(evt.user_mid) ? undefined : evt.verification,
     }));
     scrollBottom();
   } else if (t === "turn_end") {
@@ -4740,6 +4751,8 @@ function setStreaming(on) {
 // 会被静默排队且永不派发，停止按钮也把停止请求发给错误的会话。
 // 回合真身不丢：切回旧会话时由历史分页 + 补发定性（finishBoot）重建。
 function resetStreamState() {
+  executionPhase = "";
+  window.TurnChecksUI?.reset();
   closeMessageSkill();
   connectionState = "idle";
   chatLoading = false;

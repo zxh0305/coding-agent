@@ -301,7 +301,7 @@
 
       if (block.kind === "compact") return deps.compactCard(block.summary);
 
-      if (block.kind === "changes") {
+      if (block.kind === "changes" || block.kind === "checks") {
         // 本回合改了哪些文件：折叠条，展开看完整 diff。默认收起——正文区
         // 优先给回答，"它到底改了什么"是按需查阅的第二层信息。
         // textContent 而非 innerHTML：diff 内容来自用户仓库，含 <、& 等字符。
@@ -310,30 +310,44 @@
         const s = doc.createElement("summary");
         const files = (block.stat || "").trim().split("\n").filter(Boolean);
         const tail = files.length ? files[files.length - 1] : "";
-        s.textContent = `📝 本回合改动 ${tail || "（见展开）"}`;
+        s.textContent = block.kind === "checks" ? "自动检查" : `📝 本回合改动 ${tail || "（见展开）"}`;
         d.appendChild(s);
         const verification = block.verification;
         if (verification) {
           const checks = verification.results || [];
-          const failed = checks.filter(check => !check.ok).length;
+          const failed = checks.filter(check => ["failed","blocked","cancelled","stale","interrupted"].includes(check.status) || (!check.status && !check.ok)).length;
+          const passed = checks.filter(check => check.ok).length;
+          const running = checks.filter(check => ["pending","running"].includes(check.status)).length;
           if (checks.length) {
-            s.textContent += ` · 自动检查：${checks.length - failed} 项通过` + (failed ? `，${failed} 项失败` : "");
+            s.textContent += ` · 自动检查：${passed} 项通过` + (failed ? `，${failed} 项失败或未完成` : "") + (running ? `，${running} 项运行中` : "");
             if (failed) d.classList.add("has-failures");
             for (const check of checks) {
               const result = doc.createElement("pre");
               result.className = "changes-diff";
-              const status = check.ok ? "通过" : check.timed_out ? "超时" : "失败";
+              const names = {running:"运行中", pending:"待运行", blocked:"受阻", cancelled:"已停止",
+                             interrupted:"已中断", stale:"已过期", passed:"通过", failed:"失败"};
+              const status = check.timed_out ? "超时" : names[check.status] || (check.ok ? "通过" : "失败");
               result.textContent = `${status}  ${check.cmd}` +
                 (check.exit_code != null ? `（退出码 ${check.exit_code}）` : "") +
                 (check.output ? "\n" + check.output : "");
+              if (check.declared_level) result.textContent += "\n配置声明范围：" + check.declared_level;
               d.appendChild(result);
-              if (!check.ok && deps.prepareCheckRepair) {
+              if (check.check_id && deps.loadCheckOutput && check.status !== "running") {
+                const output = doc.createElement("button");
+                output.type = "button"; output.textContent = "查看检查输出";
+                output.onclick = () => deps.loadCheckOutput(check, result, output);
+                d.appendChild(output);
+              }
+              if (!check.ok && !["running","pending"].includes(check.status) && deps.prepareCheckRepair) {
                 const repair = doc.createElement("button");
                 repair.type = "button";
                 repair.textContent = "继续修复";
                 repair.onclick = () => deps.prepareCheckRepair(check);
                 d.appendChild(repair);
               }
+            }
+            if (verification.reason) {
+              const note = doc.createElement("p"); note.textContent = verification.reason; d.appendChild(note);
             }
           } else {
             s.textContent += " · 无自动检查结果";
@@ -342,6 +356,7 @@
             d.appendChild(note);
           }
         }
+        if (block.kind === "checks") return d;
         const pre = doc.createElement("pre");
         pre.className = "changes-diff";
         pre.textContent = (block.diff || "") + (block.truncated ? "\n…（diff 过长，已截断）" : "");

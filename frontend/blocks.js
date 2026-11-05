@@ -436,7 +436,7 @@
     const blocks = [];
 
     for (const m of Array.isArray(msgs) ? msgs : []) {
-      if (!isObj(m)) continue;
+      if (!isObj(m) || m.candidate) continue;
 
       if (m.role === "compact") {
         blocks.push({ kind: "compact", summary: m.content || "" });

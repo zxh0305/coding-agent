@@ -535,7 +535,7 @@ def grep(pattern: str, path: str = ".", ctx=None) -> str:
     return _ok({"path": path, "result": matches, "total": len(matches)})
 
 
-def run_bash(command: str, ctx=None, timeout: int = 0) -> str:
+def run_bash(command: str, ctx=None, timeout: int = 0, workdir: str = ".") -> str:
     """在工作区目录里执行 shell 命令（cwd 锁定工作区、默认 30 秒超时、输出截断）。
 
     高危判定不在这里做：本函数只管执行。allow/deny/ask 三态判定（含命令
@@ -580,14 +580,19 @@ def run_bash(command: str, ctx=None, timeout: int = 0) -> str:
         environment["VIRTUAL_ENV"] = str(Path(environment_path).parent.parent)
         environment.pop("PYTHONHOME", None)
         options["env"] = environment
-    res = executor.run(command, cwd=_ws(ctx), timeout=limit, **options)
+    cwd = _resolve(workdir, _ws(ctx))
+    if not cwd.is_relative_to(_ws(ctx).resolve()) or not cwd.is_dir():
+        return _err("命令工作目录不可用", "请选择当前项目内的有效目录")
+    res = executor.run(command, cwd=cwd, timeout=limit, **options)
     if getattr(res, "cancelled", False):
-        return _err("命令被用户停止",
-                    "用户主动停止了本回合，不要重试这条命令；如仍需执行，等他再次提出")
+        return json.dumps({"ok":False, "cancelled":True, "error":"命令被用户停止",
+                           "hint":"本回合已停止，不要重试", "result":(res.stdout or "")[-4000:]}, ensure_ascii=False)
     if res.timed_out:
-        return _err(f"命令执行超过 {limit} 秒被终止",
-                    f"确认这是慢命令（安装/构建/测试）就把 timeout 参数放宽到 ≤{BASH_TIMEOUT_MAX} 后重试；"
-                    "或拆成更小的步骤分次执行、给输出加 head/tail 控制")
+        return json.dumps({"ok":False, "timed_out":True, "exit_code":res.exit_code,
+                           "error":f"命令执行超过 {limit} 秒被终止",
+                           "result":((res.stdout or "") + "\n" + (res.stderr or ""))[-6000:],
+                           "hint":f"确认慢命令后可放宽 timeout 至最多 {BASH_TIMEOUT_MAX} 秒，或拆成更小的步骤分次执行"},
+                          ensure_ascii=False)
     stdout = (res.stdout or "")[-MAX_OUTPUT_CHARS:]
     stderr = (res.stderr or "")[-MAX_OUTPUT_CHARS // 2:]
     combined = (stdout + ("\n[stderr]\n" + stderr if stderr else "")).strip() or "（无输出）"
@@ -725,6 +730,7 @@ CODE_TOOL_SCHEMAS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "workdir": {"type": "string", "description": "项目内的相对工作目录，默认项目根"},
                     "command": {"type": "string", "description": "要执行的 shell 命令"},
                     "timeout": {"type": "integer",
                                 "description": "超时秒数，默认 30、上限 600。安装/构建/测试等慢命令请显式调大"},

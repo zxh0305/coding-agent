@@ -19,7 +19,9 @@
 非 git 用户塞一个 git init。
 """
 
+import hashlib
 import os
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -80,6 +82,32 @@ def create(ws: Path) -> str | None:
         return None
 
 
+def _changed_fingerprint(ws, base, env=None, max_bytes=32 * 1024 * 1024):
+    digest, total = hashlib.sha256(), 0
+    paths = _git(ws, "diff", "--name-only", "-z", base, "--", env=env).split("\0")
+    for name in sorted(path for path in paths if path):
+        path = ws / name
+        digest.update(name.encode() + b"\0")
+        if path.is_symlink():
+            digest.update(os.fsencode(os.readlink(path)))
+        elif not path.exists():
+            digest.update(b"<deleted>")
+        elif path.is_file():
+            with path.open("rb") as stream:
+                while True:
+                    chunk = stream.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise SnapshotError("本轮改动超过版本读取上限，无法完整确认检查范围")
+                    digest.update(chunk)
+        else:
+            raise SnapshotError("本轮改动包含子模块或特殊文件，无法完整确认检查范围")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def diff(ws: Path, base: str, max_chars: int = MAX_DIFF_CHARS) -> dict:
     """base 快照 → 当前工作树的完整改动，包含未跟踪的新文件。
 
@@ -99,17 +127,21 @@ def diff(ws: Path, base: str, max_chars: int = MAX_DIFF_CHARS) -> dict:
             env = dict(os.environ, GIT_INDEX_FILE=idx)
             _git(ws, "read-tree", base, env=env)
             _git(ws, "add", "-N", "--", *untracked, env=env)
-            text = _git(ws, "diff", "--no-renames", base, "--", env=env)
+            text = _git(ws, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", base, "--", env=env)
+            version = _changed_fingerprint(ws, base, env)
+            stat_text = _git(ws, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--stat", base, "--", env=env).strip()
         finally:
             try:
                 os.unlink(idx)
             except OSError:
                 pass
     else:
-        text = _git(ws, "diff", "--no-renames", base, "--")
+        text = _git(ws, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", base, "--")
+        version = _changed_fingerprint(ws, base)
+        stat_text = _git(ws, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--stat", base, "--").strip()
 
-    stat = _git(ws, "diff", "--no-renames", "--stat", base, "--").strip()
-    return {"base": base, "stat": stat, "diff": text[:max_chars],
+    return {"base": base, "stat": stat_text, "diff": text[:max_chars],
+            "fingerprint": version,
             "truncated": len(text) > max_chars}
 
 
@@ -130,3 +162,38 @@ def restore(ws: Path, base: str, paths: list[str]) -> list[str]:
         return []
     _git(ws, "checkout", base, "--", *safe)
     return safe
+
+
+def working_tree_fingerprint(ws: Path, max_files=4096, max_bytes=32 * 1024 * 1024) -> str:
+    """Bounded fallback for non-Git projects, including changes made through shell."""
+    from code_tools import IGNORED_DIRS
+    digest = hashlib.sha256()
+    files, total = 0, 0
+    def failed_walk(error):
+        raise SnapshotError("无法遍历项目目录：" + str(error))
+    for directory, dirs, names in os.walk(ws, followlinks=False, onerror=failed_walk):
+        dirs[:] = sorted(name for name in dirs if name not in IGNORED_DIRS)
+        for name in dirs:
+            if (Path(directory) / name).is_symlink():
+                raise SnapshotError("非 Git 项目存在目录链接，无法完整确认检查范围")
+        for name in sorted(names):
+            path = Path(directory) / name
+            if path.is_symlink():
+                raise SnapshotError("非 Git 项目存在文件链接，无法完整确认检查范围")
+            if not stat.S_ISREG(path.stat().st_mode):
+                raise SnapshotError("项目存在特殊文件，无法完整确认检查范围")
+            files += 1
+            if files > max_files:
+                raise SnapshotError("非 Git 项目超过检查版本文件数量上限")
+            digest.update(str(path.relative_to(ws)).encode() + b"\0")
+            with path.open("rb") as stream:
+                while True:
+                    chunk = stream.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise SnapshotError("非 Git 项目超过检查版本读取上限")
+                    digest.update(chunk)
+            digest.update(b"\0")
+    return digest.hexdigest()

@@ -33,8 +33,6 @@ from agent import Agent
 import db
 import skills
 import snapshot
-import verify
-from executor import default_executor
 from llm_client import ApiConnectionError, ApiHTTPError, _RETRYABLE_STATUS
 from services.browser import _push_browser_screenshot
 from services.trace import SNAPSHOT_INTERVAL, _persist_trace, _snapshot_trace
@@ -123,6 +121,11 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 snap_base = snapshot.create(Path(agent.ctx.workspace))
             except Exception:
                 log.exception("[会话 %s] 回合快照创建失败（忽略）", sid)
+            from services.verification import VerificationPolicy
+            policy = VerificationPolicy(agent.ctx.workspace, snap_base, store=db, sid=sid, mid=user_mid)
+            policy.start(agent)
+            agent.completion_policy = policy
+            db.set_assessment(sid, user_mid, "working")
             seg_mid = None  # 当前回答段落的 SSE 气泡 mid（每个 round 事件换一段，仅事件流用）
             error = None
             stopped = False
@@ -225,38 +228,14 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 # 消息）都由各自渲染层加 "❌ "，此处 content 存纯文本。
                 agent.history.append({"role": "assistant", "content": str(error),
                                       "error": True, "retryable": bool(retryable)})
-            # ── 自动验证闭环（verify.py）──────────────────────────────────
-            # 只在【git 工作区】且有实际文件改动时跑：
-            #   * 有快照基线才知道这回合动没动文件（diff 为空 = 纯问答，不白烧）；
-            #   * 验证命令来自工作区的 AGENTS.md / package.json / pyproject /
-            #     Makefile，发现不到就不验证（不猜命令）；
-            #   * 结果作为一条 system 消息留在 history：下一轮模型能看到"上次
-            #     验证红在哪"，用户也能在轨迹里看到证据，而不是只有模型自述。
-            # 失败只记日志——验证是增强证据，不能反过来让回合失败。
-            verification = {"reason": "回合出错，已跳过自动检查" if error else
-                                      "回合已停止，已跳过自动检查" if stopped else
-                                      "项目中未发现可用的自动检查命令"}
-            if error is None and not stopped and snap_base:
-                try:
-                    cmds = verify.discover(Path(agent.ctx.workspace))
-                    if cmds:
-                        verification = {"reason": "检查前未检测到文件差异"}
-                    if cmds and snapshot.diff(Path(agent.ctx.workspace),
-                                              snap_base).get("diff"):
-                        executor = (getattr(agent.ctx, "executor", None)
-                                    or default_executor())
-                        report = verify.run(Path(agent.ctx.workspace), executor, cmds)
-                        verification = {"results": [
-                            {**r, "output": r["output"] if not r["ok"] else ""}
-                            for r in report["results"]
-                        ]}
-                        agent.history.append(verify.as_message(report))
-                        log.info("[会话 %s] 自动验证：%s", sid, ", ".join(
-                            f"{r['cmd']}={'PASS' if r['ok'] else 'FAIL'}"
-                            for r in report["results"]))
-                except Exception:
-                    verification = {"reason": "自动检查记录异常，详情见运行日志"}
-                    log.exception("[会话 %s] 自动验证执行失败（忽略）", sid)
+            # Completion policy ran while Agent.run still owned the cancellation scope.
+            verification = {"results":policy.results, "reason":policy.reason}
+            if stopped:
+                policy.assessment, policy.reason = "cancelled", "用户已停止"
+            elif error is not None:
+                db.interrupt_checks(sid, user_mid, "回合执行出错")
+                policy.assessment, policy.reason = "insufficient", "回合执行出错，验证未完成"
+            db.set_assessment(sid, user_mid, "finished", policy.assessment, policy.reason, policy.repairs)
             # 收尾（正常/停止/出错共用）：增量落盘 → 重编号信号 → turn_end。
             # 落盘在前、turn_end 在后——turn_end 里的 user_mid 是"这回合已可
             # 从时间线读到"的承诺，顺序反了前端去重会误判。
@@ -331,6 +310,8 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                                  "error" if error is not None else "done", error)
             except Exception:
                 log.exception("[会话 %s] 回合终态落库失败（忽略）", sid)
+            bus.publish({"type": "turn_phase", "user_mid":user_mid, "phase":"finished",
+                         "assessment":policy.assessment, "reason":policy.reason})
             bus.publish({"type": "turn_end", "user_mid": user_mid})
             # 回合结束关掉本会话的浏览器：Chromium 进程不常驻；profile 目录
             # 保留在磁盘，下次 browser_* 工具再用时登录态还在。
@@ -367,6 +348,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             # 此刻 user_mid 可能还没分配（异常发生在开跑前），那就无从记账。
             try:
                 if "user_mid" in locals():
+                    db.interrupt_checks(sid, user_mid, "回合执行异常")
                     db.turn_finished(sid, user_mid, "error",
                                      "回合线程收尾异常，详情见 backend 日志")
             except Exception:

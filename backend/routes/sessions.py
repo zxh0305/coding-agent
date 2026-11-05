@@ -331,6 +331,8 @@ class SessionRoutes:
         items = []
         for m in msgs:
             role = m.get("role")
+            if m.get("_completion_candidate"):
+                continue
             if role not in ("user", "assistant", "compact"):
                 continue  # 工具消息/带 tool_calls 的中间 assistant 不进时间线
             # mid 一并带回：它是事件流（delta/done/turn_end.user_mid）与时间线

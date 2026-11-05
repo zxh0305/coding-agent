@@ -74,6 +74,25 @@ class TestSnapshot(GitRepoCase):
         self.assertEqual(out["diff"], "")
         self.assertEqual(out["stat"], "")
 
+    def test_binary_versions_have_distinct_fingerprints(self):
+        path = self.ws / "image.bin"
+        path.write_bytes(b"\0original")
+        git(self.ws, "add", "image.bin")
+        git(self.ws, "commit", "-qm", "binary")
+        base = snapshot.create(self.ws)
+        path.write_bytes(b"\0version1")
+        first = snapshot.diff(self.ws, base)
+        path.write_bytes(b"\0version2")
+        second = snapshot.diff(self.ws, base)
+        self.assertIn("Binary files a/image.bin and b/image.bin differ", first["diff"])
+        self.assertIn("Binary files a/image.bin and b/image.bin differ", second["diff"])
+        self.assertNotEqual(first["fingerprint"], second["fingerprint"])
+
+    def test_plain_project_fingerprint_is_bounded(self):
+        (self.ws / "large.txt").write_text("too large")
+        with self.assertRaises(snapshot.SnapshotError):
+            snapshot.working_tree_fingerprint(self.ws, max_bytes=2)
+
     def test_restore_only_named_file(self):
         base = snapshot.create(self.ws)
         (self.ws / "a.txt").write_text("agent edit\n")
@@ -206,28 +225,32 @@ class TurnCheckHistoryTest(unittest.TestCase):
             db.init_db()
             sid = "checks-test"
             db.create_session(sid, 1)
-            agent = Agent(llm=Mock(), verbose=False, workspace=temp)
+            workspace = Path(temp) / "workspace"
+            workspace.mkdir()
+            from tests.test_wrapup import RecordingLLM, tool_call_message, call, asst
+            agent = Agent(llm=RecordingLLM([
+                tool_call_message(call("write", "write_file", path="value.txt", content="bad")),
+                asst("candidate"), asst("still failed"), asst("final"),
+            ]), verbose=False, workspace=workspace)
+            agent.ctx.executor = FakeExecutor(code=1, out="failed assertion")
+            agent.llm.chat = Mock(return_value="title")
             message = {"role":"user", "content":"改文件", "_mid":"input1"}
-            def run(plain, user_message):
-                agent.history.extend([user_message, {"role":"assistant", "content":"已修改"}])
-                yield "done", {"answer":"已修改"}
-            agent.run = run
-            report = {"results":[{"cmd":"make test","source":"Makefile","exit_code":1,
-                                  "ok":False,"timed_out":False,"output":"failed assertion"}],
-                      "all_ok":False}
             bus = Mock()
             with patch.object(turn, "_event_bus", return_value=bus), \
-                 patch.object(snapshot, "create", return_value="base"), \
-                 patch.object(snapshot, "diff", return_value={"diff":"+ changed"}), \
-                 patch.object(verify, "discover", return_value=[{"cmd":"make test"}]), \
-                 patch.object(verify, "run", return_value=report), \
+                 patch.object(snapshot, "create", return_value=None), \
+                 patch.object(verify, "discover", return_value=[{"cmd":"make test", "source":"Makefile"}]), \
                  patch.object(turn, "_spawn_memory_extraction"), patch.object(turn, "_spawn_title_generation"):
                 app._run_round(sid, agent, "改文件", message, "nonce", [])
-            changes = db.get_trace_extras(sid, ["input1"])["input1"]["changes"]
+            saved = db.get_checks(sid, "input1")
             event = next(call.args[0] for call in bus.publish.call_args_list
-                         if call.args[0]["type"] == "turn_changes")
-            self.assertEqual(changes["verification"], event["verification"])
-            self.assertEqual(changes["verification"]["results"], report["results"])
+                         if call.args[0]["type"] == "check_update" and call.args[0]["status"] == "failed")
+            self.assertEqual(saved[0]["check_id"], event["check_id"])
+            self.assertEqual(saved[0]["output"], event["output"])
+            self.assertEqual(db.get_assessments(sid, ["input1"])["input1"]["assessment"], "failed")
+            kinds = [call.args[0]["type"] for call in bus.publish.call_args_list]
+            self.assertEqual(kinds.count("done"), 1)
+            self.assertLess(kinds.index("check_update"), kinds.index("done"))
+
 
 
 if __name__ == "__main__":

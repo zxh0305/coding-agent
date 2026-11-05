@@ -47,6 +47,11 @@ def build_agent(verbose: bool) -> Agent:
 def ask_once(agent: Agent, question: str) -> None:
     log.info("用户提问: %s", question)
     print(colored(f"\n你：{question}", "green"))
+    import snapshot
+    from services.verification import VerificationPolicy
+    policy = VerificationPolicy(agent.ctx.workspace, snapshot.create(agent.ctx.workspace))
+    policy.start(agent)
+    agent.completion_policy = policy
     answer = agent.chat(question)
     log.info("最终回答: %s", answer)
     print(colored(f"\n🤖 {answer}", "magenta"))

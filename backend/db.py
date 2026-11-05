@@ -1038,15 +1038,35 @@ def start_check(sid, mid, check_key, attempt, detail):
     return check_id
 
 
-def finish_check(sid, check_id, status, detail, output=""):
+def finish_check(sid, check_id, status, detail, output="", *, output_ref=None):
     if status not in CHECK_STATES - {"pending", "running"}:
         raise ValueError("无效检查状态")
-    reference = write_tool_result(sid, output)["path"] if output else None
+    if output_ref and (output_ref.split("/")[0] != sid or not output_ref.endswith(".txt")):
+        raise ValueError("检查输出归属无效")
+    reference = output_ref or (write_tool_result(sid, output)["path"] if output else None)
     with _conn() as conn:
         return conn.execute("UPDATE turn_checks SET status=?,ended=?,detail_json=?,output_ref=? "
                             "WHERE check_id=? AND session_id=? AND status IN ('running','pending')",
                             (status, time.time(), json.dumps(detail, ensure_ascii=False),
                              reference, check_id, sid)).rowcount == 1
+
+
+def invalidate_check(sid, check_id):
+    with _conn() as conn:
+        row = conn.execute("SELECT detail_json,status FROM turn_checks WHERE session_id=? AND check_id=?",
+                           (sid, check_id)).fetchone()
+        if row:
+            detail = json.loads(row["detail_json"])
+            detail.update(ok=False, status="stale", executed_status=row["status"])
+            conn.execute("UPDATE turn_checks SET status='stale',detail_json=? WHERE session_id=? AND check_id=?",
+                         (json.dumps(detail, ensure_ascii=False), sid, check_id))
+
+
+def interrupt_checks(sid, mid, reason):
+    with _conn() as conn:
+        conn.execute("UPDATE turn_checks SET status='interrupted',ended=? WHERE session_id=? "
+                     "AND user_mid=? AND status IN ('running','pending')", (time.time(), sid, mid))
+    set_assessment(sid, mid, "finished", "interrupted", reason)
 
 
 def get_checks(sid, mid=None):
@@ -2349,6 +2369,8 @@ def save_messages(sid: str, history: list[dict], saved: dict) -> int:
                 stub = {"_artifact": True, "path": rel, "bytes": nbytes,
                         "head": blob[:2000], "tail": blob[-1000:],
                         "role": m.get("role", "")}
+                if m.get("_completion_candidate"):
+                    stub["_completion_candidate"] = True
                 row_content = json.dumps(stub, ensure_ascii=False)
                 fp = _fingerprint(row_content)
                 # 就地替换成摘要行：指纹改按"摘要行"记，下一轮重放这段历史

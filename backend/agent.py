@@ -334,6 +334,7 @@ class Agent:
         self.ctx = ToolContext(workspace=prepare_workspace(workspace), vision_backend=vision_backend)
         from services.project_context import ProjectContext
         self.project_context = ProjectContext(self.ctx.workspace)
+        self.completion_policy = None
         self.environment_loader = None
         self.environment_profile = None
         self.project_context_sink = None
@@ -662,6 +663,8 @@ class Agent:
     def _run(self, user_input: str, user_message: dict | None = None):
         """run() 的实际循环体（run 只负责停止开关的生命周期）。"""
         from skills import context as skill_context
+        self._completion_final = False
+        self._mutation_possible = False
         self._project_digest = None
         from services.project_environment import discover
         self.environment_profile = (self.environment_loader() if self.environment_loader
@@ -758,7 +761,7 @@ class Agent:
             # 流式拿模型回复：文字片段实时往外 yield，最后拿到完整 message。
             # 消费逻辑提取成 _consume_stream——收尾轮复用同一份，防止两处漂移。
             # 工具清单按实例白名单过滤（主代理=全量；子代理=只读侦察面）。
-            assistant_msg = yield from self._consume_stream(messages, self._tool_schemas(),
+            assistant_msg = yield from self._consume_stream(messages, None if self._completion_final else self._tool_schemas(),
                                                             usage_total, metrics,
                                                             round_no)
             log.debug("LLM 原始返回: %s", json.dumps(assistant_msg, ensure_ascii=False))
@@ -770,9 +773,24 @@ class Agent:
                 yield from self._tail_stopped(assistant_msg, usage_total, metrics)
                 return
 
+            if self._completion_final and assistant_msg.get("tool_calls"):
+                assistant_msg = {key:value for key,value in assistant_msg.items() if key != "tool_calls"}
             tool_calls = assistant_msg.get("tool_calls")
             if not tool_calls:
-                # 情况 a：模型直接给出回答，循环结束。
+                if self.completion_policy is not None:
+                    decision = yield from self.completion_policy.before_answer(
+                        self, assistant_msg, can_repair=round_no < hard_limit)
+                    if self.cancel_event.is_set():
+                        yield from self._tail_stopped(assistant_msg, usage_total, metrics)
+                        return
+                    if decision:
+                        self.history.append({**assistant_msg, "_completion_candidate": True})
+                        text = assistant_msg.get("content") or ""
+                        if text:
+                            self._trace({"type": "process_text", "round": round_no, "text": text})
+                        self.history.append({"role":"system", "content":decision["feedback"]})
+                        self._completion_final = decision["final"]
+                        continue
                 yield from self._tail_answer(assistant_msg, usage_total, metrics)
                 return
 
@@ -841,6 +859,9 @@ class Agent:
         # 指令，以 tools=None 请求一轮真实总结，回合以模型自己的总结 + done 收场
         # （收尾轮与普通回答同一套完成后压缩判断，见 _wrap_up_round）。
         # 传入 soft_limit：续过轮时它就是本次实际的轮数上限，收尾文案/轮号据此对齐。
+        if self.completion_policy is not None:
+            self.completion_policy.exhausted(self)
+            self.history.append({"role":"system", "content":self.completion_policy.summary_text()})
         yield from self._wrap_up_round(usage_total, metrics, effective_max=soft_limit)
 
     # ------------------------------------------------------------------
@@ -973,6 +994,12 @@ class Agent:
         所以这里只追加纯文本回答。主循环与收尾轮共用。"""
         partial = (assistant_msg or {}).get("content") or ""
         answer = (partial + "\n\n（已手动停止）").strip()
+        if self.completion_policy is not None:
+            self.completion_policy.assessment = "cancelled"
+            self.completion_policy.reason = "用户已停止"
+            notice = self.completion_policy.summary_text()
+            if notice:
+                answer += "\n\n" + notice
         elapsed = round(time.time() - metrics["start"], 1)
         timing = self._timing_summary(usage_total, metrics)
         self.history.append({"role": "assistant", "content": answer,
@@ -1012,6 +1039,10 @@ class Agent:
             answer += ("\n\n> ⚠️ 本次响应被中断，以上内容可能不完整（"
                        + ("输出达到 max_tokens 上限" if truncated == "length"
                           else "连接提前中断") + "）。可重新发送以获取完整回答。")
+        if self.completion_policy is not None:
+            notice = self.completion_policy.summary_text()
+            if notice:
+                answer += "\n\n" + notice
         elapsed = round(time.time() - metrics["start"], 1)
         timing = self._timing_summary(usage_total, metrics)
         self.history.append({"role": "assistant", "content": answer,
@@ -2016,6 +2047,8 @@ class Agent:
         # 计时起点放在最前：白名单闸/钩子否决/参数解析失败等早返回路径也计入，
         # 这样前端看到的每个调用都有耗时（哪怕是毫秒级的拒绝）。
         tool_start = time.monotonic()
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            return json.dumps({"ok":False, "cancelled":True, "error":"用户已停止，调用未启动"})
 
         # 白名单前置闸（子代理防幻觉调用）：schema 已过滤，模型正常情况下看
         # 不到名单外的工具；这里仍拦一道，把"幻觉出的调用"变成可读的错误信封
@@ -2066,6 +2099,8 @@ class Agent:
             # 精确到"某一个"不重要；重要的是【有工具在跑】这个事实。
             self.active_tool = name
             try:
+                if name in ("run_bash", "write_file", "apply_patch"):
+                    self._mutation_possible = True
                 result = execute_tool(name, arguments, self.ctx)
                 executed_args = arguments
                 if name in ("read_file", "write_file", "apply_patch"):
