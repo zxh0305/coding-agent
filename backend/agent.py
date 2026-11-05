@@ -332,6 +332,10 @@ class Agent:
         # 工具执行上下文：工作区 + 看图后端随 Agent 实例走；images 每轮提问时更新。
         # 状态挂在实例上而不是模块级全局，两个会话并发执行工具才不会串数据。
         self.ctx = ToolContext(workspace=prepare_workspace(workspace), vision_backend=vision_backend)
+        from services.project_context import ProjectContext
+        self.project_context = ProjectContext(self.ctx.workspace)
+        self.project_context_sink = None
+        self._project_digest = None
         self.ctx.session_id = session_id  # 文档工具据此确定文档归属（会话隔离）
         # 记忆 v2：个人层按 user_id 分桶。为空（CLI / 单测裸跑）时只注入项目层，
         # 行为与旧版一致——不报错、也不注入一个空段。
@@ -438,7 +442,14 @@ class Agent:
             self._time_block = (
                 f"\n\n【当前时间】{now:%Y-%m-%d %H:%M} 周{'一二三四五六日'[now.weekday()]}"
                 "（会话开始时间；此后经过的时长请按对话推进自行估算）")
-        return self.system_prompt + block + self._time_block + getattr(self, "_skill_context", "")
+        project = self.project_context.refresh()
+        digest = hashlib.sha256(json.dumps(project, ensure_ascii=False).encode()).hexdigest()
+        if digest != self._project_digest:
+            self._project_digest = digest
+            if self.project_context_sink:
+                self.project_context_sink(project)
+        return (self.system_prompt + project["content"] + block + self._time_block
+                + getattr(self, "_skill_context", ""))
 
     def _visible_history(self) -> list[dict]:
         """模型视图的"该看哪些消息"——压缩的唯一生效点（纯函数，测试覆盖）。
@@ -644,6 +655,7 @@ class Agent:
     def _run(self, user_input: str, user_message: dict | None = None):
         """run() 的实际循环体（run 只负责停止开关的生命周期）。"""
         from skills import context as skill_context
+        self._project_digest = None
         self._skill_context = skill_context((user_message or {}).get("_skills", []))
         self.trace = []  # 每次提问重新记录过程轨迹
         self.reasoning_live = {}  # 进行中快照的推理缓冲同步重置（见 __init__ 注释）
@@ -2044,6 +2056,12 @@ class Agent:
             try:
                 result = execute_tool(name, arguments, self.ctx)
                 executed_args = arguments
+                if name in ("read_file", "write_file", "apply_patch"):
+                    try:
+                        if json.loads(result).get("ok") and isinstance(arguments.get("path"), str):
+                            self.project_context.touch(arguments["path"])
+                    except (ValueError, TypeError, OSError):
+                        pass
             except Exception as e:  # execute_tool 已兜底一次；这里再兜一层，守住"绝不抛"的承诺
                 result = error_result(f"{type(e).__name__}: {e}", "工具内部异常，可换用其它工具或稍后重试")
             finally:

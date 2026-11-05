@@ -93,6 +93,13 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             # analyze_image 永远报"没有附带图片"。拷贝让替换只毁副本，原 dict 完整
             # 进入 agent 历史；收尾整段落盘时本消息已按桩内容记过指纹，幂等跳过。
             db.save_messages(sid, [dict(user_message)], {})
+            def save_project_context(context):
+                ref = db.write_tool_result(sid, json.dumps(context, ensure_ascii=False))
+                refs = user_message.setdefault("_project_context", [])
+                if not refs or refs[-1]["path"] != ref["path"]:
+                    refs.append(ref)
+                    db.save_messages(sid, [dict(user_message)], {})
+            agent.project_context_sink = save_project_context
             # 截图推送注入（browser_tools → SSE）：回合线程里安全，publish 自带锁
             import browser_tools
             browser_tools.screenshot_pusher = _push_browser_screenshot
