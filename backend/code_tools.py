@@ -25,6 +25,7 @@ import re
 from pathlib import Path
 
 from executor import default_executor
+from services.file_observations import serialized_file_tool, ObservationConflict, fingerprint
 
 _PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_WORKSPACE = _PROJECT_DIR / "workspace"
@@ -48,7 +49,7 @@ def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
     try:
-        tmp.write_text(content, encoding="utf-8")
+        tmp.write_text(content, encoding="utf-8", newline="")
         os.replace(tmp, path)
     except BaseException:
         # 写失败（磁盘满、权限、被锁）要清掉半截 tmp，别在用户目录里留垃圾
@@ -224,6 +225,7 @@ def _err(msg: str, hint: str = "") -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+@serialized_file_tool
 def read_file(path: str, offset: int = 1, limit: int = 0, ctx=None) -> str:
     """读取文件，返回带行号的原文（apply_patch 锚定的取材来源）。
 
@@ -237,7 +239,8 @@ def read_file(path: str, offset: int = 1, limit: int = 0, ctx=None) -> str:
         return _err(f"文件不存在: {path}", "先 list_dir 查看工作区的真实目录结构，确认路径拼写")
     if p.is_dir():
         return _err(f"{path} 是目录，请用 list_dir 查看")
-    text = p.read_text(encoding="utf-8", errors="replace")
+    raw = p.read_bytes()
+    text = raw.decode("utf-8", errors="replace")
     all_lines = text.splitlines()
     total = len(all_lines)
 
@@ -256,6 +259,12 @@ def read_file(path: str, offset: int = 1, limit: int = 0, ctx=None) -> str:
     hard_end = min(end, start - 1 + MAX_READ_LINES)
     window = all_lines[start - 1:hard_end]
 
+    observations = getattr(ctx, "file_observations", None)
+    version = None
+    if observations is not None and (window or not raw):
+        version = observations.observe(p, raw, start, start + len(window) - 1, total)
+    if not window and not raw:
+        return _ok({"path": path, "result": "", "total_lines": 0, "shown": [1, 0], **({"version": version} if version else {})})
     if not window:
         return _err(f"读取区间为空：文件共 {total} 行，请求起始行 {start}"
                     + (f"（超出了文件末尾）" if start > total else ""),
@@ -270,18 +279,53 @@ def read_file(path: str, offset: int = 1, limit: int = 0, ctx=None) -> str:
                     f"用 offset/limit 读取后续段：传 offset={next_offset}。"
                     f"修改前务必读到目标位置的真实原文]")
     return _ok({"path": path, "result": content,
-                "total_lines": total, "shown": [start, start + len(window) - 1]})
+                "total_lines": total, "shown": [start, start + len(window) - 1], **({"version": version} if version else {})})
 
 
+def _commit_observed(path, text, ctx, *, original, whole=False):
+    observations = getattr(ctx, "file_observations", None)
+    if observations is None:
+        atomic_write_text(path, text)
+        return None
+    if original is None:
+        import tempfile
+        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".agent-create-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+                stream.write(text)
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                raise ObservationConflict("FS_STALE_VERSION", "新建目标已存在，请先读取当前文件")
+        finally:
+            os.unlink(temporary)
+    else:
+        observations.require(path, original, whole=whole)
+        try:
+            current = path.read_bytes()
+        except FileNotFoundError:
+            raise ObservationConflict("FS_STALE_VERSION", "文件已被删除，请确认当前工作区")
+        if fingerprint(current) != fingerprint(original):
+            raise ObservationConflict("FS_STALE_VERSION", "文件在编辑期间改变，请重新读取")
+        atomic_write_text(path, text)
+    raw = text.encode()
+    return observations.observe(path, raw, 1, len(text.splitlines()), len(text.splitlines()))
+
+
+@serialized_file_tool
 def write_file(path: str, content: str, ctx=None) -> str:
     """新建文件，或整文件覆盖。修改已有文件的局部内容请优先用 apply_patch。"""
     p = _resolve(path, _ws(ctx), _bridge_roots(ctx))
     if p.is_dir():
         return _err(f"{path} 是目录，不能当作文件写入",
                     "换一个文件路径；若想看该目录里已有什么，用 list_dir")
+    original = p.read_bytes() if p.exists() else None
+    if original is not None and getattr(ctx, "file_observations", None) is not None:
+        ctx.file_observations.require(p, original, whole=True)
     p.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(p, content)   # 原子写：崩溃不会留下截断的文件（见该函数注释）
-    return _ok({"path": path,
+    version = _commit_observed(p, content, ctx, original=original, whole=True)
+
+    return _ok({"path": path, **({"version": version} if version else {}),
                 "result": f"已写入 {path}（{len(content.encode('utf-8'))} 字节 / {len(content.splitlines())} 行）",
                 "bytes": len(content.encode("utf-8")), "lines": len(content.splitlines())})
 
@@ -342,6 +386,7 @@ def _reindent_by_position(replace_lines: list[str], file_indents: list[str]) -> 
     return out
 
 
+@serialized_file_tool
 def apply_patch(path: str, search: str, replace: str, ctx=None) -> str:
     """锚定式编辑（Aider 的 SEARCH/REPLACE 思路）：
     在文件里找 search 原文，替换为 replace。
@@ -362,7 +407,11 @@ def apply_patch(path: str, search: str, replace: str, ctx=None) -> str:
     p = _resolve(path, _ws(ctx), _bridge_roots(ctx))
     if not p.exists():
         return _err(f"文件不存在: {path}", "先 list_dir 查看工作区的真实目录结构，确认路径拼写")
-    text = p.read_text(encoding="utf-8", errors="replace")
+    original = p.read_bytes()
+    observations = getattr(ctx, "file_observations", None)
+    if observations is not None:
+        observations.require(p, original)
+    text = original.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     if not search.strip():
         return _err("search 不能为空", "把要替换的原文（取自 read_file 的输出）写进 search")
 
@@ -416,9 +465,9 @@ def apply_patch(path: str, search: str, replace: str, ctx=None) -> str:
             new_text = "\n".join(new_lines) + ("\n" if text.endswith("\n") else "")
             how = "锚定救援：search 与原文存在缩进/行尾空白差异，已按原文件逐行缩进对齐替换"
             first_line = i + 1
-    atomic_write_text(p, new_text)   # 原子写：崩溃不会截断用户正在编辑的源码
+    version = _commit_observed(p, new_text, ctx, original=original)
     payload = {
-        "path": path,
+        "path": path, **({"version": version} if version else {}),
         "result": f"已修改 {path}（第 {first_line} 行起 +{len(replace.splitlines())} / −{len(search.splitlines())} 行）",
         "added": len(replace.splitlines()), "removed": len(search.splitlines()),  # 供前端显示 +N −N
         "matched_lines": [first_line, first_line + len(search.splitlines()) - 1],
@@ -589,7 +638,7 @@ CODE_TOOL_SCHEMAS = [
             "description": "新建文件，或用 content 整文件覆盖一个已有文件。"
                            "什么时候用：新建文件；内容需要整体重写（改动的行数超过文件一半）时。"
                            "什么时候不用：改已有文件的几行、一个函数——用 apply_patch（省 token，且不会误伤文件其它部分）。"
-                           "覆盖前若没读过该文件，必须先 read_file，否则会抹掉你不了解的内容。"
+                           "Agent 会话中覆盖已有文件前必须完整 read_file；版本过期会拒绝修改并要求重读。"
                            "示例：write_file {\"path\": \"utils.py\", \"content\": \"def helper():\\n    return 1\\n\"}。",
             "parameters": {
                 "type": "object",

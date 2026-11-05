@@ -106,6 +106,7 @@ class ToolContext:
     调用方（Agent 实例）上，随每次 execute_tool 显式传入。
     """
 
+    file_observations: object = None              # Agent 会话内读取版本；独立工具调用可不提供
     environment_blocked: bool = False
     environment_path: str | None = None          # 本轮确认的项目 Python 路径
     workspace: Path | None = None               # 本会话的工作区（文件/命令工具的边界）

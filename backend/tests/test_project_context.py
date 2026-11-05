@@ -46,3 +46,26 @@ class ProjectContextTests(unittest.TestCase):
             self.assertIn("Run local tests", agent._system_content())
             self.assertNotIn("Never edit production", agent._system_content())
             self.assertEqual(agent.history, [])
+
+    def test_web_turn_records_the_rules_used_by_the_model(self):
+        import app
+        import db
+        from services import turn
+        from unittest.mock import Mock
+        with patch.object(db, "DB_PATH", self.root / "isolated.db"):
+            db.init_db()
+            db.create_session("rules", 1)
+            (self.root / "AGENTS.md").write_text("Run configured tests")
+            agent = Agent(llm=Mock(), workspace=self.root)
+            def run(plain, message):
+                agent.history.append(message)
+                self.assertIn("Run configured tests", agent._system_content())
+                agent.history.append({"role":"assistant", "content":"answer"})
+                yield "done", {"answer":"answer"}
+            agent.run = run
+            with patch.object(turn, "_spawn_title_generation"), patch.object(turn, "_spawn_memory_extraction"):
+                app._run_round("rules", agent, "question", {"role":"user", "content":"question"}, "n", [])
+            message = next(m for m in db.get_messages("rules") if m["role"] == "user")
+            reference = message["_project_context"][0]["path"]
+            context = json.loads("\n".join(db.read_tool_result(reference)["lines"]))
+            self.assertEqual(context["sources"][0]["content"], "Run configured tests")

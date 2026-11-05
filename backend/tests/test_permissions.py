@@ -967,13 +967,14 @@ class TestEndToEnd(AgentGateBase):
         (Path(agent.ctx.workspace) / "code.py").write_text("def add(a, b):\n    return a - b\n",
                                                            encoding="utf-8")
         agent.llm = ScriptedLLM([
+            tool_call_message(call("read1", "read_file", path="code.py")),
             tool_call_message(call("p1", "apply_patch", path="code.py",
                                    search="return a - b", replace="return a + b")),
             {"role": "assistant", "content": "修好了"},
         ])
         events = list(agent.run("修 bug"))
         result = json.loads(next(p["result"] for k, p in events
-                                 if k == "tool_result"))
+                                 if k == "tool_result" and p["name"] == "apply_patch"))
         self.assertTrue(result["ok"], result)
         self.assertIn("return a + b",
                       (Path(agent.ctx.workspace) / "code.py").read_text(encoding="utf-8"))

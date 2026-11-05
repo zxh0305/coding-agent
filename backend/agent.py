@@ -338,6 +338,8 @@ class Agent:
         self.environment_profile = None
         self.project_context_sink = None
         self._project_digest = None
+        from services.file_observations import FileObservations
+        self.ctx.file_observations = FileObservations()
         self.ctx.session_id = session_id  # 文档工具据此确定文档归属（会话隔离）
         # 记忆 v2：个人层按 user_id 分桶。为空（CLI / 单测裸跑）时只注入项目层，
         # 行为与旧版一致——不报错、也不注入一个空段。
