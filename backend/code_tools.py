@@ -99,11 +99,13 @@ def _ok(payload: dict) -> str:
     return json.dumps({"ok": True, **payload}, ensure_ascii=False)
 
 
-def _err(msg: str, hint: str = "") -> str:
+def _err(msg: str, hint: str = "", *, code: str = "") -> str:
     """失败信封：{ok:false, error, hint?}。hint 是给模型的下一步建议——
     错误只说明"失败了"，hint 才能让模型改道（换路径/换工具/先侦察），
     而不是原样重试同一命令。"""
     payload = {"ok": False, "error": msg}
+    if code:
+        payload["error_code"] = code
     if hint:
         payload["hint"] = hint
     return json.dumps(payload, ensure_ascii=False)
@@ -215,15 +217,6 @@ def _resolve(path: str, ws: Path, bridge: dict[str, Path] | None = None) -> Path
 # 六个工具的 ctx 形参不进 schema（模型看不到），由 execute_tool 在执行时注入——
 # 模型只该决定"操作哪个相对路径"，"在哪个工作区里操作"是服务端的会话属性。
 
-def _err(msg: str, hint: str = "") -> str:
-    """失败信封：{ok:false, error, hint?}。hint 是给模型的下一步建议——
-    错误只说明"失败了"，hint 才能让模型改道（换路径/换工具/先侦察），
-    而不是原样重试同一命令。"""
-    payload = {"ok": False, "error": msg}
-    if hint:
-        payload["hint"] = hint
-    return json.dumps(payload, ensure_ascii=False)
-
 
 @serialized_file_tool
 def read_file(path: str, offset: int = 1, limit: int = 0, ctx=None) -> str:
@@ -236,7 +229,7 @@ def read_file(path: str, offset: int = 1, limit: int = 0, ctx=None) -> str:
     """
     p = _resolve(path, _ws(ctx), _bridge_roots(ctx))
     if not p.exists():
-        return _err(f"文件不存在: {path}", "先 list_dir 查看工作区的真实目录结构，确认路径拼写")
+        return _err(f"文件不存在: {path}", "先 list_dir 查看工作区的真实目录结构，确认路径拼写", code="PATH_NOT_FOUND")
     if p.is_dir():
         return _err(f"{path} 是目录，请用 list_dir 查看")
     raw = p.read_bytes()
@@ -326,6 +319,7 @@ def write_file(path: str, content: str, ctx=None) -> str:
     version = _commit_observed(p, content, ctx, original=original, whole=True)
 
     return _ok({"path": path, **({"version": version} if version else {}),
+                "changed": original != content.encode("utf-8"),
                 "result": f"已写入 {path}（{len(content.encode('utf-8'))} 字节 / {len(content.splitlines())} 行）",
                 "bytes": len(content.encode("utf-8")), "lines": len(content.splitlines())})
 
@@ -406,7 +400,7 @@ def apply_patch(path: str, search: str, replace: str, ctx=None) -> str:
     """
     p = _resolve(path, _ws(ctx), _bridge_roots(ctx))
     if not p.exists():
-        return _err(f"文件不存在: {path}", "先 list_dir 查看工作区的真实目录结构，确认路径拼写")
+        return _err(f"文件不存在: {path}", "先 list_dir 查看工作区的真实目录结构，确认路径拼写", code="PATH_NOT_FOUND")
     original = p.read_bytes()
     observations = getattr(ctx, "file_observations", None)
     if observations is not None:
@@ -468,6 +462,7 @@ def apply_patch(path: str, search: str, replace: str, ctx=None) -> str:
     version = _commit_observed(p, new_text, ctx, original=original)
     payload = {
         "path": path, **({"version": version} if version else {}),
+        "changed": original != new_text.encode("utf-8"),
         "result": f"已修改 {path}（第 {first_line} 行起 +{len(replace.splitlines())} / −{len(search.splitlines())} 行）",
         "added": len(replace.splitlines()), "removed": len(search.splitlines()),  # 供前端显示 +N −N
         "matched_lines": [first_line, first_line + len(search.splitlines()) - 1],
@@ -560,7 +555,7 @@ def run_bash(command: str, ctx=None, timeout: int = 0, workdir: str = ".") -> st
         limit = 0
     limit = BASH_TIMEOUT if limit <= 0 else min(limit, BASH_TIMEOUT_MAX)
     if getattr(ctx, "environment_blocked", False):
-        return _err("项目解释器已失效", "请在项目上下文中重新选择环境后再发送消息")
+        return _err("项目解释器已失效", "请在项目上下文中重新选择环境后再发送消息", code="ENVIRONMENT_UNAVAILABLE")
     executor = getattr(ctx, "executor", None) or default_executor()
     # cancel 交给执行器：用户点停止时进程组立即被杀，不必等命令自己跑完。
     # 旧写法只在 run 返回之后才查 cancel_event，一条 30 秒的命令会让"停止"
@@ -574,7 +569,7 @@ def run_bash(command: str, ctx=None, timeout: int = 0, workdir: str = ".") -> st
     environment_path = getattr(ctx, "environment_path", None)
     if environment_path:
         if "env" not in parameters:
-            return _err("执行器不支持项目环境", "使用支持环境参数的执行器，或显式选择系统环境")
+            return _err("执行器不支持项目环境", "使用支持环境参数的执行器，或显式选择系统环境", code="ENVIRONMENT_UNSUPPORTED")
         environment = dict(os.environ)
         environment["PATH"] = str(Path(environment_path).parent) + os.pathsep + environment.get("PATH", "")
         environment["VIRTUAL_ENV"] = str(Path(environment_path).parent.parent)
@@ -582,8 +577,13 @@ def run_bash(command: str, ctx=None, timeout: int = 0, workdir: str = ".") -> st
         options["env"] = environment
     cwd = _resolve(workdir, _ws(ctx))
     if not cwd.is_relative_to(_ws(ctx).resolve()) or not cwd.is_dir():
-        return _err("命令工作目录不可用", "请选择当前项目内的有效目录")
-    res = executor.run(command, cwd=cwd, timeout=limit, **options)
+        return _err("命令工作目录不可用", "请选择当前项目内的有效目录", code="PATH_NOT_FOUND")
+    try:
+        res = executor.run(command, cwd=cwd, timeout=limit, **options)
+    except Exception as e:
+        return json.dumps({"ok":False, "outcome":"executor_error", "error_code":"EXECUTOR_ERROR",
+                           "error":f"执行器故障: {type(e).__name__}: {e}",
+                           "hint":"未取得命令退出状态，先检查执行器；不能认领命令已成功或直接重做有副作用的操作"}, ensure_ascii=False)
     if getattr(res, "cancelled", False):
         return json.dumps({"ok":False, "cancelled":True, "error":"命令被用户停止",
                            "hint":"本回合已停止，不要重试", "result":(res.stdout or "")[-4000:]}, ensure_ascii=False)
@@ -605,6 +605,9 @@ def run_bash(command: str, ctx=None, timeout: int = 0, workdir: str = ".") -> st
         # 供定位（命令失败不是工具失败，输出本身就是最重要的错误信息）
         payload["error"] = f"命令退出码 {res.exit_code}"
         payload["hint"] = "先读 stderr 定位原因再调整命令；不要原样重试同一条命令"
+        if re.search(r"(?m)^ModuleNotFoundError: No module named ['\"][^'\"\n]+['\"]\s*$", stderr):
+            payload["error_code"] = "DEPENDENCY_MISSING"
+            payload["hint"] = "当前解释器报告缺少模块；先确认项目环境和依赖声明，安装仍须遵守权限，不要直接改用系统环境或降低测试要求"
         return json.dumps({"ok": False, **payload}, ensure_ascii=False)
     return _ok(payload)
 

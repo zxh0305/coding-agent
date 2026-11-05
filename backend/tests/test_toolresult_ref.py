@@ -103,7 +103,10 @@ class TestExternalize(StorageTestBase):
 
     def test_within_threshold_untouched(self):
         result = json.dumps({"ok": True, "result": "small"}, ensure_ascii=False)
-        self.assertEqual(self.backfill(result), result)
+        self.assertEqual(make_agent(self.ws)._externalize_tool_result(result), result)
+        # Backfill adds execution semantics, while the small body stays intact.
+        self.assertEqual(json.loads(self.backfill(result)),
+                         {"ok":True, "result":"small", "outcome":"success"})
 
     def test_no_sink_falls_back_to_legacy_truncation(self):
         agent = make_agent(self.ws)  # CLI/单测口径：无 result_sink

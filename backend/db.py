@@ -2371,6 +2371,9 @@ def save_messages(sid: str, history: list[dict], saved: dict) -> int:
                         "role": m.get("role", "")}
                 if m.get("_completion_candidate"):
                     stub["_completion_candidate"] = True
+                for key in ("_task_evidence", "_task_state"):
+                    if key in m:
+                        stub[key] = m[key]
                 row_content = json.dumps(stub, ensure_ascii=False)
                 fp = _fingerprint(row_content)
                 # 就地替换成摘要行：指纹改按"摘要行"记，下一轮重放这段历史

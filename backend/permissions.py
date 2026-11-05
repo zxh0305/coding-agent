@@ -1007,6 +1007,7 @@ def rejection_result(verdict: Verdict) -> str:
     """
     return json.dumps(
         {"ok": False, "error": f"权限拒绝: {verdict.reason}",
+         "error_code":"PERMISSION_DENIED", "outcome":"denied",
          "hint": "该调用已被拒绝，禁止用相同参数重试同一工具。请改道："
                  "①换等价的安全做法（改工作区内路径 / 换掉高危命令 / 换工具）；"
                  "②若确需用户授权，用一句话说明「需要你授权 X」后停止调用、结束本轮，"

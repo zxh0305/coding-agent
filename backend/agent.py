@@ -38,6 +38,8 @@ import code_tools
 import db
 
 from code_tools import prepare_workspace
+from services.task_progress import ProgressWindow, task_state, state_note
+from services.tool_feedback import annotate as annotate_tool_result
 from memory import memory_blocks, memory_dir, memory_dir_for_user
 from permissions import ALLOW, ASK, DENY, PermissionGate, Verdict, rejection_result
 from subagent_tools import (SUBAGENT_MAX_PARALLEL, SUBAGENT_REPORT_MAX_CHARS,
@@ -335,6 +337,8 @@ class Agent:
         from services.project_context import ProjectContext
         self.project_context = ProjectContext(self.ctx.workspace)
         self.completion_policy = None
+        self._progress_window = ProgressWindow()
+        self._verification_dispatch = False
         self.environment_loader = None
         self.environment_profile = None
         self.project_context_sink = None
@@ -402,7 +406,11 @@ class Agent:
     @staticmethod
     def _clean_outgoing(m: dict) -> dict:
         """发给模型前剥离内部字段（_stats 等下划线前缀），部分服务商会拒绝未知字段。"""
-        return {k: v for k, v in m.items() if not k.startswith("_")}
+        clean = {k: v for k, v in m.items() if not k.startswith("_")}
+        if isinstance(clean.get("tool_calls"), list):
+            clean["tool_calls"] = [{k:v for k,v in call.items() if not k.startswith("_")}
+                                   for call in clean["tool_calls"]]
+        return clean
 
     def _tool_schemas(self) -> list[dict]:
         """本实例可用的工具清单。allowed_tools 为 None（主代理）时返回全量
@@ -482,8 +490,12 @@ class Agent:
             # 从未压缩过（或历史异常，比如边界跑到首条消息前面）→ 原样全量返回
             return self.history
         summary = self.history[last_boundary].get("content") or ""
+        retained = self.history[last_boundary].get("_task_state")
+        if isinstance(retained, dict):
+            summary += state_note(retained)
         view = [self.history[first_user],
-                {"role": "user", "content": f"{COMPACT_SUMMARY_NOTE}\n{summary}"}]
+                {"role": "user", "content": f"{COMPACT_SUMMARY_NOTE}\n{summary}",
+                 "_synthetic": True, **({"_task_state":retained} if isinstance(retained, dict) else {})}]
         view.extend(self.history[last_boundary + 1:])
         return view
 
@@ -703,6 +715,7 @@ class Agent:
         # 回合内提醒状态（防失控，见 _maybe_remind）：重复指纹 streak、提醒预算、
         # 预算提醒轮数（上限前 10 轮、前 4 轮各提醒一次）。每回合重置。
         self._streak_sig = None
+        self._progress_window = ProgressWindow()
         self._streak_count = 0
         self._reminders_used = 0
         self._denied_sigs: set[str] = set()  # 上一轮被权限拒绝的调用指纹（3b）
@@ -1163,6 +1176,7 @@ class Agent:
             fn = call.get("function") or {}
             name = fn.get("name", "")
             sig = self._tool_signature(name, fn.get("arguments"))
+            evidence_sig = call.get("_result_fingerprint")
             # 2. 被拒后原样重试：最高优先级，先判后销（一次即提醒）。
             if sig in denied_before:
                 self._denied_sigs.discard(sig)
@@ -1170,14 +1184,25 @@ class Agent:
                                       "denied_retry", {"tool": name})
                 self._streak_sig, self._streak_count = sig, 1
                 continue
-            if sig == self._streak_sig:
+            streak_sig = (sig, evidence_sig) if evidence_sig else sig
+            if name.startswith("wait") or name in ("sleep", "browser_wait"):
+                self._streak_sig, self._streak_count = None, 0
+                continue
+            if streak_sig == self._streak_sig:
                 self._streak_count += 1
             else:
-                self._streak_sig, self._streak_count = sig, 1
+                self._streak_sig, self._streak_count = streak_sig, 1
             if self._streak_count == REPEAT_STREAK_REMIND:
                 self._inject_reminder(REPEAT_REMIND_TEXT.format(
                     count=self._streak_count, name=name),
                     "repeat_loop", {"tool": name, "streak": self._streak_count})
+        if self._progress_window.pending:
+            names = self._progress_window.pending
+            self._progress_window.pending = None
+            self._inject_reminder(
+                "（系统提示：最近6次调用反复得到相同证据，尚未观察到新的进展。请说明当前卡点，"
+                "换搜索范围或验证假设；若正在合理等待或复验，可说明原因后继续。"
+                "此提示不会停止任务，也不授予额外权限。）", "no_progress", {"tools":names})
         if round_no in self._budget_remind_rounds:
             self._inject_reminder(BUDGET_REMIND_TEXT.format(
                 round_no=round_no, max_rounds=self.max_rounds),
@@ -1649,6 +1674,7 @@ class Agent:
             "content": summary,
             "is_compact_boundary": True,  # 边界标记元数据（前端据此渲染分隔卡片）
             "_stats": {"compacted": True, "est_tokens": est_before},
+            "_task_state": task_state(view[:cut]),
         }
         # 视图下标 → 原始历史下标：活区在视图里从 head 起、在 history 里从 live_start
         # 起（同一段对象一一对应），边界插到"被压缩段的最后一条"与"保留段的第一条"之间。
@@ -1862,11 +1888,10 @@ class Agent:
             group = [items[i]["call"] for i in range(idx, end)]
             for call, result in zip(group, self._run_tool_group(group)):
                 yield self._backfill_tool_result(call, result)
-                # 「实质进展」判定（续轮依据，见 _run 主循环）：本组只要有一个
-                # 非只读工具成功执行（结果无 error），就认为这一轮在推进任务。
-                # 只读侦察不算、失败/被拒不算——防"读来读去原地打转"骗续轮。
+                # Only observed changes justify extensions. Plans and exit zero
+                # alone do not prove the task advanced.
                 name = (call.get("function") or {}).get("name", "")
-                if not is_read_only(name) and '"error"' not in result:
+                if call.get("_made_progress"):
                     self._round_had_progress = True
                 # create_doc 成功：额外产出一条 doc_created 事件（走 app.py 的
                 # else 分支进 SSE 总线），前端据此自动弹出右侧文档面板。
@@ -1978,11 +2003,41 @@ class Agent:
         """把一个工具结果按请求位置回填：追加历史、记轨迹、产出事件。
         正常执行与权限拒绝共用同一条回填路径——对下游（历史配对/前端渲染）
         而言，拒绝结果就是一个普通的（带 error 的）工具结果。"""
+        name = (call.get("function") or {}).get("name", "")
+        try:
+            arguments = json.loads((call.get("function") or {}).get("arguments") or "{}")
+            if not isinstance(arguments, dict):
+                arguments = {}
+        except (ValueError, TypeError):
+            arguments = {}
+        result = annotate_tool_result(name, arguments, result)
+        fact = {}
+        try:
+            info = json.loads(result)
+            if isinstance(info, dict):
+                call["_result_fingerprint"] = hashlib.sha256(result.encode()).hexdigest()
+                if not self._verification_dispatch:
+                    self._progress_window.observe(name, arguments, info)
+                if info.get("ok") and name in ("write_file", "apply_patch") and info.get("changed"):
+                    call["_made_progress"] = True
+                    fact["modified"] = info.get("path") or arguments.get("path")
+                if info.get("ok") and name not in ("run_bash", "todo_write", "write_file", "apply_patch") and not is_read_only(name):
+                    call["_made_progress"] = True
+                if info.get("ok") and name == "todo_write":
+                    fact["pending"] = [str(t.get("content", ""))[:300] for t in (info.get("todos") or [])
+                                       if isinstance(t, dict) and t.get("status") != "done"][:12]
+                if self._verification_dispatch:
+                    fact["check"] = {"command":str(arguments.get("command", ""))[:1000],
+                                     "outcome":info.get("outcome"), "exit_code":info.get("exit_code"),
+                                     "scope":"该次执行记录，不保证当前版本仍有效"}
+        except (ValueError, TypeError):
+            pass
         result = self._externalize_tool_result(result)
         tool_msg = {
             "role": "tool",
             "tool_call_id": call.get("id", ""),  # 与请求里的 id 对应，服务商靠它配对
             "content": result,
+            **({"_task_evidence":fact} if fact else {}),
         }
         self.history.append(tool_msg)
         self._log(f"🔧 工具返回: {result}", "yellow")
@@ -2077,6 +2132,7 @@ class Agent:
 
         def args_error(reason: str) -> str:
             payload = {"ok": False, "error": reason,
+                       "error_code":"INVALID_ARGUMENTS",
                        "hint": "arguments 是【JSON 字符串】，修正后原样重试本工具"}
             schema = tool_schema(name)
             if schema:
@@ -2098,10 +2154,15 @@ class Agent:
             # 同组并行时最后提交者会覆盖前面的名字——只用于展示与超时提示，
             # 精确到"某一个"不重要；重要的是【有工具在跑】这个事实。
             self.active_tool = name
+            version_before = self._shell_progress_version() if name == "run_bash" and not self._verification_dispatch else None
             try:
                 if name in ("run_bash", "write_file", "apply_patch"):
                     self._mutation_possible = True
                 result = execute_tool(name, arguments, self.ctx)
+                if version_before is not None:
+                    version_after = self._shell_progress_version()
+                    if version_after is not None and version_after != version_before:
+                        call["_made_progress"] = True
                 executed_args = arguments
                 if name in ("read_file", "write_file", "apply_patch"):
                     try:
@@ -2128,6 +2189,18 @@ class Agent:
         # 耗时挂回 call 对象（每轮 call 是新解析出的临时 dict，不进模型历史、
         # 不落库），供 _backfill_tool_result 写进 trace 与前端事件。
         return _stamp(result)
+
+    def _shell_progress_version(self):
+        """Reuse the active turn baseline; failure to inspect never blocks a tool."""
+        policy = self.completion_policy
+        reader = getattr(policy, "_state", None)
+        if not callable(reader) or getattr(policy, "baseline_error", None):
+            return None
+        try:
+            return reader(self)[1]
+        except Exception:
+            log.debug("无法读取可选进度版本，跳过此次进展判定")
+            return None
 
     def _record_recent_read(self, name: str, arguments: dict, result: str) -> None:
         """内置 post 钩子：记录 read_file 的成功读取（供压缩后重注入 recent_reads）。

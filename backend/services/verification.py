@@ -200,10 +200,14 @@ class VerificationPolicy:
                 agent._trace({"type":"tool_call", "name":"run_bash", "arguments":call["function"]["arguments"]})
                 yield ("tool_call", {"name":"run_bash", "arguments":call["function"]["arguments"]})
                 result = None
-                for kind, payload in agent._execute_tool_calls([call]):
-                    if kind == "tool_result":
-                        result = json.loads(payload["result"])
-                    yield kind, payload
+                agent._verification_dispatch = True
+                try:
+                    for kind, payload in agent._execute_tool_calls([call]):
+                        if kind == "tool_result":
+                            result = json.loads(payload["result"])
+                        yield kind, payload
+                finally:
+                    agent._verification_dispatch = False
                 if not isinstance(result, dict):
                     result = {"ok":False, "error":"检查没有返回结构化结果"}
                 output = result.get("result") or result.get("error") or ""
