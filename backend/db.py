@@ -300,6 +300,17 @@ MIGRATIONS: list[tuple[int, str | None]] = [
          "session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, "
          "mid TEXT NOT NULL, workspace TEXT NOT NULL, payload TEXT, worker TEXT, "
          "PRIMARY KEY(user_id, nonce))"),
+    (30, "CREATE TABLE IF NOT EXISTS turn_checks("
+         "check_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+         "user_mid TEXT NOT NULL, check_key TEXT NOT NULL, attempt INTEGER NOT NULL,"
+         "status TEXT NOT NULL, started REAL NOT NULL, ended REAL, detail_json TEXT NOT NULL,"
+         "output_ref TEXT)"),
+    (31, "CREATE INDEX IF NOT EXISTS idx_turn_checks_turn ON turn_checks(session_id,user_mid,started)"),
+    (32, "CREATE TABLE IF NOT EXISTS turn_assessments("
+         "session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+         "user_mid TEXT NOT NULL, phase TEXT NOT NULL, assessment TEXT,"
+         "reason TEXT NOT NULL DEFAULT '', repair_attempts INTEGER NOT NULL DEFAULT 0,"
+         "PRIMARY KEY(session_id,user_mid))"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -779,6 +790,9 @@ def truncate_from(sid: str, mid: str) -> dict:
                         (sid, *chunk))
                 # 回合状态按主键 user_mid 删（回退到某轮起点 = 该轮及之后的
                 # 回合状态也一起作废；回退后重发会拿到新的 user_mid 重新开账）
+                for table in ("turn_checks", "turn_assessments"):
+                    conn.execute(f"DELETE FROM {table} WHERE session_id=? AND user_mid IN ({q})",
+                                 (sid, *chunk))
                 conn.execute(
                     f"DELETE FROM session_turns WHERE session_id=? AND user_mid IN ({q})",
                     (sid, *chunk))
@@ -988,6 +1002,79 @@ def claim_submission(uid, nonce, worker):
         return bool(claimed)
 
 
+CHECK_STATES = {"pending", "running", "passed", "failed", "blocked", "cancelled", "interrupted", "stale"}
+ASSESSMENTS = {"not_applicable", "passed", "failed", "insufficient", "blocked", "cancelled", "interrupted"}
+
+
+def set_assessment(sid, mid, phase, assessment=None, reason="", repair_attempts=0):
+    if phase not in {"preparing", "working", "verifying", "repairing", "finalizing", "finished"}:
+        raise ValueError("无效执行阶段")
+    if assessment is not None and assessment not in ASSESSMENTS:
+        raise ValueError("无效验收状态")
+    with _conn() as conn:
+        conn.execute("INSERT INTO turn_assessments VALUES(?,?,?,?,?,?) "
+                     "ON CONFLICT(session_id,user_mid) DO UPDATE SET phase=excluded.phase,"
+                     "assessment=excluded.assessment,reason=excluded.reason,repair_attempts=excluded.repair_attempts",
+                     (sid, mid, phase, assessment, reason, repair_attempts))
+
+
+def get_assessments(sid, mids):
+    if not mids:
+        return {}
+    with _conn() as conn:
+        # The history page is already bounded by its existing pagination contract.
+        marks = ",".join("?" for _ in mids)
+        return {row["user_mid"]: dict(row) for row in conn.execute(
+            f"SELECT * FROM turn_assessments WHERE session_id=? AND user_mid IN ({marks})",
+            (sid, *mids))}
+
+
+def start_check(sid, mid, check_key, attempt, detail):
+    check_id = uuid.uuid4().hex
+    with _conn() as conn:
+        conn.execute("INSERT INTO turn_checks VALUES(?,?,?,?,?,'running',?,NULL,?,NULL)",
+                     (check_id, sid, mid, check_key, attempt, time.time(),
+                      json.dumps(detail, ensure_ascii=False)))
+    return check_id
+
+
+def finish_check(sid, check_id, status, detail, output=""):
+    if status not in CHECK_STATES - {"pending", "running"}:
+        raise ValueError("无效检查状态")
+    reference = write_tool_result(sid, output)["path"] if output else None
+    with _conn() as conn:
+        return conn.execute("UPDATE turn_checks SET status=?,ended=?,detail_json=?,output_ref=? "
+                            "WHERE check_id=? AND session_id=? AND status IN ('running','pending')",
+                            (status, time.time(), json.dumps(detail, ensure_ascii=False),
+                             reference, check_id, sid)).rowcount == 1
+
+
+def get_checks(sid, mid=None):
+    with _conn() as conn:
+        sql = "SELECT * FROM turn_checks WHERE session_id=?"
+        values = [sid]
+        if mid is not None:
+            sql += " AND user_mid=?"
+            values.append(mid)
+        rows = conn.execute(sql + " ORDER BY started DESC, rowid DESC LIMIT 100", values).fetchall()
+    return [{**json.loads(row["detail_json"]),
+             **{key: row[key] for key in row.keys() if key != "detail_json"}}
+            for row in reversed(rows)]
+
+
+def check_output(sid, check_id, offset=1, limit=200):
+    with _conn() as conn:
+        row = conn.execute("SELECT output_ref FROM turn_checks WHERE session_id=? AND check_id=?",
+                           (sid, check_id)).fetchone()
+    if not row:
+        raise ValueError("检查记录不存在")
+    if not row["output_ref"]:
+        return {"lines": [], "total_lines": 0, "shown": [1, 0]}
+    if row["output_ref"].split("/")[0] != sid:
+        raise ValueError("检查输出归属无效")
+    return read_tool_result(row["output_ref"], offset, min(max(int(limit), 1), 500))
+
+
 def turn_started(sid: str, user_mid: str, started: float | None = None) -> None:
     """回合开始：登记 running。重复登记（同 user_mid 重放）幂等覆盖。"""
     with _conn() as conn:
@@ -1036,6 +1123,9 @@ def mark_running_turns_interrupted() -> int:
             "UPDATE session_turns SET state='interrupted', ended=? WHERE state='running'",
             (now,))
         n = cur.rowcount or 0
+        conn.execute("UPDATE turn_checks SET status='interrupted',ended=? WHERE status IN ('running','pending')", (now,))
+        conn.execute("UPDATE turn_assessments SET phase='finished',assessment='interrupted',"
+                     "reason='服务重启，检查或回合未完成' WHERE phase!='finished'")
     if n:
         log.warning("发现 %d 个上次进程退出时仍在运行的回合，已标记为 interrupted", n)
     return n

@@ -182,6 +182,21 @@ class SessionRoutes:
         _start_submission(self.user["id"], nonce, sid, agent, payload)
         self._json({"session_id": sid, "nonce": nonce, "mid": mid})
 
+    def _handle_session_checks(self, sid, check_id=None):
+        if db.session_owner(sid) != self.user["id"]:
+            return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+        try:
+            query = self._query()
+            if check_id:
+                offset = int((query.get("offset") or ["1"])[0])
+                limit = int((query.get("limit") or ["200"])[0])
+                return self._json(db.check_output(sid, check_id, offset, limit))
+            mid = (query.get("user_mid") or [None])[0]
+            return self._json({"checks": db.get_checks(sid, mid),
+                               "assessment": db.get_assessments(sid, [mid]).get(mid) if mid else None})
+        except (ValueError, FileNotFoundError) as e:
+            return self._json({"error": str(e)}, 400)
+
     def _handle_session_events(self, sid: str):
         """常驻事件流（SSE）。每连接占一个线程（ThreadingHTTPServer 每请求
         一线程，前置检查已确认），客户端断开即线程收尾。
@@ -357,6 +372,10 @@ class SessionRoutes:
                 it["changes"] = extras[it["mid"]].get("changes")
         # 回合状态（session_turns）随用户消息带回：前端据此在时间线上画出
         # "◐ 上次被中断 · 跑到第 N 轮"，而不是让用户面对一个永远转圈的空回合。
+        assessments = db.get_assessments(sid, user_mids)
+        for it in items:
+            if it["mid"] in assessments:
+                it["assessment"] = assessments[it["mid"]]
         turns = db.get_turns(sid, user_mids)
         for it in items:
             if it["mid"] in turns:

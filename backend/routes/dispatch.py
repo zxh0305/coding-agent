@@ -74,6 +74,9 @@ class DispatchMixin:
             return self._handle_skills()
         if path == "/api/experiments" or path.startswith("/api/experiments/"):
             return self._handle_experiments(path, "GET")
+        if re.fullmatch(r"/api/sessions/[^/]+/checks(?:/[^/]+/output)?", path):
+            parts = path.split("/")
+            return self._handle_session_checks(parts[3], parts[5] if len(parts) > 5 else None)
         if path == "/api/auth/me":
             user = self._auth_user()   # auth 路径不走 _require_auth，这里自己解析
             if user is None:
