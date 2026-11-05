@@ -510,19 +510,28 @@ def run_bash(command: str, ctx=None, timeout: int = 0) -> str:
     except (TypeError, ValueError):
         limit = 0
     limit = BASH_TIMEOUT if limit <= 0 else min(limit, BASH_TIMEOUT_MAX)
+    if getattr(ctx, "environment_blocked", False):
+        return _err("项目解释器已失效", "请在项目上下文中重新选择环境后再发送消息")
     executor = getattr(ctx, "executor", None) or default_executor()
     # cancel 交给执行器：用户点停止时进程组立即被杀，不必等命令自己跑完。
     # 旧写法只在 run 返回之后才查 cancel_event，一条 30 秒的命令会让"停止"
     # 等满 30 秒。注入的 Executor 若实现了 cancel 形参就传（Docker 实现同样
     # 需要）；没实现的旧提供者按原样调用，行为不变。
     cancel = getattr(ctx, "cancel_event", None)
-    try:
-        if cancel is not None and "cancel" in inspect.signature(executor.run).parameters:
-            res = executor.run(command, cwd=_ws(ctx), timeout=limit, cancel=cancel)
-        else:
-            res = executor.run(command, cwd=_ws(ctx), timeout=limit)
-    except TypeError:  # 提供者用 *args 之类的签名导致探针失准：退回旧调用
-        res = executor.run(command, cwd=_ws(ctx), timeout=limit)
+    parameters = inspect.signature(executor.run).parameters
+    options = {}
+    if cancel is not None and "cancel" in parameters:
+        options["cancel"] = cancel
+    environment_path = getattr(ctx, "environment_path", None)
+    if environment_path:
+        if "env" not in parameters:
+            return _err("执行器不支持项目环境", "使用支持环境参数的执行器，或显式选择系统环境")
+        environment = dict(os.environ)
+        environment["PATH"] = str(Path(environment_path).parent) + os.pathsep + environment.get("PATH", "")
+        environment["VIRTUAL_ENV"] = str(Path(environment_path).parent.parent)
+        environment.pop("PYTHONHOME", None)
+        options["env"] = environment
+    res = executor.run(command, cwd=_ws(ctx), timeout=limit, **options)
     if getattr(res, "cancelled", False):
         return _err("命令被用户停止",
                     "用户主动停止了本回合，不要重试这条命令；如仍需执行，等他再次提出")

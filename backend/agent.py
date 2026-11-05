@@ -334,6 +334,8 @@ class Agent:
         self.ctx = ToolContext(workspace=prepare_workspace(workspace), vision_backend=vision_backend)
         from services.project_context import ProjectContext
         self.project_context = ProjectContext(self.ctx.workspace)
+        self.environment_loader = None
+        self.environment_profile = None
         self.project_context_sink = None
         self._project_digest = None
         self.ctx.session_id = session_id  # 文档工具据此确定文档归属（会话隔离）
@@ -443,12 +445,15 @@ class Agent:
                 f"\n\n【当前时间】{now:%Y-%m-%d %H:%M} 周{'一二三四五六日'[now.weekday()]}"
                 "（会话开始时间；此后经过的时长请按对话推进自行估算）")
         project = self.project_context.refresh()
-        digest = hashlib.sha256(json.dumps(project, ensure_ascii=False).encode()).hexdigest()
+        snapshot = {**project, "environment": self.environment_profile}
+        digest = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False).encode()).hexdigest()
         if digest != self._project_digest:
             self._project_digest = digest
             if self.project_context_sink:
-                self.project_context_sink(project)
-        return (self.system_prompt + project["content"] + block + self._time_block
+                self.project_context_sink(snapshot)
+        from services.project_environment import model_context
+        environment = model_context(self.environment_profile) if self.environment_profile else ""
+        return (self.system_prompt + project["content"] + environment + block + self._time_block
                 + getattr(self, "_skill_context", ""))
 
     def _visible_history(self) -> list[dict]:
@@ -656,6 +661,11 @@ class Agent:
         """run() 的实际循环体（run 只负责停止开关的生命周期）。"""
         from skills import context as skill_context
         self._project_digest = None
+        from services.project_environment import discover
+        self.environment_profile = (self.environment_loader() if self.environment_loader
+                                    else discover(self.ctx.workspace))
+        self.ctx.environment_blocked = self.environment_profile["blocked"]
+        self.ctx.environment_path = (self.environment_profile["selected"] or {}).get("path")
         self._skill_context = skill_context((user_message or {}).get("_skills", []))
         self.trace = []  # 每次提问重新记录过程轨迹
         self.reasoning_live = {}  # 进行中快照的推理缓冲同步重置（见 __init__ 注释）

@@ -106,6 +106,8 @@ class ToolContext:
     调用方（Agent 实例）上，随每次 execute_tool 显式传入。
     """
 
+    environment_blocked: bool = False
+    environment_path: str | None = None          # 本轮确认的项目 Python 路径
     workspace: Path | None = None               # 本会话的工作区（文件/命令工具的边界）
     images: list = field(default_factory=list)  # 本轮用户消息附带的图片（OpenAI content 部分）
     todos: list = field(default_factory=list)   # 本会话任务清单（todo_write 维护，会话隔离）

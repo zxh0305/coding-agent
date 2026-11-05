@@ -124,6 +124,7 @@
           <input type="file" id="file-input" multiple hidden
                  accept="image/png,image/jpeg,image/webp,image/gif,.txt,.md,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.html,.css,.csv,.log,.xml,.sh,.sql,.java,.c,.cpp,.go,.rs">
           <button id="perm-chip" class="chip" title="权限模式：只读 = 写入和命令逐次确认；确认 = 高危操作才确认；完全访问 = 全部放行">🛡 <span id="perm-label">确认</span></button>
+          <button id="project-context-open" class="chip" title="查看项目规则和运行环境">项目上下文</button>
           <button id="ws-pick" class="chip" title="选择工作区文件夹">📁 <span id="ws-short">工作区</span></button>
           <button id="docs-chip" class="chip" title="查看本会话生成的文档">📄 文档 <span id="docs-count">0</span></button>
           <button id="skills-chip" class="chip" type="button" aria-haspopup="dialog" aria-expanded="false">✦ 技能 <span id="skills-count"></span></button>
@@ -300,6 +301,12 @@
       </div>
     </div>
   </div>
+
+  <dialog id="project-context-dialog" class="project-context-dialog">
+    <header><strong>项目上下文</strong><button id="project-context-close" type="button" aria-label="关闭项目上下文">关闭</button></header>
+    <p id="project-context-status" role="status"></p>
+    <div id="project-context-body"></div>
+  </dialog>
 
   <!-- 选择工作区的弹窗：逐级浏览本地文件夹 -->
   <div id="modal" class="modal hidden">
@@ -581,6 +588,7 @@
   <script src="app.js"></script>
   <script src="skills_state.js"></script>
   <script src="skills_view.js"></script>
+  <script src="project_context_view.js"></script>
   <script src="experiments_view.js"></script>
   <script src="experiments.js"></script>
 </body>

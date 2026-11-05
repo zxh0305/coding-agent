@@ -13,6 +13,35 @@ from routes import busref
 
 
 class WorkspaceRoutes:
+    def _handle_project_context(self):
+        from services.project_context import ProjectContext
+        from services.project_environment import discover, preference_key
+        from services.workspace import project_directory
+        from code_tools import DEFAULT_WORKSPACE
+        query = self._query()
+        sid = (query.get("session_id") or [""])[0]
+        requested = (query.get("workspace") or [""])[0]
+        uid = self.user["id"]
+        if sid and db.session_owner(sid) != uid:
+            return self._json({"error": "任务不存在或不属于当前用户"}, 404)
+        try:
+            target = (project_directory(uid, sid) or DEFAULT_WORKSPACE) if sid else selected_directory(requested)
+            target = selected_directory(str(target))
+            if sid and requested and str(target) != requested:
+                return self._json({"error": "任务目录已变更，请重新打开"}, 409)
+            key = preference_key(target, uid)
+            if self.command == "POST":
+                preferred = self._body().get("executable")
+                profile = discover(target)
+                paths = [c["path"] for c in profile["candidates"]]
+                if preferred != "system" and preferred not in paths:
+                    raise ValueError("请从当前项目的解释器候选中选择")
+                db.set_setting(key, preferred)
+            profile = discover(target, db.get_setting(key))
+            return self._json({"rules": ProjectContext(target).refresh(), "environment": profile})
+        except (ValueError, OSError, RuntimeError) as e:
+            return self._json({"error": str(e)}, 400)
+
     def _handle_workspace_set(self):
         """切换工作区（按任务隔离，替代曾经的"全局环境变量 + 写回 .env"）：
         - 带 session_id：只改该任务的工作区（须是自己的任务）；

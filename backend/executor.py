@@ -110,7 +110,7 @@ def _kill_and_drain(proc: subprocess.Popen, *, cancelled: bool) -> ExecResult:
 class LocalExecutor:
     """本机子进程执行（默认提供者，与旧 run_bash 内联实现行为一致）。"""
 
-    def run(self, command: str, cwd, timeout: int, cancel=None) -> ExecResult:
+    def run(self, command: str, cwd, timeout: int, cancel=None, env=None) -> ExecResult:
         """跑一条 shell 命令。超时/取消都杀【整个进程组】。
 
         cancel：threading.Event | None。用户点「停止」时置位，进程组立即被
@@ -127,7 +127,7 @@ class LocalExecutor:
            （如测试日志的最后一屏），据此判断是加大超时还是换做法。
         """
         proc = subprocess.Popen(
-            command, shell=True, cwd=cwd,
+            command, shell=True, cwd=cwd, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             **_SPAWN_NEW_GROUP,
         )

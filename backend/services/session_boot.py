@@ -104,6 +104,9 @@ def get_session(session_id, user_id: int, *, initial_workspace: str | None = Non
                   user_id=user_id)  # 记忆 v2：个人记忆层按 user_id 分桶
     # 落盘工具结果的读侧（read_tool_result 工具用，与 result_sink 同一套目录）
     agent.ctx.tool_result_reader = db.read_tool_result
+    from services.project_environment import discover, preference_key
+    agent.environment_loader = lambda: discover(
+        workspace, db.get_setting(preference_key(workspace, user_id)))
     # 窗口恢复：从未压缩 = 全量；压缩过 = 锚点 + 最后一条边界及其之后
     # （边界摘要是后续再压缩的输入）。内存占用与当前窗口成正比，而非
     # 全会话长度；模型视图与全量恢复逐字节一致。

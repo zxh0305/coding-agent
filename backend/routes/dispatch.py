@@ -112,6 +112,8 @@ class DispatchMixin:
             for p in db.list_providers():
                 provs.append({**p, "api_key": None, "api_key_masked": _mask(p["api_key"])})
             self._json(provs)
+        elif path == "/api/project-context":
+            self._handle_project_context()
         elif path == "/api/submissions":
             nonce = (self._query().get("nonce") or [""])[0]
             self._json(db.submission_status(self.user["id"], nonce))
@@ -214,6 +216,8 @@ class DispatchMixin:
             if not self._require_auth():
                 return
             path = urllib.parse.urlparse(self.path).path  # 剥掉 ?query 再匹配
+            if path == "/api/project-context":
+                return self._handle_project_context()
             if path == "/api/skills":
                 return self._handle_skills()
             if path == "/api/experiments" or path.startswith("/api/experiments/"):

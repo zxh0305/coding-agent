@@ -65,6 +65,7 @@ function setWho(name) {
 }
 
 function showLogin() {
+  window.ProjectContextUI?.close();
   sessionViewVersion++;
   if (window.ExperimentsUI) window.ExperimentsUI.close();
   if (window.SkillUI) SkillUI.reset();
@@ -725,6 +726,7 @@ async function doDeleteSession(id) {
 }
 
 async function newTask(presetProject = null) {
+  window.ProjectContextUI?.close();
   sessionViewVersion++;
   historyCompletedMids = new Set();
   historyMids = new Set();
@@ -1086,6 +1088,7 @@ async function switchSession(id, forceReload = false) {
 
 async function doSwitchSession(id, forceReload) {
   if (id === currentSession && !forceReload) return;
+  window.ProjectContextUI?.close();
   const viewVersion = ++sessionViewVersion;
   const isCurrentView = () => currentSession === id && sessionViewVersion === viewVersion;
   saveDraft(currentSession);     // 离开前：把输入框内容存进旧会话的草稿
