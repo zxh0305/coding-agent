@@ -85,6 +85,7 @@
           <span class="git-chip-icon">🌿</span>
           <span id="git-chip-branch" class="git-chip-branch mono">Git</span>
         </button>
+        <button id="project-context-open" class="git-chip" type="button" title="项目设置：运行环境与项目规则" aria-label="项目设置" aria-haspopup="dialog" aria-controls="project-context-dialog"><span aria-hidden="true">⚙</span><span class="chip-label">项目设置</span></button>
         <!-- 会话附件浮窗的入口：只看【已经上传落盘】的附件（用户视角的查看器），
              与工具栏的 📎（选本地文件、待发队列）是两回事，所以图标与位置都分开。
              "附件" 二字包在 .chip-label 里：手机顶栏太窄，只留 🗂 + 数字。 -->
@@ -124,7 +125,6 @@
           <input type="file" id="file-input" multiple hidden
                  accept="image/png,image/jpeg,image/webp,image/gif,.txt,.md,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.html,.css,.csv,.log,.xml,.sh,.sql,.java,.c,.cpp,.go,.rs">
           <button id="perm-chip" class="chip" title="权限模式：只读 = 写入和命令逐次确认；确认 = 高危操作才确认；完全访问 = 全部放行">🛡 <span id="perm-label">确认</span></button>
-          <button id="project-context-open" class="chip" title="查看项目规则和运行环境">项目上下文</button>
           <button id="ws-pick" class="chip" title="选择工作区文件夹">📁 <span id="ws-short">工作区</span></button>
           <button id="docs-chip" class="chip" title="查看本会话生成的文档">📄 文档 <span id="docs-count">0</span></button>
           <button id="skills-chip" class="chip" type="button" aria-haspopup="dialog" aria-expanded="false">✦ 技能 <span id="skills-count"></span></button>
@@ -302,10 +302,11 @@
     </div>
   </div>
 
-  <dialog id="project-context-dialog" class="project-context-dialog">
-    <header><strong>项目上下文</strong><button id="project-context-close" type="button" aria-label="关闭项目上下文">关闭</button></header>
+  <dialog id="project-context-dialog" class="project-context-dialog" aria-labelledby="project-context-title">
+    <header><div><h2 id="project-context-title">项目设置</h2><p>运行环境与自动加载的项目规则</p></div><button id="project-context-close" type="button" aria-label="关闭项目设置">×</button></header>
     <p id="project-context-status" role="status"></p>
     <div id="project-context-body"></div>
+    <footer>设置按项目保存，日常对话无需重复配置。</footer>
   </dialog>
 
   <!-- 选择工作区的弹窗：逐级浏览本地文件夹 -->

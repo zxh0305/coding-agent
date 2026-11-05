@@ -2782,11 +2782,41 @@ button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset
 [data-mode="mobile"] .bubble.assistant { padding: 14px 15px; }
 @media (max-height: 650px) { #sp-detail .sp-instruction pre { max-height: 120px; } }
 
-.project-context-dialog { width: min(620px, calc(100vw - 24px)); max-height: 80vh; overflow: auto; padding: 20px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); color: var(--text); }
-.project-context-dialog::backdrop { background: #0005; }
-.project-context-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.project-context-dialog h3 { font-size: 14px; margin: 18px 0 8px; }
-.project-context-dialog select { max-width: 100%; margin: 0 8px 8px 0; }
-.project-context-dialog p { font-size: 12px; color: var(--text-2); overflow-wrap: anywhere; }
-.project-context-dialog pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; font-size: 12px; padding: 10px; background: var(--panel-soft); }
-.project-context-dialog button { padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-soft); color: var(--text); cursor: pointer; }
+/* Low-frequency project settings live above the conversation, outside the composer. */
+.project-context-dialog { margin: auto; inset: 0; width: min(640px, calc(100vw - 32px)); max-height: min(820px, calc(100dvh - 48px)); padding: 0; border: 1px solid var(--border); border-radius: 18px; background: var(--panel); color: var(--text); box-shadow: 0 24px 90px #0004; }
+.project-context-dialog[open] { display: flex; flex-direction: column; }
+.project-context-dialog::backdrop { background: #18203365; backdrop-filter: blur(3px); }
+.project-context-dialog > header { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 22px 24px 18px; border-bottom: 1px solid var(--border); }
+.project-context-dialog h2 { font-size: 17px; font-weight: 650; }
+.project-context-dialog header p { margin-top: 5px; font-size: 12px; color: var(--text-3); }
+#project-context-close { display: grid; place-items: center; width: 30px; height: 30px; padding: 0; flex: none; border: 0; border-radius: 7px; background: transparent; color: var(--text-2); cursor: pointer; font-size: 23px; }
+#project-context-close:hover { background: var(--hover); }
+#project-context-body { min-height: 180px; overflow-y: auto; overscroll-behavior: contain; padding: 20px 24px 24px; display: flex; flex-direction: column; gap: 16px; }
+#project-context-status { flex: none; padding: 12px 24px 0; font-size: 12px; line-height: 1.6; color: var(--text-2); overflow-wrap: anywhere; }
+#project-context-status:empty { display: none; }
+#project-context-status[data-state="error"] { color: var(--danger); }
+#project-context-status[data-state="success"] { color: var(--success); }
+.pc-project { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.pc-project strong { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.pc-project span { font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pc-card { flex: none; min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); }
+.pc-card h3 { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+.pc-caption, .pc-note, .pc-empty { font-size: 12px; line-height: 1.7; color: var(--text-3); }
+.pc-caption { margin-top: 5px; }
+.pc-note { margin-top: 10px; font-size: 11px; }
+.pc-environment-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; margin-top: 14px; }
+.pc-environment-controls select { min-width: 0; width: 100%; height: 36px; padding: 0 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-alt); color: var(--text); font: inherit; font-size: 12px; }
+.pc-save, .pc-retry { min-height: 36px; padding: 0 12px; border: 1px solid var(--accent-weak-border); border-radius: 7px; background: var(--accent-weak); color: var(--accent); font-size: 12px; cursor: pointer; }
+.pc-save:disabled { opacity: .45; cursor: default; }
+.pc-count { padding: 1px 6px; border-radius: 4px; background: var(--bg-alt); color: var(--text-3); font-size: 10px; font-weight: 400; }
+.pc-warnings { flex: none; padding: 11px 14px 11px 28px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-alt); color: var(--text-2); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.pc-rules details { margin-top: 12px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.pc-rules summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; cursor: pointer; font-size: 12px; font-weight: 500; overflow-wrap: anywhere; list-style: none; }
+.pc-rules summary::-webkit-details-marker { display: none; }
+.pc-rules summary::after { content: '⌄'; flex: none; color: var(--text-3); }
+.pc-rules details[open] summary { border-bottom: 1px solid var(--border); background: var(--bg-alt); }
+.pc-rules details[open] summary::after { transform: rotate(180deg); }
+.pc-rules pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; padding: 14px; background: var(--bg-alt); color: var(--text-2); font: 11px/1.8 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.pc-empty { margin-top: 12px; }
+.project-context-dialog > footer { flex: none; padding: 12px 24px; border-top: 1px solid var(--border); background: var(--bg-alt); color: var(--text-3); font-size: 11px; }
+@media (max-width: 480px) { .project-context-dialog { width: calc(100vw - 24px); max-height: calc(100dvh - 32px); border-radius: 14px; } .project-context-dialog > header { padding: 18px; } #project-context-body { padding: 16px; gap: 12px; } .pc-card { padding: 13px; } .pc-environment-controls { grid-template-columns: minmax(0, 1fr); gap: 8px; } .pc-save { justify-self: end; } }
