@@ -337,6 +337,7 @@ class Agent:
         from services.project_context import ProjectContext
         self.project_context = ProjectContext(self.ctx.workspace)
         self.completion_policy = None
+        self.input_controller = None
         self._progress_window = ProgressWindow()
         self._verification_dispatch = False
         self.environment_loader = None
@@ -533,9 +534,15 @@ class Agent:
            否则不支持视觉的服务商会对图片输入直接报 400。"""
         sanitized = []
         for m in self._visible_history():
+            if m.get("_superseded"):
+                continue
             if m.get("_artifact"):
                 m = self._expand_artifact(m)  # 还原后同样走下面的剥离/视觉处理
             content = m.get("content")
+            if m.get("_references"):
+                from services.conversation_inputs import referenced_content
+                m = {**m,"content":referenced_content(content,m["_references"])}
+                content = m["content"]
             if m.get("role") == "user" and isinstance(content, list) and not self.vision_supported:
                 texts, has_image = [], False
                 for part in content:
@@ -656,6 +663,8 @@ class Agent:
         finally:
             if cancel_event is None:
                 self.cancel_event.set()
+            if self.input_controller is not None:
+                self.input_controller.seal()
 
     def stop(self) -> None:
         """请求停止当前这轮生成（Web「停止」按钮 → /api/chat/stop 调到这里）。"""
@@ -676,6 +685,9 @@ class Agent:
         """run() 的实际循环体（run 只负责停止开关的生命周期）。"""
         from skills import context as skill_context
         self._completion_final = False
+        for message in self.history:
+            if message.get("_completion_feedback"):
+                message["_superseded"] = True
         self._mutation_possible = False
         self._project_digest = None
         from services.project_environment import discover
@@ -756,6 +768,7 @@ class Agent:
             if self.cancel_event.is_set():
                 # 工具结果刚入完历史就被叫停：历史以上一条 tool 消息结尾，依然合法
                 break
+            yield from self._apply_turn_inputs()
             self._log(f"── 第 {round_no} 轮：请求 LLM ──", "gray")
             self._trace({"type": "round", "round": round_no})
             yield "round", {"round": round_no}
@@ -786,6 +799,10 @@ class Agent:
                 yield from self._tail_stopped(assistant_msg, usage_total, metrics)
                 return
 
+            if (yield from self._apply_turn_inputs()):
+                self.history.append({"role":"assistant","content":assistant_msg.get("content"),"_completion_candidate":True})
+                self.history.append({"role":"user","_synthetic":True,"content":"用户补充已纳入，请按最新补充重新判断。此前候选回复和未派发工具不代表已执行。"})
+                continue
             if self._completion_final and assistant_msg.get("tool_calls"):
                 assistant_msg = {key:value for key,value in assistant_msg.items() if key != "tool_calls"}
             tool_calls = assistant_msg.get("tool_calls")
@@ -801,9 +818,12 @@ class Agent:
                         text = assistant_msg.get("content") or ""
                         if text:
                             self._trace({"type": "process_text", "round": round_no, "text": text})
-                        self.history.append({"role":"system", "content":decision["feedback"]})
+                        self.history.append({"role":"system", "content":decision["feedback"],"_completion_feedback":True})
                         self._completion_final = decision["final"]
                         continue
+                if self.input_controller is not None and not self.input_controller.commit():
+                    self.history.append({**assistant_msg,"_completion_candidate":True})
+                    continue
                 yield from self._tail_answer(assistant_msg, usage_total, metrics)
                 return
 
@@ -875,7 +895,19 @@ class Agent:
         if self.completion_policy is not None:
             self.completion_policy.exhausted(self)
             self.history.append({"role":"system", "content":self.completion_policy.summary_text()})
+        if self.input_controller is not None:
+            while not self.input_controller.commit():
+                if self.cancel_event.is_set():
+                    yield from self._tail_stopped(None,usage_total,metrics)
+                    return
+                yield from self._apply_turn_inputs()
         yield from self._wrap_up_round(usage_total, metrics, effective_max=soft_limit)
+
+    def _apply_turn_inputs(self):
+        count = self.input_controller.apply(self) if self.input_controller is not None else 0
+        if count:
+            yield "turn_inputs_changed", {"user_mid":self.input_controller.mid}
+        return count
 
     # ------------------------------------------------------------------
     # 收尾轮与流的统一消费（主循环 / 收尾轮共用，防两份逻辑漂移）

@@ -96,6 +96,8 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             # analyze_image 永远报"没有附带图片"。拷贝让替换只毁副本，原 dict 完整
             # 进入 agent 历史；收尾整段落盘时本消息已按桩内容记过指纹，幂等跳过。
             db.save_messages(sid, [dict(user_message)], {})
+            from services.conversation_inputs import TurnInputs
+            agent.input_controller = TurnInputs(sid,user_mid,agent.ctx.workspace)
             def save_project_context(context):
                 ref = db.write_tool_result(sid, json.dumps(context, ensure_ascii=False))
                 refs = user_message.setdefault("_project_context", [])
@@ -111,6 +113,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                          # 全文跟着走等于每次断线重连都重播一遍技能指令。徽章展开
                          # 时前端按 user_mid 走 /api/skills?mid= 懒取全文。
                          "skills": skills.slim(user_message.get("_skills", [])),
+                         "references": user_message.get("_references",[]),
                          # 回合真起点（秒）。补发/多标签页/刷新后的页面没有本地
                          # 计时起点，靠它把「已工作 N 秒」接上，而不是从 0 重数。
                          "started_at": time.time(),
@@ -259,6 +262,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                 answer_mid = next((m.get("_mid") for m in reversed(agent.history)
                                    if m.get("role") == "assistant" and not m.get("_synthetic")), None)
                 if answer_mid:
+                    bus.publish({"type":"message_committed","stream_mid":seg_mid,"mid":answer_mid,"user_mid":user_mid})
                     # 执行过程轨迹随最终回答落库：切换会话/刷新后历史回放仍能
                     # 展开看"当时每一步做了什么、改了哪些文件"。失败不阻塞收尾。
                     try:
@@ -364,5 +368,10 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             except Exception:
                 pass
         finally:
-            if _running_agents.get(sid) is agent:
-                _running_agents.pop(sid, None)
+            try:
+                if getattr(agent,"input_controller",None) is not None:
+                    agent.input_controller.seal()
+                    bus.publish({"type":"turn_inputs_changed","user_mid":agent.input_controller.mid})
+            finally:
+                if _running_agents.get(sid) is agent:
+                    _running_agents.pop(sid, None)

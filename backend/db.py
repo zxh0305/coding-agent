@@ -322,6 +322,15 @@ MIGRATIONS: list[tuple[int, str | None]] = [
          "WHERE worker IS NULL AND payload IS NOT NULL"),
     (35, "CREATE INDEX IF NOT EXISTS idx_submission_queue_session "
          "ON submission_queue(session_id,state,position)"),
+    (36, "CREATE TABLE IF NOT EXISTS turn_input_gates("
+         "session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+         "user_mid TEXT NOT NULL,workspace TEXT,state TEXT NOT NULL DEFAULT 'open',PRIMARY KEY(session_id,user_mid))"),
+    (37, "CREATE TABLE IF NOT EXISTS turn_inputs("
+         "id TEXT PRIMARY KEY,session_id TEXT NOT NULL,user_mid TEXT NOT NULL,user_id INTEGER NOT NULL,"
+         "nonce TEXT NOT NULL,digest TEXT NOT NULL,text TEXT NOT NULL,refs_json TEXT NOT NULL,"
+         "state TEXT NOT NULL DEFAULT 'accepted',created REAL NOT NULL,"
+         "UNIQUE(user_id,nonce),FOREIGN KEY(session_id,user_mid) REFERENCES turn_input_gates(session_id,user_mid) ON DELETE CASCADE)"),
+    (38, "CREATE INDEX IF NOT EXISTS idx_turn_inputs_target ON turn_inputs(session_id,user_mid,state,created)"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -801,7 +810,7 @@ def truncate_from(sid: str, mid: str) -> dict:
                         (sid, *chunk))
                 # 回合状态按主键 user_mid 删（回退到某轮起点 = 该轮及之后的
                 # 回合状态也一起作废；回退后重发会拿到新的 user_mid 重新开账）
-                for table in ("turn_checks", "turn_assessments"):
+                for table in ("turn_checks", "turn_assessments", "turn_input_gates"):
                     conn.execute(f"DELETE FROM {table} WHERE session_id=? AND user_mid IN ({q})",
                                  (sid, *chunk))
                 conn.execute(
@@ -1170,6 +1179,8 @@ def mark_running_turns_interrupted() -> int:
             "UPDATE session_turns SET state='interrupted', ended=? WHERE state='running'",
             (now,))
         n = cur.rowcount or 0
+        conn.execute("UPDATE turn_input_gates SET state='closed' WHERE state!='closed'")
+        conn.execute("UPDATE turn_inputs SET state='expired' WHERE state='accepted'")
         conn.execute("UPDATE submission_queue SET state='finished',payload=NULL WHERE state='claimed' AND EXISTS "
                      "(SELECT 1 FROM session_turns t WHERE t.session_id=submission_queue.session_id AND t.user_mid=submission_queue.mid AND t.state IN ('done','error'))")
         conn.execute("UPDATE submission_queue SET state='interrupted',reason='服务重启时执行中断，请先检查项目',revision=revision+1 "
@@ -2405,7 +2416,7 @@ def save_messages(sid: str, history: list[dict], saved: dict) -> int:
                         "role": m.get("role", "")}
                 if m.get("_completion_candidate"):
                     stub["_completion_candidate"] = True
-                for key in ("_task_evidence", "_task_state"):
+                for key in ("_task_evidence", "_task_state", "_references", "_supplement_of", "_completion_feedback", "_superseded"):
                     if key in m:
                         stub[key] = m[key]
                 row_content = json.dumps(stub, ensure_ascii=False)
@@ -2682,7 +2693,8 @@ def user_message_index(sid: str) -> list[dict]:
     """
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT mid, ord FROM messages WHERE session_id=? AND role='user' "
+            "SELECT mid, ord FROM messages m WHERE session_id=? AND role='user' "
+            "AND NOT EXISTS (SELECT 1 FROM turn_inputs i WHERE i.id=m.mid AND i.session_id=m.session_id) "
             "ORDER BY ord, rowid", (sid,)).fetchall()
     return [{"mid": r["mid"], "ord": r["ord"]} for r in rows]
 

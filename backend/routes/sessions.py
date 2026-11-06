@@ -223,6 +223,10 @@ class SessionRoutes:
             workspace = str(initial_workspace or project_directory(self.user["id"], sid)
                             or DEFAULT_WORKSPACE.resolve())
         plain, user_message = _build_user_message(body, sid)
+        from services.conversation_inputs import resolve_references
+        references = resolve_references(sid,body.get("references",[]))
+        if references:
+            user_message["_references"] = references
         if user_message is not None and selected_skills:
             user_message["_skills"] = selected_skills
         if not plain:
@@ -267,6 +271,31 @@ class SessionRoutes:
             return self._json({"error":str(e)}, 409)
         except ValueError as e:
             return self._json({"error":str(e)}, 400)
+
+    def _handle_turn_inputs(self,sid):
+        from services import conversation_inputs as inputs
+        if db.session_owner(sid)!=self.user["id"]:
+            return self._json({"error":"任务不存在或不属于当前用户"},404)
+        try:
+            if self.command=="POST":
+                body=self._body()
+                if body.get("attachments") or body.get("skills"):
+                    raise ValueError("补充仅支持文字与引用，附件和技能请作为下一项发送")
+                ident=inputs.accept(sid,self.user["id"],body.get("user_mid"),body.get("nonce"),body.get("message"),
+                                    body.get("references",[]),body.get("expected_workspace"),
+                                    lambda: bool((agent:=busref._running_agents.get(sid)) and agent.cancel_event and agent.cancel_event.is_set()))
+                busref._event_bus(sid).publish({"type":"turn_inputs_changed","user_mid":body.get("user_mid")})
+                return self._json({"session_id":sid,"supplement_id":ident})
+            nonce=(self._query().get("nonce") or [None])[0]
+            if nonce:
+                with db._conn() as conn:
+                    row=conn.execute("SELECT id,user_mid,state FROM turn_inputs WHERE session_id=? AND user_id=? AND nonce=?",(sid,self.user["id"],nonce)).fetchone()
+                return self._json({"accepted":bool(row),**(dict(row) if row else {})})
+            return self._json({"items":inputs.list_inputs(sid,(self._query().get("user_mid") or [None])[0])})
+        except inputs.InputConflict as e:
+            return self._json({"error":str(e)},409)
+        except (ValueError,FileNotFoundError) as e:
+            return self._json({"error":str(e)},400)
 
     def _handle_session_checks(self, sid, check_id=None):
         if db.session_owner(sid) != self.user["id"]:
@@ -420,6 +449,8 @@ class SessionRoutes:
             role = m.get("role")
             if m.get("_completion_candidate"):
                 continue
+            if m.get("_supplement_of"):
+                continue
             if role not in ("user", "assistant", "compact"):
                 continue  # 工具消息/带 tool_calls 的中间 assistant 不进时间线
             # mid 一并带回：它是事件流（delta/done/turn_end.user_mid）与时间线
@@ -444,6 +475,8 @@ class SessionRoutes:
                 if m.get("tool_calls"):
                     item["tool_calls"] = m["tool_calls"]
                 items.append(item)
+            if items and items[-1].get("mid")==m.get("_mid") and m.get("_references"):
+                items[-1]["references"]=m["_references"]
         # 执行过程轨迹按本页的 mid 批量取（只有最终回答消息才有）：前端历史
         # 回放渲染折叠条，点开可看当时每一步做了什么
         answer_mids = [it["mid"] for it in items if it["role"] == "assistant"]
@@ -455,6 +488,11 @@ class SessionRoutes:
         # 随用户消息带回，前端回放时在对应回合画改动画布。与 trace 分开取，
         # 因为二者挂在不同的消息上（answer_mid vs user_mid）。
         user_mids = [it["mid"] for it in items if it["role"] == "user" and it["mid"]]
+        from services.conversation_inputs import list_inputs
+        supplements=list_inputs(sid,parents=user_mids)
+        for item in items:
+            related=[s for s in supplements if s["user_mid"]==item["mid"]]
+            if related: item["supplements"]=related
         extras = db.get_trace_extras(sid, user_mids)
         for it in items:
             if it["mid"] in extras:

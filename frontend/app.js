@@ -808,12 +808,14 @@ function saveDraft(sid) {
   if (text) localStorage.setItem(draftKey(sid), text);
   else localStorage.removeItem(draftKey(sid));  // 空草稿不留残留，避免下次误恢复
   if (window.SkillUI) SkillUI.saveDraft(sid);
+  window.ConversationInputsUI?.save(sid);
   saveAttachDraft(sid);                          // 附件与文本同一归属，一起存
 }
 
 function restoreDraft(sid) {
   inputEl.value = localStorage.getItem(draftKey(sid)) || "";
   if (window.SkillUI) SkillUI.restoreDraft(sid);
+  window.ConversationInputsUI?.restore(sid);
   restoreAttachDraft(sid);                       // 并恢复该会话自己的附件托盘
 }
 
@@ -1440,7 +1442,10 @@ function historyNode(m) {
     }
     return node;
   }
-  return tagLiveTrace(blocksRenderer.renderBlocks(blocksFromHistory([m])), m);
+  const node = tagLiveTrace(blocksRenderer.renderBlocks(blocksFromHistory([m])), m);
+  for (const answer of node.querySelectorAll?.('[data-role="assistant"]') || []) answer.dataset.persisted = "true";
+  ConversationInputsUI.decorate(node,m);
+  return node;
 }
 
 // 给"进行中回合快照"画出的过程卡打接管标记（user_mid → DOM）。SSE 补发到达
@@ -1477,8 +1482,9 @@ function artifactCard(m) {
         `/artifact?path=${encodeURIComponent(m.path)}`).then((r) => {
       const msg = r.message;
       const [user] = blocksFromHistory([{...msg, role:"user"}]);
-      const full = buildUserBubble(user.text, user.atts, msg._skills || msg.skills || [], m.mid, user.instruction);
+      const full = buildUserBubble(user.text, user.atts, msg._skills || msg.skills || [], m.mid, user.instruction,msg._references || m.references || []);
       holder.replaceChildren(full);              // 原位替换占位气泡
+      ConversationInputsUI.decorate(holder,m);
       scrollBottom();                            // 图片加载会撑高；贴底才跟随
     }).catch(() => { /* 取回失败：保留 head 预览占位，不打扰 */ });
     return holder;
@@ -1868,7 +1874,7 @@ async function openMessageSkill(trigger, skill, loadBody) {
   }
 }
 
-function buildUserBubble(text, atts, skills = [], mid = null, instruction = text) {
+function buildUserBubble(text, atts, skills = [], mid = null, instruction = text, references = []) {
   const div = document.createElement("div");
   div.className = "bubble user";
   if (text) {
@@ -1877,6 +1883,7 @@ function buildUserBubble(text, atts, skills = [], mid = null, instruction = text
     t.textContent = text;
     div.appendChild(t);
   }
+  for (const reference of references || []) div.appendChild(ConversationInputsUI.referenceButton(reference));
   for (const skill of skills) {
     const badge = document.createElement("button"); badge.type = "button"; badge.className = "ub-skill";
     badge.textContent = "✦ " + (skill.name || skill.id);
@@ -1965,9 +1972,9 @@ function buildUserBubble(text, atts, skills = [], mid = null, instruction = text
   return wrapWithActions(div, actions);
 }
 
-function userBubble(text, atts, mid, skills = []) {
+function userBubble(text, atts, mid, skills = [], references = []) {
   hideWelcome();
-  chatEl.appendChild(railTag(buildUserBubble(text, atts, skills, mid), mid, "user"));
+  chatEl.appendChild(railTag(buildUserBubble(text, atts, skills, mid, text, references), mid, "user"));
   // 自己发消息=明确要看底部：显式恢复跟随（全局统一规则的合法恢复入口之一）
   stickBottom = true;
   scrollBottom();
@@ -1989,7 +1996,7 @@ async function hydrateUserImage(mid) {
     if (sid !== currentSession || view !== sessionViewVersion || token !== authToken || !node.isConnected) return;
     const user = blocksFromHistory([{...message,role:"user"}]).find(block => block.kind === "user");
     if (!user) return;
-    const replacement = railTag(buildUserBubble(user.text,user.atts,user.skills || message.skills || message._skills || [],mid,user.instruction),mid,"user");
+    const replacement = railTag(buildUserBubble(user.text,user.atts,user.skills || message.skills || message._skills || [],mid,user.instruction,user.references || message.references || message._references || []),mid,"user");
     (node.closest(".msg-group") || node).replaceWith(replacement);
     scrollBottom();
   } catch { /* The persisted image remains available on normal history reload. */ }
@@ -4354,6 +4361,13 @@ function queueStreamDelta(kind, mid, text) {
 function applyEvent(evt, seq) {
   if (seq != null) lastSeq = seq;
   const t = evt.type;
+  if (t === "message_committed") {
+    const answer = chatEl.querySelector(`[data-role="assistant"][data-mid="${CSS.escape(evt.stream_mid || "")}"]`);
+    if (answer) { answer.dataset.mid = evt.mid; answer.dataset.persisted = "true"; }
+    if (evt.mid) historyMids.add(evt.mid);
+    return;
+  }
+  if (t === "turn_inputs_changed") { void ConversationInputsUI.refresh(); return; }
   if (t === "queue_changed") { void ServerQueueUI.refresh(); return; }
   if (t === "turn_start") {
     const submission = inFlight.get(evt.nonce);
@@ -4377,7 +4391,7 @@ function applyEvent(evt, seq) {
     if ((!evt.nonce || evt.nonce !== myNonce) && !alreadyShown) {
       userBubble(evt.input || "（仅附件）",
         (evt.atts || []).map(a => ({ kind: a.kind, name: a.name, preview: "" })),
-        evt.user_mid, evt.skills || []);
+        evt.user_mid, evt.skills || [],evt.references || []);
       scheduleRail();  // 补画的用户消息也要进导航条
     }
     if (evt.user_mid && evt.atts?.some(att => att.kind === "image")) void hydrateUserImage(evt.user_mid);
@@ -4706,15 +4720,16 @@ function applyEvent(evt, seq) {
 // 则进队列；不手动清输入框——输入框在出错时早已是空的。
 function retryLast() {
   if (!lastSent || workspacePending || lastSent.owner !== who || lastSent.sessionId !== currentSession) return;
-  if (streaming) { queueMessage(lastSent.text, lastSent.payloadAtts, lastSent.skills || []); return; }
-  userBubble(lastSent.text, lastSent.outAtts, null, lastSent.skills || []);
-  performSend({ text: lastSent.text, payloadAtts: lastSent.payloadAtts, skills: lastSent.skills || [] });
+  if (streaming) { queueMessage(lastSent.text, lastSent.payloadAtts, lastSent.skills || [], lastSent.references || []); return; }
+  userBubble(lastSent.text, lastSent.outAtts, null, lastSent.skills || [], lastSent.references || []);
+  performSend({ text: lastSent.text, payloadAtts: lastSent.payloadAtts, skills: lastSent.skills || [], references: lastSent.references || [] });
 }
 
 // 生成期间「发送」变身「停止」：点它请求服务端掐断当前生成。
 // 按钮复位不在点击处——等 SSE 流送来 done/error 后，在 send() 的 finally 里。
 function setStreaming(on) {
   streaming = on;
+  window.ConversationInputsUI?.sync();
   const btn = $("send");
   // 生成中保持可点（此时点 = 停止）；但归档会话例外——只读态不允许被流式
   // 状态变化解锁（真实 bug：归档任务里点停止/回合结束，发送按钮被这里重新点亮）
@@ -4892,7 +4907,8 @@ function outgoingItem(text, payloadAtts, skills) {
     expectedWorkspace: currentSession ? confirmedWorkspace : undefined,
     chosenPath: currentSession ? undefined : pendingProjectPath,
     nonce: crypto.randomUUID?.() || Date.now().toString(16) + Math.random().toString(16).slice(2),
-    created: Date.now(), state: "queued"};
+    created: Date.now(), state: "queued", references: ConversationInputsUI.selection(),
+    ...ConversationInputsUI.delivery()};
 }
 
 async function discardSessionQueue(sid) {
@@ -4925,7 +4941,7 @@ async function restoreQueue(sid) {
       if (entry.state === "sending") entry.state = "uncertain";
       if (entry.state === "uncertain") {
         let receipt;
-        try { receipt = await api("/api/submissions?nonce=" + encodeURIComponent(entry.nonce)); }
+        try { receipt = await api(entry.delivery === "steer" ? `/api/sessions/${encodeURIComponent(sid)}/inputs?nonce=${encodeURIComponent(entry.nonce)}` : "/api/submissions?nonce=" + encodeURIComponent(entry.nonce)); }
         catch { /* Keep the original request available while offline. */ }
         if (owner !== who || view !== sessionViewVersion || sid !== currentSession) return;
         if (receipt?.accepted) {
@@ -4970,6 +4986,11 @@ async function send() {
   if (currentSessionArchived) return;  // 归档任务只读：兜底拦截（正常情况下输入框已禁用）
   const text = inputEl.value.trim();
   if (!text && !attachments.length) return;
+  const delivery = ConversationInputsUI.delivery();
+  if (delivery.delivery === "steer") {
+    if (!streaming || !activeTurnMid || delivery.targetMid !== activeTurnMid) { toast("原任务已结束或发生变化，请选择下一项任务后发送"); return; }
+    if (attachments.length || editTarget) { toast("补充仅支持文字和引用，带附件或回退编辑请选择下一项任务"); return; }
+  }
   if (text === "/compact") {  // 斜杠命令：手动压缩，不作为消息发送
     inputEl.value = "";
     runManualCompact();
@@ -5011,12 +5032,15 @@ async function send() {
     }
   }
   inputEl.value = "";
-  if (window.SkillUI) SkillUI.afterSend();
+  if (window.SkillUI && item.delivery !== "steer") SkillUI.afterSend();
+  ConversationInputsUI.clear();
   attachments = [];              // 附件必须先清再存草稿：saveDraft 会把托盘快照
   renderAttachTray();            // 写回会话槽，若带着刚发出的附件存，它们会留在
                                  // __new__ 槽里，之后开任何新会话都会被恢复出来
   clearTimeout(draftTimer);      // 已发出：取消待写的防抖存盘
   saveDraft(currentSession);     // 并立即清掉该会话草稿（此刻输入框/托盘已空 → 删除）
+
+  if (item.delivery === "steer") { pendingQueue.push(item); renderQueueBar(); dispatchNextQueued(); return; }
 
   if (editTarget) {
     // 回退编辑的发送：先截断（服务端删该轮及其后），重拉时间线，再走常规发送。
@@ -5057,13 +5081,16 @@ async function send() {
     dispatchNextQueued();
     return;
   }
-  userBubble(text, outAtts, null, selectedSkills);
+  userBubble(text, outAtts, null, selectedSkills, item.references);
   performSend(item);
   pendingProjectPath = null;
 }
 
-async function queueMessage(text, payloadAtts, skills = []) {
+async function queueMessage(text, payloadAtts, skills = [], references = []) {
   const item = outgoingItem(text, payloadAtts, skills);
+  item.references = references;
+  item.delivery = "queue";
+  item.targetMid = null;
   try { await Outbox.put(item); }
   catch (e) { toast("无法保存待发消息：" + e.message); return; }
   if (item.owner !== who) return;
@@ -5082,20 +5109,22 @@ async function acceptQueued(item) {
     await Outbox.put(item);
     let accepted = false;
     if (item.checkReceipt) {
-      const receipt = await api("/api/submissions?nonce=" + encodeURIComponent(item.nonce));
+      const receipt = await api(item.delivery === "steer" ? `/api/sessions/${encodeURIComponent(item.sessionId)}/inputs?nonce=${encodeURIComponent(item.nonce)}` : "/api/submissions?nonce=" + encodeURIComponent(item.nonce));
       accepted = receipt.accepted;
     }
     if (!accepted) {
-      await ServerQueueUI.ensureAvailable(item.sessionId);
-      await api(`/api/sessions/${encodeURIComponent(item.sessionId)}/messages`, {method:"POST", body:JSON.stringify({
-        message:item.text, nonce:item.nonce, attachments:item.payloadAtts, skills:item.skills || [],
-        expected_workspace:item.expectedWorkspace
+      if (item.delivery !== "steer") await ServerQueueUI.ensureAvailable(item.sessionId);
+      await api(`/api/sessions/${encodeURIComponent(item.sessionId)}/${item.delivery === "steer" ? "inputs" : "messages"}`, {method:"POST", body:JSON.stringify({
+        message:item.text, nonce:item.nonce, attachments:item.delivery === "steer" ? undefined : item.payloadAtts,
+        skills:item.delivery === "steer" ? undefined : item.skills || [],
+        user_mid:item.delivery === "steer" ? item.targetMid : undefined,
+        references:item.references?.length ? item.references : undefined, expected_workspace:item.expectedWorkspace
       })});
     }
     await Outbox.remove(item);
     if (owner !== who) return;
     pendingQueue = pendingQueue.filter(entry => entry.nonce !== item.nonce);
-    renderQueueBar(); void ServerQueueUI.refresh();
+    renderQueueBar(); void ServerQueueUI.refresh(); void ConversationInputsUI.refresh();
   } catch(error) {
     if (item.confirmed) {
       await Outbox.remove(item).catch(() => {});
@@ -5135,6 +5164,7 @@ function renderQueueBar() {
     const t = document.createElement("div");
     t.className = "q-text";
     t.textContent = (item.skills?.length ? "✦ " + item.skills.map(s => s.name || s.id).join("、") + " · " : "") + (item.text || "（仅附件）");
+    if (item.delivery === "steer") t.textContent = "补充当前任务 · " + t.textContent;
     if (item.expectedWorkspace !== undefined && item.expectedWorkspace !== confirmedWorkspace) {
       t.textContent = "项目已变更，切回原项目或编辑后发送 · " + t.textContent;
       row.title = item.expectedWorkspace;
@@ -5196,12 +5226,13 @@ function renderQueueBar() {
       if (streaming) stopGeneration();
       else dispatchNextQueued();
     }, "q-immediate");
-    mk("✏", "编辑", async () => {
+    mk(item.delivery === "steer" ? "作为下一项编辑" : "✏", item.delivery === "steer" ? "保留原文，改为下一项任务" : "编辑", async () => {
       if (inputEl.value || attachments.length) { toast("请先处理输入框里的草稿"); return; }
       if (item.state === "uncertain") { toast("请先重试以确认原消息是否已接收"); return; }
       pendingQueue.splice(pendingQueue.indexOf(item), 1);
       renderQueueBar();
       inputEl.value = item.text;
+      ConversationInputsUI.fromItem(item);
       if (window.SkillUI) SkillUI.setSelection(item.skills || []);
       for (const a of item.payloadAtts) {
         attachments.push({ kind: a.kind, name: a.name, mime: a.mime, data: a.data, uploaded: !a.data && !!a.name,
@@ -5313,6 +5344,7 @@ async function performSend(item) {
     nonce: item.nonce,
     attachments: item.payloadAtts,
     skills: item.skills || [],
+    references:item.references?.length ? item.references : undefined,
     // 创建即绑定项目（原子——回合启动前落库）
     workspace: (creating && bindPath) || undefined,
     expected_workspace: creating ? undefined : (item.expectedWorkspace ?? confirmedWorkspace),

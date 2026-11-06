@@ -2835,3 +2835,26 @@ button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset
 .queue-edit-dialog textarea { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-alt); color: var(--text); font: inherit; font-size: 13px; resize: vertical; }
 .queue-edit-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .queue-edit-actions button { padding: 7px 12px; border: 1px solid var(--border); border-radius: 7px; color: var(--text); background: var(--bg-alt); cursor: pointer; }
+
+/* Frequent conversation actions stay beside send; quotes remain small, inspectable chips. */
+#delivery-mode { flex: none; max-width: 150px; font-size: 11px; }
+.reference-tray { display: flex; flex-wrap: wrap; gap: 6px; padding-bottom: 8px; }
+.reference-tray.hidden { display: none; }
+.reference-pill { display: inline-flex; max-width: 100%; border: 1px solid var(--accent-weak-border); border-radius: 7px; background: var(--accent-weak); }
+.reference-pill button, .ub-reference { border: 0; background: transparent; color: var(--accent); padding: 5px 7px; font-size: 11px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.reference-pill button:first-child { min-width: 0; }
+.reference-pill button:last-child { flex: none; }
+.ub-reference { display: block; margin-top: 6px; border: 1px solid var(--accent-weak-border); border-radius: 6px; }
+.quote-selection-action { position: fixed; z-index: 70; padding: 7px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel); color: var(--accent); box-shadow: 0 4px 15px #0002; font-size: 12px; cursor: pointer; }
+.quote-selection-action.hidden { display: none; }
+.reference-view-dialog { margin: auto; inset: 0; width: min(560px,calc(100vw - 28px)); max-height: 80dvh; padding: 22px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); color: var(--text); }
+.reference-view-dialog::backdrop { background: #18203365; }
+.reference-view-dialog h3 { font-size: 15px; margin-bottom: 14px; }
+.reference-view-dialog blockquote { max-height: 48dvh; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.8; border-left: 2px solid var(--accent-weak-border); padding-left: 12px; margin-bottom: 16px; }
+.reference-view-dialog button, .turn-input-list button { padding: 5px 8px; margin-right: 6px; border: 1px solid var(--border); border-radius: 6px; color: var(--text-2); background: var(--panel); font-size: 11px; cursor: pointer; }
+.quote-source-highlight { outline: 2px solid var(--accent); outline-offset: 3px; }
+.turn-input-list { width: min(420px,100%); margin-top: 8px; font-size: 12px; color: var(--text-2); }
+.turn-input-list details { margin-top: 5px; border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; background: var(--bg-alt); }
+.turn-input-list summary { cursor: pointer; overflow-wrap: anywhere; line-height: 1.6; }
+.turn-input-list p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; line-height: 1.7; }
+@media (max-width:480px) { #delivery-mode { max-width: 120px; font-size: 10px; } .turn-input-list { width: 100%; } }
