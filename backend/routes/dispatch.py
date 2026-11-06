@@ -72,6 +72,8 @@ class DispatchMixin:
         path = urllib.parse.urlparse(self.path).path  # 剥掉 ?query 后的纯路径
         if path == "/api/skills":
             return self._handle_skills()
+        if re.fullmatch(r"/api/sessions/[^/]+/queue", path):
+            return self._handle_session_queue(path.split("/")[3])
         if path == "/api/experiments" or path.startswith("/api/experiments/"):
             return self._handle_experiments(path, "GET")
         if re.fullmatch(r"/api/sessions/[^/]+/checks(?:/[^/]+/output)?", path):
@@ -230,6 +232,8 @@ class DispatchMixin:
             elif path == "/api/sessions":
                 # 新任务的第一次发送：创建任务 + 入队（老任务每次都带 id 走下面）
                 self._handle_session_submit(None)
+            elif re.fullmatch(r"/api/sessions/[^/]+/queue", path):
+                self._handle_session_queue(path.split("/")[3])
             elif re.fullmatch(r"/api/sessions/[^/]+/messages", path):
                 sid = path.split("/")[3]
                 if db.session_owner(sid) != self.user["id"]:

@@ -2820,3 +2820,17 @@ button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset
 .pc-empty { margin-top: 12px; }
 .project-context-dialog > footer { flex: none; padding: 12px 24px; border-top: 1px solid var(--border); background: var(--bg-alt); color: var(--text-3); font-size: 11px; }
 @media (max-width: 480px) { .project-context-dialog { width: calc(100vw - 24px); max-height: calc(100dvh - 32px); border-radius: 14px; } .project-context-dialog > header { padding: 18px; } #project-context-body { padding: 16px; gap: 12px; } .pc-card { padding: 13px; } .pc-environment-controls { grid-template-columns: minmax(0, 1fr); gap: 8px; } .pc-save { justify-self: end; } }
+
+/* Accepted work is shown independently from local, unconfirmed outbox items. */
+#server-queue-bar { display: flex; flex-direction: column; gap: 5px; max-height: 190px; overflow-y: auto; margin-bottom: 10px; }
+#server-queue-bar.hidden { display: none; }
+.server-queue-title { color: var(--text-3); font-size: 11px; padding: 0 3px 3px; }
+#server-queue-bar .queue-item { flex-wrap: wrap; }
+#server-queue-bar .queue-actions { margin-left: auto; flex-wrap: wrap; max-width: 100%; }
+.queue-edit-dialog { margin: auto; inset: 0; width: min(520px, calc(100vw - 28px)); padding: 22px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); color: var(--text); }
+.queue-edit-dialog::backdrop { background: #18203365; }
+.queue-edit-dialog h3 { font-size: 15px; margin-bottom: 10px; }
+.queue-edit-dialog p { color: var(--text-3); font-size: 12px; line-height: 1.7; margin-bottom: 10px; }
+.queue-edit-dialog textarea { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-alt); color: var(--text); font: inherit; font-size: 13px; resize: vertical; }
+.queue-edit-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.queue-edit-actions button { padding: 7px 12px; border: 1px solid var(--border); border-radius: 7px; color: var(--text); background: var(--bg-alt); cursor: pointer; }

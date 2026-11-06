@@ -4331,6 +4331,7 @@ function queueStreamDelta(kind, mid, text) {
 function applyEvent(evt, seq) {
   if (seq != null) lastSeq = seq;
   const t = evt.type;
+  if (t === "queue_changed") { void ServerQueueUI.refresh(); return; }
   if (t === "turn_start") {
     const submission = inFlight.get(evt.nonce);
     if (submission) submission.confirmed = true;
@@ -4912,6 +4913,7 @@ async function restoreQueue(sid) {
       pendingQueue.push(entry);
     }
     renderQueueBar();
+    void ServerQueueUI.refresh();
   } catch (e) { toast("无法读取本地待发消息：" + e.message); }
 }
 
@@ -5022,6 +5024,7 @@ async function send() {
   // 消息；只判 streaming 会让新消息【插队】到积压消息前面，而积压消息永远
   // 卡住。这条规则的单测见 queue_state.test.mjs 的 decideSend 用例组。
   if (decideSend(refreshTurnState(), currentSession).action === "queue") {
+    if (currentSession) { pendingQueue.push(item); renderQueueBar(); dispatchNextQueued(); return; }
     // 排队：只显示输入框上方的队列条，正式气泡等派发执行时再渲染（否则会出现两条重复消息）
     pendingQueue.push(item);
     renderQueueBar();
@@ -5042,6 +5045,47 @@ async function queueMessage(text, payloadAtts, skills = []) {
   if (item.owner !== who) return;
   pendingQueue.push(item);
   renderQueueBar();
+  dispatchNextQueued();
+}
+
+async function acceptQueued(item) {
+  if (inFlight.has(item.nonce)) return;
+  inFlight.set(item.nonce, item);
+  const owner = who;
+  try {
+    item.state = "sending";
+    renderQueueBar();
+    await Outbox.put(item);
+    let accepted = false;
+    if (item.checkReceipt) {
+      const receipt = await api("/api/submissions?nonce=" + encodeURIComponent(item.nonce));
+      accepted = receipt.accepted;
+    }
+    if (!accepted) {
+      await api(`/api/sessions/${encodeURIComponent(item.sessionId)}/messages`, {method:"POST", body:JSON.stringify({
+        message:item.text, nonce:item.nonce, attachments:item.payloadAtts, skills:item.skills || [],
+        expected_workspace:item.expectedWorkspace
+      })});
+    }
+    await Outbox.remove(item);
+    if (owner !== who) return;
+    pendingQueue = pendingQueue.filter(entry => entry.nonce !== item.nonce);
+    renderQueueBar(); void ServerQueueUI.refresh();
+  } catch(error) {
+    if (item.confirmed) {
+      await Outbox.remove(item).catch(() => {});
+      if (owner === who) { pendingQueue = pendingQueue.filter(entry => entry.nonce !== item.nonce); renderQueueBar(); }
+      return;
+    }
+    item.state = error.status >= 400 && error.status < 500 ? "failed" : "uncertain";
+    item.error = error.message;
+    await Outbox.put(item).catch(() => {});
+    if (owner === who && !pendingQueue.some(entry => entry.nonce === item.nonce)) pendingQueue.push(item);
+    if (owner === who) { renderQueueBar(); toast("排队未确认：" + error.message); }
+  } finally {
+    inFlight.delete(item.nonce);
+    if (owner === who) queueMicrotask(dispatchNextQueued);
+  }
 }
 
 // 排队消息条：渲染在输入框上方（composer 内），不进会话消息流——正式气泡
@@ -5049,6 +5093,7 @@ async function queueMessage(text, payloadAtts, skills = []) {
 // DOM 跟随会话流被清空后留下悬空引用的问题。只画属于当前会话的条目，
 // 其他会话的排队消息保持静默（派发时同样有 sessionId 守卫）。
 function renderQueueBar() {
+  void ServerQueueUI.refresh();
   const bar = $("queue-bar");
   if (!bar) return;
   bar.innerHTML = "";
@@ -5091,6 +5136,10 @@ function renderQueueBar() {
       b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
       actions.appendChild(b);
     };
+    if (item.state === "sending") {
+      t.textContent = "正在提交排队 · " + (item.text || "（仅附件）");
+      row.appendChild(actions); bar.appendChild(row); continue;
+    }
     if (item.receivedSession) {
       t.textContent = "已接收 · " + (item.text || "附件");
       mk("查看任务", "打开已创建的任务", async () => {
@@ -5154,6 +5203,11 @@ function renderQueueBar() {
 
 function dispatchNextQueued() {
   if (workspacePending || chatLoading || currentSessionArchived || bootBuffer !== null) return;
+  if (currentSession) {
+    const item = pendingQueue.find(it => it.sessionId === currentSession);
+    if (item && item.state === "queued" && !inFlight.has(item.nonce) && (item.checkReceipt || item.expectedWorkspace === undefined || item.expectedWorkspace === confirmedWorkspace)) void acceptQueued(item);
+    return;
+  }
   // 派发判据交给 queue_state.nextDispatch（纯函数，有单测）：没在生成、
   // 队首恰好属于当前会话才发。队首属于别的会话时【不跳过】——跳过会破坏
   // FIFO，也会把消息渲染进错误的对话视图（见该函数注释与单测）。

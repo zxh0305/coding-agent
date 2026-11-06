@@ -38,14 +38,77 @@ from routes import busref
 # The model runs outside the lock. A durable claim also protects replay after restart.
 _submit_locks = [threading.Lock() for _ in range(64)]
 _worker_id = uuid.uuid4().hex
+_consumer_lock = threading.Lock()
+_consumers = set()
 
 
 def _start_submission(uid, nonce, sid, agent, payload):
+    from services import submission_queue as queue
+    key = (str(db.DB_PATH), sid)
+    with _consumer_lock:
+        if key in _consumers:
+            return
+        _consumers.add(key)
     def run():
-        if db.claim_submission(uid, nonce, _worker_id):
-            plain, message, atts = payload
-            busref._run_round(sid, agent, plain, message, nonce, atts)
-    threading.Thread(target=run, daemon=True).start()
+        failed = False
+        try:
+            while queue.next_entry(sid):
+                _, current_agent = get_session(sid, uid)
+                taken = []
+                def accept():
+                    with busref._lock:
+                        if busref._agents.get(sid) is not current_agent:
+                            pending = queue.next_entry(sid)
+                            if pending:
+                                queue.pause(pending["user_id"], pending["nonce"], "项目或模型已变更，请确认后继续排队")
+                            return None
+                    entry = queue.take_next(sid, str(current_agent.ctx.workspace), _worker_id)
+                    if entry is None:
+                        return None
+                    taken.append(entry)
+                    plain, message, atts = json.loads(entry["payload"])
+                    _publish_queue(sid)
+                    return plain, message, entry["nonce"], atts
+                # Claim inside the existing execution lock, not while another turn still runs.
+                busref._run_round(sid, current_agent, "", {}, "", [], accept)
+                if not taken:
+                    pending = queue.next_entry(sid)
+                    if pending and not pending["reason"]:
+                        queue.pause(pending["user_id"], pending["nonce"], "队列尚未开始，请点击继续排队")
+                    _publish_queue(sid)
+                    break
+                queue.finish(taken[0]["user_id"], taken[0]["nonce"])
+                _publish_queue(sid)
+        except Exception:
+            failed = True
+            busref.log.exception("会话队列执行失败: %s", sid)
+            try:
+                pending = queue.next_entry(sid)
+                if pending:
+                    queue.pause(pending["user_id"], pending["nonce"], "队列执行异常，请检查后继续排队")
+            except Exception:
+                busref.log.exception("队列暂停状态暂时无法写入: %s", sid)
+        finally:
+            with _consumer_lock:
+                _consumers.discard(key)
+            # Recheck after releasing registration: a submission may have arrived at exit.
+            if not failed:
+                try:
+                    pending = queue.next_entry(sid)
+                    if pending and not pending["reason"]:
+                        _start_submission(uid, nonce, sid, agent, payload)
+                except Exception:
+                    busref.log.exception("队列结束对账失败，等待后续恢复: %s", sid)
+    thread = threading.Thread(target=run, daemon=True, name="submission-" + sid[:8])
+    thread.submission_database = key[0]
+    thread.start()
+
+
+def _publish_queue(sid):
+    try:
+        busref._event_bus(sid).publish({"type":"queue_changed"})
+    except Exception:
+        busref.log.exception("队列通知失败，状态可通过查询恢复: %s", sid)
 
 
 def resume_submissions():
@@ -57,6 +120,8 @@ def resume_submissions():
                 _start_submission(entry["user_id"], entry["nonce"], sid, agent,
                                   json.loads(entry["payload"]))
             else:
+                from services.submission_queue import pause
+                pause(entry["user_id"], entry["nonce"], "项目已变更，请切回原项目后继续排队")
                 busref.log.warning("工作目录已变更，暂停恢复会话 %s 的提交", sid)
         except Exception:
             busref.log.exception("恢复提交失败，会话 %s", entry["session_id"])
@@ -170,6 +235,7 @@ class SessionRoutes:
                 for a in (body.get("attachments") or [])[:6]]
         mid = uuid.uuid4().hex
         user_message["_mid"] = mid
+        user_message["_input_text"] = _text
         payload = [plain, user_message, atts]
         db.record_submission(self.user["id"], nonce, digest, sid, mid, workspace, payload,
                              new_session=not sid_or_none, initial_workspace=initial_workspace)
@@ -180,7 +246,27 @@ class SessionRoutes:
             if str(agent.ctx.workspace) != workspace:
                 return self._json({"error": "工作目录已变更，已暂停发送"}, 409)
         _start_submission(self.user["id"], nonce, sid, agent, payload)
+        _publish_queue(sid)
         self._json({"session_id": sid, "nonce": nonce, "mid": mid})
+
+    def _handle_session_queue(self, sid):
+        from services import submission_queue as queue
+        if db.session_owner(sid) != self.user["id"]:
+            return self._json({"error":"任务不存在或不属于当前用户"}, 404)
+        try:
+            mid = (self._query().get("mid") or [None])[0]
+            if self.command == "GET" and mid:
+                return self._json(queue.detail(sid, mid))
+            if self.command == "POST":
+                body = self._body()
+                queue.change(sid, self.user["id"], body.get("mid"), body.get("revision"), body.get("action"), body.get("text"))
+                _publish_queue(sid)
+                _start_submission(self.user["id"], "", sid, None, None)
+            return self._json({"items":queue.entries(sid)})
+        except queue.QueueConflict as e:
+            return self._json({"error":str(e)}, 409)
+        except ValueError as e:
+            return self._json({"error":str(e)}, 400)
 
     def _handle_session_checks(self, sid, check_id=None):
         if db.session_owner(sid) != self.user["id"]:

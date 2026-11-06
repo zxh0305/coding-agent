@@ -50,12 +50,17 @@ _spawn_title_generation = None
 
 
 def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
-               nonce: str, atts: list) -> None:
+               nonce: str, atts: list, before_start=None) -> None:
     bus = _event_bus(sid)
     with _session_lock(sid):
         # 排队期间任务可能已被删除：直接放弃（会话行没了，落盘也会跳过）
         if db.session_owner(sid) is None:
             return
+        if before_start is not None:
+            accepted = before_start()
+            if accepted is None:
+                return
+            plain, user_message, nonce, atts = accepted
         # 登记"正在跑回合的实例"：停止请求的真正目标（见 _running_agents 注释）。
         # finally 里只有仍是本实例时才摘除——若回合中途实例被重建，新实例的
         # 登记不能被旧回合的收尾误删。

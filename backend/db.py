@@ -311,6 +311,17 @@ MIGRATIONS: list[tuple[int, str | None]] = [
          "user_mid TEXT NOT NULL, phase TEXT NOT NULL, assessment TEXT,"
          "reason TEXT NOT NULL DEFAULT '', repair_attempts INTEGER NOT NULL DEFAULT 0,"
          "PRIMARY KEY(session_id,user_mid))"),
+    (33, "CREATE TABLE IF NOT EXISTS submission_queue("
+         "user_id INTEGER NOT NULL,nonce TEXT NOT NULL,session_id TEXT NOT NULL,"
+         "mid TEXT NOT NULL,position INTEGER NOT NULL,revision INTEGER NOT NULL DEFAULT 1,"
+         "state TEXT NOT NULL DEFAULT 'queued',payload TEXT,preview_json TEXT,reason TEXT NOT NULL DEFAULT '',"
+         "PRIMARY KEY(user_id,nonce),FOREIGN KEY(user_id,nonce) "
+         "REFERENCES submission_receipts(user_id,nonce) ON DELETE CASCADE)"),
+    (34, "INSERT OR IGNORE INTO submission_queue(user_id,nonce,session_id,mid,position,payload) "
+         "SELECT user_id,nonce,session_id,mid,rowid*1024,payload FROM submission_receipts "
+         "WHERE worker IS NULL AND payload IS NOT NULL"),
+    (35, "CREATE INDEX IF NOT EXISTS idx_submission_queue_session "
+         "ON submission_queue(session_id,state,position)"),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -979,6 +990,9 @@ def submission_status(uid, nonce):
 def record_submission(uid, nonce, digest, sid, mid, workspace, payload, *, new_session=False,
                       initial_workspace=None):
     with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT COUNT(*) FROM submission_queue WHERE session_id=? AND state='queued'", (sid,)).fetchone()[0] >= 50:
+            raise ValueError("排队任务已达50项，请先处理已有队列")
         if new_session:
             now = time.time()
             conn.execute("INSERT INTO sessions(id,title,user_id,created,updated,workspace) VALUES(?,?,?,?,?,?)",
@@ -986,14 +1000,27 @@ def record_submission(uid, nonce, digest, sid, mid, workspace, payload, *, new_s
         conn.execute("INSERT INTO submission_receipts "
                      "(user_id,nonce,digest,session_id,mid,workspace,payload) VALUES(?,?,?,?,?,?,?)",
                      (uid, nonce, digest, sid, mid, str(workspace), json.dumps(payload)))
+        position = conn.execute("SELECT COALESCE(MAX(position),0)+1024 FROM submission_queue WHERE session_id=?", (sid,)).fetchone()[0]
+        conn.execute("INSERT INTO submission_queue(user_id,nonce,session_id,mid,position,payload,preview_json) VALUES(?,?,?,?,?,?,?)",
+                     (uid, nonce, sid, mid, position, json.dumps(payload), submission_preview(payload)))
+
+
+def submission_preview(payload):
+    text = payload[1].get("_input_text", payload[0])
+    return json.dumps({"text":text[:4000], "text_truncated":len(text)>4000,
+                       "editable":len(text.encode())<=64000, "attachments":payload[2],
+                       "skills":[{"id":s.get("id"),"name":s.get("name")} for s in payload[1].get("_skills", [])]})
 
 
 def claim_submission(uid, nonce, worker):
     with _conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         claimed = conn.execute("UPDATE submission_receipts SET worker=?, payload=NULL "
                                "WHERE user_id=? AND nonce=? AND worker IS NULL",
                                (worker, uid, nonce)).rowcount
         if claimed:
+            conn.execute("UPDATE submission_queue SET state='claimed',payload=NULL,revision=revision+1 WHERE user_id=? AND nonce=?",
+                         (uid, nonce))
             # A crash between claiming and entering the agent loop must also appear
             # as interrupted to the normal startup recovery and history UI.
             conn.execute("INSERT INTO session_turns(session_id,user_mid,state,started) "
@@ -1143,6 +1170,13 @@ def mark_running_turns_interrupted() -> int:
             "UPDATE session_turns SET state='interrupted', ended=? WHERE state='running'",
             (now,))
         n = cur.rowcount or 0
+        conn.execute("UPDATE submission_queue SET state='finished',payload=NULL WHERE state='claimed' AND EXISTS "
+                     "(SELECT 1 FROM session_turns t WHERE t.session_id=submission_queue.session_id AND t.user_mid=submission_queue.mid AND t.state IN ('done','error'))")
+        conn.execute("UPDATE submission_queue SET state='interrupted',reason='服务重启时执行中断，请先检查项目',revision=revision+1 "
+                     "WHERE state='claimed'")
+        conn.execute("UPDATE submission_queue SET reason='前项任务执行中断，请检查后继续排队',revision=revision+1 "
+                     "WHERE state='queued' AND reason='' AND session_id IN "
+                     "(SELECT session_id FROM submission_queue WHERE state='interrupted')")
         conn.execute("UPDATE turn_checks SET status='interrupted',ended=? WHERE status IN ('running','pending')", (now,))
         conn.execute("UPDATE turn_assessments SET phase='finished',assessment='interrupted',"
                      "reason='服务重启，检查或回合未完成' WHERE phase!='finished'")

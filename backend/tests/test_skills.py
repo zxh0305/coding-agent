@@ -102,12 +102,16 @@ class SkillApiTest(ApiTestBase):
         self.assertEqual(self.call("POST", "/api/sessions/s2/messages",
                                    {"message": "go", "skills": [a]})[0], 400)
         event = Event()
-        with patch.object(busref, "_run_round", side_effect=lambda *args: event.set()) as run:
+        accepted = []
+        def execute(*args):
+            accepted.append(args[6]())
+            event.set()
+        with patch.object(busref, "_run_round", side_effect=execute) as run:
             code, _ = self.call("POST", "/api/sessions", {"message": "go", "workspace": str(project),
                                                            "skills": [a, personal]})
             self.assertEqual(code, 200)
             self.assertTrue(event.wait(2))
-            self.assertEqual([s["body"] for s in run.call_args.args[3]["_skills"]], ["审查 A", "通用"])
+            self.assertEqual([s["body"] for s in accepted[0][1]["_skills"]], ["审查 A", "通用"])
         self.assertEqual(self.call("POST", "/api/skills?session_id=s1",
                                    dict(base, id=a["id"], body="changed"))[0], 409)
         self.assertEqual(self.call("DELETE", "/api/skills?" + urlencode(

@@ -46,6 +46,19 @@ class SessionModelBase(unittest.TestCase):
         db.create_session("s2", self.uid)
 
     def tearDown(self):
+        # Queue workers own this fixture's database until all their cleanup has settled.
+        # Resetting DB_PATH first can send a late worker into the next test or real data.
+        import time
+        deadline = time.monotonic() + 5
+        while True:
+            workers = [t for t in threading.enumerate()
+                       if getattr(t, "submission_database", None) == str(db.DB_PATH)]
+            if not workers:
+                break
+            for worker in workers:
+                worker.join(max(0, deadline-time.monotonic()))
+            if time.monotonic() >= deadline:
+                self.fail("队列线程未在临时数据库切换前退出")
         db.DB_PATH = self._orig_db_path
 
     # ---------- 夹具 ----------
@@ -277,7 +290,10 @@ class TestSubmissionReceipt(ApiTestBase):
         self.set_global("p1", "a-small")
         entered = threading.Event()
         body = {"message": "test", "nonce": "same-first-request"}
-        with patch.object(busref, "_run_round", side_effect=lambda *args: entered.set()) as run:
+        def execute(*args):
+            args[6]()
+            entered.set()
+        with patch.object(busref, "_run_round", side_effect=execute) as run:
             with ThreadPoolExecutor(max_workers=2) as pool:
                 results = list(pool.map(lambda _: self.call("POST", "/api/sessions", body), range(2)))
             self.assertTrue(entered.wait(2))
@@ -304,12 +320,16 @@ class TestSubmissionReceipt(ApiTestBase):
             code, receipt = self.call("POST", "/api/sessions/s1/messages", body)
         self.assertEqual(code, 200)
         entered = threading.Event()
-        with patch.object(busref, "_run_round", side_effect=lambda *args: entered.set()) as run:
+        accepted = []
+        def execute(*args):
+            accepted.append(args[6]())
+            entered.set()
+        with patch.object(busref, "_run_round", side_effect=execute) as run:
             resume_submissions()
             self.assertTrue(entered.wait(2))
             resume_submissions()
             run.assert_called_once()
-            self.assertEqual(run.call_args.args[3]["_mid"], receipt["mid"])
+            self.assertEqual(accepted[0][1]["_mid"], receipt["mid"])
 
 
 class TestWorkspaceSubmit(ApiTestBase):

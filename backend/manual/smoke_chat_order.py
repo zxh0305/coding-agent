@@ -36,10 +36,14 @@ try:
         page.evaluate('switchSession("s1")')
         page.wait_for_function('bootBuffer === null')
         sent=[]
+        server_queue=[]
         def submit(route):
             sent.append(route.request.post_data_json)
+            if sent[-1]["message"] == "提问B":
+                server_queue.append({"mid":"uB","nonce":sent[-1]["nonce"],"text":"提问B", "attachments":[],"skills":[],"revision":1,"reason":""})
             route.fulfill(status=200,json={'session_id':'s1'})
         page.route('**/api/sessions/s1/messages', submit)
+        page.route('**/api/sessions/s1/queue', lambda route:route.fulfill(json={"items":server_queue}))
         page.locator('#input').fill('提问A')
         with page.expect_response(lambda r:r.request.method=='POST' and '/s1/messages' in r.url): page.locator('#input').press('Enter')
         nonce=sent[0]['nonce']
@@ -48,9 +52,13 @@ try:
         emit(page,{'type':'answer_delta','mid':'aA','delta':'回答A'},3)
         page.evaluate('flushStreamBuffers()')
         page.locator('#input').fill('提问B');page.locator('#input').press('Enter')
-        expect(page.locator('#queue-bar')).to_contain_text('提问B')
+        expect(page.locator('#server-queue-bar')).to_contain_text('提问B')
         page.evaluate('autoCatchup=false;openEvents("s1",true)')
         for seq, evt in enumerate([start,{'type':'round','round':1,'mid':'aA'}, {'type':'answer_delta','mid':'aA','delta':'回答A'}, {'type':'done','mid':'aA','answer':'回答A','elapsed_s':1,'usage':{}}, {'type':'turn_end','user_mid':'uA'}],1): emit(page,evt,seq)
+        server_queue.clear()
+        emit(page,{'type':'turn_start','nonce':sent[1]['nonce'],'user_mid':'uB','input':'提问B'},6)
+        emit(page,{'type':'round','round':1,'mid':'aB'},7)
+        emit(page,{'type':'reasoning_delta','delta':'正在处理第二项'},8)
         emit(page,{'type':'caught_up','running':False},None)
         page.wait_for_function('pendingQueue.length === 0')
         observed=page.locator('#chat .bubble').all_text_contents()
@@ -66,16 +74,16 @@ try:
         page = new_page()
         page.evaluate('switchSession("s1")')
         page.wait_for_function('bootBuffer === null && !workspacePending')
-        page.evaluate("""async () => {
-          await queueMessage('队列中的消息', [{kind:'file', name:'a.txt', data:'YWJj'}],
-                             [{id:'review', version:'original'}]);
-        }""")
         page.locator('#input').fill('新草稿')
         requests = []
         def lose_reply(route):
             requests.append(route.request.post_data_json)
             route.abort()
         page.route('**/api/sessions/s1/messages', lose_reply)
+        page.evaluate("""async () => {
+          await queueMessage('队列中的消息', [{kind:'file', name:'a.txt', data:'YWJj'}],
+                             [{id:'review', version:'original'}]);
+        }""")
         page.evaluate('dispatchNextQueued()')
         expect(page.locator('#queue-bar')).to_contain_text('待确认')
         expect(page.locator('#input')).to_have_value('新草稿')
