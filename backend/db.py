@@ -2504,17 +2504,21 @@ def read_artifact(rel_path: str) -> dict:
 
 
 def get_messages(sid: str, since_ord: int | None = None,
-                 before_ord: int | None = None, limit: int | None = None) -> list[dict]:
+                 before_ord: int | None = None, limit: int | None = None, mid: str | None = None) -> list[dict]:
     """按 ord 升序取回消息（自动回填 _mid/_ord/_stats）。
 
     参数全不传 = 全量加载（兼容旧行为）；since_ord/before_ord/limit 供窗口
     化：since_ord 取"该序及之后"（压缩边界起），before_ord 取"严格之前"
     （向上翻页），limit 语义是"最近 limit 条"（先降序取满一页再反转回升序，
     时间线分页要的是尾部一页，不是头部）。
+    mid 按会话与消息身份精确读取，供实时图片需求恢复；不依赖最新一条消息。
     """
     with _conn() as conn:
         sql = "SELECT mid, ord, role, content FROM messages WHERE session_id=?"
         params: list = [sid]
+        if mid is not None:
+            sql += " AND mid = ?"
+            params.append(mid)
         if since_ord is not None:
             sql += " AND ord >= ?"
             params.append(since_ord)

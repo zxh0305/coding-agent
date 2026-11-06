@@ -42,6 +42,20 @@ try:
         page.locator("#input").fill("added while running");page.locator("#input").press("Enter")
         expect(page.locator("#server-queue-bar")).to_contain_text("added while running")
         assert page.locator("#chat .bubble.user").count()==0, "queued input must not appear as an executed turn"
+        def unavailable(route):route.fulfill(status=404,json={"error":"unknown endpoint"})
+        page.route("**/api/sessions/s1/queue",unavailable)
+        page.evaluate("ServerQueueUI.refresh()")
+        expect(page.locator(".server-queue-status")).to_contain_text("重启后端")
+        before=case.call("GET","/api/sessions/s1/queue")[1]["items"]
+        page.locator("#input").fill("keep locally until server supports queue")
+        page.locator("#input").press("Enter")
+        expect(page.locator("#queue-bar")).to_contain_text("发送失败")
+        self_items=case.call("GET","/api/sessions/s1/queue")[1]["items"]
+        assert len(self_items)==len(before), "unsupported queue must not fall through to the old submit API"
+        page.locator("#queue-bar").get_by_title("删除",exact=True).click()
+        page.unroute("**/api/sessions/s1/queue",unavailable)
+        page.evaluate("ServerQueueUI.refresh()")
+        expect(page.locator(".server-queue-status")).to_have_count(0)
         page.reload();expect(page.locator("#layout")).to_be_visible()
         page.evaluate('switchSession("s1")');page.wait_for_function('bootBuffer===null && !workspacePending')
         expect(page.locator("#server-queue-bar .queue-item")).to_have_count(2)

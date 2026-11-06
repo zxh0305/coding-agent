@@ -106,6 +106,16 @@ class QueueStorageTest(DbTestBase):
 
 
 class QueueApiTest(ApiTestBase):
+    def test_exact_message_lookup_is_scoped_and_not_latest_only(self):
+        db.save_messages("s1",[{"role":"user","content":"first input","_mid":"first-input"},
+                               {"role":"assistant","content":"later answer","_mid":"later-answer"}],{})
+        db.save_messages("s2",[{"role":"user","content":"other session","_mid":"other-input"}],{})
+        code,data=self.call("GET","/api/sessions/s1/messages?mid=first-input")
+        self.assertEqual(code,200)
+        self.assertEqual([message["content"] for message in data["messages"]],["first input"])
+        self.assertEqual(self.call("GET","/api/sessions/s1/messages?mid=other-input")[1]["messages"],[])
+        self.assertEqual(self.call("GET","/api/sessions/foreign/messages?mid=first-input")[0],404)
+
     def test_owner_revision_cancel_and_lost_original_reply(self):
         self.set_global("p1","a-small")
         body = {"nonce":"original","message":"queued"}

@@ -1973,6 +1973,29 @@ function userBubble(text, atts, mid, skills = []) {
   scrollBottom();
 }
 
+async function hydrateUserImage(mid) {
+  const sid = currentSession, view = sessionViewVersion, token = authToken;
+  const node = railFindNode(mid);
+  if (!node || node.querySelector(".msg-img") || node.dataset.loadingImage) return;
+  node.dataset.loadingImage = "true";
+  try {
+    const data = await api(`/api/sessions/${encodeURIComponent(sid)}/messages?mid=${encodeURIComponent(mid)}`);
+    let message = data.messages?.find(item => item.mid === mid && item.role === "user");
+    if (!message) return;
+    if (message.artifact) {
+      const artifact = await api(`/api/sessions/${encodeURIComponent(sid)}/artifact?path=${encodeURIComponent(message.path)}`);
+      message = {...artifact.message, mid};
+    }
+    if (sid !== currentSession || view !== sessionViewVersion || token !== authToken || !node.isConnected) return;
+    const user = blocksFromHistory([{...message,role:"user"}]).find(block => block.kind === "user");
+    if (!user) return;
+    const replacement = railTag(buildUserBubble(user.text,user.atts,user.skills || message.skills || message._skills || [],mid,user.instruction),mid,"user");
+    (node.closest(".msg-group") || node).replaceWith(replacement);
+    scrollBottom();
+  } catch { /* The persisted image remains available on normal history reload. */ }
+  finally { delete node.dataset.loadingImage; }
+}
+
 // ---------- 回退编辑（ZCode editUserQuery rewind 语义） ----------
 // 点用户气泡上的 ✏️：该轮原文回到输入框；再次发送时先调 truncate 端点删掉
 // 这一轮及其后的消息，再作为新的一轮发出。已被压缩进摘要的旧消息后端会拒绝
@@ -4357,6 +4380,7 @@ function applyEvent(evt, seq) {
         evt.user_mid, evt.skills || []);
       scheduleRail();  // 补画的用户消息也要进导航条
     }
+    if (evt.user_mid && evt.atts?.some(att => att.kind === "image")) void hydrateUserImage(evt.user_mid);
     // 回合级状态复位（原在 performSend 里；改为事件驱动后，刷新页面接上
     // 正在进行的回合也走同一套初始化）
     liveMsgs = new Map();
@@ -5062,6 +5086,7 @@ async function acceptQueued(item) {
       accepted = receipt.accepted;
     }
     if (!accepted) {
+      await ServerQueueUI.ensureAvailable(item.sessionId);
       await api(`/api/sessions/${encodeURIComponent(item.sessionId)}/messages`, {method:"POST", body:JSON.stringify({
         message:item.text, nonce:item.nonce, attachments:item.payloadAtts, skills:item.skills || [],
         expected_workspace:item.expectedWorkspace

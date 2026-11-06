@@ -19,6 +19,10 @@ window.ServerQueueUI = (() => {
     return api(`/api/sessions/${encodeURIComponent(sid)}/queue`, {method:"POST",
       body:JSON.stringify({mid:item.mid,revision:item.revision,action,text})});
   }
+  async function ensureAvailable(sid) {
+    const data = await api(`/api/sessions/${encodeURIComponent(sid)}/queue`);
+    if (!Array.isArray(data.items)) throw new Error("队列接口版本不兼容，请更新并重启后端");
+  }
   function draw(items, sid) {
     bar.replaceChildren(); bar.classList.toggle("hidden", !items.length);
     if (!items.length) return;
@@ -90,8 +94,14 @@ window.ServerQueueUI = (() => {
       const data = await api(`/api/sessions/${encodeURIComponent(sid)}/queue`);
       if (request !== generation || view !== sessionViewVersion || currentSession !== sid || token !== authToken) return;
       draw(data.items, sid);
-    } catch { /* Connection status already reports offline; keep drafts and accepted work. */ }
+    } catch(error) {
+      if (request !== generation || view !== sessionViewVersion || currentSession !== sid || token !== authToken) return;
+      let warning = bar.querySelector(".server-queue-status");
+      if (!warning) { warning = document.createElement("div"); warning.className = "server-queue-status"; warning.setAttribute("role","status"); bar.prepend(warning); }
+      warning.textContent = error.status === 404 ? "队列不可用，请刷新任务；更新代码后需重启后端。" : "队列暂时无法同步，已接收任务以服务端记录为准。";
+      bar.classList.remove("hidden");
+    }
   }
   setInterval(() => { if (!document.hidden) void refresh(); }, 5000);
-  return {refresh};
+  return {refresh,ensureAvailable};
 })();

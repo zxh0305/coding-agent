@@ -2825,6 +2825,7 @@ button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset
 #server-queue-bar { display: flex; flex-direction: column; gap: 5px; max-height: 190px; overflow-y: auto; margin-bottom: 10px; }
 #server-queue-bar.hidden { display: none; }
 .server-queue-title { color: var(--text-3); font-size: 11px; padding: 0 3px 3px; }
+.server-queue-status { color: var(--danger); background: var(--danger-weak); border-radius: 7px; padding: 7px 9px; font-size: 11px; line-height: 1.6; }
 #server-queue-bar .queue-item { flex-wrap: wrap; }
 #server-queue-bar .queue-actions { margin-left: auto; flex-wrap: wrap; max-width: 100%; }
 .queue-edit-dialog { margin: auto; inset: 0; width: min(520px, calc(100vw - 28px)); padding: 22px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); color: var(--text); }

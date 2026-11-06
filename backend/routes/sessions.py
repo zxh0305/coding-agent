@@ -413,7 +413,8 @@ class SessionRoutes:
         if around_ord is not None:
             win = db.window_around_ord(sid, around_ord, before=limit, after=limit)
             return self._json({"window": win, "user_index": db.user_message_index(sid)})
-        msgs = db.get_messages(sid, before_ord=before_ord, limit=limit)
+        requested_mid = (qs.get("mid") or [None])[0]
+        msgs = db.get_messages(sid, before_ord=before_ord, limit=1 if requested_mid else limit, mid=requested_mid)
         items = []
         for m in msgs:
             role = m.get("role")
