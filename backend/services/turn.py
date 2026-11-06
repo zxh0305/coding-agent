@@ -132,6 +132,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             db.set_assessment(sid, user_mid, "working")
             seg_mid = None  # 当前回答段落的 SSE 气泡 mid（每个 round 事件换一段，仅事件流用）
             error = None
+            completion_problem = None
             stopped = False
             retryable = False  # 出错时是否值得引导用户重试（见下面的归因逻辑）
             # 进行中快照（方案A核心）：回合事件实时推给在线订阅者，但切走再切回
@@ -202,6 +203,8 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                     if kind in ("usage", "compacted"):  # 最新上下文容量，供 /api/context
                         _ctx[sid] = payload
                     if kind == "done":
+                        if payload.get("completion_status") in ("recovered_draft","invalid_final"):
+                            completion_problem="最终答复格式异常，自动恢复未成功，请查看保留草稿和实际执行记录"
                         stopped = bool(payload.get("stopped"))
                         log.info("[会话 %s] 最终回答: %s", sid, str(payload.get("answer"))[:200])
             except RuntimeError as e:
@@ -312,7 +315,7 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             # running）。写失败只记日志：前端仍靠 turn_end 复位。
             try:
                 db.turn_finished(sid, user_mid,
-                                 "error" if error is not None else "done", error)
+                                 "error" if error is not None or completion_problem else "done", error or completion_problem)
             except Exception:
                 log.exception("[会话 %s] 回合终态落库失败（忽略）", sid)
             bus.publish({"type": "turn_phase", "user_mid":user_mid, "phase":"finished",

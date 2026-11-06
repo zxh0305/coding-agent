@@ -689,6 +689,7 @@ class Agent:
             if message.get("_completion_feedback"):
                 message["_superseded"] = True
         self._mutation_possible = False
+        self._final_candidate = None
         self._project_digest = None
         from services.project_environment import discover
         self.environment_profile = (self.environment_loader() if self.environment_loader
@@ -804,7 +805,10 @@ class Agent:
                 self.history.append({"role":"user","_synthetic":True,"content":"用户补充已纳入，请按最新补充重新判断。此前候选回复和未派发工具不代表已执行。"})
                 continue
             if self._completion_final and assistant_msg.get("tool_calls"):
-                assistant_msg = {key:value for key,value in assistant_msg.items() if key != "tool_calls"}
+                if self.input_controller is not None and not self.input_controller.commit():
+                    continue
+                yield from self._tail_answer(assistant_msg,usage_total,metrics)
+                return
             tool_calls = assistant_msg.get("tool_calls")
             if not tool_calls:
                 if self.completion_policy is not None:
@@ -814,6 +818,9 @@ class Agent:
                         yield from self._tail_stopped(assistant_msg, usage_total, metrics)
                         return
                     if decision:
+                        from services.final_answer import invalid_reply
+                        if not invalid_reply(assistant_msg) and not assistant_msg.get("_truncated"):
+                            self._final_candidate = dict(assistant_msg)
                         self.history.append({**assistant_msg, "_completion_candidate": True})
                         text = assistant_msg.get("content") or ""
                         if text:
@@ -906,6 +913,7 @@ class Agent:
     def _apply_turn_inputs(self):
         count = self.input_controller.apply(self) if self.input_controller is not None else 0
         if count:
+            self._final_candidate = None
             yield "turn_inputs_changed", {"user_mid":self.input_controller.mid}
         return count
 
@@ -930,11 +938,24 @@ class Agent:
         """
         assistant_msg = None
         reasoning_parts: list[str] = []
+        final_deltas = [] if tools is None else None
+        leading_markup = []
+        text_started = False
         round_wait = time.monotonic()  # 本轮请求发出到流结束的墙钟（含思考+工具分片）
         for kind, payload in self.llm.chat_stream(messages=messages, tools=tools,
                                                   cancel=self.cancel_event):
             if kind == "delta":
-                yield "answer_delta", {"delta": payload}
+                if final_deltas is not None:
+                    final_deltas.append(payload)
+                elif not text_started:
+                    leading_markup.append(payload)
+                    prefix="".join(leading_markup)
+                    if prefix.strip() and not prefix.lstrip().startswith("<"):
+                        text_started=True
+                        leading_markup.clear()
+                        yield "answer_delta", {"delta":prefix}
+                else:
+                    yield "answer_delta", {"delta": payload}
             elif kind == "reasoning_delta":
                 reasoning_parts.append(payload)
                 # 同步累积进 live 缓冲：进行中快照（app.py 节流落库）在流尚未
@@ -1000,6 +1021,11 @@ class Agent:
         metrics["llm_total_s"] = round(metrics.get("llm_total_s", 0.0) + gen_s, 3)
         if ttft is not None:
             metrics.setdefault("ttft_samples", []).append(ttft)
+        buffered=final_deltas if final_deltas is not None else leading_markup
+        if buffered:
+            from services.final_answer import invalid_reply
+            if not invalid_reply(assistant_msg):
+                yield "answer_delta", {"delta":"".join(buffered)}
         return assistant_msg
 
     def _timing_summary(self, usage_total: dict, metrics: dict) -> dict:
@@ -1068,6 +1094,34 @@ class Agent:
 
         stopped_reason：非 None 时附加到 done payload（收尾轮用它标记
         "max_rounds"），其余字段与正常 done 完全一致。"""
+        from services.final_answer import invalid_reply
+        completion_status = None
+        if invalid_reply(assistant_msg):
+            log.warning("最终回复包含工具协议，进行一次禁工具文字恢复")
+            round_no=max((entry.get("round",0) for entry in self.trace if entry.get("type")=="round"),default=0)+1
+            self._trace({"type":"round","round":round_no,"answer_recovery":True})
+            yield "round", {"round":round_no,"answer_recovery":True}
+            messages=[{"role":"system","content":self._system_content()},*self._messages_for_model(),
+                      {"role":"user","content":"上一条未形成可用的最终文字答复。现在只用自然语言总结已实际完成的工作、证据和未完成事项；禁止工具调用、DSML/XML 协议或新命令。未执行的操作不得声称已执行。"}]
+            try:
+                recovered=yield from self._consume_stream(messages,None,usage_total,metrics,round_no)
+            except RuntimeError:
+                log.exception("最终文字恢复请求失败")
+                recovered={"role":"assistant","content":""}
+            if self.cancel_event.is_set():
+                yield from self._tail_stopped({"role":"assistant","content":"已停止最终答复恢复。"},usage_total,metrics)
+                return
+            if recovered.get("content") and not invalid_reply(recovered) and not recovered.get("_truncated"):
+                assistant_msg=recovered
+                completion_status="recovered"
+            else:
+                candidate=getattr(self,"_final_candidate",None)
+                text=candidate.get("content") if candidate and not invalid_reply(candidate) else None
+                assistant_msg={"role":"assistant","content":(
+                    "最终答复生成异常，文字恢复未成功。本轮未正常完成；未执行异常回复中的工具指令。"
+                    + ("\n\n以下保留本轮尚未完成最终校验的草稿，请结合检查限制查看：\n\n"+text if text else "\n请查看执行过程中的实际结果后再继续。"))}
+                completion_status="recovered_draft" if text else "invalid_final"
+                stopped_reason="invalid_final_response"
         answer = assistant_msg.get("content") or ""
         # 空回答兜底：模型这一轮只产出了推理、没有正文（或推理被服务商混进
         # content 后由 llm_client 剥离）时，不能把空串当回答——前端 done 分支
@@ -1092,6 +1146,7 @@ class Agent:
         timing = self._timing_summary(usage_total, metrics)
         self.history.append({"role": "assistant", "content": answer,
                              "_stats": {"elapsed_s": elapsed, "usage": dict(usage_total),
+                                        **({"completion_status":completion_status} if completion_status else {}),
                                         "cache_hit_rate": timing["cache_hit_rate"],
                                         "context_tokens": metrics["context_tokens"],
                                         **timing,
@@ -1103,6 +1158,8 @@ class Agent:
                    "cache_hit_rate": timing["cache_hit_rate"], "context": metrics["context"],
                    "timing": timing,
                    "context_tokens": metrics["context_tokens"]}
+        if completion_status:
+            payload["completion_status"] = completion_status
         if stopped_reason:
             payload["stopped_reason"] = stopped_reason
         yield "done", payload
@@ -2185,6 +2242,7 @@ class Agent:
             # 登记"正在跑哪个工具"（停止按钮据此区分"请求已发"与"工具已退"）。
             # 同组并行时最后提交者会覆盖前面的名字——只用于展示与超时提示，
             # 精确到"某一个"不重要；重要的是【有工具在跑】这个事实。
+            self._final_candidate = None  # New evidence/actions invalidate an older delivery draft.
             self.active_tool = name
             version_before = self._shell_progress_version() if name == "run_bash" and not self._verification_dispatch else None
             try:

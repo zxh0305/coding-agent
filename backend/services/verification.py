@@ -122,6 +122,18 @@ class VerificationPolicy:
 
     def start(self, agent):
         try:
+            markers=(".git","pyproject.toml","package.json","requirements.txt","Cargo.toml","go.mod","pom.xml")
+            if not self.base and not any((self.root/name).exists() for name in markers):
+                # A parent workspace is not one repository. Do not hash every
+                # child project or run inferred checks against the parent.
+                projects=[]
+                for child in self.root.iterdir():
+                    if child.is_dir() and not child.is_symlink() and any((child/name).exists() for name in markers):
+                        projects.append(child.name)
+                    if len(projects)>=2:
+                        self.baseline_error="当前工作目录包含多个独立项目，未执行跨项目自动验收；请在具体项目中分别验证"
+                        return
+
             if self.base:
                 initial = snapshot.diff(self.root, self.base)
                 self.initial_tree = initial.get("fingerprint") or hashlib.sha256(initial.get("diff", "").encode()).hexdigest()
@@ -153,7 +165,9 @@ class VerificationPolicy:
         except (OSError, ValueError, snapshot.SnapshotError) as e:
             self.assessment, self.reason = "blocked", "无法确认验证范围：" + str(e)
             yield self._phase("finalizing")
-            return self._terminal_feedback()
+            # Keep the actual task answer. A scope failure must not discard it
+            # merely to ask the model to paraphrase a host limitation.
+            return None
         if not changed:
             self.assessment, self.reason = "not_applicable", ""
             return None

@@ -143,7 +143,8 @@ class VerificationPolicyTests(unittest.TestCase):
         agent, policy = self.agent([
             tool_call_message(call("write", "write_file", path="value.txt", content="bad")),
             asst("candidate"), asst("no fix"),
-            tool_call_message(call("forbidden", "write_file", path="unexpected.txt", content="x"))
+            tool_call_message(call("forbidden", "write_file", path="unexpected.txt", content="x")),
+            asst("只报告实际结果")
         ])
         events = list(agent.run("fix"))
         self.assertFalse((self.root / "unexpected.txt").exists())
