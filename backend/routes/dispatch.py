@@ -74,6 +74,8 @@ class DispatchMixin:
             return self._handle_skills()
         if re.fullmatch(r"/api/sessions/[^/]+/queue", path):
             return self._handle_session_queue(path.split("/")[3])
+        if re.fullmatch(r"/api/sessions/[^/]+/browser", path):
+            return self._handle_browser_control(path.split("/")[3])
         if re.fullmatch(r"/api/sessions/[^/]+/inputs", path):
             return self._handle_turn_inputs(path.split("/")[3])
         if path == "/api/experiments" or path.startswith("/api/experiments/"):
@@ -236,6 +238,8 @@ class DispatchMixin:
                 self._handle_session_submit(None)
             elif re.fullmatch(r"/api/sessions/[^/]+/queue", path):
                 self._handle_session_queue(path.split("/")[3])
+            elif re.fullmatch(r"/api/sessions/[^/]+/browser", path):
+                self._handle_browser_control(path.split("/")[3])
             elif re.fullmatch(r"/api/sessions/[^/]+/inputs", path):
                 self._handle_turn_inputs(path.split("/")[3])
             elif re.fullmatch(r"/api/sessions/[^/]+/messages", path):

@@ -170,7 +170,7 @@
       </div>
     </aside>
 
-    <!-- 右侧浏览器栏：agent 用内置浏览器（browser_* 工具）时出现的实时画面。
+    <!-- 右侧浏览器栏：agent 和用户共享的真实浏览器窗口控制。
          与文档栏同一套「并列面板 + --docs-w 宽度」机制，同一时刻只开一个。 -->
     <aside id="browser-panel" class="docs-panel browser-panel hidden">
       <div id="browser-resizer" class="docs-resizer" title="拖动调整宽度"></div>
@@ -182,7 +182,19 @@
         <span id="browser-url" class="browser-url">—</span>
         <span id="browser-note" class="browser-note"></span>
       </div>
-      <div id="browser-view" class="browser-view"></div>
+      <div id="browser-view" class="browser-view">
+        <div class="browser-window-card">
+          <strong>可操作浏览器</strong>
+          <p>页面在运行此服务的电脑上打开，你和 Agent 共用同一个窗口。</p>
+          <form id="browser-navigate"><input id="browser-address" type="url" placeholder="http://localhost:3000" aria-label="浏览器地址"><button type="submit">打开</button></form>
+          <div class="browser-controls">
+            <button data-browser-action="back" title="后退">←</button><button data-browser-action="forward" title="前进">→</button><button data-browser-action="reload">刷新</button>
+          </div>
+          <p id="browser-status" role="status">尚未打开浏览器</p>
+          <div class="browser-controls"><button data-browser-action="takeover">打开窗口并接管</button><button data-browser-action="release">交回 Agent</button><button data-browser-action="close">结束浏览器</button></div>
+          <p class="browser-help">接管后，Agent 的浏览器操作等待你交回；已开始的操作先完成。登录和输入可以直接在窗口里完成。</p>
+        </div>
+      </div>
     </aside>
 
   </div>

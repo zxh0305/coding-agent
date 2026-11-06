@@ -570,6 +570,20 @@ class SessionRoutes:
             return self._json({"error": "文档不存在"}, 404)
         self._json({"name": name, "content": content})
 
+    def _handle_browser_control(self,sid):
+        if db.session_owner(sid)!=self.user["id"]:
+            return self._json({"error":"任务不存在或不属于当前用户"},404)
+        import browser_tools
+        try:
+            manager=browser_tools.manager_for(sid)
+            if self.command=="GET":return self._json(manager.state())
+            if db.session_archived(sid):
+                return self._json({"error":"归档会话只可查看"},409)
+            body=self._body()
+            return self._json(manager.control(body.get("action"),body.get("url")))
+        except ValueError as error:return self._json({"error":str(error)},400)
+        except Exception:return self._json({"error":"浏览器操作失败，请确认部署电脑可打开窗口且已安装 Chromium"},503)
+
     def _handle_browser_shot(self, sid: str):
         """浏览器工具推送的截图（PNG 字节流）。?n=<序号> 指定第几张，
         缺省取最新一张。归属已在上层校验；n 只允许数字，杜绝路径逃逸。"""
@@ -783,6 +797,8 @@ class SessionRoutes:
         但那个假设只在"会话从不被删除"时成立；长期增删会让锁表随删除过的会话
         数无界增长。_sigs（模型指纹）同理。
         """
+        import browser_tools
+        browser_tools.close_session(sid)
         db.delete_session(sid)
         memory.drop_extraction_lock(sid)  # 记忆提取锁以 sid 为键、只增不减，随会话回收
         with busref._lock:

@@ -2858,3 +2858,16 @@ button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset
 .turn-input-list summary { cursor: pointer; overflow-wrap: anywhere; line-height: 1.6; }
 .turn-input-list p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; line-height: 1.7; }
 @media (max-width:480px) { #delivery-mode { max-width: 120px; font-size: 10px; } .turn-input-list { width: 100%; } }
+
+/* Browser controls refer to a real shared window, never a screenshot gallery. */
+.browser-window-card { margin: 8px; padding: 20px; border: 1px solid var(--border); border-radius: 14px; background: var(--bg); line-height: 1.65; }
+.browser-window-card strong { font-size: 16px; }
+.browser-window-card p { color: var(--text-2); font-size: 13px; margin: 12px 0; }
+.browser-controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.browser-window-card button { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); padding: 7px 10px; cursor: pointer; }
+.browser-window-card button:disabled { opacity: .45; cursor: default; }
+#browser-navigate { display: flex; gap: 8px; }
+#browser-address { min-width: 0; width: 100%; border: 1px solid var(--border); border-radius: 8px; padding: 8px; background: var(--bg); color: var(--text); }
+.browser-window-card .browser-help { font-size: 12px; color: var(--text-3); }
+
+#browser-navigate button { flex-shrink: 0; white-space: nowrap; }

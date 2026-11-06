@@ -1,31 +1,16 @@
-"""
-内置浏览器工具（Browser tools）
-===============================
+"""Shared, interactive Chromium window with per-session persistent storage.
 
-让 agent 能驱动一个真实的 Chromium 完成「验证改动 / 自动登录 / 网页调研」：
-
-  browser_open(url)          打开页面（带着复制的本地浏览器 profile，免登录）
-  browser_click(selector)    点击元素
-  browser_type(selector, t)  输入文字（密码等敏感值可用 env:VAR 引用环境变量）
-  browser_screenshot()       截图给视觉模型"看"，同步推右侧「浏览器」弹窗
-
-设计要点（与项目其它工具模块一致的约定）：
-  * 工具层不持有全局状态：浏览器实例挂在 ToolContext.browser 上，
-    由 app.py 按【会话】创建/复用/销毁（回合结束自动清理）；
-  * 失败走统一信封 {ok:false, error, hint?}，让模型读原因改道；
-  * selector 统一用 Playwright 的 text=/css=/xpath= 等引擎前缀语法，
-    裸字符串默认按 text= 处理（对模型最友好：直接写按钮文字）。
-
-登录态复用：首次使用时把用户的 Chrome 默认 profile【复制】一份到
-data/browser-profiles/<sid>/，之后的 cookies/localStorage 一直留在这份
-副本里。为什么复制而不直接用原目录：Chrome 运行中会锁 profile（SingletonLock），
-且自动化直接用原目录有污染/风险；副本与真实浏览器互不干扰。
-
-依赖：playwright（pip install playwright && playwright install chromium）。
-未安装时工具返回可读错误并给出安装指引——不炸服务，其它功能照常。
+A dedicated actor thread owns every Playwright object. The UI can take control,
+then return it to the agent. Screenshots are only collected for explicit visual
+analysis, never used as the interactive surface. New profiles are isolated;
+system Chrome data is not copied. Windows stay open across turns and can be
+closed explicitly; unattended actor threads reclaim their browser after idle.
 """
 
 import json
+import queue
+from concurrent.futures import Future
+from functools import wraps
 import shutil
 import threading
 import time
@@ -48,17 +33,13 @@ PW_INSTALL_HINT = "后端未安装 playwright：pip install playwright && playwr
 _MANAGERS: dict = {}
 _MANAGERS_LOCK = threading.Lock()
 
-# 截图推送回调：由 app.py 注入 fn(sid, png_bytes, url) —— 截图落库/进 SSE。
-# 工具层保持传输无关（与 vision_backend 同一个注入模式）。
-screenshot_pusher = None
-
 VIEWPORT = {"width": 1280, "height": 800}
 NAV_TIMEOUT_MS = 20000
 ACTION_TIMEOUT_MS = 8000
 
 
 def manager_for(sid: str) -> "BrowserManager":
-    """取（或创建）一个会话的浏览器管理器。app.py 在回合收尾时调 close_session。"""
+    """取（或创建）一个会话的浏览器管理器。显式关闭或空闲回收 Chromium；管理器可跨回合复用。"""
     with _MANAGERS_LOCK:
         if sid not in _MANAGERS:
             _MANAGERS[sid] = BrowserManager(sid)
@@ -94,15 +75,7 @@ def cleanup_stale_profiles(keep_days: int) -> int:
 
 
 def close_session(sid: str) -> None:
-    """回合收尾：关掉该会话的浏览器进程（playwright 线程一并退出），但
-    manager 实例保留在字典里。profile 目录保留在磁盘上——下次同会话再用
-    时登录态还在。
-
-    不能从 _MANAGERS 删除实例：Agent 构造时把 manager 绑进 ctx.browser
-    （agent.py:259），Agent 实例跨回合复用——删掉后旧引用指向已 close 的
-    死线程，下次 browser_* 工具报 "cannot switch to a different thread
-    (which happens to have exited)"。保留实例则 _ensure 检查 _page 为空
-    会重新惰性拉起新线程，引用始终有效。"""
+    """Close Chromium on its actor thread while keeping the manager reusable."""
     with _MANAGERS_LOCK:
         mgr = _MANAGERS.get(sid)
     if mgr:
@@ -120,42 +93,131 @@ def _err(msg: str, hint: str = "") -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _serialized(method):
+    @wraps(method)
+    def wrapper(self,*args,**kwargs):
+        def invoke():
+            if self._manual:
+                return _err("用户正在手动操作浏览器，请等待交回 Agent")
+            self._last_action=time.monotonic()
+            return method(self,*args,**kwargs)
+        return invoke() if threading.current_thread() is self._worker else self._call(invoke)
+    return wrapper
+
+
 class BrowserManager:
     """一个会话的 Chromium 生命周期。惰性启动（第一次工具调用才拉起浏览器）。"""
 
-    def __init__(self, sid: str):
+    def __init__(self, sid: str, *, headless=False):
         self.sid = sid
+        self.headless = headless
+        self._last_action = time.monotonic()
+        self._epoch = 0
+        self._jobs = queue.Queue()
+        self._dispatch_lock = threading.Lock()
+        self._worker = None
+        self._manual = False
+        self._released = threading.Event()
+        self._released.set()
         self._pw = None          # sync_playwright() 返回的 Playwright 对象
         self._ctx = None         # 持久化上下文（带 profile）
         self._page = None
         self.last_shot_b64 = None  # 最新截图的 base64（analyze_image 的浏览器回退路径用）
-        self._lock = threading.Lock()  # Playwright sync API 不允许跨线程并发使用
+        self._lock = threading.RLock()  # Playwright sync API 不允许跨线程并发使用
+
+    def _call(self, fn, *args):
+        with self._dispatch_lock:
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(target=self._work,daemon=True,name="browser-"+self.sid[:12])
+                self._worker.start()
+            future = Future()
+            self._jobs.put((future,fn,args))
+        return future.result()
+
+    def _work(self):
+        # All Playwright objects are created, used and destroyed on this thread.
+        while True:
+            try:
+                future,fn,args = self._jobs.get(timeout=60)
+            except queue.Empty:
+                with self._dispatch_lock:
+                    if self._jobs.empty() and not self._manual and time.monotonic()-self._last_action>1800:
+                        self._close()
+                        self._worker = None
+                        return
+                continue
+            try:
+                if not self._manual and time.monotonic()-self._last_action>1800:self._close()
+                future.set_result(fn(*args))
+            except Exception as error: future.set_exception(error)
+
+    def state(self):
+        with self._dispatch_lock:
+            if self._worker is None:
+                return {"open":False,"url":"","manual":False,"mode":"window","title":""}
+        return self._call(self._state)
+
+    def _state(self):
+        page=self._page
+        live=page is not None and not page.is_closed()
+        if not live:
+            self._manual=False;self._released.set()
+        return {"open":live,"url":page.url if live else "", "manual":self._manual,
+                "mode":"window","title":page.title() if live else ""}
+
+    def control(self,action,url=None):
+        return self._call(self._control,action,url)
+
+    def _control(self,action,url):
+        self._last_action=time.monotonic()
+        if action=="release":
+            self._manual=False;self._released.set()
+        elif action=="close":
+            self._close()
+        elif action in ("takeover","open","back","forward","reload"):
+            if action=="open" and (not isinstance(url,str) or not url.startswith(("http://","https://")) or len(url)>4096):
+                raise ValueError("请输入完整的 http:// 或 https:// 地址")
+            page=self._ensure()
+            self._manual=True;self._released.clear()
+            if action=="open":
+                page.goto(url,timeout=NAV_TIMEOUT_MS,wait_until="domcontentloaded")
+            elif action=="back":page.go_back(timeout=NAV_TIMEOUT_MS,wait_until="domcontentloaded")
+            elif action=="forward":page.go_forward(timeout=NAV_TIMEOUT_MS,wait_until="domcontentloaded")
+            elif action=="reload":page.reload(timeout=NAV_TIMEOUT_MS,wait_until="domcontentloaded")
+            page.bring_to_front()
+        else:raise ValueError("未知浏览器操作")
+        self._publish_state("用户操作")
+        return self._state()
+
+    def tool_call(self,name,ctx,*args):
+        epoch=self._epoch
+        cancel=getattr(ctx,"cancel_event",None)
+        while not self._released.wait(.2):
+            if cancel is not None and cancel.is_set():return _err("任务已停止，未操作浏览器")
+        if cancel is not None and cancel.is_set():return _err("任务已停止，未操作浏览器")
+        def invoke():
+            if epoch!=self._epoch:return _err("浏览器已关闭，未继续等待中的操作")
+            return getattr(self,name)(*args)
+        return self._call(invoke)
 
     # ---------- 生命周期 ----------
 
     def _profile_dir(self) -> Path:
-        """本会话的浏览器 profile 副本目录。首次调用时从系统 Chrome 复制。"""
+        """本会话独立 profile，登录一次后在本会话中复用。"""
         base = Path("data/browser-profiles") / self.sid
         if base.exists():
             return base
         base.mkdir(parents=True, exist_ok=True)
-        src = _chrome_profile_src()
-        if src:
-            try:
-                # 只复制 HTTP Storage（cookies/localStorage/密码自动填充的元数据）
-                # ——Cache 等几个 GB 的目录没有复用价值，纯浪费时间与磁盘。
-                shutil.copytree(src, base, dirs_exist_ok=True,
-                                ignore=shutil.ignore_patterns(
-                                    "Cache*", "Code Cache", "GPUCache",
-                                    "Service Worker", "*.tmp"))
-            except OSError:
-                pass  # 复制失败（权限/磁盘）：退化为全新 profile，登录态需重登
         return base
 
     def _ensure(self):
         """惰性启动：返回 (page, ok_msg)。失败时抛 RuntimeError（带可读原因）。"""
         if self._page is not None:
-            return self._page
+            if not self._page.is_closed():
+                pages=[p for p in self._ctx.pages if not p.is_closed()]
+                if pages:self._page=pages[-1]
+                return self._page
+            self._close()
         if not _PW_AVAILABLE:
             raise RuntimeError(PW_INSTALL_HINT)
         # 启动/复用在锁内：Playwright 的 sync API 绑定创建线程，跨线程调用
@@ -169,18 +231,24 @@ class BrowserManager:
                 # 不依赖用户机器上有没有装 Chrome
                 self._ctx = self._pw.chromium.launch_persistent_context(
                     str(self._profile_dir()),
-                    headless=True,
+                    headless=self.headless,
                     viewport=VIEWPORT,
                     args=["--no-sandbox", "--disable-dev-shm-usage"],
                 )
                 self._page = self._ctx.pages[0] if self._ctx.pages else self._ctx.new_page()
                 self._page.set_default_timeout(ACTION_TIMEOUT_MS)
             except Exception as e:
-                self.close()
+                self._close()
                 raise RuntimeError(f"浏览器启动失败：{e}") from e
         return self._page
 
     def close(self):
+        with self._dispatch_lock:
+            worker=self._worker
+        if worker is not None:self._call(self._close)
+
+    def _close(self):
+        self._epoch+=1
         with self._lock:
             for closer in (
                 lambda: self._ctx.close(),
@@ -193,32 +261,28 @@ class BrowserManager:
             self._page = None
             self._ctx = None
             self._pw = None
+            self._manual = False
+            self._released.set()
 
     # ---------- 内部动作 ----------
 
-    def _push_screenshot(self, note: str = ""):
-        """把当前页面截图推给前端（右侧浏览器弹窗）。失败静默：截图推送
-        只是可视化，不该让工具调用本身失败。"""
-        push = screenshot_pusher
-        if push is None or self._page is None:
-            return
+    def _publish_state(self, note: str = ""):
+        """Publish lightweight state; never stream image snapshots to the panel."""
         try:
-            png = self._page.screenshot(type="png")
-            push(self.sid, png, self._page.url, note)
+            from services import browser as service
+            if service._event_bus is not None:
+                service._event_bus(self.sid).publish({"type":"browser_state",**self._state(),"note":note})
         except Exception:
             pass
 
-    @staticmethod
-    def _selector(sel: str) -> str:
-        """归一化 selector：裸字符串默认按页面文本匹配（text=引擎）。
-        带 Playwright 引擎前缀（css= / xpath= / text=）的原样透传。"""
-        sel = (sel or "").strip()
-        if not sel:
-            return sel
-        for prefix in ("css=", "xpath=", "text=", "id="):
-            if sel.startswith(prefix):
-                return sel
-        return f"text={sel}"
+    def _locator(self,page,selector):
+        if selector.startswith(("css=","xpath=","text=","id=")):
+            return page.locator(selector)
+        label=page.get_by_label(selector,exact=True)
+        if label.count():return label
+        placeholder=page.get_by_placeholder(selector,exact=True)
+        if placeholder.count():return placeholder
+        return page.get_by_text(selector,exact=True)
 
     def _describe_page(self) -> dict:
         """当前页面的结构化摘要（给模型当"眼睛"用），带超时保护。"""
@@ -240,12 +304,15 @@ class BrowserManager:
 
     # ---------- 工具入口（被 browser_tools_* 包装后进 TOOL_REGISTRY） ----------
 
+    @_serialized
     def open(self, url: str) -> str:
+        if not isinstance(url,str) or not url.startswith(("http://","https://")) or len(url)>4096:
+            return _err("请输入完整的 http:// 或 https:// 地址")
         try:
             page = self._ensure()
             page.goto(url, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
             info = self._describe_page()
-            self._push_screenshot("打开页面")
+            self._publish_state("打开页面")
             return _ok({"result": f"已打开 {url}", **info})
         except PWTimeout:
             return _err(f"打开 {url} 超时（{NAV_TIMEOUT_MS // 1000}s）",
@@ -255,22 +322,24 @@ class BrowserManager:
         except Exception as e:
             return _err(f"打开页面失败：{e}", "检查 URL 格式（须带 http:// 或 https://）")
 
+    @_serialized
     def click(self, selector: str) -> str:
         try:
             page = self._ensure()
-            page.click(self._selector(selector), timeout=ACTION_TIMEOUT_MS)
+            self._locator(page,selector).click(timeout=ACTION_TIMEOUT_MS)
             page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
             info = self._describe_page()
-            self._push_screenshot(f"点击 {selector}")
+            self._publish_state(f"点击 {selector}")
             return _ok({"result": f"已点击「{selector}」", **info})
         except PWTimeout:
             return _err(f"找不到可点击的元素「{selector}」或页面加载超时",
-                        "先 browser_screenshot 看当前页面，按页面上的真实文字重写 selector")
+                        "先 browser_snapshot 读取当前页面，按页面上的真实文字重写 selector")
         except RuntimeError as e:
             return _err(str(e))
         except Exception as e:
             return _err(f"点击失败：{e}", "selector 用页面元素的可见文字（自动按 text= 匹配）")
 
+    @_serialized
     def type_text(self, selector: str, text: str) -> str:
         # 敏感值支持 env:VAR 引用：密码不进对话历史、不进模型上下文
         if text.startswith("env:"):
@@ -282,28 +351,46 @@ class BrowserManager:
                             "让用户在部署环境设置该变量后重试（密码不经过对话明文传输）")
         try:
             page = self._ensure()
-            page.fill(self._selector(selector), text, timeout=ACTION_TIMEOUT_MS)
-            self._push_screenshot(f"输入 {selector}")
+            self._locator(page,selector).fill(text, timeout=ACTION_TIMEOUT_MS)
+            self._publish_state(f"输入 {selector}")
             return _ok({"result": f"已在「{selector}」输入 {len(text)} 个字符",
                         "url": page.url})
         except PWTimeout:
             return _err(f"找不到输入框「{selector}」",
-                        "先 browser_screenshot 看当前页面；输入框定位用它的 placeholder 或 name")
+                        "先 browser_snapshot 读取当前页面；输入框定位用它的 placeholder 或 name")
         except RuntimeError as e:
             return _err(str(e))
         except Exception as e:
             return _err(f"输入失败：{e}")
 
+    @_serialized
+    def snapshot(self):
+        try:
+            self._ensure()
+            return _ok(self._describe_page())
+        except Exception as error:return _err(f"读取页面失败：{error}")
+
+    @_serialized
+    def press(self,key):
+        try:
+            if key not in ("Enter","Tab","Escape","ArrowDown","ArrowUp","PageDown","PageUp","Space"):
+                return _err("不支持此按键")
+            self._ensure().keyboard.press(key)
+            self._publish_state("按键")
+            return _ok(self._describe_page())
+        except Exception as error:return _err(f"按键失败：{error}")
+
+    @_serialized
     def screenshot(self) -> str:
         try:
             page = self._ensure()
             png = page.screenshot(type="png")
-            self._push_screenshot("截图")
+            self._publish_state("截图")
             import base64
             # 挂在管理器上（ctx.browser.last_shot_b64）：analyze_image 的浏览器
             # 回退路径靠它把这张截图交给视觉模型——图片本体不进对话文本。
             self.last_shot_b64 = base64.b64encode(png).decode()
-            return _ok({"result": "已截图并展示给用户（右侧浏览器面板）。"
+            return _ok({"result": "已采集页面供视觉分析；用户可在独立浏览器窗口直接操作。"
                                   "请立刻调用 analyze_image 查看页面内容，再决定下一步。",
                         "url": page.url,
                         "size": len(png)})
@@ -311,20 +398,6 @@ class BrowserManager:
             return _err(str(e))
         except Exception as e:
             return _err(f"截图失败：{e}")
-
-
-def _chrome_profile_src() -> Path | None:
-    """探测系统 Chrome 的默认 profile 目录（跨平台）。找不到返回 None。"""
-    home = Path.home()
-    candidates = (
-        home / "Library/Application Support/Google/Chrome/Default",   # macOS
-        home / ".config/google-chrome/Default",                        # Linux
-        home / "AppData/Local/Google/Chrome/User Data/Default",        # Windows
-    )
-    for c in candidates:
-        if c.is_dir():
-            return c
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -340,22 +413,22 @@ def _ctx_browser(ctx):
 
 def browser_open(url: str, ctx=None) -> str:
     mgr, err = _ctx_browser(ctx)
-    return err if err else mgr.open(url)
+    return err if err else mgr.tool_call("open",ctx,url)
 
 
 def browser_click(selector: str, ctx=None) -> str:
     mgr, err = _ctx_browser(ctx)
-    return err if err else mgr.click(selector)
+    return err if err else mgr.tool_call("click",ctx,selector)
 
 
 def browser_type(selector: str, text: str, ctx=None) -> str:
     mgr, err = _ctx_browser(ctx)
-    return err if err else mgr.type_text(selector, text)
+    return err if err else mgr.tool_call("type_text",ctx,selector,text)
 
 
 def browser_screenshot(ctx=None) -> str:
     mgr, err = _ctx_browser(ctx)
-    return err if err else mgr.screenshot()
+    return err if err else mgr.tool_call("screenshot",ctx)
 
 
 BROWSER_TOOL_SCHEMAS = [
@@ -363,7 +436,7 @@ BROWSER_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "browser_open",
-            "description": "打开一个网页（内置 Chromium，自动复用本地浏览器登录态，已登录的网站无需再登录）。"
+            "description": "打开真实可操作的 Chromium 窗口（会话独立登录态；用户可手动接管）。"
                            "什么时候用：验证前端/接口改动、自动登录或操作网页、上网调研（需要看真实渲染效果的站点）。"
                            "返回页面标题、URL、标题层级、按钮与输入框摘要，帮你决定下一步点哪/填哪。"
                            "示例：{\"url\": \"http://localhost:8000\"}。",
@@ -414,7 +487,7 @@ BROWSER_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "browser_screenshot",
-            "description": "对当前页面截图并在右侧「浏览器」面板展示给用户。你自己看不到像素——"
+            "description": "仅为视觉分析采集当前页面，不向右侧面板追加截图。你自己看不到像素——"
                            "截完图【必须紧接着调用 analyze_image】读取页面内容再决定下一步。"
                            "什么时候用：browser_open/click/type 返回的摘要不足以判断页面状态时、"
                            "验证渲染效果时、需要读验证码/弹窗内容时。无参数。",
@@ -438,3 +511,21 @@ BROWSER_TOOL_READ_ONLY = {
     "browser_type": False,
     "browser_screenshot": False,
 }
+
+
+def browser_snapshot(ctx=None):
+    mgr,err=_ctx_browser(ctx)
+    return err if err else mgr.tool_call("snapshot",ctx)
+
+
+def browser_press(key,ctx=None):
+    mgr,err=_ctx_browser(ctx)
+    return err if err else mgr.tool_call("press",ctx,key)
+
+
+BROWSER_TOOL_REGISTRY.update(browser_snapshot=browser_snapshot,browser_press=browser_press)
+BROWSER_TOOL_READ_ONLY.update(browser_snapshot=False,browser_press=False)
+BROWSER_TOOL_SCHEMAS.extend([
+    {"type":"function","function":{"name":"browser_snapshot","description":"读取当前浏览器页面标题、按钮和输入框摘要，无需截图。优先用此工具观察页面变化。","parameters":{"type":"object","properties":{}}}},
+    {"type":"function","function":{"name":"browser_press","description":"在当前页面按键，如 Enter 提交、Tab 切换、PageDown 滚动。","parameters":{"type":"object","properties":{"key":{"type":"string","enum":["Enter","Tab","Escape","ArrowDown","ArrowUp","PageDown","PageUp","Space"]}},"required":["key"]}}}
+])

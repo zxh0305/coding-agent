@@ -4649,9 +4649,11 @@ function applyEvent(evt, seq) {
   } else if (t === "doc_created") {
     // agent 生成了一份文档：刷新列表、展开右侧面板并打开新文档
     onDocCreated(evt.name);
+  } else if (t === "browser_state") {
+    onBrowserState(evt);
   } else if (t === "browser_shot") {
-    // agent 的内置浏览器推来了新截图：展开右侧浏览器栏、追加最新画面
-    onBrowserShot(evt.url, evt.note, evt.shot);
+    // Old replay events must not recreate the retired screenshot gallery.
+    void refreshBrowserState();
   } else if (t === "session_title") {
     // 首轮结束后服务端用 AI 总结出了更好的任务名（后台线程，可能在本回合
     // turn_end 之后几十秒才到）。就地更新列表那一行，不必等 8 秒轮询——
@@ -5507,7 +5509,7 @@ bind("back-bottom", "click", () => {
 bind("browser-chip", "click", () => {
   const p = browserPanelEl();
   if (!p) return;
-  if (p.classList.contains("hidden")) { p.classList.remove("hidden"); closeDocsPanel(); }
+  if (p.classList.contains("hidden")) { p.classList.remove("hidden"); closeDocsPanel(); void refreshBrowserState(); }
   else closeBrowserPanel();
 });
 bind("browser-close", "click", closeBrowserPanel);
@@ -7202,50 +7204,54 @@ function onDocCreated(name) {
 
 function browserPanelEl() { return $("browser-panel"); }
 
-// browser_shot 事件：展开浏览器栏、显示最新截图。
-function onBrowserShot(url, note, shot) {
-  const chip = $("browser-chip");
-  if (chip) chip.classList.remove("hidden");
-  const p = browserPanelEl();
-  if (!p) return;
-  if (!p.classList.contains("hidden")) syncBrowser(url, note, shot);
-  else {
-    p.classList.remove("hidden");
-    closeDocsPanel();  // 两个面板共用 --docs-w：只保留一个，避免互相挤压
-    syncBrowser(url, note, shot);
+function onBrowserState(state) {
+  $("browser-chip")?.classList.remove("hidden");
+  const panel=browserPanelEl();
+  if(state.open && panel?.classList.contains("hidden")) {panel.classList.remove("hidden");closeDocsPanel();}
+  renderBrowserState(state);
+}
+function renderBrowserState(state) {
+  $("browser-url").textContent=state.url || "—";
+  $("browser-url").title=state.url || "";
+  $("browser-note").textContent=state.open ? "真实窗口" : "";
+  $("browser-status").textContent=state.open ? (state.manual ? "你正在操作 · Agent 的浏览器操作等待中" : "Agent 可操作 · 可随时手动接管") : "尚未打开浏览器";
+  for(const button of document.querySelectorAll("[data-browser-action]")) {
+    const action=button.dataset.browserAction;
+    button.disabled=currentSessionArchived || (!state.open && action!=="takeover") || (action==="release" && !state.manual);
   }
+  $("browser-address").disabled=currentSessionArchived;
+  $("browser-navigate").querySelector("button").disabled=currentSessionArchived;
 }
-
-// 把一条截图信息渲染进浏览器栏（追加，保留历史画面可回看）
-function syncBrowser(url, note, shot) {
-  const urlEl = $("browser-url"), noteEl = $("browser-note"), view = $("browser-view");
-  if (!view) return;
-  if (urlEl) { urlEl.textContent = url || "—"; urlEl.title = url || ""; }
-  if (noteEl) noteEl.textContent = note || "";
-  const img = document.createElement("img");
-  // <img> 是浏览器原生请求，带不了 Authorization 头——token 走查询参数
-  // （与 SSE events 端点同一先例），服务端 _require_auth 对该端点放行。
-  // t= 破缓存：同一 n 的截图内容不会变，但保底避免历史帧被内存缓存干扰。
-  img.src = shot + (shot.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(authToken) + "&t=" + Date.now();
-  img.alt = note || url || "浏览器截图";
-  view.appendChild(img);
-  view.scrollTop = view.scrollHeight;
+async function refreshBrowserState() {
+  const sid=currentSession,view=sessionViewVersion,token=authToken;
+  if(!sid || !token)return;
+  try {
+    const state=await api(`/api/sessions/${encodeURIComponent(sid)}/browser`);
+    if(sid!==currentSession || view!==sessionViewVersion || token!==authToken)return;
+    renderBrowserState(state);
+    if(state.open)$("browser-chip")?.classList.remove("hidden");
+  } catch(error) {if(sid===currentSession && !browserPanelEl()?.classList.contains("hidden"))$("browser-status").textContent="浏览器状态暂不可用："+error.message;}
 }
-
-function closeBrowserPanel() {
-  const p = browserPanelEl();
-  if (p) p.classList.add("hidden");
+let browserControlBusy=false;
+async function controlBrowser(action,url) {
+  if(browserControlBusy || !currentSession || currentSessionArchived)return;
+  const sid=currentSession,view=sessionViewVersion,token=authToken;
+  browserControlBusy=true;
+  try {
+    const state=await api(`/api/sessions/${encodeURIComponent(sid)}/browser`,{method:"POST",body:JSON.stringify({action,url})});
+    if(sid===currentSession && view===sessionViewVersion && token===authToken)renderBrowserState(state);
+  } catch(error) {if(sid===currentSession && view===sessionViewVersion)toast(error.message);}
+  finally {browserControlBusy=false;}
 }
-
-// 切会话/新建任务时复位浏览器栏：收起 + 清空画面，chip 藏回（新会话还没有浏览器活动）
+for(const button of document.querySelectorAll("[data-browser-action]"))button.onclick=()=>void controlBrowser(button.dataset.browserAction);
+$("browser-navigate").onsubmit=event=>{event.preventDefault();void controlBrowser("open",$("browser-address").value.trim());};
+setInterval(()=>{if(!document.hidden && !browserPanelEl()?.classList.contains("hidden"))void refreshBrowserState();},3000);
+function closeBrowserPanel() {browserPanelEl()?.classList.add("hidden");}
 function resetBrowserPanel() {
   closeBrowserPanel();
-  const view = $("browser-view");
-  if (view) view.innerHTML = "";
-  const urlEl = $("browser-url"), noteEl = $("browser-note"), chip = $("browser-chip");
-  if (urlEl) urlEl.textContent = "—";
-  if (noteEl) noteEl.textContent = "";
-  if (chip) chip.classList.add("hidden");
+  $("browser-address").value="";
+  renderBrowserState({open:false});
+  $("browser-chip")?.classList.remove("hidden");
 }
 
 // ---------------------------------------------------------------------------

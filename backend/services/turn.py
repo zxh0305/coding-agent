@@ -34,7 +34,6 @@ import db
 import skills
 import snapshot
 from llm_client import ApiConnectionError, ApiHTTPError, _RETRYABLE_STATUS
-from services.browser import _push_browser_screenshot
 from services.trace import SNAPSHOT_INTERVAL, _persist_trace, _snapshot_trace
 
 # 由 app.install_service_hooks() 注入的装配层能力。
@@ -105,9 +104,6 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                     refs.append(ref)
                     db.save_messages(sid, [dict(user_message)], {})
             agent.project_context_sink = save_project_context
-            # 截图推送注入（browser_tools → SSE）：回合线程里安全，publish 自带锁
-            import browser_tools
-            browser_tools.screenshot_pusher = _push_browser_screenshot
             bus.publish({"type": "turn_start", "nonce": nonce, "input": plain, "atts": atts,
                          # 只带元数据（skills.slim）：这条事件会被环形缓冲反复补发，
                          # 全文跟着走等于每次断线重连都重播一遍技能指令。徽章展开
@@ -322,13 +318,8 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             bus.publish({"type": "turn_phase", "user_mid":user_mid, "phase":"finished",
                          "assessment":policy.assessment, "reason":policy.reason})
             bus.publish({"type": "turn_end", "user_mid": user_mid})
-            # 回合结束关掉本会话的浏览器：Chromium 进程不常驻；profile 目录
-            # 保留在磁盘，下次 browser_* 工具再用时登录态还在。
-            try:
-                import browser_tools
-                browser_tools.close_session(sid)
-            except Exception:
-                pass
+            # Browser remains available for manual use and the next turn.
+            # Explicit close, session deletion, or the worker idle timeout reclaims it.
             # 轮末自动提取（memory.py）：daemon 线程异步跑，绝不阻塞 worker
             # 返回与下一个回合。全程静默——不发 SSE 事件、不写数据库：记忆是
             # 后台维护动作，用户无需感知，推送事件反而会进环形缓冲、打扰所有

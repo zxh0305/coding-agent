@@ -410,7 +410,9 @@ READONLY_TOOLS = {"read_file", "list_dir", "grep", "analyze_image", "todo_write"
 # 填表，操作面大于工作区工具——每个动作先弹确认卡，用户可用「本会话内允许」
 # 一次性放行。readonly 模式下它们同样不在 READONLY_TOOLS，逐次 ask，天然覆盖。
 BROWSER_ASK_RULES = [
-    Rule("browser_open", None, ASK, "打开网页（内置浏览器，复用本地登录态）"),
+    Rule("browser_snapshot", None, ASK, "读取浏览器页面摘要"),
+    Rule("browser_press", None, ASK, "操作浏览器按键"),
+    Rule("browser_open", None, ASK, "打开网页（可操作浏览器窗口，会话独立登录态）"),
     Rule("browser_click", None, ASK, "点击页面元素（内置浏览器）"),
     Rule("browser_type", None, ASK, "向网页输入内容（内置浏览器）"),
     Rule("browser_screenshot", None, ASK, "页面截图（内置浏览器）"),
