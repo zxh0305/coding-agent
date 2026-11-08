@@ -2908,3 +2908,63 @@ button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset
 #db-result[data-empty="true"] .db-empty p {font-size:11px;max-width:300px;}
 .db-results-section:has(#db-result[data-empty="true"]) .db-row-pages {visibility:hidden;}
 .database-dialog input[name="path"],.database-dialog input[name="host"] {font-family:ui-monospace,monospace;font-size:11px;}
+
+/* Workbench presentation: explicit surfaces, typed values and a read-only cell viewer. */
+.database-dialog {border-color:#dce2ed;border-radius:14px;box-shadow:0 30px 100px #18254435;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+.database-dialog svg,.db-cell-dialog svg {width:15px;height:15px;flex-shrink:0;}
+.database-dialog .db-header {background:var(--panel);padding:13px 20px;min-height:65px;}
+.db-header>div {gap:13px;}
+.db-brand-icon {display:flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px solid #dce4f6;border-radius:9px;background:#edf2fc;color:#506bb7;}
+.db-brand-icon svg {width:19px;height:19px;}
+.database-dialog .db-badge {font-size:10px;border:0;border-radius:5px;background:var(--hover-soft);color:var(--text-3);padding:4px 6px;font-weight:400;}
+.database-dialog .db-project {border-left:1px solid var(--border);padding-left:14px;margin-left:5px;}
+.db-sidebar {background:#f7f8fb;padding:16px 13px;}
+.db-connection-card {border:1px solid #e0e5ee;background:var(--panel);border-radius:9px;padding:11px;box-shadow:0 2px 4px #1d2d5010;}
+.db-card-caption {font-size:10px;letter-spacing:.3px;color:var(--text-3);}
+.database-dialog #db-list {border:0;background:transparent;padding:0;font-size:13px;font-weight:600;height:30px;}
+.db-connection-card .db-connection-meta {margin:0 0 8px;font-size:10px;color:#737e91;}
+.db-connection-card .db-connection-actions {border-top:1px solid #edf0f5;padding-top:8px;margin-top:0;}
+.db-connection-card button {border:0;background:transparent;padding:3px 7px;min-height:26px;}
+.db-search-field {position:relative;}.db-search-field>svg {position:absolute;left:9px;top:9px;color:#909bad;width:14px;height:14px;pointer-events:none;}.database-dialog #db-search {padding-left:29px;background:var(--panel);border-color:#e0e5ee;}
+#db-table-list {margin:9px -5px 0;padding:0 4px;scrollbar-width:thin;scrollbar-color:#d4dce9 transparent;}
+.database-dialog .db-table-item {border-radius:5px;min-height:30px;font-size:11px;color:#59677d;position:relative;}
+.database-dialog .db-table-item.active {color:#385dc0;background:#e9eefc;font-weight:600;box-shadow:inset 2px 0 #5478cd;}
+.database-dialog .db-table-item:hover:not(.active) {background:#edf0f6;}
+.db-main {padding:17px 18px 0;background:var(--panel);}
+#db-breadcrumb {font-size:13px;letter-spacing:-.15px;}
+.db-view-tabs {gap:3px;width:fit-content;padding:3px;border-radius:8px;background:#f1f3f7;}
+.database-dialog .db-view-tabs button {padding:4px 12px;min-height:27px;font-size:11px;border-radius:5px;color:#748096;}
+.database-dialog .db-view-tabs button.active {background:white;color:#3f5fba;box-shadow:0 1px 4px #23304d18;}
+.db-query-section>summary {padding:7px 11px;border:1px solid #e1e6ee;border-radius:6px;background:var(--panel);color:#58667d;}
+.db-query-section[open]>summary {width:fit-content;margin-bottom:10px;}
+.db-grid-tools {display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:37px;padding:4px 0 8px;}
+.db-grid-tools>div {display:flex;gap:5px;}.database-dialog .db-grid-tools button {border:0;background:transparent;color:var(--text-3);font-size:10px;min-height:25px;}.database-dialog .db-grid-tools button[aria-pressed=true] {background:#e9eefc;color:#3f5fba;}
+#db-state {margin:0;min-width:0;font-size:11px;}.database-dialog[data-loading=true] #db-state::before {content:'';display:inline-block;width:8px;height:8px;border:1.5px solid #cbd5eb;border-top-color:#4b70c8;border-radius:50%;margin-right:7px;animation:db-spin .7s linear infinite;}
+@keyframes db-spin {to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.database-dialog[data-loading=true] #db-state::before {animation:none;}}
+#db-result {border-color:#e0e5ee;border-radius:8px;scrollbar-width:thin;scrollbar-color:#ccd5e5 transparent;background:white;}
+#db-result th {height:37px;background:#f7f9fc;font-size:11px;color:#52617a;font-weight:500;}
+#db-result th,#db-result td {border-right-color:#e9edf4;border-bottom-color:#edf0f5;}
+#db-result td {height:33px;font-size:12px;color:#3a465b;}
+#db-result tr:nth-child(even) td {background:#fcfdff;}
+#db-result tr:hover td {background:#f3f6fc;}
+.db-column-kind {font:10px ui-monospace,monospace;color:#94a0b5;margin-right:8px;}
+#db-result .db-row-number {background:#f9fafd;color:#a0aabd;}
+#db-result .db-value-number {text-align:right;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;font-variant-numeric:tabular-nums;}
+.db-value-tag,.db-json-preview {display:inline-block;padding:2px 6px;border-radius:4px;background:#f0f3f8;color:#65758e;font:10px/1.5 ui-monospace,monospace;}
+#db-result .db-value-null .db-value-tag {background:transparent;color:#9aa5b6;border:1px solid #edf0f5;font-size:9px;}
+#db-result .db-value-boolean .db-value-tag {background:#eef3fd;color:#5672b3;}
+#db-result .db-json-preview {color:#74619f;background:#f3effa;}
+#db-result td:focus {outline:none;}#db-result td.db-cell-selected {box-shadow:inset 0 0 0 1.5px #7092df;background:#edf3ff!important;}
+#db-result.db-wrap-values td {white-space:pre-wrap;overflow-wrap:anywhere;max-width:300px;}
+#db-result .db-no-rows {text-align:center;height:110px;color:var(--text-3);}
+.db-row-pages {padding:9px 1px;min-height:47px;font-size:10px;}
+#db-result[data-empty=true] {background:transparent;}
+#db-result .db-empty-icon {width:54px;height:54px;border-radius:14px;border-color:#e0e7f5;background:#f3f6fc;color:#8094be;}
+#db-result .db-empty-icon svg {width:25px;height:25px;}
+.db-cell-dialog {position:fixed;inset:0;margin:auto;width:min(650px,calc(100vw - 32px));max-height:75dvh;border:1px solid #dce3ef;border-radius:12px;padding:0;background:var(--panel);color:var(--text);box-shadow:0 24px 80px #14213b30;overflow:hidden;}
+.db-cell-dialog[open] {display:flex;flex-direction:column;}.db-cell-dialog::backdrop {background:#18203366;backdrop-filter:blur(2px);}
+.db-cell-dialog header {display:flex;align-items:center;justify-content:space-between;padding:17px 20px;border-bottom:1px solid var(--border);}.db-cell-dialog h3 {font-size:15px;margin:5px 0 0;overflow-wrap:anywhere;}.db-cell-dialog button {display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:6px;padding:5px 8px;background:var(--panel);color:var(--text-2);font-size:11px;cursor:pointer;}
+.db-cell-dialog #db-cell-close {border:0;font-size:18px;}.db-cell-caption {display:flex;align-items:center;justify-content:space-between;padding:10px 20px;background:#f8fafd;font:10px ui-monospace,monospace;color:var(--text-3);}
+#db-cell-value {overflow:auto;min-height:140px;max-height:48dvh;white-space:pre-wrap;overflow-wrap:anywhere;padding:20px;margin:0;font:12px/1.9 ui-monospace,SFMono-Regular,Consolas,monospace;tab-size:2;}
+.db-json-key {color:#7255ac;}.db-json-string {color:#36836b;}.db-json-number {color:#3c6aaa;}.db-json-literal {color:#ad6e3d;}
+@media(max-width:720px){.db-header>div {display:flex;flex-wrap:wrap;gap:8px;}.db-brand-icon {width:28px;height:28px;}.database-dialog .db-project {flex-basis:100%;border:0;padding:0;margin:0;}.database-dialog h2 {font-size:14px;}.db-main {padding:14px 12px 0;}.db-grid-tools {align-items:flex-start;}.db-grid-tools button {padding:4px 5px;}.db-grid-tools>div {flex-shrink:0;}.db-cell-dialog header {padding:14px;}#db-cell-value {padding:14px;}}
