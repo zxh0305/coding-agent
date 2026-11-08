@@ -2871,3 +2871,8 @@ button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset
 .browser-window-card .browser-help { font-size: 12px; color: var(--text-3); }
 
 #browser-navigate button { flex-shrink: 0; white-space: nowrap; }
+
+.database-dialog { width:min(900px,92vw); max-height:88vh; overflow:auto; border:1px solid var(--border); border-radius:16px; padding:24px; color:var(--text); background:var(--panel); }
+.database-dialog::backdrop {background:#0005;} .database-dialog header,.db-actions {display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px;}
+.database-dialog input,.database-dialog select,.database-dialog button,.database-dialog textarea {font:inherit;padding:8px;border:1px solid var(--border);border-radius:7px;background:var(--panel);color:var(--text);margin:4px 0;max-width:100%;}
+.database-dialog textarea {width:100%;min-height:110px;font-family:monospace;box-sizing:border-box;} #db-result {overflow:auto;max-height:320px;} #db-result table {border-collapse:collapse;font-size:13px;} #db-result td,#db-result th {padding:8px;border:1px solid var(--border);white-space:pre-wrap;max-width:380px;overflow-wrap:anywhere;} .database-dialog p {font-size:13px;color:var(--text-2);} @media(max-width:600px){.db-actions {flex-wrap:wrap;} .database-dialog {padding:14px;} }

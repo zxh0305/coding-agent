@@ -420,3 +420,19 @@ cd backend/manual
 当前交付是本机独立窗口，尚非 ZCode 的桌面内嵌页面。远程访问时窗口位于部署电脑，不会出现在访问者设备；无桌面环境的服务器不支持此窗口模式。截图工具仅保留为模型视觉分析手段，不作为用户操作界面。
 
 此批验证：后端882项、前端105项通过。隔离账号的真实窗口联调覆盖手动输入、Agent 共用页面、接管/交回、跨线程调用、页面刷新、关闭重开后的存储和手机布局；已回归补充当前任务与引用提问。
+
+### 项目数据库（第一批，只读）
+
+打开已绑定项目的会话，点击输入区“数据库”，保存 SQLite 文件连接或 MySQL 连接，查看结构并执行 SQL。SQLite 文件须已存在；结果最多200行，查询有5秒执行预算。MySQL 需 `pip install pymysql`，并使用专用只读账号；需支持 `MAX_EXECUTION_TIME` 与只读事务的 MySQL，不宣称兼容所有 MariaDB 版本。
+
+连接配置按应用用户和项目路径隔离。密码仅保存在本机 `data/database-connections.json`（文件权限0600，不加密），不返回浏览器、不传给模型。该文件及其备份须按凭据保管。第一批尚无数据写入、表结构修改和SQL历史记录功能。Agent 可在权限确认后使用 database_connections、database_schema、database_query，共用只读执行器。
+
+命令行在后端电脑上运行，信任当前操作系统账号，可读取本机配置；它不是对外开放的身份认证入口：
+
+```bash
+python3 backend/database_cli.py list --user 你的应用用户名 --workspace /绝对项目路径
+python3 backend/database_cli.py tables --user 你的应用用户名 --workspace /绝对项目路径 --connection 连接ID
+python3 backend/database_cli.py query --user 你的应用用户名 --workspace /绝对项目路径 --connection 连接ID --sql 'SELECT * FROM notes LIMIT 20'
+```
+
+查询也可用 `--file query.sql` 替代 `--sql`。不要把数据库密码放入命令行参数或 SQL。数据库工作台与 Agent 不会建立数据库级安全沙箱，MySQL 的最小权限仍应由数据库专用账号落实。

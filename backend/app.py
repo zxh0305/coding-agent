@@ -404,7 +404,9 @@ def _assert_hooks_installed() -> None:
 install_service_hooks()  # 模块导入即装配（只需一次，重复调用幂等）
 
 
-class Handler(ExperimentRoutes, AuthRoutes, SessionRoutes, ChatRoutes, ModelRoutes,
+from routes.databases import DatabaseRoutes
+
+class Handler(DatabaseRoutes, ExperimentRoutes, AuthRoutes, SessionRoutes, ChatRoutes, ModelRoutes,
               GitRoutes, WorkspaceRoutes, MemoryRoutes, SkillRoutes, DispatchMixin, HandlerBase):
     """API 路由 + 静态文件托管（frontend/ 目录）。
 

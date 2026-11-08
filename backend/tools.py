@@ -410,3 +410,9 @@ def execute_tool(name: str, arguments: dict, ctx: ToolContext | None = None) -> 
 def describe_tools() -> str:
     """列出工具清单（启动横幅用）。"""
     return "\n".join(f"  - {s['function']['name']}: {s['function']['description']}" for s in TOOL_SCHEMAS)
+
+# Project-bound database tools share the workbench's read-only executor.
+from database_tools import REGISTRY as DATABASE_TOOLS, SCHEMAS as DATABASE_SCHEMAS
+TOOL_REGISTRY.update(DATABASE_TOOLS)
+TOOL_SCHEMAS.extend(DATABASE_SCHEMAS)
+TOOL_READ_ONLY.update({name: True for name in DATABASE_TOOLS})
