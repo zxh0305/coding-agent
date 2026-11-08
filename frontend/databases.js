@@ -5,7 +5,7 @@
   const dialog=document.createElement('dialog');dialog.className='database-dialog';
   dialog.setAttribute('aria-label','项目数据库');
   dialog.innerHTML=`
-    <header class="db-header"><div><span class="db-eyebrow">PROJECT WORKSPACE</span><h2>数据库<span class="db-badge">只读模式</span></h2><button id="db-project" class="db-project">选择项目文件夹</button></div><button id="db-close" aria-label="关闭数据库">✕</button></header>
+    <header class="db-header"><div><h2>数据库<span class="db-badge">只读模式</span></h2><button id="db-project" class="db-project">选择项目文件夹</button></div><button id="db-close" aria-label="关闭数据库">✕</button></header>
     <div class="db-workbench">
       <aside class="db-sidebar">
         <div class="db-section-heading"><h3>项目连接</h3><button id="db-add" title="添加连接" aria-label="添加连接">＋</button></div>
@@ -52,7 +52,7 @@
     if(!valid(version))throw new Error('项目已切换');return data;
   }
   async function run(fn){const version=++generation;if(!valid())return;state('处理中…');try{await fn(version);}catch(error){if(valid(version))state(error.message,true);}}
-  function show(data){const result=el('db-result');result.replaceChildren();const table=document.createElement('table');const head=document.createElement('tr');for(const name of data.columns){const th=document.createElement('th');th.textContent=name;head.append(th);}table.append(head);for(const row of data.rows){const tr=document.createElement('tr');for(const value of row){const td=document.createElement('td');td.textContent=value===null?'NULL':String(value);td.title=td.textContent;tr.append(td);}table.append(tr);}result.append(table);state(`显示 ${data.rows.length} 行`+(data.limited?' · 结果已限制，请缩小范围':''));}
+  function show(data){const result=el('db-result');result.replaceChildren();const table=document.createElement('table');const head=document.createElement('tr');const numberHead=document.createElement('th');numberHead.textContent='#';numberHead.className='db-row-number';head.append(numberHead);for(const name of data.columns){const th=document.createElement('th');th.textContent=name;head.append(th);}table.append(head);for(const [index,row] of data.rows.entries()){const tr=document.createElement('tr');const number=document.createElement('td');number.textContent=(mode==='rows' && selectedTable ? rowPage*100 : 0)+index+1;number.className='db-row-number';tr.append(number);for(const value of row){const td=document.createElement('td');td.textContent=value===null?'NULL':String(value);td.classList.toggle('db-null',value===null);td.title=td.textContent;tr.append(td);}table.append(tr);}result.append(table);state(`显示 ${data.rows.length} 行`+(data.limited?' · 结果已限制，请缩小范围':''));}
   function setKind(){const kind=dialog.querySelector('[name=kind]').value;el('db-sqlite').hidden=kind!=='sqlite';el('db-mysql').hidden=kind!=='mysql';}
   async function catalog(version){
     const id=el('db-list').value;el('db-table-list').replaceChildren();if(!id)return;
@@ -79,7 +79,7 @@
   function open(){
     generation++;const workspace=project();context={key:key(),sid:currentSession,workspace};
     el('db-connect').reset();dialog.querySelector('[name=id]').value='';setKind();el('db-sql').value='';clearTable();el('db-table-list').replaceChildren();state('');
-    el('db-project').textContent=workspace || '选择项目文件夹';el('db-project').title=workspace || '';el('db-project-guide').hidden=!!workspace;el('db-content').hidden=!workspace;dialog.querySelector('.db-sidebar').hidden=!workspace;
+    el('db-project').textContent=workspace ? '项目 · '+workspace.split(/[\\/]/).filter(Boolean).pop() : '选择项目文件夹';el('db-project').title=workspace || '';el('db-project-guide').hidden=!!workspace;el('db-content').hidden=!workspace;dialog.querySelector('.db-sidebar').hidden=!workspace;
     if(!dialog.open)dialog.showModal();if(workspace)void run(version=>load(version));
   }
   function chooseProject(){reopen=true;dialog.close();void openPicker();}
