@@ -20,7 +20,8 @@ case "$1" in
     if pgrep -f "backend/app.py" > /dev/null; then
       echo "✔ 应用服务已在运行,跳过"
     else
-      nohup python3 backend/app.py > "$WEB_LOG" 2>&1 &
+      python3 start.py --install-only || exit 1
+      nohup .venv/bin/python backend/app.py > "$WEB_LOG" 2>&1 &
       echo "✔ 应用服务已启动 (PID $!)"
     fi
     if pgrep -f "cloudflared tunnel" > /dev/null; then
@@ -42,9 +43,10 @@ case "$1" in
     fi
     ;;
   restart)   # 只重启后端;隧道不动,公网网址保持不变
+    python3 start.py --install-only || exit 1
     pkill -f "backend/app.py" && echo "✔ 旧后端已停止" || echo "后端本来就没在跑"
     sleep 1
-    nohup python3 backend/app.py > "$WEB_LOG" 2>&1 &
+    nohup .venv/bin/python backend/app.py > "$WEB_LOG" 2>&1 &
     echo "✔ 后端已重启 (PID $!)"
     URL=$(get_url)
     [ -n "$URL" ] && echo "🌐 公网地址不变: $URL"

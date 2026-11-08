@@ -1,0 +1,2 @@
+# Default runtime dependencies. MySQL works after a normal project install.
+-r requirements-database.txt

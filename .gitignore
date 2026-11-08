@@ -26,3 +26,6 @@ workspace/
 # 智序实验输出与本机成员配置
 /runs/
 backend/experiments/cases/*/experiment.local.json
+
+# Portable local runtime
+.venv/

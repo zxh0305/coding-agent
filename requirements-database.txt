@@ -1,0 +1,2 @@
+# Installed by the default project requirements, including MySQL authentication.
+PyMySQL[rsa]==1.2.3

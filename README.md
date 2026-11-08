@@ -4,7 +4,7 @@
 
 一个跑在本机的 AI 编程助手：你在网页里用自然语言提任务，它在指定的本地文件夹里读代码、改文件、跑命令，并把执行过程实时展示给你看。
 
-后端纯 Python 标准库（不用任何 Web 框架），前端原生 HTML/CSS/JS（无构建步骤），零第三方依赖。前后端分离，数据全部落在本机。
+后端纯 Python 标准库（不用任何 Web 框架），前端原生 HTML/CSS/JS（无构建步骤），核心服务使用标准库，默认依赖包含 MySQL 驱动。前后端分离，数据全部落在本机。
 
 ```
  浏览器 frontend/                        后端 backend/
@@ -39,8 +39,8 @@
 ## 二、快速开始
 
 ```bash
-python3 backend/app.py
-# 浏览器打开 http://127.0.0.1:8000
+python3 start.py
+# 自动安装项目依赖，浏览器打开 http://127.0.0.1:8000
 # 登录后，在「模型配置」填 API Key（可顺便改 Base URL / 模型名）→ 保存 → 直接对话
 ```
 
@@ -423,7 +423,7 @@ cd backend/manual
 
 ### 项目数据库（第一批，只读）
 
-打开已绑定项目的会话，点击输入区“数据库”，保存 SQLite 文件连接或 MySQL 连接，查看结构并执行 SQL。SQLite 文件须已存在；结果最多200行，查询有5秒执行预算。MySQL 需 `pip install pymysql`，并使用专用只读账号；需支持 `MAX_EXECUTION_TIME` 与只读事务的 MySQL，不宣称兼容所有 MariaDB 版本。
+打开已绑定项目的会话，点击输入区“数据库”，保存 SQLite 文件连接或 MySQL 连接，查看结构并执行 SQL。SQLite 文件须已存在；结果最多200行，查询有5秒执行预算。项目启动器会自动安装 MySQL 驱动，请使用专用只读账号；需支持 `MAX_EXECUTION_TIME` 与只读事务的 MySQL，不宣称兼容所有 MariaDB 版本。
 
 连接配置按应用用户和项目路径隔离。密码仅保存在本机 `data/database-connections.json`（文件权限0600，不加密），不返回浏览器、不传给模型。该文件及其备份须按凭据保管。第一批尚无数据写入、表结构修改和SQL历史记录功能。Agent 可在权限确认后使用 database_connections、database_schema、database_query，共用只读执行器。
 
@@ -436,3 +436,20 @@ python3 backend/database_cli.py query --user 你的应用用户名 --workspace /
 ```
 
 查询也可用 `--file query.sql` 替代 `--sql`。不要把数据库密码放入命令行参数或 SQL。数据库工作台与 Agent 不会建立数据库级安全沙箱，MySQL 的最小权限仍应由数据库专用账号落实。
+
+
+### 克隆后运行（包含 MySQL 支持）
+
+不依赖开发者电脑中的 MySQL 客户端、Homebrew 或全局 Python 包。需要 Python 3.11+，首次安装需要访问包源：
+
+```bash
+git clone https://github.com/zxh0305/coding-agent.git
+cd coding-agent
+python3 start.py
+```
+
+Windows 使用 `py start.py`。启动器在项目 `.venv` 内安装仓库声明的依赖；依赖未变化时不会重复安装。手动安装可用 `python -m pip install -r requirements.txt`。命令行查询也应使用该虚拟环境的 Python。
+
+在应用里选择 MySQL，填写你要访问的 MySQL 服务地址、端口、库名和只读账号，点“测试连接”。不需要在应用电脑上安装 MySQL 服务。驱动支持 MySQL 8 的 caching_sha2_password 认证，相关依赖一并安装。
+
+真实 MySQL 联调脚本 `backend/manual/smoke_mysql.py` 是开发测试工具，需要 mysqld 才能启动临时实例；正常应用运行完全不依赖该脚本或本机 mysqld。

@@ -20,7 +20,8 @@ def save(uid,workspace,body):
     workspace=str(Path(workspace).expanduser().resolve())
     kind=body.get('kind');name=body.get('name','').strip()
     if kind not in ('sqlite','mysql') or not name or len(name)>100:raise ValueError('连接名称或类型无效')
-    item=dict(id=uuid.uuid4().hex,owner=uid,workspace=workspace,name=name,kind=kind)
+    existing=_get(uid,workspace,body['id']) if body.get('id') else None
+    item=dict(id=existing['id'] if existing else uuid.uuid4().hex,owner=uid,workspace=workspace,name=name,kind=kind)
     if kind=='sqlite':
         path=Path(body.get('path','')).expanduser()
         if not path.is_absolute():path=Path(workspace)/path
@@ -33,10 +34,10 @@ def save(uid,workspace,body):
             value=body.get(key)
             if not isinstance(value,str) or not value or len(value)>255:raise ValueError('MySQL 连接信息不完整')
             item[key]=value
-        item['port']=int(body.get('port',3306));item['password']=body.get('password','')
+        item['port']=int(body.get('port',3306));item['password']=body.get('password','') or (existing.get('password','') if existing and existing['kind']=='mysql' else '')
         if not isinstance(item['password'],str) or not 1<=item['port']<=65535:raise ValueError('连接信息无效')
     with _LOCK:
-        items=_load();items.append(item);_save(items)
+        items=[x for x in _load() if x['id']!=item['id']];items.append(item);_save(items)
     return item['id']
 def remove(uid,workspace,ident):
     workspace=str(Path(workspace).expanduser().resolve())
@@ -58,7 +59,7 @@ def _connect(item):
         return conn
     try:import pymysql
     except ImportError:raise ValueError('MySQL 需要安装可选依赖：pip install pymysql') from None
-    conn=pymysql.connect(host=item['host'],port=item['port'],user=item['user'],password=item['password'],database=item['database'],connect_timeout=3,read_timeout=6,write_timeout=3,autocommit=False,cursorclass=pymysql.cursors.SSCursor)
+    conn=pymysql.connect(host=item['host'],port=item['port'],user=item['user'],password=item['password'],database=item['database'],charset='utf8mb4',connect_timeout=3,read_timeout=6,write_timeout=3,autocommit=False,cursorclass=pymysql.cursors.SSCursor)
     try:
         with conn.cursor() as cursor:
             cursor.execute('SET SESSION MAX_EXECUTION_TIME=5000')
@@ -66,11 +67,19 @@ def _connect(item):
     except Exception:conn.close();raise
     return conn
 
+def test_connection(uid,workspace,ident):
+    result=query(uid,workspace,ident,'SELECT 1')
+    return {'ok':True,'message':'连接成功，只读查询可用'}
+
 def query(uid,workspace,ident,sql):
     item=_get(uid,workspace,ident)
-    if not isinstance(sql,str) or len(sql)>32000 or not re.match(r'^\s*(SELECT|WITH|EXPLAIN)\b',sql,re.I):raise ValueError('第一版仅支持 SELECT、WITH 查询和 EXPLAIN')
+    if not isinstance(sql,str) or len(sql)>32000:raise ValueError('SQL 无效或超过长度限制')
+    sql=sql.strip().removesuffix(';').rstrip()
+    ordinary=re.match(r'^(SELECT|WITH|EXPLAIN)\b',sql,re.I)
+    metadata=item['kind']=='mysql' and re.match(r'^(SHOW\s+(?:FULL\s+)?(?:TABLES|COLUMNS|INDEX|INDEXES|KEYS|CREATE\s+TABLE)\b|DESCRIBE\s+)',sql,re.I)
+    if not ordinary and not metadata:raise ValueError('仅支持只读查询、EXPLAIN 和 MySQL 表结构查询')
     if item['kind']=='mysql' and re.search(r';|\b(INTO|OUTFILE|DUMPFILE|SLEEP|BENCHMARK|GET_LOCK|RELEASE_LOCK)\b',sql,re.I):raise ValueError('不支持多语句或带副作用的查询')
-    conn=None
+    conn=None;cursor=None
     try:
         conn=_connect(item);cursor=conn.cursor();cursor.execute(sql)
         cols=[x[0] for x in cursor.description or []];rows=[];size=0;limited=False
@@ -83,10 +92,23 @@ def query(uid,workspace,ident,sql):
             rows.append(values)
         return {'columns':cols,'rows':rows,'limited':limited}
     except ValueError:raise
-    except Exception:raise ValueError('连接或查询失败：请检查连接信息、只读权限、SQL 语法及超时限制') from None
+    except Exception as error:
+        code=error.args[0] if error.args else None
+        reason={1045:'MySQL 认证失败，请检查用户名和密码',1049:'MySQL 数据库不存在',1142:'数据库账号没有所需读取权限',1146:'查询的表不存在',1064:'SQL 语法错误',1193:'数据库不支持查询超时设置，请使用支持 MAX_EXECUTION_TIME 的 MySQL',2003:'无法连接 MySQL，请检查地址、端口和服务状态',2013:'MySQL 连接中断或查询超时',3024:'查询超过执行时间限制'}.get(code,'连接或查询失败：请检查连接信息、只读权限、SQL 语法及超时限制')
+        raise ValueError(reason) from None
     finally:
-        if conn:conn.close()
+        if conn:
+            # We deliberately abandon rows beyond the cap, rather than draining
+            # an unbounded SSCursor. Disarm PyMySQL's destructor before closing
+            # its one-shot socket (never pooled or reused).
+            result=getattr(conn,'_result',None)
+            if result is not None and getattr(result,'unbuffered_active',False):
+                result.unbuffered_active=False
+                if cursor is not None:
+                    cursor._result=None
+                    cursor.connection=None
+            conn.close()
 def tables(uid,workspace,ident):
     item=_get(uid,workspace,ident)
-    sql="SELECT name,type,sql FROM sqlite_schema WHERE type IN ('table','view','index') AND name NOT LIKE 'sqlite_%' ORDER BY name" if item['kind']=='sqlite' else 'SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION'
+    sql="SELECT name,type,sql FROM sqlite_schema WHERE type IN ('table','view','index') AND name NOT LIKE 'sqlite_%' ORDER BY name" if item['kind']=='sqlite' else 'SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_KEY,COLUMN_DEFAULT,EXTRA,COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION'
     return query(uid,workspace,ident,sql)

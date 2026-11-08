@@ -22,6 +22,16 @@ class DatabaseTests(unittest.TestCase):
         ident=service.save(1,str(self.root),dict(name='mysql',kind='mysql',host='localhost',user='reader',database='demo',password='secret'))
         self.assertNotIn('secret',str(service.connections(1,str(self.root))));self.assertEqual(service._file().stat().st_mode & 0o777,0o600)
         service.remove(1,str(self.root),ident);self.assertEqual(len(service.connections(1,str(self.root))),1)
+    def test_edit_mysql_preserves_password_without_returning_it(self):
+        body=dict(name='mysql',kind='mysql',host='localhost',user='reader',database='demo',password='secret')
+        ident=service.save(1,str(self.root),body)
+        result=service.save(1,str(self.root),dict(body,id=ident,host='db.example',password=''))
+        self.assertEqual(result,ident)
+        self.assertEqual(service._get(1,str(self.root),ident)['password'],'secret')
+        self.assertEqual(service._get(1,str(self.root),ident)['host'],'db.example')
+        self.assertEqual(len(service.connections(1,str(self.root))),2)
+        with self.assertRaises(ValueError):service.save(2,str(self.root),dict(body,id=ident))
+
     def test_missing_file_not_created(self):
         with self.assertRaises(ValueError):service.save(1,str(self.root),dict(name='bad',kind='sqlite',path='missing.db'))
         self.assertFalse((self.root/'missing.db').exists())
