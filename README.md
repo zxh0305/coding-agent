@@ -421,22 +421,24 @@ cd backend/manual
 
 此批验证：后端882项、前端105项通过。隔离账号的真实窗口联调覆盖手动输入、Agent 共用页面、接管/交回、跨线程调用、页面刷新、关闭重开后的存储和手机布局；已回归补充当前任务与引用提问。
 
-### 项目数据库（第一批，只读）
+### 项目数据库与 SQL 工作台
 
-新任务选择项目后即可点击顶部“数据库”，不必先发送消息或创建会话；保存 SQLite 或 MySQL 连接后，从左侧数据库树搜索、分页选择表，在右侧查看字段结构或分页数据，也可展开 SQL 编辑器查询。SQLite 文件须已存在；结果最多200行，查询有5秒执行预算。项目启动器会自动安装 MySQL 驱动，请使用专用只读账号；需支持 `MAX_EXECUTION_TIME` 与只读事务的 MySQL，不宣称兼容所有 MariaDB 版本。
+先选项目，再点击顶部“数据库”，无需发送消息。支持 SQLite 与 MySQL，多连接列表中绿色表示实际连接可用、灰色表示断开，闪电按钮可连接/断开。每个连接由当前应用用户与项目隔离；修改配置会关闭旧连接，15分钟空闲自动释放。状态定期检查，服务重启后重新建立连接，不把历史成功记录当成在线状态。
 
-连接配置按应用用户和项目路径隔离。密码仅保存在本机 `data/database-connections.json`（文件权限0600，不加密），不返回浏览器、不传给模型。该文件及其备份须按凭据保管。第一批尚无数据写入、表结构修改和SQL历史记录功能。Agent 可在权限确认后使用 database_connections、database_schema、database_query，共用只读执行器。
+左侧数据库/表目录支持搜索和分页；右侧查看字段、分页数据与完整单元格。SQL 编辑器可执行增删改、建表和其他单条语句，不按SQL类型设置应用级白名单，由MySQL账号权限或SQLite文件权限决定。修改立即提交，返回影响行数；表结构操作可能由数据库隐式提交，不能承诺统一回滚。连接丢失时不自动重试写入，先核对实际结果。多条 SQL 可保存为常用内容，选中其中一条再执行；支持 Ctrl/Cmd+Enter。
 
-命令行在后端电脑上运行，信任当前操作系统账号，可读取本机配置；它不是对外开放的身份认证入口：
+常用 SQL 可命名保存、选择、更新与删除，服务端保存在 data/database-snippets.json，刷新、退出或重新登录后仍可读取。当前编辑草稿与选中的连接额外保存在当前浏览器，加载SQL不会自动执行。
+
+项目启动器自动安装MySQL驱动。连接密码存放在 data/database-connections.json，文件权限0600，不返回浏览器或模型；常用SQL文件同样0600。它们不是加密保险库。SQLite不自动创建新文件。结果上限200行、执行超时等资源预算仍保留。
+
+Agent保留只读的database_query工具，并新增经权限确认、串行执行的database_execute；命令行示例：
 
 ```bash
-python3 backend/database_cli.py list --user 你的应用用户名 --workspace /绝对项目路径
-python3 backend/database_cli.py tables --user 你的应用用户名 --workspace /绝对项目路径 --connection 连接ID
-python3 backend/database_cli.py query --user 你的应用用户名 --workspace /绝对项目路径 --connection 连接ID --sql 'SELECT * FROM notes LIMIT 20'
+.venv/bin/python backend/database_cli.py query --user 你的用户名 --workspace /项目绝对路径 --connection 连接ID --sql 'SELECT * FROM notes LIMIT 20'
+.venv/bin/python backend/database_cli.py execute --user 你的用户名 --workspace /项目绝对路径 --connection 连接ID --sql "UPDATE notes SET title='updated' WHERE id=1"
 ```
 
-查询也可用 `--file query.sql` 替代 `--sql`。不要把数据库密码放入命令行参数或 SQL。数据库工作台与 Agent 不会建立数据库级安全沙箱，MySQL 的最小权限仍应由数据库专用账号落实。
-
+Windows使用 `.venv\Scripts\python.exe`。CLI信任当前操作系统账号，不是公网身份认证入口；可用 `--file query.sql` 替代 `--sql`。MySQL需支持MAX_EXECUTION_TIME；不宣称兼容所有MariaDB版本。
 
 ### 克隆后运行（包含 MySQL 支持）
 

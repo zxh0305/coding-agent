@@ -1,4 +1,4 @@
-"""Project-bound read-only database connections. Credentials never leave this service."""
+"""Project-bound connection configuration and bounded database browsing."""
 import json, os, re, sqlite3, threading, time, uuid
 from pathlib import Path
 import db
@@ -37,32 +37,38 @@ def save(uid,workspace,body):
         if not isinstance(item['password'],str) or not 1<=item['port']<=65535:raise ValueError('连接信息无效')
     with _LOCK:
         items=[x for x in _load() if x['id']!=item['id']];items.append(item);_save(items)
+    if existing:
+        from services.database_runtime import forget
+        forget(uid,workspace,item['id'])
     return item['id']
 def remove(uid,workspace,ident):
     workspace=str(Path(workspace).expanduser().resolve())
     with _LOCK:_save([x for x in _load() if not(x['id']==ident and x['owner']==uid and x['workspace']==workspace)])
+    from services.database_runtime import forget
+    forget(uid,workspace,ident)
 def _get(uid,workspace,ident):
     workspace=str(Path(workspace).expanduser().resolve())
     with _LOCK:
         for x in _load():
             if x['id']==ident and x['owner']==uid and x['workspace']==workspace:return x
     raise ValueError('连接不存在或不属于当前项目')
-def _connect(item,metadata=False):
+def _connect(item,metadata=False,writable=False):
     if item['kind']=='sqlite':
-        conn=sqlite3.connect(Path(item['path']).as_uri()+'?mode=ro',uri=True,timeout=3)
+        conn=sqlite3.connect(Path(item['path']).as_uri()+('?mode=rw' if writable else '?mode=ro'),uri=True,timeout=3,check_same_thread=not writable)
         conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH,200000)
+        if writable:return conn
         conn.execute('PRAGMA query_only=ON');deadline=time.monotonic()+5
         conn.set_progress_handler(lambda:time.monotonic()>deadline,1000)
         allowed={sqlite3.SQLITE_SELECT,sqlite3.SQLITE_READ,sqlite3.SQLITE_FUNCTION,sqlite3.SQLITE_RECURSIVE}
         conn.set_authorizer(lambda action,*args:sqlite3.SQLITE_OK if (metadata and action==sqlite3.SQLITE_PRAGMA and args[0]=='table_info') or action in allowed and not(action==sqlite3.SQLITE_FUNCTION and str(args[1]).lower() in ('load_extension','writefile','readfile')) else sqlite3.SQLITE_DENY)
         return conn
     try:import pymysql
-    except ImportError:raise ValueError('MySQL 需要安装可选依赖：pip install pymysql') from None
-    conn=pymysql.connect(host=item['host'],port=item['port'],user=item['user'],password=item['password'],database=item['database'],charset='utf8mb4',connect_timeout=3,read_timeout=6,write_timeout=3,autocommit=False,cursorclass=pymysql.cursors.SSCursor)
+    except ImportError:raise ValueError('MySQL 驱动未安装，请运行 python start.py 或安装 requirements.txt') from None
+    conn=pymysql.connect(host=item['host'],port=item['port'],user=item['user'],password=item['password'],database=item['database'],charset='utf8mb4',connect_timeout=3,read_timeout=6,write_timeout=3,autocommit=writable,cursorclass=pymysql.cursors.SSCursor)
     try:
         with conn.cursor() as cursor:
             cursor.execute('SET SESSION MAX_EXECUTION_TIME=5000')
-            cursor.execute('START TRANSACTION READ ONLY')
+            if not writable:cursor.execute('START TRANSACTION READ ONLY')
     except Exception:conn.close();raise
     return conn
 

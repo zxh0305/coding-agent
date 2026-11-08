@@ -48,6 +48,20 @@ try:
     with patch.object(sys,'argv',['database_cli','query','--owner',str(case.uid),'--workspace',str(root),'--connection',ident,'--sql','SELECT count(*) FROM notes']),redirect_stdout(output):database_cli.main()
     assert json.loads(output.getvalue())['rows']==[[220]]
     with admin.cursor() as cursor:cursor.execute('SELECT VERSION()');version=cursor.fetchone()[0]
+    from services import database_runtime as runtime
+    with admin.cursor() as cursor:
+        cursor.execute("CREATE USER 'writer'@'127.0.0.1' IDENTIFIED BY 'isolated-writer-password'");cursor.execute("GRANT ALL ON demo.* TO 'writer'@'127.0.0.1'")
+    writer=service.save(case.uid,str(root),dict(body,name='Writer',user='writer',password='isolated-writer-password'))
+    runtime.execute(case.uid,str(root),writer,'CREATE TABLE write_test(id INT PRIMARY KEY,title VARCHAR(100))')
+    assert runtime.execute(case.uid,str(root),writer,"INSERT INTO write_test VALUES(1,'test')")['affected_rows']==1
+    runtime.execute(case.uid,str(root),writer,"UPDATE write_test SET title='changed'")
+    assert runtime.execute(case.uid,str(root),writer,'SELECT title FROM write_test')['rows']==[['changed']]
+    runtime.execute(case.uid,str(root),writer,'DELETE FROM write_test');runtime.execute(case.uid,str(root),writer,'DROP TABLE write_test')
+    try:runtime.execute(case.uid,str(root),ident,"UPDATE notes SET title='forbidden'");raise AssertionError('readonly account accepted write')
+    except ValueError as error:assert '权限' in str(error),error
+    limited=runtime.execute(case.uid,str(root),ident,'SELECT * FROM notes ORDER BY id');assert len(limited['rows'])==200 and limited['limited'] and limited['connected']
+    assert runtime.execute(case.uid,str(root),ident,'SELECT count(*) FROM notes')['rows']==[[220]]
+    assert runtime.status(case.uid,str(root),writer)['connected'];runtime.disconnect(case.uid,str(root),writer);assert not runtime.status(case.uid,str(root),writer)['connected']
     from playwright.sync_api import sync_playwright,expect
     db.create_user('mysql-ui','browser-test-pass');ui_uid=db.get_user_by_name('mysql-ui')['id'];db.create_session('mysql-ui',ui_uid,workspace=str(root))
     with sync_playwright() as pw:

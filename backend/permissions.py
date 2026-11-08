@@ -412,6 +412,7 @@ READONLY_TOOLS = {"read_file", "list_dir", "grep", "analyze_image", "todo_write"
 BROWSER_ASK_RULES = [
     Rule("database_connections", None, ASK, "查看项目数据库连接"),
     Rule("database_schema", None, ASK, "读取数据库结构"),
+    Rule("database_execute", None, ASK, "执行数据库SQL（含数据与表结构变更）"),
     Rule("database_query", None, ASK, "执行只读数据库查询"),
     Rule("browser_snapshot", None, ASK, "读取浏览器页面摘要"),
     Rule("browser_press", None, ASK, "操作浏览器按键"),

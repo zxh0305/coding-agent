@@ -2987,3 +2987,15 @@ button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset
 #db-result .db-json-preview {display:block;padding:0;background:transparent;color:#68558e;max-width:300px;overflow:hidden;text-overflow:ellipsis;font:11px/1.6 ui-monospace,monospace;white-space:pre;}
 #db-result.db-wrap-values .db-json-preview {white-space:pre-wrap;overflow-wrap:anywhere;max-height:110px;overflow:auto;}
 @media(max-width:720px){#db-tree {flex:none;min-height:0;}#db-tree-body {flex:none;max-height:290px;}#db-table-list {flex:none;max-height:170px;}.db-sidebar:has(#db-config[open]) #db-tree-body {height:230px;}}
+#db-list {display:none!important;}
+#db-connections {max-height:185px;overflow:auto;margin-top:7px;display:flex;flex-direction:column;gap:4px;}
+.db-source-row {display:flex;align-items:center;border-radius:6px;gap:4px;}.db-source-row.active {background:#edf2fc;}
+.database-dialog .db-source-select {flex:1;min-width:0;justify-content:flex-start;border:0;background:transparent;padding:7px 4px;font-size:12px;}
+.db-source-select span {overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.db-status-dot {width:7px;height:7px;border-radius:50%;background:#a6aebc;flex-shrink:0;}.db-status-dot[data-connected=true] {background:#35a66d;box-shadow:0 0 0 3px #35a66d12;}
+.database-dialog .db-source-power {background:transparent;border:0;font-size:20px;color:#657aab;padding:2px 7px;}
+.db-connection-card .db-connection-actions {flex-wrap:wrap;}
+.db-snippet-bar {display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin:10px 0;}.db-snippet-bar select {width:180px;}.db-snippet-bar input {flex:1;min-width:120px;}
+@media(max-width:720px){.db-snippet-bar select {width:100%;}#db-connections {max-height:145px;}}
+.db-execution-result {padding:26px;margin:18px;border:1px solid #dce9e1;border-radius:8px;background:#f5faf7;}.db-execution-result strong {color:#32734b;font-size:14px;}.db-execution-result p {font-size:12px;color:var(--text-2);margin:8px 0 0;}
+.db-source-kind {margin-left:auto;font:9px ui-monospace,monospace;color:var(--text-3);text-transform:uppercase;}.db-source-row.active .db-source-select {font-weight:600;}

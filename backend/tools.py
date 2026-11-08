@@ -415,4 +415,4 @@ def describe_tools() -> str:
 from database_tools import REGISTRY as DATABASE_TOOLS, SCHEMAS as DATABASE_SCHEMAS
 TOOL_REGISTRY.update(DATABASE_TOOLS)
 TOOL_SCHEMAS.extend(DATABASE_SCHEMAS)
-TOOL_READ_ONLY.update({name: True for name in DATABASE_TOOLS})
+TOOL_READ_ONLY.update({name: name != "database_execute" for name in DATABASE_TOOLS})
