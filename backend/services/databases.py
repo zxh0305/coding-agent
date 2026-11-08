@@ -14,8 +14,8 @@ def _save(items):
     with os.fdopen(fd,'w') as out:json.dump(items,out)
     os.replace(temp,path);os.chmod(path,0o600)
 def connections(uid,workspace):
-    workspace=str(Path(workspace).expanduser().resolve())
-    with _LOCK:return [{k:v for k,v in x.items() if k!='password'} for x in _load() if x['owner']==uid and x['workspace']==workspace]
+    workspace=str(Path(workspace).expanduser().resolve()) if workspace is not None else None
+    with _LOCK:return [{k:v for k,v in x.items() if k!='password'} for x in _load() if x['owner']==uid and (workspace is None or x['workspace']==workspace)]
 def save(uid,workspace,body):
     workspace=str(Path(workspace).expanduser().resolve())
     kind=body.get('kind');name=body.get('name','').strip()
@@ -161,3 +161,13 @@ def table_rows(uid,workspace,ident,name,page=0):
     result=query(uid,workspace,ident,f'SELECT * FROM {quoted}{order} LIMIT 101 OFFSET {page*100}',_metadata=True)
     result['has_more']=len(result['rows'])>100;result['rows']=result['rows'][:100];result['page']=page;result['stable_order']=bool(keys)
     return result
+
+
+def rename(uid,workspace,ident,name):
+    if not isinstance(name,str) or not name.strip() or len(name)>100:raise ValueError('请输入连接名称（最多100字）')
+    with _LOCK:
+        item=_get(uid,workspace,ident);items=_load()
+        for entry in items:
+            if entry['id']==item['id']:entry['name']=name.strip()
+        _save(items)
+    return {'ok':True}

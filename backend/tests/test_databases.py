@@ -88,3 +88,8 @@ class DatabaseApiTests(ApiTestBase):
         output=io.StringIO()
         with patch.object(sys,'argv',['database_cli','query','--owner',str(self.uid),'--workspace',str(root),'--connection',ident,'--sql','SELECT * FROM sample']),redirect_stdout(output):database_cli.main()
         self.assertEqual(json.loads(output.getvalue())['rows'],[['hello']])
+
+    def test_global_workbench_without_session(self):
+        status,data=self.call('GET','/api/databases?global=1')
+        self.assertEqual(status,200);self.assertIn('connections',data)
+        self.assertEqual(self.call('GET','/api/databases?global=1',token=False)[0],401)

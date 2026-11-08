@@ -2999,3 +2999,19 @@ button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset
 @media(max-width:720px){.db-snippet-bar select {width:100%;}#db-connections {max-height:145px;}}
 .db-execution-result {padding:26px;margin:18px;border:1px solid #dce9e1;border-radius:8px;background:#f5faf7;}.db-execution-result strong {color:#32734b;font-size:14px;}.db-execution-result p {font-size:12px;color:var(--text-2);margin:8px 0 0;}
 .db-source-kind {margin-left:auto;font:9px ui-monospace,monospace;color:var(--text-3);text-transform:uppercase;}.db-source-row.active .db-source-select {font-weight:600;}
+
+/* A single, independent entry for personal database connections. */
+.sidebar .database-nav {display:flex;align-items:center;gap:10px;margin:8px 16px 0;width:calc(100% - 32px);padding:11px 14px;text-align:left;font-size:14px;}
+.database-nav svg {width:18px;height:18px;flex:none;color:#6277ad;}
+.database-dialog .db-connection-actions {display:flex;flex-wrap:wrap;gap:5px;}
+.database-dialog .db-connection-actions button {font-size:12px;padding:6px 8px;}
+.database-dialog #db-project:disabled {opacity:1;cursor:default;border:0;background:transparent;color:var(--muted,#697386);}
+.db-rename-dialog {width:min(420px,calc(100vw - 32px));border:1px solid #e1e6f0;border-radius:16px;padding:24px;box-shadow:0 20px 70px #18243830;color:#252b38;}
+.db-rename-dialog::backdrop {background:#18243850;}
+.db-rename-dialog h3 {margin:0 0 20px;font-size:18px;}
+.db-rename-dialog label {display:grid;gap:8px;font-size:13px;}
+.db-rename-dialog input {width:100%;box-sizing:border-box;border:1px solid #dce2ed;border-radius:8px;padding:10px 12px;font:inherit;}
+.db-rename-dialog p {font-size:12px;color:#788295;line-height:1.6;}
+.db-rename-dialog footer {display:flex;justify-content:flex-end;gap:8px;margin-top:24px;}
+.db-rename-dialog button {padding:8px 14px;border:1px solid #dce2ed;border-radius:8px;background:#fff;color:inherit;cursor:pointer;}
+.db-rename-dialog .db-primary {background:#496bce;color:#fff;border-color:#496bce;}

@@ -1,25 +1,25 @@
-/* Project-scoped read-only database workbench. */
+/* Personal database workbench; saved SQL and drafts are isolated per connection. */
 (() => {
-  const chip=document.createElement('button');chip.className='git-chip';chip.innerHTML='<svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0"/></svg><span class="chip-label">数据库</span>';chip.id='database-chip';chip.type='button';chip.title='项目数据库';chip.setAttribute('aria-label','项目数据库');chip.setAttribute('aria-haspopup','dialog');
-  document.getElementById('project-context-open').after(chip);
+  const chip=document.createElement('button');chip.className='git-chip';chip.innerHTML='<svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0"/></svg><span class="chip-label">数据库</span>';chip.id='database-chip';chip.type='button';chip.title='数据库工作台';chip.setAttribute('aria-label','数据库工作台');chip.setAttribute('aria-haspopup','dialog');
+  document.getElementById('exp-open').before(chip);chip.className='new-task database-nav';chip.querySelector('.chip-label').textContent='数据库工作台';
   const icons={bolt:'<path d="m13 2-9 12h7l-1 8 10-12h-7l1-8Z"/>',database:'<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0"/>',table:'<rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 9v12"/>',search:'<circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/>',eye:'<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>',copy:'<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M15 8V4H4v11h4"/>'};
   const icon=name=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">'+icons[name]+'</svg>';
   const dialog=document.createElement('dialog');dialog.className='database-dialog';
-  dialog.setAttribute('aria-label','项目数据库');
+  dialog.setAttribute('aria-label','数据库工作台');
   dialog.innerHTML=`
     <header class="db-header"><div><span class="db-brand-icon">${icon("database")}</span><h2>数据库工作台<span class="db-badge">账号权限</span></h2><button id="db-project" class="db-project">选择项目文件夹</button></div><button id="db-close" aria-label="关闭数据库">✕</button></header>
     <div class="db-workbench">
       <aside class="db-sidebar">
-        <div class="db-section-heading"><h3>项目连接</h3><button id="db-add" title="添加连接" aria-label="添加连接">＋</button></div>
-        <div class="db-connection-card"><span class="db-card-caption">已保存的连接</span><select id="db-list" aria-label="数据库连接"></select><div id="db-connections" aria-label="项目连接列表"></div><div id="db-connection-meta" class="db-connection-meta"></div>
-        <div class="db-connection-actions"><button id="db-connect-toggle" title="连接或断开数据库">ϟ 连接</button><button id="db-edit">编辑</button><button id="db-test">测试连接</button><button id="db-remove" class="db-danger">移除</button></div></div>
+        <div class="db-section-heading"><h3>数据库连接</h3><button id="db-add" title="添加连接" aria-label="添加连接">＋</button></div>
+        <div class="db-connection-card"><span class="db-card-caption">已保存的连接</span><select id="db-list" aria-label="数据库连接"></select><div id="db-connections" aria-label="数据库连接列表"></div><div id="db-connection-meta" class="db-connection-meta"></div>
+        <div class="db-connection-actions"><button id="db-connect-toggle" title="连接或断开数据库">ϟ 连接</button><button id="db-edit">编辑</button><button id="db-test">测试</button><button id="db-rename">重命名</button><button id="db-remove" class="db-danger">删除连接</button></div></div>
         <div class="db-divider"></div><section id="db-tree"><button id="db-tree-toggle" aria-expanded="true"><span class="db-tree-chevron" aria-hidden="true">⌄</span>${icon("database")}<strong id="db-database-name">数据库</strong></button><div id="db-tree-body"><div class="db-section-heading"><span>表与视图</span><button id="db-refresh">刷新</button></div><div class="db-search-field">${icon("search")}<input id="db-search" placeholder="搜索表名…" aria-label="搜索表名"></div><div id="db-table-list"></div><div class="db-tree-pages"><button id="db-table-prev">上一页</button><span id="db-table-page"></span><button id="db-table-next">下一页</button></div></div></section>
         <details id="db-config" open><summary>连接配置</summary>
         <form id="db-connect">
           <input type="hidden" name="id">
           <label>连接名称<input name="name" placeholder="例如：开发环境" required></label>
           <label>数据库类型<select name="kind"><option value="sqlite">SQLite</option><option value="mysql">MySQL</option></select></label>
-          <div id="db-sqlite"><label>数据库文件<input name="path" placeholder="例如：data/demo.db"></label><p class="db-help">支持项目相对路径或绝对路径，不会创建新文件。</p></div>
+          <div id="db-sqlite"><label>数据库文件<input name="path" placeholder="例如：/Users/me/data/demo.db"></label><p class="db-help">请输入 SQLite 文件的绝对路径，不会创建新文件。</p></div>
           <div id="db-mysql" hidden>
             <div class="db-host-row"><label>主机地址<input name="host" placeholder="127.0.0.1" spellcheck="false"></label><label>端口<input name="port" type="number" value="3306"></label></div>
             <label>数据库名称<input name="database" placeholder="数据库名" spellcheck="false"></label>
@@ -46,9 +46,8 @@
 
   const el=id=>dialog.querySelector('#'+id);
   const cellEl=id=>inspector.querySelector('#'+id);
-  let context=null,generation=0,saving=false,executing=false,connectionStates={},statusRevision=0,preferredConnection=null,snippets=[],snippetId=null,connections=[],selectedTable=null,tablePage=0,rowPage=0,hasTables=false,hasRows=false,mode='schema',search='',reopen=false,searchTimer;
-  const project=()=>currentSession ? (wsCustom ? confirmedWorkspace : null) : pendingProjectPath;
-  const key=()=>JSON.stringify([authToken,currentSession,project()]);
+  let context=null,generation=0,saving=false,executing=false,connectionStates={},statusRevision=0,preferredConnection=null,snippets=[],snippetId=null,connections=[],selectedTable=null,tablePage=0,rowPage=0,hasTables=false,hasRows=false,mode='schema',search='',searchTimer;
+  const key=()=>JSON.stringify([authToken]);
   const valid=version=>dialog.open && context && context.key===key() && (version===undefined || version===generation);
   function empty(text){resetCell();const result=el('db-result');result.dataset.empty='true';result.replaceChildren();const node=document.createElement('div');node.className='db-empty';const glyph=document.createElement('span');glyph.className='db-empty-icon';glyph.innerHTML=icon('table');const title=document.createElement('strong');title.textContent=text;const hint=document.createElement('p');hint.textContent='字段结构与表数据分开查看，也可以展开 SQL 编辑器查询。';node.append(glyph,title,hint);result.append(node);}
   function connectionMeta(){const item=connections.find(x=>x.id===el('db-list').value);const meta=el('db-connection-meta');meta.textContent=item ? (item.kind==='sqlite'?'SQLite · '+item.path.split(/[\\/]/).pop():'MySQL · '+item.host+':'+item.port+' / '+item.database) : '添加连接后即可浏览表和数据';meta.title=item?.path || meta.textContent;}
@@ -56,10 +55,10 @@
   function state(text,error=false){dialog.dataset.loading=text==='处理中…'?'true':'false';el('db-state').textContent=text;el('db-state').dataset.tone=error?'error':'';}
   function clearTable(){selectedTable=null;rowPage=0;hasRows=false;mode='schema';el('db-fields').disabled=true;el('db-data').disabled=true;el('db-fields').classList.remove('active');el('db-data').classList.remove('active');el('db-breadcrumb').textContent='选择数据库连接，再选择一张表';el('db-row-page').textContent='';el('db-row-prev').disabled=true;el('db-row-next').disabled=true;empty('选择左侧的表，查看字段结构或表数据');}
   async function request(body,version){
-    if(!valid(version))throw new Error('项目已切换，请重新打开数据库');
+    if(!valid(version))throw new Error('工作台状态已变化，请重新打开');
     const scope=context;
-    const data=await api('/api/databases',{method:'POST',body:JSON.stringify({session_id:scope.sid,workspace:scope.workspace,...body})});
-    if(!valid(version))throw new Error('项目已切换');return data;
+    const data=await api('/api/databases',{method:'POST',body:JSON.stringify({global:true,id:el('db-list').value,...body})});
+    if(!valid(version))throw new Error('工作台状态已变化');return data;
   }
   async function run(fn){const version=++generation;if(!valid())return;state('处理中…');try{await fn(version);}catch(error){if(valid(version))state(error.message,true);}}
   function resetCell(){if(selectedCell)selectedCell.node.classList.remove('db-cell-selected');selectedCell=null;el('db-cell-open').disabled=true;if(inspector.open)inspector.close();}
@@ -112,23 +111,28 @@
     show(data);hasRows=!!data.has_more;el('db-row-page').textContent=mode==='rows'?`第 ${rowPage+1} 页 · 每页 100 行`:'';el('db-row-prev').disabled=mode!=='rows'||!rowPage;el('db-row-next').disabled=mode!=='rows'||!hasRows;
   }
   async function load(version,selected){
-    const scope=context;const params=new URLSearchParams(scope.sid?{session_id:scope.sid}:{workspace:scope.workspace});const data=await api('/api/databases?'+params);
+    const scope=context;const params=new URLSearchParams({global:'1'});const data=await api('/api/databases?'+params);
     if(!valid(version))return;connections=data.connections;el('db-list').replaceChildren();
     if(!connections.length){const option=document.createElement('option');option.value='';option.textContent='尚未添加连接';el('db-list').append(option);}
     for(const item of connections){const option=document.createElement('option');option.value=item.id;option.textContent=item.name+' · '+item.kind;el('db-list').append(option);}
-    const preferred=selected || preferredConnection;if(preferred && connections.some(x=>x.id===preferred))el('db-list').value=preferred;preferredConnection=el('db-list').value;saveSqlDraft();connectionMeta();renderConnections();el('db-config').open=!connections.length;tablePage=0;search='';el('db-search').value='';clearTable();await loadSnippets(version);await catalog(version);void refreshStatuses();
+    const preferred=selected || preferredConnection;if(preferred && connections.some(x=>x.id===preferred))el('db-list').value=preferred;preferredConnection=el('db-list').value;restoreSqlDraft();connectionMeta();renderConnections();el('db-config').open=!connections.length;tablePage=0;search='';el('db-search').value='';clearTable();if(connections.length){await loadSnippets(version);await catalog(version);}else{snippets=[];el('db-snippet-list').replaceChildren();}void refreshStatuses();
   }
   function renderConnections(){
     const list=el('db-connections');list.replaceChildren();
     for(const item of connections){const row=document.createElement('div');row.className='db-source-row';row.classList.toggle('active',item.id===el('db-list').value);const select=document.createElement('button');select.className='db-source-select';const dot=document.createElement('i');dot.className='db-status-dot';dot.dataset.connected=String(connectionStates[item.id]===true);dot.title=connectionStates[item.id]?'已连接':'已断开';dot.setAttribute('role','img');dot.setAttribute('aria-label',dot.title);const name=document.createElement('span');name.textContent=item.name;const kind=document.createElement('small');kind.className='db-source-kind';kind.textContent=item.kind;select.append(dot,name,kind);select.disabled=executing;select.title=item.kind+' · '+(item.database || item.path);select.onclick=()=>{el('db-list').value=item.id;el('db-list').dispatchEvent(new Event('change'));};const toggle=document.createElement('button');toggle.className='db-source-power';toggle.disabled=executing;toggle.innerHTML=icon('bolt');toggle.title=connectionStates[item.id]?'断开 '+item.name:'连接 '+item.name;toggle.onclick=()=>toggleConnection(item.id);row.append(select,toggle);list.append(row);}
-    const connected=connectionStates[el('db-list').value]===true;el('db-connect-toggle').innerHTML=icon('bolt')+(connected?'断开':'连接');for(const id of ['db-connect-toggle','db-edit','db-test','db-remove','db-run','db-refresh'])el(id).disabled=!el('db-list').value || executing;
+    const connected=connectionStates[el('db-list').value]===true;el('db-connect-toggle').innerHTML=icon('bolt')+(connected?'断开':'连接');for(const id of ['db-connect-toggle','db-edit','db-test','db-rename','db-remove','db-run','db-refresh'])el(id).disabled=!el('db-list').value || executing;
   }
   function toggleConnection(id){statusRevision++;void run(async version=>{const connected=connectionStates[id]===true;const result=await request({action:connected?'disconnect':'connect',id},version);connectionStates[id]=result.connected;renderConnections();if(id===el('db-list').value){clearTable();if(result.connected)await catalog(version);else{el('db-table-list').replaceChildren();state('连接已断开，点击闪电重新连接');}}else state(result.connected?'连接已建立':'连接已断开');});}
   el('db-connect-toggle').onclick=()=>toggleConnection(el('db-list').value);
   async function refreshStatuses(){if(!valid() || !context.workspace)return;const stamp=statusRevision,scope=context;try{const result=await request({action:'status'});if(!valid() || scope!==context || stamp!==statusRevision)return;for(const item of connections)connectionStates[item.id]=result.statuses[item.id]?.connected===true;renderConnections();}catch{}}
   setInterval(()=>{if(!document.hidden && dialog.open)void refreshStatuses();},10000);
-  const draftKey=()=>context?'database-sql-'+who+'-'+context.workspace:null;
+  const draftKey=()=>context?'database-sql-connection-'+who+'-'+el('db-list').value:null;
   function saveSqlDraft(){const key=draftKey();if(!key)return;try{localStorage.setItem(key,JSON.stringify({sql:el('db-sql').value,name:el('db-snippet-name').value,id:snippetId,connection:el('db-list').value}));}catch{}}
+  function restoreSqlDraft(){
+    snippetId=null;el('db-sql').value='';el('db-snippet-name').value='';
+    try{const draft=JSON.parse(localStorage.getItem(draftKey())||'null');if(draft){el('db-sql').value=draft.sql||'';el('db-snippet-name').value=draft.name||'';snippetId=draft.id||null;}}catch{}
+    try{localStorage.setItem('database-last-'+who,el('db-list').value);}catch{}
+  }
   async function loadSnippets(version){const data=await request({action:'snippets'},version);snippets=data.items;el('db-snippet-list').replaceChildren();const option=document.createElement('option');option.value='';option.textContent='选择常用 SQL';el('db-snippet-list').append(option);for(const item of snippets){const option=document.createElement('option');option.value=item.id;option.textContent=item.name;el('db-snippet-list').append(option);}if(snippetId && snippets.some(x=>x.id===snippetId))el('db-snippet-list').value=snippetId;}
   el('db-snippet-list').onchange=()=>{const item=snippets.find(x=>x.id===el('db-snippet-list').value);if(!item)return;snippetId=item.id;el('db-snippet-name').value=item.name;el('db-sql').value=item.sql;saveSqlDraft();};
   el('db-snippet-name').oninput=saveSqlDraft;
@@ -136,24 +140,30 @@
   el('db-snippet-save').onclick=()=>void run(async version=>{const result=await request({action:'snippet_save',snippet_id:snippetId,name:el('db-snippet-name').value,sql:el('db-sql').value},version);snippetId=result.id;await loadSnippets(version);saveSqlDraft();state('常用 SQL 已保存，刷新或重新登录后仍可读取');});
   el('db-snippet-delete').onclick=()=>void run(async version=>{if(!snippetId)throw new Error('请先选择常用 SQL');await request({action:'snippet_remove',snippet_id:snippetId},version);snippetId=null;el('db-snippet-name').value='';await loadSnippets(version);saveSqlDraft();state('常用 SQL 已删除');});
   function open(){
-    generation++;statusRevision++;connectionStates={};preferredConnection=null;const workspace=project();context={key:key(),sid:currentSession,workspace};
+    generation++;statusRevision++;connectionStates={};preferredConnection=null;const workspace='global';context={key:key(),sid:null,workspace};
     el('db-connect').reset();dialog.querySelector('[name=id]').value='';setKind();el('db-sql').value='';snippetId=null;el('db-snippet-name').value='';try{const draft=JSON.parse(localStorage.getItem(draftKey())||'null');if(draft){el('db-sql').value=draft.sql || '';el('db-snippet-name').value=draft.name || '';snippetId=draft.id || null;preferredConnection=draft.connection || null;}}catch{}clearTable();el('db-table-list').replaceChildren();state('');
-    el('db-project').textContent=workspace ? '项目 · '+workspace.split(/[\\/]/).filter(Boolean).pop() : '选择项目文件夹';el('db-project').title=workspace || '';el('db-project-guide').hidden=!!workspace;el('db-content').hidden=!workspace;dialog.querySelector('.db-sidebar').hidden=!workspace;
+    el('db-project').textContent='我的数据库';el('db-project').disabled=true;el('db-project-guide').hidden=true;el('db-content').hidden=false;dialog.querySelector('.db-sidebar').hidden=false;try{preferredConnection=localStorage.getItem('database-last-'+who);}catch{}
     if(!dialog.open)dialog.showModal();if(workspace)void run(version=>load(version));
   }
-  function chooseProject(){reopen=true;dialog.close();void openPicker();}
-  chip.onclick=open;el('db-project').onclick=chooseProject;el('db-choose-project').onclick=chooseProject;
-  window.DatabaseWorkbench={projectPickerClosed(){reopen=false;},projectChanged(){if(reopen){reopen=false;open();}else if(dialog.open)open();}};
+  chip.onclick=open;
+  window.DatabaseWorkbench={projectPickerClosed(){},projectChanged(){}};
   el('db-close').onclick=()=>dialog.close();dialog.addEventListener('close',()=>{resetCell();generation++;context=null;clearTimeout(searchTimer);dialog.querySelector('[name=password]').value='';});
   dialog.querySelector('[name=kind]').onchange=setKind;
   el('db-sql').addEventListener('input',saveSqlDraft);el('db-sql').addEventListener('keydown',event=>{if(event.key==='Enter' && (event.ctrlKey || event.metaKey)){event.preventDefault();el('db-run').click();}});
-  el('db-list').onchange=()=>{if(executing)return;statusRevision++;preferredConnection=el('db-list').value;saveSqlDraft();connectionMeta();renderConnections();clearTable();search='';el('db-search').value='';tablePage=0;void run(catalog);};
+  el('db-list').onchange=()=>{if(executing)return;statusRevision++;preferredConnection=el('db-list').value;restoreSqlDraft();connectionMeta();renderConnections();clearTable();search='';el('db-search').value='';tablePage=0;void run(async version=>{await loadSnippets(version);await catalog(version);});};
   el('db-connect').onsubmit=async event=>{event.preventDefault();if(saving)return;saving=true;const button=event.target.querySelector('[type=submit]');button.disabled=true;const body=Object.fromEntries(new FormData(event.target));try{await run(async version=>{const saved=await request({action:'save',...body},version);dialog.querySelector('[name=id]').value=saved.id;dialog.querySelector('[name=password]').value='';await load(version,saved.id);if(valid(version))state('连接已保存，可选择表或测试连接');});}finally{saving=false;button.disabled=false;}};
   el('db-edit').onclick=()=>{const item=connections.find(x=>x.id===el('db-list').value);if(!item)return;for(const name of ['id','name','kind','path','host','port','database','user'])dialog.querySelector('[name='+name+']').value=item[name] || (name==='port'?'3306':'');dialog.querySelector('[name=password]').value='';setKind();el('db-config').open=true;el('db-config').scrollIntoView({block:'nearest'});};
   el('db-new').onclick=()=>{el('db-connect').reset();dialog.querySelector('[name=id]').value='';setKind();el('db-config').open=true;el('db-config').scrollIntoView({block:'nearest'});};
   el('db-add').onclick=el('db-new').onclick;
-  el('db-test').onclick=()=>void run(async version=>{await request({action:'connect',id:el('db-list').value},version);connectionStates[el('db-list').value]=true;statusRevision++;renderConnections();state('连接成功');});
-  el('db-remove').onclick=()=>void run(async version=>{await request({action:'remove',id:el('db-list').value},version);await load(version);});
+  el('db-test').onclick=()=>void run(async version=>{await request({action:'test',id:el('db-list').value},version);state('测试成功，数据库可以访问');});
+  el('db-remove').onclick=()=>{if(!confirm('仅删除保存的连接，实际数据库和数据不会被删除。继续吗？'))return;void run(async version=>{await request({action:'remove',id:el('db-list').value},version);await load(version);});};
+  const renameDialog=document.createElement('dialog');renameDialog.className='db-rename-dialog';
+  renameDialog.innerHTML='<form><h3>重命名连接</h3><label>连接名称<input name="name" required maxlength="100" autocomplete="off"></label><p>只修改显示名称，连接和数据库内容保持不变。</p><footer><button type="button">取消</button><button type="submit" class="db-primary">保存名称</button></footer></form>';
+  document.body.append(renameDialog);let renameId=null;
+  renameDialog.querySelector('[type=button]').onclick=()=>renameDialog.close();
+  el('db-rename').onclick=()=>{const item=connections.find(x=>x.id===el('db-list').value);if(!item)return;renameId=item.id;const input=renameDialog.querySelector('input');input.value=item.name;renameDialog.showModal();input.select();};
+  renameDialog.querySelector('form').onsubmit=event=>{event.preventDefault();const id=renameId,name=renameDialog.querySelector('input').value;renameDialog.close();void run(async version=>{await request({action:'rename',id,name},version);const item=connections.find(x=>x.id===id);if(item)item.name=name.trim();renderConnections();state('连接已重命名');});};
+
   el('db-tables').onclick=el('db-refresh').onclick=()=>{tablePage=0;clearTable();void run(catalog);};
   el('db-search').oninput=()=>{clearTimeout(searchTimer);generation++;searchTimer=setTimeout(()=>{search=el('db-search').value;tablePage=0;clearTable();void run(catalog);},250);};
   el('db-table-prev').onclick=()=>{if(tablePage){tablePage--;void run(catalog);}};el('db-table-next').onclick=()=>{if(hasTables){tablePage++;void run(catalog);}};

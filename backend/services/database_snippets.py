@@ -7,11 +7,16 @@ import db
 def _path():return db.DB_PATH.parent/'database-snippets.json'
 def _read():return json.loads(_path().read_text()) if _path().exists() else []
 def _scope(uid,workspace):return uid,str(Path(workspace).resolve())
-def list_snippets(uid,workspace):
+def list_snippets(uid,workspace,connection=None):
     uid,workspace=_scope(uid,workspace)
+    if connection:
+        _migrate(uid,workspace,connection)
+        workspace='connection:'+connection
     with _LOCK:return sorted([x for x in _read() if x['owner']==uid and x['workspace']==workspace],key=lambda x:x['updated'],reverse=True)
-def save(uid,workspace,body):
-    uid,workspace=_scope(uid,workspace);name=body.get('name');sql=body.get('sql')
+def save(uid,workspace,body,connection=None):
+    uid,workspace=_scope(uid,workspace)
+    if connection:workspace='connection:'+connection
+    name=body.get('name');sql=body.get('sql')
     if not isinstance(name,str) or not name.strip() or len(name)>100:raise ValueError('请输入名称（最多100字）')
     if not isinstance(sql,str) or not sql.strip() or len(sql)>32000:raise ValueError('请输入 SQL（最多32000字符）')
     with _LOCK:
@@ -21,11 +26,23 @@ def save(uid,workspace,body):
         item={'id':ident,'owner':uid,'workspace':workspace,'name':name.strip(),'sql':sql,'updated':time.time()}
         items=[x for x in items if x['id']!=ident];items.append(item);_write(items)
     return ident
-def remove(uid,workspace,ident):
+def remove(uid,workspace,ident,connection=None):
     uid,workspace=_scope(uid,workspace)
+    if connection:workspace='connection:'+connection
     with _LOCK:_write([x for x in _read() if not(x['id']==ident and x['owner']==uid and x['workspace']==workspace)])
 def _write(items):
     path=_path();path.parent.mkdir(parents=True,exist_ok=True);temp=path.with_suffix('.tmp')
     fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
     with os.fdopen(fd,'w') as out:json.dump(items,out,ensure_ascii=False)
     os.replace(temp,path);os.chmod(path,0o600)
+
+
+def _migrate(uid,workspace,connection):
+    # Retain legacy SQL and copy it once to each connection in the old project.
+    scope='connection:'+connection
+    with _LOCK:
+        items=_read();marker='migration:'+connection
+        if any(x['owner']==uid and x['workspace']==marker for x in items):return
+        items.extend([dict(x,id=uuid.uuid4().hex,workspace=scope) for x in items if x['owner']==uid and x['workspace']==workspace])
+        items.append(dict(id=uuid.uuid4().hex,owner=uid,workspace=marker,name='',sql='',updated=time.time()))
+        _write(items)
