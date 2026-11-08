@@ -46,6 +46,16 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(len(rows['rows']),20);self.assertFalse(rows['has_more'])
         with self.assertRaises(ValueError):service.table_schema(1,str(self.root),self.ident,'notes; DROP TABLE notes')
 
+    def test_application_database_can_be_browsed_but_not_modified(self):
+        db.init_db()
+        ident=service.save(1,str(self.root),dict(name='Agent internal',kind='sqlite',path=str(db.DB_PATH)))
+        self.assertTrue(service.test_connection(1,str(self.root),ident)['ok'])
+        names=[item['name'] for item in service.catalog(1,str(self.root),ident)['items']]
+        self.assertIn('sessions',names)
+        self.assertIn('id',[r[0] for r in service.table_schema(1,str(self.root),ident,'sessions')['rows']])
+        self.assertEqual(service.query(1,str(self.root),ident,'SELECT count(*) FROM sessions')['rows'],[[0]])
+        with self.assertRaises(ValueError):service.query(1,str(self.root),ident,'DELETE FROM sessions')
+
     def test_missing_file_not_created(self):
         with self.assertRaises(ValueError):service.save(1,str(self.root),dict(name='bad',kind='sqlite',path='missing.db'))
         self.assertFalse((self.root/'missing.db').exists())

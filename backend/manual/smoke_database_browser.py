@@ -28,6 +28,7 @@ try:
         page.locator('#db-close').click();page.locator('#database-chip').click();expect(page.locator('#db-table-list button')).to_have_count(100)
         assert page.evaluate('currentSession') is None
         with db._conn() as c:assert c.execute('SELECT count(*) FROM sessions').fetchone()[0]==before
+        page.locator('#db-add').click();form.locator('[name=name]').fill('Agent internal');form.locator('[name=path]').fill(str(db.DB_PATH));form.locator('[type=submit]').click();expect(page.locator('#db-state')).to_contain_text('已保存');page.locator('#db-search').fill('sessions');expect(page.locator('#db-table-list button')).to_have_count(1);page.locator('#db-table-list button').click();expect(page.locator('#db-result')).to_contain_text('id');page.locator('#db-data').click();expect(page.locator('#db-result')).to_contain_text('s1');page.locator('.database-dialog').screenshot(path='/tmp/db-internal-browser.png')
         page.set_viewport_size({'width':390,'height':844});page.wait_for_function('document.documentElement.dataset.mode==="mobile"');page.locator('.database-dialog').screenshot(path='/tmp/db-tree-mobile.png');assert not errors,errors;browser.close()
     print('PASS: project picker, no message/session, saved connection reuse, table search/catalog paging, field/data tabs, data paging, mobile')
 finally:case.tearDown()

@@ -9,7 +9,7 @@
     <div class="db-workbench">
       <aside class="db-sidebar">
         <div class="db-section-heading"><h3>项目连接</h3><button id="db-add" title="添加连接" aria-label="添加连接">＋</button></div>
-        <select id="db-list" aria-label="数据库连接"></select>
+        <select id="db-list" aria-label="数据库连接"></select><div id="db-connection-meta" class="db-connection-meta"></div>
         <div class="db-connection-actions"><button id="db-edit">编辑</button><button id="db-test">测试连接</button><button id="db-remove" class="db-danger">移除</button></div>
         <div class="db-divider"></div><details id="db-tree" open><summary><span aria-hidden="true">▱</span> <strong id="db-database-name">数据库</strong></summary><div class="db-section-heading"><span>表与视图</span><button id="db-refresh">刷新</button></div><input id="db-search" placeholder="搜索表名" aria-label="搜索表名"><div id="db-table-list"></div><div class="db-tree-pages"><button id="db-table-prev">上一页</button><span id="db-table-page"></span><button id="db-table-next">下一页</button></div></details>
         <details id="db-config" open><summary>连接配置</summary>
@@ -42,7 +42,9 @@
   const project=()=>currentSession ? (wsCustom ? confirmedWorkspace : null) : pendingProjectPath;
   const key=()=>JSON.stringify([authToken,currentSession,project()]);
   const valid=version=>dialog.open && context && context.key===key() && (version===undefined || version===generation);
-  function empty(text){el('db-result').replaceChildren();const node=document.createElement('div');node.className='db-empty';node.textContent=text;el('db-result').append(node);}
+  function empty(text){const result=el('db-result');result.dataset.empty='true';result.replaceChildren();const node=document.createElement('div');node.className='db-empty';const icon=document.createElement('span');icon.className='db-empty-icon';icon.textContent='▦';icon.setAttribute('aria-hidden','true');const title=document.createElement('strong');title.textContent=text;const hint=document.createElement('p');hint.textContent='字段结构与表数据分开查看，也可以展开 SQL 编辑器查询。';node.append(icon,title,hint);result.append(node);}
+  function connectionMeta(){const item=connections.find(x=>x.id===el('db-list').value);const meta=el('db-connection-meta');meta.textContent=item ? (item.kind==='sqlite'?'SQLite · '+item.path.split(/[\\/]/).pop():'MySQL · '+item.host+':'+item.port+' / '+item.database) : '添加连接后即可浏览表和数据';meta.title=item?.path || meta.textContent;}
+
   function state(text,error=false){el('db-state').textContent=text;el('db-state').dataset.tone=error?'error':'';}
   function clearTable(){selectedTable=null;rowPage=0;hasRows=false;mode='schema';el('db-fields').disabled=true;el('db-data').disabled=true;el('db-fields').classList.remove('active');el('db-data').classList.remove('active');el('db-breadcrumb').textContent='选择数据库连接，再选择一张表';el('db-row-page').textContent='';el('db-row-prev').disabled=true;el('db-row-next').disabled=true;empty('选择左侧的表，查看字段结构或表数据');}
   async function request(body,version){
@@ -52,7 +54,7 @@
     if(!valid(version))throw new Error('项目已切换');return data;
   }
   async function run(fn){const version=++generation;if(!valid())return;state('处理中…');try{await fn(version);}catch(error){if(valid(version))state(error.message,true);}}
-  function show(data){const result=el('db-result');result.replaceChildren();const table=document.createElement('table');const head=document.createElement('tr');const numberHead=document.createElement('th');numberHead.textContent='#';numberHead.className='db-row-number';head.append(numberHead);for(const name of data.columns){const th=document.createElement('th');th.textContent=name;head.append(th);}table.append(head);for(const [index,row] of data.rows.entries()){const tr=document.createElement('tr');const number=document.createElement('td');number.textContent=(mode==='rows' && selectedTable ? rowPage*100 : 0)+index+1;number.className='db-row-number';tr.append(number);for(const value of row){const td=document.createElement('td');td.textContent=value===null?'NULL':String(value);td.classList.toggle('db-null',value===null);td.title=td.textContent;tr.append(td);}table.append(tr);}result.append(table);state(`显示 ${data.rows.length} 行`+(data.limited?' · 结果已限制，请缩小范围':''));}
+  function show(data){const result=el('db-result');result.dataset.empty='false';result.replaceChildren();const table=document.createElement('table');const head=document.createElement('tr');const numberHead=document.createElement('th');numberHead.textContent='#';numberHead.className='db-row-number';head.append(numberHead);for(const name of data.columns){const th=document.createElement('th');th.textContent=name;head.append(th);}table.append(head);for(const [index,row] of data.rows.entries()){const tr=document.createElement('tr');const number=document.createElement('td');number.textContent=(mode==='rows' && selectedTable ? rowPage*100 : 0)+index+1;number.className='db-row-number';tr.append(number);for(const value of row){const td=document.createElement('td');td.textContent=value===null?'NULL':String(value);td.classList.toggle('db-null',value===null);td.title=td.textContent;tr.append(td);}table.append(tr);}result.append(table);state(`显示 ${data.rows.length} 行`+(data.limited?' · 结果已限制，请缩小范围':''));}
   function setKind(){const kind=dialog.querySelector('[name=kind]').value;el('db-sqlite').hidden=kind!=='sqlite';el('db-mysql').hidden=kind!=='mysql';}
   async function catalog(version){
     const id=el('db-list').value;el('db-table-list').replaceChildren();if(!id)return;
@@ -74,7 +76,7 @@
     if(!valid(version))return;connections=data.connections;el('db-list').replaceChildren();
     if(!connections.length){const option=document.createElement('option');option.value='';option.textContent='尚未添加连接';el('db-list').append(option);}
     for(const item of connections){const option=document.createElement('option');option.value=item.id;option.textContent=item.name+' · '+item.kind;el('db-list').append(option);}
-    if(selected)el('db-list').value=selected;el('db-config').open=!connections.length;tablePage=0;search='';el('db-search').value='';clearTable();await catalog(version);
+    if(selected)el('db-list').value=selected;connectionMeta();el('db-config').open=!connections.length;tablePage=0;search='';el('db-search').value='';clearTable();await catalog(version);
   }
   function open(){
     generation++;const workspace=project();context={key:key(),sid:currentSession,workspace};
@@ -87,7 +89,7 @@
   window.DatabaseWorkbench={projectPickerClosed(){reopen=false;},projectChanged(){if(reopen){reopen=false;open();}else if(dialog.open)open();}};
   el('db-close').onclick=()=>dialog.close();dialog.addEventListener('close',()=>{generation++;context=null;clearTimeout(searchTimer);dialog.querySelector('[name=password]').value='';});
   dialog.querySelector('[name=kind]').onchange=setKind;
-  el('db-list').onchange=()=>{clearTable();search='';el('db-search').value='';tablePage=0;void run(catalog);};
+  el('db-list').onchange=()=>{connectionMeta();clearTable();search='';el('db-search').value='';tablePage=0;void run(catalog);};
   el('db-connect').onsubmit=async event=>{event.preventDefault();if(saving)return;saving=true;const button=event.target.querySelector('[type=submit]');button.disabled=true;const body=Object.fromEntries(new FormData(event.target));try{await run(async version=>{const saved=await request({action:'save',...body},version);dialog.querySelector('[name=id]').value=saved.id;dialog.querySelector('[name=password]').value='';await load(version,saved.id);if(valid(version))state('连接已保存，可选择表或测试连接');});}finally{saving=false;button.disabled=false;}};
   el('db-edit').onclick=()=>{const item=connections.find(x=>x.id===el('db-list').value);if(!item)return;for(const name of ['id','name','kind','path','host','port','database','user'])dialog.querySelector('[name='+name+']').value=item[name] || (name==='port'?'3306':'');dialog.querySelector('[name=password]').value='';setKind();el('db-config').open=true;};
   el('db-new').onclick=()=>{el('db-connect').reset();dialog.querySelector('[name=id]').value='';setKind();el('db-config').open=true;};

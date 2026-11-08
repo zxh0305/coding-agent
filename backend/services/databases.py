@@ -27,7 +27,6 @@ def save(uid,workspace,body):
         if not path.is_absolute():path=Path(workspace)/path
         path=path.resolve()
         if not path.is_file():raise ValueError('SQLite 文件不存在，不会创建新库')
-        if path==db.DB_PATH.resolve():raise ValueError('不能连接应用自己的数据库')
         item['path']=str(path)
     else:
         for key in ('host','user','database'):

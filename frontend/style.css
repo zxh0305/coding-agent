@@ -2900,3 +2900,11 @@ button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset
 @media(max-width:720px){.database-dialog {width:calc(100vw - 16px);height:calc(100dvh - 16px);border-radius:9px;}.database-dialog .db-header {padding:10px 12px;}.db-header>div {display:block;}.database-dialog .db-project {max-width:70vw;font-size:10px;}.db-workbench {display:block;overflow:auto;}.db-sidebar {padding:12px;border-right:0;border-bottom:1px solid var(--border);overflow:visible;}.db-main {padding:12px;overflow:visible;min-height:400px;}#db-content {min-height:400px;height:auto;grid-template-rows:auto auto minmax(260px,1fr);}#db-table-list {max-height:170px;min-height:28px;flex:none;}#db-result {max-height:420px;min-height:220px;}.db-editor-label span {display:none;}.db-query-footer .db-help {font-size:10px;}}
 #db-tree::details-content {display:contents;}
 #db-result .db-row-number {width:40px;max-width:40px;min-width:40px;}
+.db-connection-meta {margin-top:6px;font:10px/1.6 ui-monospace,monospace;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#db-result[data-empty="true"] {border:0;background:transparent;}
+#db-result[data-empty="true"] .db-empty {gap:7px;}
+#db-result .db-empty-icon {display:flex;align-items:center;justify-content:center;width:44px;height:44px;border:1px solid var(--border);border-radius:10px;background:var(--hover-soft);font-size:24px;color:var(--text-3);margin-bottom:4px;}
+#db-result[data-empty="true"] .db-empty strong {font-size:13px;}
+#db-result[data-empty="true"] .db-empty p {font-size:11px;max-width:300px;}
+.db-results-section:has(#db-result[data-empty="true"]) .db-row-pages {visibility:hidden;}
+.database-dialog input[name="path"],.database-dialog input[name="host"] {font-family:ui-monospace,monospace;font-size:11px;}
