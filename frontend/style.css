@@ -2926,3 +2926,18 @@ button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset
 @media(max-width:720px) {.database-dialog {width:calc(100vw - 24px);height:calc(100dvh - 24px);border-radius:14px;}.database-dialog .db-header {padding:16px 18px;}.db-workbench {display:block;overflow-y:auto;}.db-sidebar {border-right:0;border-bottom:1px solid var(--border);padding:18px;overflow:visible;}.db-main {padding:18px;overflow:visible;}.db-editor-label span {display:none;}.db-query-footer .db-help {font-size:10px;}.database-dialog textarea {min-height:130px;}}
 
 .database-dialog .db-sidebar label {margin-bottom:10px;gap:5px;}.db-sidebar .db-divider {margin:16px 0;}.database-dialog .db-sidebar input,.database-dialog .db-sidebar select {height:34px;}.db-sidebar .db-form-actions {margin-top:12px;} #db-result:empty {border:0;} #db-state[data-tone="error"] {color:#b45454;border-left:2px solid #cf8585;padding-left:10px;}
+.db-project {max-width:620px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:8px!important;font-size:11px!important;color:var(--text-3)!important;border:0!important;padding:0!important;min-height:20px!important;justify-content:flex-start!important;background:transparent!important;}
+.db-workbench:has(.db-sidebar[hidden]) {grid-template-columns:1fr;}
+.db-main:has(#db-project-guide:not([hidden])) {grid-column:1/-1;}
+#db-config {margin-top:20px;border-top:1px solid var(--border);padding-top:15px;} #db-config summary,.db-query-section>summary {font-size:12px;color:var(--text-2);cursor:pointer;margin-bottom:14px;}
+#db-table-list {max-height:260px;overflow-y:auto;margin-top:10px;display:flex;flex-direction:column;gap:3px;}
+.database-dialog .db-table-item {justify-content:flex-start;text-align:left;width:100%;border:0;background:transparent;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block;font-family:ui-monospace,monospace;font-size:12px;}
+.database-dialog .db-table-item.active,.database-dialog .db-view-tabs .active {background:#587ed619;color:#4468cb;}
+#db-database-name {overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.db-tree-pages,.db-row-pages {display:flex;align-items:center;gap:8px;justify-content:space-between;margin-top:12px;font-size:11px;color:var(--text-3);}
+#db-breadcrumb {font-size:13px;font-weight:600;margin-bottom:14px;overflow-wrap:anywhere;}
+.db-view-tabs {display:flex;gap:8px;margin-bottom:18px;}.db-query-section {margin-top:16px;}
+#db-result table {width:max-content;min-width:100%;}#db-result th {white-space:nowrap;}#db-result td {white-space:pre;max-width:500px;overflow:hidden;text-overflow:ellipsis;}#db-result td,#db-result th {overflow-wrap:normal;word-break:normal;}
+.db-project {max-width:min(620px,60vw);}
+#db-tree>summary {display:flex;align-items:center;gap:6px;cursor:pointer;padding:8px 0 12px;font-size:13px;color:var(--text);list-style:none;}#db-tree>summary::before {content:'⌄';font-size:14px;color:var(--text-3);}#db-tree:not([open])>summary::before {content:'›';}#db-tree>.db-section-heading {padding-left:15px;margin-bottom:8px;}#db-tree .db-table-item {padding-left:18px;}#db-tree .db-table-item::before {content:'▦';margin-right:8px;color:var(--text-3);}#db-tree .db-table-item.active::before {color:#4468cb;}.db-workbench {grid-template-columns:310px minmax(0,1fr);}#db-content {min-width:0;}@media(max-width:720px){.db-workbench {display:block;}#db-table-list {max-height:190px;}#db-result {max-height:360px;}}
+.database-dialog [hidden] {display:none!important;}

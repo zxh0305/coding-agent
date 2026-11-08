@@ -48,14 +48,14 @@ def _get(uid,workspace,ident):
         for x in _load():
             if x['id']==ident and x['owner']==uid and x['workspace']==workspace:return x
     raise ValueError('连接不存在或不属于当前项目')
-def _connect(item):
+def _connect(item,metadata=False):
     if item['kind']=='sqlite':
         conn=sqlite3.connect(Path(item['path']).as_uri()+'?mode=ro',uri=True,timeout=3)
         conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH,200000)
         conn.execute('PRAGMA query_only=ON');deadline=time.monotonic()+5
         conn.set_progress_handler(lambda:time.monotonic()>deadline,1000)
         allowed={sqlite3.SQLITE_SELECT,sqlite3.SQLITE_READ,sqlite3.SQLITE_FUNCTION,sqlite3.SQLITE_RECURSIVE}
-        conn.set_authorizer(lambda action,*args:sqlite3.SQLITE_OK if action in allowed and not(action==sqlite3.SQLITE_FUNCTION and str(args[1]).lower() in ('load_extension','writefile','readfile')) else sqlite3.SQLITE_DENY)
+        conn.set_authorizer(lambda action,*args:sqlite3.SQLITE_OK if (metadata and action==sqlite3.SQLITE_PRAGMA and args[0]=='table_info') or action in allowed and not(action==sqlite3.SQLITE_FUNCTION and str(args[1]).lower() in ('load_extension','writefile','readfile')) else sqlite3.SQLITE_DENY)
         return conn
     try:import pymysql
     except ImportError:raise ValueError('MySQL 需要安装可选依赖：pip install pymysql') from None
@@ -71,17 +71,17 @@ def test_connection(uid,workspace,ident):
     result=query(uid,workspace,ident,'SELECT 1')
     return {'ok':True,'message':'连接成功，只读查询可用'}
 
-def query(uid,workspace,ident,sql):
+def query(uid,workspace,ident,sql,*,_params=None,_metadata=False):
     item=_get(uid,workspace,ident)
     if not isinstance(sql,str) or len(sql)>32000:raise ValueError('SQL 无效或超过长度限制')
     sql=sql.strip().removesuffix(';').rstrip()
     ordinary=re.match(r'^(SELECT|WITH|EXPLAIN)\b',sql,re.I)
     metadata=item['kind']=='mysql' and re.match(r'^(SHOW\s+(?:FULL\s+)?(?:TABLES|COLUMNS|INDEX|INDEXES|KEYS|CREATE\s+TABLE)\b|DESCRIBE\s+)',sql,re.I)
-    if not ordinary and not metadata:raise ValueError('仅支持只读查询、EXPLAIN 和 MySQL 表结构查询')
-    if item['kind']=='mysql' and re.search(r';|\b(INTO|OUTFILE|DUMPFILE|SLEEP|BENCHMARK|GET_LOCK|RELEASE_LOCK)\b',sql,re.I):raise ValueError('不支持多语句或带副作用的查询')
+    if not ordinary and not metadata and not _metadata:raise ValueError('仅支持只读查询、EXPLAIN 和 MySQL 表结构查询')
+    if not _metadata and item['kind']=='mysql' and re.search(r';|\b(INTO|OUTFILE|DUMPFILE|SLEEP|BENCHMARK|GET_LOCK|RELEASE_LOCK)\b',sql,re.I):raise ValueError('不支持多语句或带副作用的查询')
     conn=None;cursor=None
     try:
-        conn=_connect(item);cursor=conn.cursor();cursor.execute(sql)
+        conn=_connect(item,metadata=_metadata);cursor=conn.cursor();cursor.execute(sql,_params) if _params is not None else cursor.execute(sql)
         cols=[x[0] for x in cursor.description or []];rows=[];size=0;limited=False
         for _ in range(201):
             row=cursor.fetchone()
@@ -112,3 +112,47 @@ def tables(uid,workspace,ident):
     item=_get(uid,workspace,ident)
     sql="SELECT name,type,sql FROM sqlite_schema WHERE type IN ('table','view','index') AND name NOT LIKE 'sqlite_%' ORDER BY name" if item['kind']=='sqlite' else 'SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_KEY,COLUMN_DEFAULT,EXTRA,COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION'
     return query(uid,workspace,ident,sql)
+
+
+def _page(value):
+    if type(value) is not int or not 0<=value<=100000:raise ValueError('分页参数无效')
+    return value
+
+def catalog(uid,workspace,ident,page=0,search=''):
+    page=_page(page);item=_get(uid,workspace,ident)
+    if not isinstance(search,str) or len(search)>100:raise ValueError('搜索内容过长')
+    if item['kind']=='sqlite':
+        sql="SELECT name,type,'' FROM sqlite_schema WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' AND name LIKE ? ORDER BY name LIMIT 101 OFFSET ?"
+    else:
+        sql="SELECT TABLE_NAME,TABLE_TYPE,TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE %s ORDER BY TABLE_NAME LIMIT 101 OFFSET %s"
+    result=query(uid,workspace,ident,sql,_params=('%'+search+'%',page*100),_metadata=True)
+    return {'database':item.get('database') or Path(item['path']).name,'items':[dict(name=r[0],type=r[1],comment=r[2]) for r in result['rows'][:100]],'page':page,'has_more':len(result['rows'])>100}
+
+def _table(uid,workspace,ident,name):
+    if not isinstance(name,str) or not name or len(name)>255:raise ValueError('表名称无效')
+    item=_get(uid,workspace,ident)
+    sql="SELECT name FROM sqlite_schema WHERE name=? AND type IN ('table','view')" if item['kind']=='sqlite' else 'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s'
+    if not query(uid,workspace,ident,sql,_params=(name,),_metadata=True)['rows']:raise ValueError('表不存在或无权读取')
+    quote='"' if item['kind']=='sqlite' else '`'
+    return item,quote+name.replace(quote,quote*2)+quote
+
+def table_schema(uid,workspace,ident,name):
+    item,quoted=_table(uid,workspace,ident,name)
+    if item['kind']=='sqlite':
+        result=query(uid,workspace,ident,'PRAGMA table_info('+quoted+')',_metadata=True)
+        return {'columns':['字段','类型','可空','默认值','主键'],'rows':[[r[1],r[2],'否' if r[3] or r[5] else '是',r[4],'是' if r[5] else ''] for r in result['rows']],'limited':result['limited']}
+    return query(uid,workspace,ident,"SELECT COLUMN_NAME AS `字段`,COLUMN_TYPE AS `类型`,IS_NULLABLE AS `可空`,COLUMN_DEFAULT AS `默认值`,COLUMN_KEY AS `键`,EXTRA AS `属性`,COLUMN_COMMENT AS `说明` FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s ORDER BY ORDINAL_POSITION",_params=(name,),_metadata=True)
+
+def table_rows(uid,workspace,ident,name,page=0):
+    page=_page(page);item,quoted=_table(uid,workspace,ident,name)
+    if item['kind']=='sqlite':
+        info=query(uid,workspace,ident,'PRAGMA table_info('+quoted+')',_metadata=True)
+        keys=[r[1] for r in sorted(info['rows'],key=lambda r:r[5]) if r[5]]
+        quote='"'
+    else:
+        info=query(uid,workspace,ident,"SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND CONSTRAINT_NAME='PRIMARY' ORDER BY ORDINAL_POSITION",_params=(name,),_metadata=True)
+        keys=[r[0] for r in info['rows']];quote='`'
+    order=' ORDER BY '+','.join(quote+k.replace(quote,quote*2)+quote for k in keys) if keys else ''
+    result=query(uid,workspace,ident,f'SELECT * FROM {quoted}{order} LIMIT 101 OFFSET {page*100}',_metadata=True)
+    result['has_more']=len(result['rows'])>100;result['rows']=result['rows'][:100];result['page']=page;result['stable_order']=bool(keys)
+    return result

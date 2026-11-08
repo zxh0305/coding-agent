@@ -2643,6 +2643,7 @@ async function openPicker() {
 
 // 关闭选择弹窗：✕ / 取消 / Esc / 点遮罩空白处都走这里
 function closePicker() {
+  window.DatabaseWorkbench?.projectPickerClosed();
   directoryRequest++;
   $("modal").classList.add("hidden");
 }
@@ -2659,7 +2660,8 @@ async function chooseWorkspace() {
     renderWsChip();
     refreshGitChip();  // 预选项目后徽章立即显示该项目的分支（不必等首条消息）
     $("modal").classList.add("hidden");
-    toast(`已选择项目 ${path.split("/").pop()}，发送消息时绑定`);
+    window.DatabaseWorkbench?.projectChanged();
+    toast(`已选择项目 ${path.split("/").pop()}`);
     return;
   }
   const isCurrent = workspaceGuard();
@@ -2673,6 +2675,7 @@ async function chooseWorkspace() {
     setWorkspacePending(false);
     wsCustom = true;
     confirmedWorkspace = w.path;
+    window.DatabaseWorkbench?.projectChanged();
     setWsLabel(w.path);
     renderWsChip();
     renderQueueBar();

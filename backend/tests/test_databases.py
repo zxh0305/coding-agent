@@ -32,6 +32,20 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(len(service.connections(1,str(self.root))),2)
         with self.assertRaises(ValueError):service.save(2,str(self.root),dict(body,id=ident))
 
+    def test_catalog_and_table_details_are_separate_and_paginated(self):
+        c=sqlite3.connect(self.root/'sample.db')
+        for i in range(210):c.execute('CREATE TABLE "item_%03d" (value TEXT)'%i)
+        c.commit();c.close()
+        first=service.catalog(1,str(self.root),self.ident,search='item_')
+        self.assertEqual(len(first['items']),100);self.assertTrue(first['has_more'])
+        last=service.catalog(1,str(self.root),self.ident,page=2,search='item_')
+        self.assertEqual(len(last['items']),10);self.assertFalse(last['has_more'])
+        fields=service.table_schema(1,str(self.root),self.ident,'notes')
+        self.assertEqual([r[0] for r in fields['rows']],['id','title'])
+        rows=service.table_rows(1,str(self.root),self.ident,'notes',2)
+        self.assertEqual(len(rows['rows']),20);self.assertFalse(rows['has_more'])
+        with self.assertRaises(ValueError):service.table_schema(1,str(self.root),self.ident,'notes; DROP TABLE notes')
+
     def test_missing_file_not_created(self):
         with self.assertRaises(ValueError):service.save(1,str(self.root),dict(name='bad',kind='sqlite',path='missing.db'))
         self.assertFalse((self.root/'missing.db').exists())
@@ -39,6 +53,14 @@ class DatabaseApiTests(ApiTestBase):
     def test_auth_and_scope(self):
         self.assertEqual(self.call('GET','/api/databases?session_id=foreign')[0],404)
         self.assertEqual(self.call('GET','/api/databases?session_id=s1',token=False)[0],401)
+    def test_project_connections_need_no_session_or_messages(self):
+        root=str(Path(self.tmp).resolve())
+        with db._conn() as c:before=c.execute('SELECT count(*) FROM sessions').fetchone()[0]
+        code,result=self.call('GET','/api/databases?workspace='+__import__('urllib.parse',fromlist=['quote']).quote(root))
+        self.assertEqual(code,200);self.assertEqual(result['connections'],[])
+        with db._conn() as c:self.assertEqual(c.execute('SELECT count(*) FROM sessions').fetchone()[0],before)
+        self.assertEqual(self.call('GET','/api/databases?workspace='+root,token=False)[0],401)
+
     def test_agent_and_cli_share_project_executor(self):
         import json,io,sys
         from types import SimpleNamespace

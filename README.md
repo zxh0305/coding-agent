@@ -423,7 +423,7 @@ cd backend/manual
 
 ### 项目数据库（第一批，只读）
 
-打开已绑定项目的会话，点击输入区“数据库”，保存 SQLite 文件连接或 MySQL 连接，查看结构并执行 SQL。SQLite 文件须已存在；结果最多200行，查询有5秒执行预算。项目启动器会自动安装 MySQL 驱动，请使用专用只读账号；需支持 `MAX_EXECUTION_TIME` 与只读事务的 MySQL，不宣称兼容所有 MariaDB 版本。
+新任务选择项目后即可点击顶部“数据库”，不必先发送消息或创建会话；保存 SQLite 或 MySQL 连接后，从左侧数据库树搜索、分页选择表，在右侧查看字段结构或分页数据，也可展开 SQL 编辑器查询。SQLite 文件须已存在；结果最多200行，查询有5秒执行预算。项目启动器会自动安装 MySQL 驱动，请使用专用只读账号；需支持 `MAX_EXECUTION_TIME` 与只读事务的 MySQL，不宣称兼容所有 MariaDB 版本。
 
 连接配置按应用用户和项目路径隔离。密码仅保存在本机 `data/database-connections.json`（文件权限0600，不加密），不返回浏览器、不传给模型。该文件及其备份须按凭据保管。第一批尚无数据写入、表结构修改和SQL历史记录功能。Agent 可在权限确认后使用 database_connections、database_schema、database_query，共用只读执行器。
 

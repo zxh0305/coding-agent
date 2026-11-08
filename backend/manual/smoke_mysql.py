@@ -26,6 +26,9 @@ try:
     body=dict(name='MySQL test',kind='mysql',host='127.0.0.1',port=port,user='reader',password='isolated-test-password',database='demo')
     code,reply=case.call('POST','/api/databases',dict(session_id='mysql-test',action='save',**body));assert code==200,reply;ident=reply['id']
     result=service.query(case.uid,str(root),ident,'SELECT * FROM notes ORDER BY id');assert len(result['rows'])==200 and result['limited']
+    assert service.catalog(case.uid,str(root),ident)['items'][0]['name']=='notes'
+    assert service.table_schema(case.uid,str(root),ident,'notes')['rows'][0][0]=='id'
+    assert len(service.table_rows(case.uid,str(root),ident,'notes',2)['rows'])==20
     assert service.test_connection(case.uid,str(root),ident)['ok']
     assert 'notes' in str(service.query(case.uid,str(root),ident,'SHOW TABLES;'))
     assert 'title' in str(service.query(case.uid,str(root),ident,'DESCRIBE notes'))
@@ -53,7 +56,7 @@ try:
         form=page.locator('#db-connect');form.locator('[name=kind]').select_option('mysql')
         for key in ('name','host','port','user','password','database'):form.locator('[name='+key+']').fill(str(body[key]))
         form.locator('button').first.click();expect(page.locator('#db-state')).to_contain_text('已保存');page.locator('#db-test').click();expect(page.locator('#db-state')).to_contain_text('连接成功')
-        page.locator('#db-sql').fill('SELECT count(*) FROM notes');page.locator('#db-run').click();expect(page.locator('#db-result')).to_contain_text('220');assert not errors,errors;browser.close()
+        page.locator('.db-query-section > summary').click();page.locator('#db-sql').fill('SELECT count(*) FROM notes');page.locator('#db-run').click();expect(page.locator('#db-result')).to_contain_text('220');assert not errors,errors;browser.close()
     admin.close();print('PASS: real MySQL '+version+'; API/Agent/CLI query, structure, row limit, write rejection and credential masking')
 finally:
     if process:
