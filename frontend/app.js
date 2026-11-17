@@ -400,12 +400,82 @@ let sessionsLoadError = "";      // 失败原因：放进提示行的 title，�
 let renamingSession = null;   // 正在重命名的任务 id（行内出现输入框）
 const collapsedGroups = new Set();  // 已折叠的项目组（存组名）
 
+// ---------- 会话栏显示偏好：文件夹顺序 + 折叠（本浏览器持久化） ----------
+// 为什么只在这里存、不进库：文件夹顺序/折叠都是"这个窗口怎么看列表"，不是
+// 任务数据；换设备/清缓存无非回到默认（最近更新降序、全展开），不会丢任务。
+// 项目文件夹本身不是实体，标识就是目录名（组键），所以顺序表里存组键。
+const SIDEBAR_PREFS_KEY = "sessionSidebarPrefs";
+const GROUP_ORDER_MAX = 500;   // 顺序表上限：防 localStorage 被历史项目名无限撑大
+const UNGROUPED_KEY = "__other__";  // "其他"组：固定垫底，不可拖动
+
+// 选择器里的 id/目录名转义：目录名可能带引号或反斜杠，CSS.escape 缺失时退化为
+// 转义引号（与文件里既有的写法一致）。
+function cssEsc(value) {
+  return (window.CSS && CSS.escape) ? CSS.escape(String(value)) : String(value).replace(/["\\]/g, "\\$&");
+}
+
+function readSidebarPrefs() {
+  const prefs = { order: [], collapsed: [] };
+  try {
+    const raw = JSON.parse(localStorage.getItem(SIDEBAR_PREFS_KEY) || "null");
+    if (raw && Array.isArray(raw.order)) prefs.order = raw.order.filter(k => typeof k === "string");
+    if (raw && Array.isArray(raw.collapsed)) prefs.collapsed = raw.collapsed.filter(k => typeof k === "string");
+  } catch (e) { /* 损坏的偏好当作没有：默认顺序/展开，不影响任务数据 */ }
+  return prefs;
+}
+
+function writeSidebarPrefs(prefs) {
+  try { localStorage.setItem(SIDEBAR_PREFS_KEY, JSON.stringify(prefs)); }
+  catch (e) { /* 配额满/隐私模式：本次会话内仍然生效，只是刷新后回到默认 */ }
+}
+
+const sidebarPrefs = readSidebarPrefs();
+for (const key of sidebarPrefs.collapsed) collapsedGroups.add(key);
+
+function saveCollapsedGroups() {
+  sidebarPrefs.collapsed = [...collapsedGroups].slice(-GROUP_ORDER_MAX);
+  writeSidebarPrefs(sidebarPrefs);
+}
+
+// 按保存的顺序排列项目组：保存过的按保存次序在前，没保存过的（新项目）按名排在其后。
+// 这样"新建项目"永远出现在列表末尾而不是插进老项目中间，用户上次摆的次序也不被打乱。
+function orderGroupKeys(labels, order) {
+  const rank = new Map(order.map((key, i) => [key, i]));
+  const known = [...rank.keys()].filter(k => labels.has(k));
+  const unknown = [...labels.keys()].filter(k => !rank.has(k)).sort(
+    (a, b) => labels.get(a).localeCompare(labels.get(b), "zh"));
+  return [...known, ...unknown];
+}
+
+// 只对"完整顺序"（拖拽后的实际可拖动组）落盘：与拖动事件共用同一套相邻计算，
+// 保证相邻两项一定能换位——否则下一次加载会算出不同的起点，顺序看着"没生效"。
+function saveGroupOrder(keys) {
+  const movable = keys.filter(k => k !== UNGROUPED_KEY).slice(0, GROUP_ORDER_MAX);
+  // 只剩一个文件夹时不能把 order 清空：顺序里已不存在的键会被 orderGroupKeys 过滤，
+  // 但用户之前摆好的相对次序要留着（项目换回来时才不乱）
+  if (movable.length > 1 || sidebarPrefs.order.length === 0) sidebarPrefs.order = movable;
+  writeSidebarPrefs(sidebarPrefs);
+}
+
+// 拖动中的文件夹/任务：只记 id 与"指针是否真的动过"。拖动期间列表不重画——
+// 重画会掐断浏览器原生拖动会话——轮询回来的新列表先攒在 pendingSessionList，
+// 松手后再换上并画一次。任务行在拖动中就按坐标落位（见 insertTaskRow）。
+let groupDragId = null;
+let groupDragMoved = false;
+let taskDragId = null;
+let taskDragMoved = false;
+let pendingSessionList = null;  // 拖动期间到达的新列表：dragend 时再换上
+
 async function loadSessions() {
   try {
     const list = await api("/api/sessions");
     sessionsLoadFailed = false;
     sessionsLoadError = "";
-    sessionsCache = Array.isArray(list) ? list : [];
+    const next = Array.isArray(list) ? list : [];
+    // 正在拖着任务行时后台轮询回来了：先接住数据（拖拽落点按最新列表算），
+    // 不重画——重画会抹掉浏览器原生拖动，手一松就"什么都没发生"。
+    if (taskDragId === null) sessionsCache = next;
+    else pendingSessionList = next;
     refreshConversationHeader();
   } catch (e) {
     // 拉取失败必须显式说出来：接口 500 时列表区原先只剩"还没有任务，发一条消息
@@ -416,6 +486,7 @@ async function loadSessions() {
     sessionsLoadFailed = true;
     sessionsLoadError = String((e && e.message) || "未知错误");
   }
+  if (taskDragId !== null || groupDragId !== null) return;  // 拖动中：等收尾再画（见 pendingSessionList）
   renderSessions(sessionsCache);   // 两条路径都重画：失败时也要把提示行画出来
 }
 
@@ -482,7 +553,7 @@ function stateBadge(state) {
   return el;
 }
 
-function taskRow(s, list) {
+function taskRow(s, list, groupKey = UNGROUPED_KEY) {
   const li = document.createElement("li");
   li.className = "task" + (s.id === currentSession ? " active" : "");
 
@@ -613,8 +684,199 @@ function taskRow(s, list) {
     confirmingArchive = null;
     switchSession(s.id);
   });
+  makeTaskDraggable(li, s, groupKey);
   return li;
 }
+
+function makeTaskDraggable(li, s, groupKey) {
+  // 行本身不可拖：拖动源只给行首的 ⠿ 抓手（见文件里的拖动说明）
+  li.dataset.sid = s.id;
+  li.dataset.gkey = groupKey;
+  const grip = document.createElement("span");
+  grip.className = "t-grip";
+  grip.textContent = "⠿";
+  grip.title = "拖动调整顺序";
+  grip.setAttribute("aria-hidden", "true");
+  grip.draggable = true;
+  grip.addEventListener("dragstart", (e) => {
+    if (groupDragId !== null) { e.preventDefault(); return; }   // 两条拖动通道互斥
+    taskDragId = s.id;
+    taskDragMoved = false;
+    li.classList.add("dragging");
+    e.stopPropagation();   // 不让 dragstart 冒泡到组头
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", `s:${s.id}`);  // 只用于让 Firefox 起拖
+  });
+  li.prepend(grip);
+}
+
+// ---------- 拖动：任务行 / 文件夹 ----------
+// 拖动源是行首的 ⠿ 抓手（不是整行）：整行可拖会吞掉"点组头折叠""点行切会话"
+// 这样最常用的点击——鼠标一抖就叫拖动，用户读到的却是"点了没反应"。
+// 落点由列表层按指针坐标统一算（taskDropTarget），拖动中就把行/组插到 DOM 的
+// 对应槽位（insertTaskRow / placeGroupLocally）：看到的插入线与松手结果永远一致。
+//
+// 状态机刻意做简单：拖动期间列表不重画（重画会掐断浏览器原生拖动），轮询或
+// 其他路径发起的重画一律记进 pendingSessionList，由 dragend 统一收尾（见
+// finishDrag）。dragend 挂在 document 捕获阶段，不依赖拖动源元素还在原处——
+// 拖动中组头会被搬到别的位置，依赖元素事件在部分引擎上并不牢靠。
+function insertTaskRow(ul, source, target) {
+  if (!source || !target) return;
+  const parent = target.li.parentNode;
+  if (!parent) return;
+  if (target.pos === "before" || target.pos === "after") {
+    const items = [...ul.querySelectorAll(`.task[data-gkey="${cssEsc(target.gkey)}"]`)];
+    const order = computeTaskOrder(items.map(r => r.dataset.sid), source.dataset.gkey === target.gkey,
+      source.dataset.sid, target);
+    if (order === null) return;   // 落在原处：不动
+    const at = order.indexOf(source.dataset.sid);
+    const prevId = at > 0 ? order[at - 1] : null;
+    const prevRow = prevId === null ? null : items.find(r => r.dataset.sid === prevId);
+    let ref;
+    if (prevRow) ref = prevRow.nextSibling;   // 跟在上一行后面
+    else {
+      const head = ul.querySelector(`:scope > .group-head[data-gkey="${cssEsc(target.gkey)}"]`);
+      if (!head) return;
+      ref = head.nextSibling;                 // 空文件夹：跟在组头后面
+    }
+    if (ref === source) return;               // 已经在位
+    source.dataset.gkey = target.gkey;
+    parent.insertBefore(source, ref);         // 目标行与源行同一父节点：插到它前面即落在槽位
+    return;
+  }
+  // 落在组头 / 末尾落点：接到该文件夹末尾
+  const head = ul.querySelector(`:scope > .group-head[data-gkey="${cssEsc(target.gkey)}"]`);
+  if (!head) return;
+  let last = head;
+  for (let el = head.nextElementSibling; el && !el.classList.contains("group-head"); el = el.nextElementSibling) {
+    if (el.classList.contains("task")) last = el;
+  }
+  if (last === source) return;
+  source.dataset.gkey = target.gkey;
+  parent.insertBefore(source, last.nextSibling);
+}
+
+// 拖动文件夹时把该组（组头 + 它的任务行）整体挪到目标组之前/之后。先用
+// DocumentFragment 把整组从原位置"整段摘下"（一次插入即整组移除，不会出现
+// "组头走了、任务行还留在原地"的半截状态），再一次性插到落点。
+function placeGroupLocally(ul, movingKey, targetKey, after = false) {
+  const heads = [...ul.querySelectorAll(":scope > .group-head[data-gkey]")];
+  const from = heads.find(h => h.dataset.gkey === movingKey);
+  const to = heads.find(h => h.dataset.gkey === targetKey);
+  if (!from || !to || from === to) return;
+  const rows = [];
+  // 先用 nextElementSibling 把整段行收齐再动 DOM：移动后前后指针都会变
+  for (let el = from.nextElementSibling; el && !el.classList.contains("group-head"); el = el.nextElementSibling) {
+    rows.push(el);
+  }
+  // 落点：插到目标组之前 / 之后（最后一段行之后，没有行就是组头之后）
+  let ref = to;
+  if (after) {
+    ref = to.nextElementSibling;
+    while (ref && !ref.classList.contains("group-head")) ref = ref.nextElementSibling;
+  }
+  const fragment = document.createDocumentFragment();
+  fragment.append(from, ...rows);
+  ul.insertBefore(fragment, ref);
+}
+
+// 文件夹顺序以 DOM 为准落盘：把每个组头后面的任务行归到该组名下（拖动只改了
+// 位置，没改数据），"其他"/平铺区属于此前最近的那个项目组。
+function orderGroupsFromDom(ul) {
+  let current = UNGROUPED_KEY;
+  for (const el of ul.children) {
+    if (el.classList.contains("group-head") && el.dataset.gkey) current = el.dataset.gkey;
+    else if (el.classList.contains("task") && el.dataset.sid && el.dataset.gkey !== current) {
+      el.dataset.gkey = current;
+    }
+  }
+}
+
+let dropHintNow = null;   // 当前显示的落点提示（el + class）
+function clearTaskDropHint() {
+  dropHintNow = null;
+  const ul = $("task-list");
+  if (!ul) return;
+  for (const el of ul.querySelectorAll(".drop-before, .drop-after, .drop-into")) {
+    el.classList.remove("drop-before", "drop-after", "drop-into");
+  }
+}
+
+function showOnly(el, cls) {
+  if (dropHintNow && dropHintNow.el === el && dropHintNow.cls === cls) return;
+  clearTaskDropHint();
+  dropHintNow = el ? { el, cls } : null;
+  if (el) el.classList.add(cls);
+}
+
+// 按指针位置算出落点：{ li, pos: "before"|"after"|"into", gkey }。
+// 只有指针真正进入某一行才算行间落点；落在组头上就是"拖进这个文件夹末尾"；
+// 都不命中时钳到最近一次越过的行，最后退到列表末尾落点。
+function taskDropTarget(ul, clientY) {
+  if (!ul) return null;
+  let best = null;
+  for (const li of ul.querySelectorAll(".task[data-sid]")) {
+    const r = li.getBoundingClientRect();
+    if (r.height === 0) continue;
+    if (clientY < r.top) break;   // 已在上方：钳到它之前
+    best = { li, pos: clientY < r.top + r.height / 2 ? "before" : "after", gkey: li.dataset.gkey || UNGROUPED_KEY };
+  }
+  for (const head of ul.querySelectorAll(":scope > .group-head[data-gkey]")) {
+    const r = head.getBoundingClientRect();
+    if (clientY >= r.top && clientY <= r.bottom) {
+      return { li: head, pos: "into", gkey: head.dataset.gkey };
+    }
+  }
+  if (best) return best;
+  const tail = ul.querySelector(":scope > .list-tail");
+  return tail ? { li: tail, pos: "into", gkey: tail.dataset.gkey || UNGROUPED_KEY } : null;
+}
+
+// 把「源行 + 落点」换算成目标文件夹的完整任务顺序；null = 落到原处（不必落位）。
+// 源行本来就属于目标文件夹时先从原位置摘出来，再按落点插回，避免"插到自己旁边"
+// 造成的错位（这也是"拖动没反应"最常见的来源）。
+function computeTaskOrder(rows, sourceInGroup, sid, target) {
+  const i = sourceInGroup ? rows.indexOf(sid) : -1;
+  const pool = rows.filter(id => id !== sid);
+  const at = rows.indexOf(target.li.dataset.sid);
+  if (at < 0) return null;   // 落点不在目标文件夹里（数据已变）：放弃，等下次重画
+  let insertAt = target.pos === "after" ? at + 1 : at;
+  if (i >= 0 && i < insertAt) insertAt -= 1;   // 源行先被摘走，落点序号随之左移
+  insertAt = Math.max(0, Math.min(pool.length, insertAt));
+  const order = [...pool.slice(0, insertAt), sid, ...pool.slice(insertAt)];
+  return order.join() === rows.join() ? null : order;
+}
+
+// 拖动收尾（document 上只挂一次）：清状态、换上新列表、按需重画一次。
+// 任何路径（松手、拖到窗口外、列表被外部原因重建）都走这里，标志位不会漏清。
+function finishDrag() {
+  if (taskDragId === null && groupDragId === null) return;
+  const ul = $("task-list");
+  const movedTask = taskDragMoved;
+  const movedGroup = groupDragMoved;
+  taskDragId = null;
+  groupDragId = null;
+  taskDragMoved = false;
+  groupDragMoved = false;
+  autoScrollStep = 0;
+  cancelAnimationFrame(autoScrollFrame);
+  autoScrollFrame = 0;
+  if (ul) {
+    for (const el of ul.querySelectorAll(".dragging")) el.classList.remove("dragging");
+    if (movedGroup) {
+      orderGroupsFromDom(ul);
+      saveGroupOrder([...ul.querySelectorAll(":scope > .group-head[data-gkey]")].map(h => h.dataset.gkey));
+    }
+  }
+  clearTaskDropHint();
+  const latest = pendingSessionList;
+  pendingSessionList = null;
+  if (latest) sessionsCache = latest;
+  if (movedTask || movedGroup || latest) renderSessions(sessionsCache);
+}
+
+let autoScrollStep = 0;    // 边缘自动滚动速度（px/帧），0 = 不滚
+let autoScrollFrame = 0;   // 正在跑的 rAF 句柄
 
 // 列表拉取失败时的一行提示：点一下立刻重试（比等 8 秒轮询快）。用 role/tabIndex
 // 让它键盘可达——这行是"列表为什么是空的"的唯一解释，读屏用户也得够得着。
@@ -634,6 +896,9 @@ function listErrorRow() {
 }
 
 function renderSessions(list) {
+  // 拖动中不重画（会掐断浏览器原生拖动）；被跳过的这次重画记进 pendingSessionList，
+  // 由 finishDrag 松手后补画——任何路径来的重画都不会被悄悄吞掉
+  if (taskDragId !== null || groupDragId !== null) { pendingSessionList = list; return; }
   const ul = $("task-list");
   ul.innerHTML = "";
   if (sessionsLoadFailed) ul.appendChild(listErrorRow());
@@ -661,11 +926,62 @@ function renderSessions(list) {
     const icon = key === "__other__" ? "💬" : "📁";
     const text = document.createElement("span");
     text.className = "gh-label";
-    text.textContent = `${collapsed ? "▸" : "▾"} ${icon} ${label}（${count}）`;
+    // 折叠标记/图标/名字分开成元素：只有名字可省略号截断，长项目名不会把
+    // 折叠箭头和计数挤没（原来整串文本超宽时两端都会被裁）。
+    const caret = document.createElement("span");
+    caret.className = "gh-caret";
+    caret.textContent = collapsed ? "▸" : "▾";
+    const iconEl = document.createElement("span");
+    iconEl.className = "gh-ico";
+    iconEl.textContent = icon;
+    const name = document.createElement("span");
+    name.className = "gh-name";
+    name.textContent = label;
+    const countEl = document.createElement("span");
+    countEl.className = "gh-count";
+    countEl.textContent = `(${count})`;
+    text.append(caret, iconEl, name, countEl);
+    text.title = `${label} · ${count} 个任务 · 点击${collapsed ? "展开" : "折叠"}`;
     text.addEventListener("click", () => {
       collapsed ? collapsedGroups.delete(key) : collapsedGroups.add(key);
+      saveCollapsedGroups();
       renderSessions(sessionsCache);
     });
+    // 拖动文件夹：行首的 ⠿ 抓手是拖动源（整行可拖会让"点一下折叠"变成误拖）。
+    // 拖动中按指针在目标文件夹的上/下半区插到它之前/之后，松手后落盘顺序。
+    // "其他"是兜底分组，不是项目，不参与排序。
+    head.title = key === UNGROUPED_KEY ? "没有归属项目的任务" : "点名称展开/折叠；拖 ⠿ 调整文件夹顺序";
+    head.dataset.gkey = key;
+    const grip = document.createElement("span");
+    grip.className = "gh-grip";
+    grip.textContent = "⠿";
+    grip.setAttribute("aria-hidden", "true");
+    if (key !== UNGROUPED_KEY) {
+      head.classList.add("draggable");
+      grip.title = "拖动调整文件夹顺序";
+      grip.draggable = true;
+      grip.addEventListener("dragstart", (e) => {
+        if (taskDragId !== null) { e.preventDefault(); return; }   // 两条拖动通道互斥
+        groupDragId = key;
+        groupDragMoved = false;
+        head.classList.add("dragging");
+        e.stopPropagation();
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", `g:${key}`);  // 只用于让 Firefox 起拖
+      });
+    }
+    head.addEventListener("dragover", (e) => {
+      if (groupDragId === null) return;
+      e.preventDefault();
+      e.stopPropagation();   // 文件夹拖动归组头处理：列表层不再按任务落点算一次
+      e.dataTransfer.dropEffect = "move";
+      if (groupDragId === key) return;
+      const r = head.getBoundingClientRect();
+      // 上半区插到本组之前，下半区插到本组之后（与"拖动文件夹"的直觉一致）
+      groupDragMoved = true;
+      placeGroupLocally(ul, groupDragId, key, e.clientY >= r.top + r.height / 2);
+    });
+    head.appendChild(grip);
     head.appendChild(text);
     // 项目组头部「＋」：新建一个直接绑定该项目的任务（首条消息建会话时原子绑定）
     if (key !== "__other__") {
@@ -682,18 +998,32 @@ function renderSessions(list) {
     }
     return head;
   };
-  // 项目组在前（按名排序），"其他"固定垫底
-  const keys = [...groups.keys()].filter(k => k !== "__other__").sort(
-    (a, b) => groups.get(a).label.localeCompare(groups.get(b).label, "zh"));
-  if (groups.has("__other__")) keys.push("__other__");
+  // 项目组在前：按用户拖出的顺序（没拖过的按名排），"其他"固定垫底
+  const projectKeys = [...groups.keys()].filter(k => k !== UNGROUPED_KEY);
+  const keys = orderGroupKeys(
+    new Map(projectKeys.map(k => [k, groups.get(k).label])), sidebarPrefs.order);
+  if (groups.has(UNGROUPED_KEY)) keys.push(UNGROUPED_KEY);
   const onlyOneGroup = keys.length === 1;
   for (const key of keys) {
     const g = groups.get(key);
     // 只有一个组且是"其他"（全场都没有项目）时不显示组头——列表退化为平铺
-    if (!(onlyOneGroup && key === "__other__")) ul.appendChild(groupHeader(g.label, g.items.length, key));
+    // （此时也没有拖动抓手：单个兜底组没有顺序可调）
+    if (!(onlyOneGroup && key === UNGROUPED_KEY)) {
+      ul.appendChild(groupHeader(g.label, g.items.length, key));
+    }
     if (collapsedGroups.has(key) && !onlyOneGroup) continue;
-    for (const s of g.items) ul.appendChild(taskRow(s, list));
+    for (const s of g.items) {
+      ul.appendChild(taskRow(s, list, key));
+    }
   }
+  // 末尾垫一个空落点：把任务拖到最后一个文件夹（或最下面）时能命中"追加到此处"
+  const tail = document.createElement("li");
+  tail.className = "list-tail";
+  // 末尾落点挂在最后一个【看得见】的文件夹上：末尾文件夹折叠时不让它指向空组
+  const visibleKeys = keys.filter(k => !(collapsedGroups.has(k) && !onlyOneGroup));
+  tail.dataset.gkey = visibleKeys[visibleKeys.length - 1] || keys[keys.length - 1] || UNGROUPED_KEY;
+  tail.setAttribute("aria-hidden", "true");
+  ul.appendChild(tail);
 }
 
 // 服务端首轮结束后 AI 总结出的新任务名（SSE session_title）：就地改缓存并
@@ -6147,6 +6477,62 @@ refreshCtx();
 const SIDE_COLLAPSED_KEY = "sidebarCollapsed";
 const SIDE_LEAVE_DELAY = 260;   // 鼠标移出后延迟收起：给"滑向悬浮层"留出过渡时间
 
+// 任务列表的两条拖动通道，都在列表层统一接线（行是每次重画新建的，挂在行上的
+// 监听不承担"算落点"的职责）：
+//   1. 拖动行里的任务 → 按指针坐标在任务行之间落位（含跨文件夹）；
+//   2. 拖动文件夹 → 在组头之间落位，松手后保存文件夹顺序。
+function initTaskListDrag() {
+  const ul = $("task-list");
+  if (!ul) return;
+  ul.addEventListener("dragover", (e) => {
+    if (taskDragId === null) return;   // 文件夹拖动由各自的组头处理（组头会 stopPropagation）
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    const source = ul.querySelector(`.task[data-sid="${cssEsc(taskDragId)}"]`);
+    const nowGroup = source ? source.dataset.gkey : null;
+    const target = taskDropTarget(ul, e.clientY);
+    if (!target) { clearTaskDropHint(); return; }
+    // 跨文件夹：只在目标文件夹上高亮，不画行间插入线——任务不属于那个项目，
+    // 松手后列表按真实归属重画即归位（任务归属由"工作区"决定，拖动不改数据）。
+    if (target.gkey !== nowGroup) {
+      const marker = target.pos === "into"
+        ? target.li
+        : (ul.querySelector(`:scope > .group-head[data-gkey="${cssEsc(target.gkey)}"]`) || target.li);
+      showOnly(marker, "drop-into");
+      return;
+    }
+    if (target.pos === "into") { showOnly(target.li, "drop-into"); return; }
+    showOnly(target.li, target.pos === "before" ? "drop-before" : "drop-after");
+    taskDragMoved = true;
+    insertTaskRow(ul, source, target);
+  });
+  // 拖到列表上下边缘时自动滚动：列表很长时，否则最后一屏的任务永远拽不到上面
+  ul.addEventListener("dragover", (e) => {
+    if (taskDragId === null && groupDragId === null) return;
+    const r = ul.getBoundingClientRect();
+    const edge = 36;
+    const next = e.clientY < r.top + edge ? -10 : e.clientY > r.bottom - edge ? 10 : 0;
+    if (next === autoScrollStep && autoScrollFrame) return;
+    autoScrollStep = next;
+    if (autoScrollStep && !autoScrollFrame) autoScrollFrame = requestAnimationFrame(stepAutoScroll);
+  });
+  const stepAutoScroll = () => {
+    autoScrollFrame = 0;
+    if ((taskDragId === null && groupDragId === null) || autoScrollStep === 0) return;   // 指针离开边缘即停
+    ul.scrollTop += autoScrollStep;
+    autoScrollFrame = requestAnimationFrame(stepAutoScroll);
+  };
+  // 拖出列表：清掉插入线（dropEffect 变成 none，松手即取消）
+  ul.addEventListener("dragleave", (e) => {
+    if (taskDragId === null) return;
+    if (!e.relatedTarget || !ul.contains(e.relatedTarget)) clearTaskDropHint();
+  });
+  // 松手/拖出窗口都走同一条收尾路径；挂在 document 捕获阶段，拖动源被搬走也不丢
+  document.addEventListener("dragend", finishDrag, true);
+  document.addEventListener("drop", finishDrag, true);
+  ul.addEventListener("drop", (e) => e.preventDefault());
+}
+
 function sidebarEl() { return document.querySelector(".sidebar"); }
 
 function initSidebar() {
@@ -6156,6 +6542,7 @@ function initSidebar() {
   const mask = $("side-mask");
   const nav = $("nav-toggle");
   if (!side || !btn || !hover) return;
+  initTaskListDrag();
 
   const setCollapsed = (collapsed) => {
     side.classList.toggle("collapsed", collapsed);

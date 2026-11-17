@@ -1054,12 +1054,53 @@ button.primary:hover { background: var(--accent-hover); }
 .perm-chip-warn { color: var(--warning); }  /* yolo 时图标染警示色 */
 
 /* 任务列表：项目分组头 + 行内重命名输入框 */
+/* 文件夹行：折叠箭头 + 图标 + 名字（可截断）+ 计数，行首的 ⠿ 是排序抓手。
+   整行可拖（原生拖动）；悬停时才显形抓手，安静但一摸就知道能拖。 */
 .group-head {
   font-size: 12px; font-weight: 600; color: var(--text-2);
-  padding: 8px 10px 4px; cursor: pointer; user-select: none;
-  display: flex; align-items: center; justify-content: space-between;
+  padding: 4px 6px 4px 2px; margin-top: 2px;
+  border-radius: 7px;
+  cursor: pointer; user-select: none;
+  display: flex; align-items: center; justify-content: space-between; gap: 2px;
+  position: relative;
 }
-.group-head:hover { color: var(--text); }
+.group-head:hover { color: var(--text); background: var(--hover); }
+.group-head:focus-within { outline: none; }
+.group-head.draggable { cursor: grab; }
+.group-head.draggable:active { cursor: grabbing; }
+.group-head .gh-label {
+  display: flex; align-items: center; gap: 5px; min-width: 0; flex: 1;
+  padding: 2px 2px 2px 0; border-radius: 5px;
+}
+.group-head .gh-label:hover { color: var(--text); }
+.group-head .gh-caret { flex: 0 0 auto; width: 12px; text-align: center; color: var(--text-3); font-size: 10px; }
+.group-head .gh-ico { flex: 0 0 auto; font-size: 12px; }
+.group-head .gh-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group-head .gh-count { flex: 0 0 auto; color: var(--text-3); font-weight: 500; font-size: 11px; font-variant-numeric: tabular-nums; }
+/* 排序抓手：常驻低对比（不然没人知道能拖），悬停时加深；读屏软件忽略（aria-hidden） */
+.group-head .gh-grip {
+  flex: 0 0 auto; width: 12px; text-align: center;
+  color: var(--text-3); font-size: 11px; line-height: 1;
+  opacity: .35; transition: opacity .12s, color .12s;
+}
+.group-head.draggable:hover .gh-grip { opacity: .9; }
+.group-head .gh-grip:hover { opacity: 1; color: var(--text-2); }
+/* "其他"是兜底分组：不能拖，抓手不出现，鼠标也不是抓手 */
+.group-head:not(.draggable) .gh-grip { display: none; }
+.group-head.dragging { opacity: .45; }
+/* 跨文件夹拖任务时的目标文件夹：整行高亮（行间插入线只在同一文件夹内出现） */
+.group-head.drop-into {
+  background: var(--selected-soft);
+  color: var(--text);
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+/* 任务行拖动：插入线（行间）与整行高亮（末尾落点） */
+.task.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.task.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+.task.drop-into { background: var(--selected-soft); box-shadow: inset 0 0 0 1px var(--accent-weak-border); }
+.list-tail.drop-into { min-height: 22px; border-radius: 8px; box-shadow: inset 0 2px 0 var(--accent); }
+/* 拖动中的任务行：半透明，其余行保持原位（落点由插入线表达） */
+.task.dragging { opacity: .4; }
 .group-head .gh-add {
   border: none; background: transparent; color: var(--text-3);
   font-size: 13px; cursor: pointer; padding: 0 4px; border-radius: 4px;
@@ -2717,6 +2758,16 @@ button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); 
 .trace .proc-line > :first-child { margin-top: 0; }
 .trace .proc-line > :last-child { margin-bottom: 0; }
 .task-standard { position: relative; align-items: flex-start; }
+/* 任务行排序抓手：行首 10px 的 ⠿，平时淡淡的（暗示可拖），悬停该行时加深 */
+.t-grip {
+  flex: 0 0 auto; width: 10px; margin-left: -2px;
+  color: var(--text-3); font-size: 10px; line-height: 1.9; text-align: center;
+  opacity: .28; transition: opacity .12s, color .12s; cursor: grab; user-select: none;
+}
+.task-standard:hover .t-grip, .task-standard:focus-within .t-grip { opacity: .85; }
+.t-grip:active { cursor: grabbing; }
+/* 触屏没有原生 HTML5 拖动：把手在手机上藏起来，避免"看得见拖不动" */
+[data-mode="mobile"] .t-grip, [data-mode="mobile"] .gh-grip { display: none; }
 .task-standard .t-title { min-width: 0; }
 .t-heading { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .t-heading .t-name { flex: 1; min-width: 0; font-weight: 500; }
@@ -2727,7 +2778,7 @@ button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); 
 .task-actions .t-del { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 2px; opacity: 1; }
 .task-standard:hover .task-actions, .task-standard:focus-within .task-actions { opacity: 1; pointer-events: auto; }
 .task-standard:hover .t-time, .task-standard:focus-within .t-time { visibility: hidden; }
-.group-head { font-size: 11px; line-height: 1.5; padding: 12px 10px 5px; }
+.group-head { font-size: 11px; line-height: 1.5; padding: 5px 4px 4px 2px; margin-top: 4px; }
 .gh-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 [data-mode="mobile"] .task-standard { min-height: 62px; }
 [data-mode="mobile"] .task-actions { opacity: 1; pointer-events: auto; top: auto; bottom: 6px; }
