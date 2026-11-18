@@ -111,6 +111,61 @@ def execute(uid,workspace,ident,sql):
             if entry['conn'] is not None and item['kind']=='sqlite':entry['conn'].set_progress_handler(None,0)
 
 
+_UNCONFIRMED={2006,2013,2045,2055}  # connection lost while the statement may have run
+
+def update(uid,workspace,ident,table,column,key,value):
+    """Change one cell of one row: a single bound UPDATE, committed once.
+
+    The workbench's SQL editor is never reused here, so a failed or interrupted
+    edit is reported (and never silently retried) instead of duplicating a write.
+    """
+    plan=config._check(uid,workspace,ident,table,column,key,value)
+    statement,parameters,kind=plan['statement'],plan['parameters'],plan['kind']
+    conn=config._connect(plan['item'],writable=True)
+    if kind=='sqlite':
+        deadline=time.monotonic()+10;conn.set_progress_handler(lambda:time.monotonic()>deadline,1000)
+    cursor=conn.cursor();executed=False
+    try:
+        cursor.execute(statement,parameters);executed=True
+        affected=cursor.rowcount;cursor.close()
+        if affected>1:
+            conn.rollback();raise ValueError('定位条件匹配了多行，已取消修改；请改用主键定位')
+        if kind=='sqlite':
+            # Prove the new value really sits in a row with this key before committing
+            # (rowcount is -1 for UPDATE in Python's sqlite3, so it proves nothing).
+            check=conn.execute('SELECT 1 FROM '+config._quote_name('"',table)+' WHERE '+' AND '.join(config._quote_name('"',name)+(' IS NULL' if raw is None else ' IS ?') for name,raw in key.items())+
+                               (' AND '+config._quote_name('"',column)+' IS NULL' if value is None else ' AND '+config._quote_name('"',column)+' IS ?'),
+                               [raw for raw in key.values() if raw is not None]+([] if value is None else [value])).fetchone()
+            if not check:
+                conn.rollback();raise ValueError('没有匹配到这一行，可能已被删除或主键已变化；请刷新表数据后重试')
+        elif affected==0:
+            conn.rollback();raise ValueError('没有匹配到这一行，可能已被删除或主键已变化；请刷新表数据后重试')
+        conn.commit()
+        return {'ok':True,'affected_rows':affected,'sql':plan['sql']}
+    except Exception as error:
+        try:
+            # SQLite keeps its statement in a transaction, so a rollback is exact.
+            # MySQL autocommits: if the connection broke after execution the write
+            # may or may not have landed, so report it as unconfirmed and never retry.
+            if kind=='mysql' and executed:conn.close()
+            else:conn.rollback()
+        except Exception:pass
+        if isinstance(error,ValueError):raise
+        if kind=='sqlite':raise ValueError('修改失败：'+config._sqlite_reason(error)) from None
+        code=error.args[0] if error.args else None
+        if code in _UNCONFIRMED:raise ValueError('连接中断，修改结果未确认；请重新读取这一行核对，不要直接重复执行') from None
+        reason={1045:'数据库账号认证失败',1054:'字段不存在，请刷新表数据后重试',1062:'该值与其他行重复，违反唯一约束',1064:'SQL 语法错误',
+                1142:'数据库账号没有该表的修改权限',1143:'数据库账号没有该字段的修改权限',1264:'数值超出字段范围',
+                1290:'数据库实例只读，无法写入',1406:'内容超出字段长度',3819:'该值未通过字段检查约束'}.get(code)
+        raise ValueError(reason or '修改失败，请检查字段类型、约束和账号写权限') from None
+    finally:
+        if cursor is not None:
+            try:cursor.close()
+            except Exception:pass
+        if kind=='sqlite' and conn is not None:
+            try:conn.set_progress_handler(None,0);conn.close()
+            except Exception:pass
+
 def touch(uid,workspace,ident):
     entry=_entry(uid,workspace,ident)
     with entry['lock']:

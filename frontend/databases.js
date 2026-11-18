@@ -32,7 +32,7 @@
       </aside>
       <main class="db-main"><div id="db-project-guide" class="db-empty" hidden><strong>先选择一个项目</strong><p>配置数据库不需要发送消息，也不会创建空会话。</p><button id="db-choose-project" class="db-primary">选择项目文件夹</button></div><div id="db-content"><div id="db-breadcrumb">选择数据库连接，再选择一张表</div><div class="db-view-tabs"><button id="db-fields">字段结构</button><button id="db-data">表数据</button></div>
         <details class="db-query-section"><summary>SQL 编辑器</summary><div class="db-section-heading"><div><h3>SQL 查询</h3><p class="db-help">按数据库账号权限执行 · 查询最多返回 200 行</p></div><button id="db-tables">查看表结构</button></div>
-          <div class="db-snippet-bar"><select id="db-snippet-list" aria-label="常用SQL"><option value="">常用 SQL</option></select><input id="db-snippet-name" placeholder="常用 SQL 名称" aria-label="SQL名称"><button id="db-snippet-save">保存</button><button id="db-snippet-new">新建</button><button id="db-snippet-delete">删除</button></div><div class="db-editor"><div class="db-editor-label">SQL <span>SQL</span></div><textarea id="db-sql" aria-label="SQL 查询" spellcheck="false" placeholder="SELECT * FROM your_table LIMIT 20"></textarea></div>
+          <div class="db-snippet-bar"><select id="db-snippet-list" aria-label="常用SQL"><option value="">常用 SQL</option></select><input id="db-snippet-name" placeholder="常用 SQL 名称" aria-label="SQL名称"><button id="db-snippet-save">保存</button><button id="db-snippet-new">新建</button><button id="db-snippet-delete">删除</button></div><div class="db-editor" id="db-sql-editor"><div class="db-editor-label">SQL <span>SQL · Tab/Enter 补全</span></div><textarea id="db-sql" aria-label="SQL 查询" spellcheck="false" placeholder="SELECT * FROM your_table LIMIT 20"></textarea></div>
           <div class="db-query-footer"><span class="db-help">选中语句优先执行 · 修改立即提交</span><button id="db-run" class="db-primary">执行 SQL <span aria-hidden="true">↗</span></button></div>
         </details>
         <section class="db-results-section"><div class="db-section-heading"><h3 id="db-result-title">字段与数据</h3></div><div class="db-grid-tools"><p id="db-state" role="status"></p><div><button id="db-wrap" aria-pressed="false">换行</button><button id="db-cell-open" disabled>${icon("eye")}查看单元格</button></div></div><div id="db-result"><div class="db-empty"><span class="db-empty-icon">▤</span><strong>从一次查询开始</strong><p>选择或添加连接，查看表结构后执行 SQL。</p></div></div><div class="db-row-pages"><button id="db-row-prev">上一页</button><span id="db-row-page"></span><button id="db-row-next">下一页</button></div></section></div>
@@ -40,7 +40,10 @@
     </div>`;
   document.body.append(dialog);
   const inspector=document.createElement('dialog');inspector.className='db-cell-dialog';inspector.setAttribute('aria-label','单元格详情');
-  inspector.innerHTML='<header><div><span class="db-card-caption">单元格内容 · 只读</span><h3 id="db-cell-title"></h3></div><button id="db-cell-close" aria-label="关闭单元格详情">✕</button></header><div class="db-cell-caption"><span id="db-cell-type"></span><button id="db-cell-copy">'+icon('copy')+'复制原值</button></div><pre id="db-cell-value"></pre>';
+  inspector.innerHTML='<header><div><span class="db-card-caption" id="db-cell-caption">单元格内容</span><h3 id="db-cell-title"></h3></div><button id="db-cell-close" aria-label="关闭单元格详情">✕</button></header><div class="db-cell-caption"><span id="db-cell-type"></span><button id="db-cell-copy">'+icon('copy')+'复制原值</button></div><pre id="db-cell-value"></pre>'
+    +'<section id="db-cell-edit" hidden><div class="db-cell-edit-head"><h4>修改这一格</h4><span id="db-cell-target"></span></div><textarea id="db-cell-input" spellcheck="false" aria-label="修改后的值"></textarea><div class="db-cell-edit-options"><label><input type="checkbox" id="db-cell-null">设为 NULL</label><span class="db-help">只修改这一行的一列；保存前请确认下方语句。</span></div>'
+    +'<div id="db-cell-sql-box" class="db-cell-sql"><div class="db-cell-sql-head"><span><strong>对应的修改语句</strong><small>可直接交给运维执行</small></span><button id="db-cell-sql-copy">'+icon('copy')+'复制语句</button></div><pre id="db-cell-sql-text"></pre><p id="db-cell-sql-state" class="db-help" role="status"></p></div>'
+    +'<footer class="db-cell-edit-actions"><button id="db-cell-reset">还原</button><button id="db-cell-save" class="db-primary">执行修改</button></footer></section>';
   document.body.append(inspector);
   let selectedCell=null;
 
@@ -61,9 +64,11 @@
     if(!valid(version))throw new Error('工作台状态已变化');return data;
   }
   async function run(fn){const version=++generation;if(!valid())return;state('处理中…');try{await fn(version);}catch(error){if(valid(version))state(error.message,true);}}
-  function resetCell(){if(selectedCell)selectedCell.node.classList.remove('db-cell-selected');selectedCell=null;el('db-cell-open').disabled=true;if(inspector.open)inspector.close();}
+  // 只允许浏览器自己的关闭按钮关闭详情：数据刷新时若用 inspector.close()，浏览器会把它当成
+  // “用户按了 Esc”，于是连带关闭工作台 dialog（表现为表格与 SQL 编辑器整块消失）。
+  function resetCell(){if(selectedCell)selectedCell.node.classList.remove('db-cell-selected');selectedCell=null;el('db-cell-open').disabled=true;if(inspector.open)inspector.removeAttribute('open');}
+  function selectCell(node,value,column,identity){if(selectedCell){selectedCell.node.classList.remove('db-cell-selected');selectedCell.node.tabIndex=-1;}selectedCell={node,value,column,identity};node.classList.add('db-cell-selected');node.tabIndex=0;el('db-cell-open').disabled=false;}
   function valueKind(value){if(value===null)return 'null';if(typeof value==='number')return 'number';if(typeof value==='boolean')return 'boolean';if(typeof value==='string' && /^[{[]/.test(value.trim())){try{const parsed=JSON.parse(value);if(parsed!==null && typeof parsed==='object')return 'json';}catch{}}return 'text';}
-  function selectCell(node,value,column){if(selectedCell){selectedCell.node.classList.remove('db-cell-selected');selectedCell.node.tabIndex=-1;}selectedCell={node,value,column};node.classList.add('db-cell-selected');node.tabIndex=0;el('db-cell-open').disabled=false;}
   function formatJson(source){
     const tokens=source.match(/"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null|[{}\[\]:,]/g) || [];
     let depth=0,output='';const line=()=>"\n"+'  '.repeat(Math.min(depth,16));
@@ -71,9 +76,84 @@
     return output;
   }
   function renderJson(pre,text){const regex=/("(?:[^"\\]|\\.)*"(?=\s*:))|("(?:[^"\\]|\\.)*")|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|\b(true|false|null)\b/g;let last=0;for(const match of text.matchAll(regex)){pre.append(document.createTextNode(text.slice(last,match.index)));const token=document.createElement('span');token.className='db-json-'+(match[1]?'key':match[2]?'string':match[3]?'number':'literal');token.textContent=match[0];pre.append(token);last=match.index+match[0].length;}pre.append(document.createTextNode(text.slice(last)));}
-  function inspectCell(){if(!selectedCell)return;const {value,column}=selectedCell;const kind=valueKind(value);cellEl('db-cell-title').textContent=column;cellEl('db-cell-type').textContent=kind.toUpperCase();const pre=cellEl('db-cell-value');pre.replaceChildren();if(kind==='json')renderJson(pre,formatJson(value));else pre.textContent=value===null?'NULL':String(value);if(!inspector.open)inspector.showModal();}
+  // Cell editor: reads left alone; a change is previewed as the exact UPDATE it
+  // would run, then executed once after an explicit confirmation.
+  let editInfo=null,editTable=null,previewRevision=0,previewLoading=false,savingCell=false;
+  const editInput=()=>cellEl('db-cell-input');
+  const previewEl=()=>cellEl('db-cell-sql-text');
+  function sameValue(){return selectedCell && (cellEl('db-cell-null').checked ? selectedCell.value===null : editInput().value===(selectedCell.value===null?'':String(selectedCell.value)));}
+  function keyFor(info){
+    if(!info || !selectedCell || !selectedCell.identity)return null;
+    const row=selectedCell.identity();const primary=info.primary?.length?info.primary:(info.unique?.[0]||[]);
+    // A NULL in a primary key cannot be matched; the preview then reports it instead of guessing.
+    // SQL literals are rendered from text, so every key value is normalised first.
+    if(!primary.length)return null;const key={};for(const name of primary){const raw=row[name];key[name]=raw===null||raw===undefined?null:String(raw);}return key;
+  }
+  function renderPreview(sql,error){
+    const previewBox=previewEl();previewBox.textContent=sql||'';const note=cellEl('db-cell-sql-state');
+    note.textContent=error||(sql?'未执行 · 仅在点击“执行修改”后写入':'改写内容后自动生成对应语句');note.dataset.tone=error?'error':'';
+  }
+  async function refreshPreview(){
+    if(!selectedCell)return;
+    const cell=selectedCell,revision=++previewRevision;
+    if(sameValue()){renderPreview('');cellEl('db-cell-reset').disabled=true;cellEl('db-cell-save').disabled=true;return;}
+    cellEl('db-cell-reset').disabled=false;cellEl('db-cell-save').disabled=true;
+    if(!editTable || !editInfo?.editable){renderPreview('',editInfo?.reason || '当前表不支持在页面内修改');return;}
+    const key=keyFor(editInfo);if(!key){renderPreview('','无法确定这一行的主键或唯一值，不能安全地修改');return;}
+    const value=cellEl('db-cell-null').checked?null:editInput().value;
+    previewLoading=true;renderPreview('','正在生成语句…');
+    try{const data=await request({action:'update_preview',id:el('db-list').value,table:editTable,column:cell.column,key,value},generation);if(revision!==previewRevision || !valid() || cell!==selectedCell)return;renderPreview(data.sql);cellEl('db-cell-save').disabled=false;}
+    catch(error){if(revision===previewRevision)renderPreview('',error.message);}
+    finally{if(revision===previewRevision)previewLoading=false;}
+  }
+  function paintCell(node,value){const kind=valueKind(value);node.className='db-value-'+kind;node.title=value===null?'NULL':String(value);node.replaceChildren();
+    if(kind==='json'){const token=document.createElement('span');token.className='db-json-preview';token.textContent=value;node.append(token);}else{const text=document.createElement('span');text.textContent=value===null?'NULL':String(value);if(kind==='null'||kind==='boolean')text.className='db-value-tag';node.append(text);}}
+  async function inspectCell(){
+    if(!selectedCell)return;const {value,column}=selectedCell;const kind=valueKind(value);cellEl('db-cell-title').textContent=column;cellEl('db-cell-type').textContent=kind.toUpperCase();const pre=cellEl('db-cell-value');pre.replaceChildren();if(kind==='json')renderJson(pre,formatJson(value));else pre.textContent=value===null?'NULL':String(value);
+    editTable=selectedTable||null;editInfo=null;previewRevision++;editInput().value=value===null?'':String(value);cellEl('db-cell-null').checked=false;editInput().disabled=false;cellEl('db-cell-null').disabled=false;renderPreview('');
+    if(!inspector.open)inspector.showModal();
+    if(mode!=='rows' || !editTable){cellEl('db-cell-caption').textContent='单元格内容 · 表格视图可修改';cellEl('db-cell-edit').hidden=true;return;}
+    cellEl('db-cell-caption').textContent='单元格内容 · 可修改';cellEl('db-cell-edit').hidden=false;cellEl('db-cell-target').textContent=editTable+' · '+column;
+    cellEl('db-cell-save').disabled=true;cellEl('db-cell-reset').disabled=true;
+    try{const info=await request({action:'edit_info',id:el('db-list').value,table:editTable},generation);if(column!==selectedCell?.column || editTable!==selectedTable || !inspector.open)return;editInfo=info;if(!info.editable){editInput().disabled=true;cellEl('db-cell-null').disabled=true;renderPreview('',info.reason||'当前表不支持在页面内修改');}else{editInput().disabled=false;cellEl('db-cell-null').disabled=false;if(sameValue())renderPreview('');else void refreshPreview();}}catch(error){renderPreview('',error.message);}
+  }
   cellEl('db-cell-close').onclick=()=>inspector.close();cellEl('db-cell-copy').onclick=async()=>{if(!selectedCell)return;const value=selectedCell.value;const ok=await copyText(value===null?'NULL':String(value));cellEl('db-cell-copy').textContent=ok?'已复制':'复制失败';};
-  el('db-cell-open').onclick=inspectCell;inspector.addEventListener('close',()=>{cellEl('db-cell-copy').innerHTML=icon('copy')+'复制原值';});
+  cellEl('db-cell-sql-copy').onclick=async()=>{const sql=previewEl().textContent;if(!sql)return;const ok=await copyText(sql);cellEl('db-cell-sql-copy').textContent=ok?'已复制语句':'复制失败';setTimeout(()=>{cellEl('db-cell-sql-copy').innerHTML=icon('copy')+'复制语句';},1600);};
+  editInput().addEventListener('input',()=>{if(cellEl('db-cell-null').checked){cellEl('db-cell-null').checked=false;}editInput().style.height='';editInput().style.height=Math.min(editInput().scrollHeight+2,220)+'px';void refreshPreview();});
+  cellEl('db-cell-null').onchange=()=>{if(cellEl('db-cell-null').checked)editInput().value='';void refreshPreview();};
+  editInput().addEventListener('keydown',event=>{if(event.key==='Enter' && (event.ctrlKey||event.metaKey) && !cellEl('db-cell-save').disabled){event.preventDefault();cellEl('db-cell-save').click();}});
+  cellEl('db-cell-reset').onclick=()=>{if(!selectedCell)return;editInput().value=selectedCell.value===null?'':String(selectedCell.value);cellEl('db-cell-null').checked=false;void refreshPreview();};
+  cellEl('db-cell-save').onclick=async()=>{
+    if(savingCell || !selectedCell || !editInfo?.editable)return;
+    const cell=selectedCell,key=keyFor(editInfo);if(!key)return;
+    const value=cellEl('db-cell-null').checked?null:editInput().value;
+    const yes=await new Promise(resolve=>{const box=document.createElement('dialog');box.className='db-rename-dialog db-confirm-dialog';
+      box.innerHTML='<h3>执行这次修改？</h3><p>只更新 <code>'+esc(editTable)+'</code> 中 <code>'+esc(cell.column)+'</code> 这一列，执行后立即提交，不自动重试。</p><pre></pre><footer><button type="button">取消</button><button type="button" class="db-primary">确认执行</button></footer>';
+      box.querySelector('pre').textContent=previewEl().textContent||'（语句尚未生成）';
+      const finish=result=>{box.close();box.remove();resolve(result);};box.querySelectorAll('button')[0].onclick=()=>finish(false);box.querySelectorAll('button')[1].onclick=()=>finish(true);box.addEventListener('cancel',()=>finish(false));document.body.append(box);box.showModal();});
+    if(!yes || cell!==selectedCell)return;
+    savingCell=true;cellEl('db-cell-save').disabled=true;const label=cellEl('db-cell-save').textContent;cellEl('db-cell-save').textContent='执行中…';let committed=false;
+    try{
+      const data=await request({action:'update',id:el('db-list').value,table:editTable,column:cell.column,key,value},generation);
+      paintCell(cell.node,value);cell.value=value;
+      renderPreview(data.sql);editInput().value=value===null?'':String(value);cellEl('db-cell-null').checked=value===null;
+      cellEl('db-cell-title').textContent=cell.column;cellEl('db-cell-value').textContent=value===null?'NULL':String(value);cellEl('db-cell-type').textContent=valueKind(value).toUpperCase();
+      cellEl('db-cell-sql-state').textContent='已执行 · 影响 '+data.affected_rows+' 行 · 已提交';cellEl('db-cell-sql-state').dataset.tone='';committed=true;cellEl('db-cell-save').disabled=true;cellEl('db-cell-reset').disabled=true;
+    }catch(error){cellEl('db-cell-sql-state').textContent='修改失败 · 请刷新这一行核对：'+error.message;cellEl('db-cell-sql-state').dataset.tone='error';state('修改失败：'+error.message,true);}
+    // After a failure the statement stays visible but save stays locked: check the row first.
+    finally{savingCell=false;cellEl('db-cell-save').textContent=label;cellEl('db-cell-save').disabled=committed || !previewEl().textContent || (!committed && cellEl('db-cell-sql-state').dataset.tone==='error');}
+  };
+  // 点击“查看单元格”时不把焦点留在按钮上：否则详情一旦关闭，焦点回到已隐藏的 dialog 里。
+  el('db-cell-open').onclick=()=>{inspectCell();el('db-cell-open').blur();};
+  // 嵌套模态对话框会让浏览器把同一个 Esc 依次发给每一层：先关详情，再关整个工作台。
+  // 这里在捕获阶段拦住工作台的 Esc，并关闭最上层的详情/重命名框，工作台保持不变。
+  document.addEventListener('keydown',event=>{
+    if(event.key!=='Escape' || !dialog.open)return;
+    const top=document.querySelector('.db-confirm-dialog[open]') || (inspector.open?inspector:null) || (renameDialog.open?renameDialog:null);
+    if(!top)return;
+    event.preventDefault();event.stopPropagation();top.close();
+  },true);
+  inspector.addEventListener('close',()=>{cellEl('db-cell-copy').innerHTML=icon('copy')+'复制原值';editInfo=null;previewRevision++;});
   el('db-tree-toggle').onclick=()=>{const expanded=el('db-tree-toggle').getAttribute('aria-expanded')!=='true';el('db-tree-toggle').setAttribute('aria-expanded',String(expanded));el('db-tree-body').hidden=!expanded;};
   el('db-wrap').onclick=()=>{const wrap=el('db-wrap').getAttribute('aria-pressed')!=='true';el('db-wrap').setAttribute('aria-pressed',String(wrap));el('db-result').classList.toggle('db-wrap-values',wrap);};
   function show(data){
@@ -85,8 +165,8 @@
     for(const [index,row] of data.rows.entries()){const tr=document.createElement('tr');const number=document.createElement('td');number.textContent=(mode==='rows' && selectedTable ? rowPage*100 : 0)+index+1;number.className='db-row-number';tr.append(number);
       for(const [column,value] of row.entries()){const td=document.createElement('td');const kind=valueKind(value);td.className='db-value-'+kind;td.tabIndex=cells.length===0?0:-1;td.title=value===null?'NULL':String(value);td.setAttribute('aria-label',data.columns[column]+': '+td.title);
         if(kind==='json'){const token=document.createElement('span');token.className='db-json-preview';token.textContent=value;td.append(token);}else{const text=document.createElement('span');text.textContent=value===null?'NULL':String(value);if(kind==='null'||kind==='boolean'||(mode==='schema' && data.columns[column]==='类型'))text.className='db-value-tag';td.append(text);}
-        const position=cells.length;cells.push(td);td.onclick=()=>selectCell(td,value,data.columns[column]);td.ondblclick=()=>{selectCell(td,value,data.columns[column]);inspectCell();};
-        td.onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();selectCell(td,value,data.columns[column]);inspectCell();return;}const offset={ArrowRight:1,ArrowLeft:-1,ArrowDown:data.columns.length,ArrowUp:-data.columns.length}[event.key];if(offset && cells[position+offset]){event.preventDefault();cells[position+offset].click();cells[position+offset].focus();}};tr.append(td);
+        const position=cells.length;const identity=()=>Object.fromEntries(data.columns.map((name,columnIndex)=>[name,row[columnIndex]??null]));cells.push(td);td.onclick=()=>selectCell(td,value,data.columns[column],identity);td.ondblclick=()=>{selectCell(td,value,data.columns[column],identity);inspectCell();};
+        td.onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();selectCell(td,value,data.columns[column],identity);inspectCell();return;}const offset={ArrowRight:1,ArrowLeft:-1,ArrowDown:data.columns.length,ArrowUp:-data.columns.length}[event.key];if(offset && cells[position+offset]){event.preventDefault();cells[position+offset].click();cells[position+offset].focus();}};tr.append(td);
       }tbody.append(tr);
     }
     if(!data.rows.length){const tr=document.createElement('tr');const td=document.createElement('td');td.colSpan=data.columns.length+1;td.className='db-no-rows';td.textContent='没有返回记录';tr.append(td);tbody.append(tr);}table.append(tbody);result.append(table);
@@ -143,12 +223,73 @@
     generation++;statusRevision++;connectionStates={};preferredConnection=null;const workspace='global';context={key:key(),sid:null,workspace};
     el('db-connect').reset();dialog.querySelector('[name=id]').value='';setKind();el('db-sql').value='';snippetId=null;el('db-snippet-name').value='';try{const draft=JSON.parse(localStorage.getItem(draftKey())||'null');if(draft){el('db-sql').value=draft.sql || '';el('db-snippet-name').value=draft.name || '';snippetId=draft.id || null;preferredConnection=draft.connection || null;}}catch{}clearTable();el('db-table-list').replaceChildren();state('');
     el('db-project').textContent='我的数据库';el('db-project').disabled=true;el('db-project-guide').hidden=true;el('db-content').hidden=false;dialog.querySelector('.db-sidebar').hidden=false;try{preferredConnection=localStorage.getItem('database-last-'+who);}catch{}
+    // 视图状态（表格模式、选中表、缓存）从零开始：上一次打开留下的表名会让新的编辑上下文错位。
+    mode='schema';selectedTable=null;rowPage=0;hasRows=false;sqlCatalog.clear();sqlColumnCache.clear();sqlColumnPending.clear();
     if(!dialog.open)dialog.showModal();if(workspace)void run(version=>load(version));
   }
   chip.onclick=open;
   window.DatabaseWorkbench={projectPickerClosed(){},projectChanged(){}};
   el('db-close').onclick=()=>dialog.close();dialog.addEventListener('close',()=>{resetCell();generation++;context=null;clearTimeout(searchTimer);dialog.querySelector('[name=password]').value='';});
   dialog.querySelector('[name=kind]').onchange=setKind;
+  // SQL 补全上下文：表名来自表目录（也包含当前页之外的搜索结果），
+  // 字段来自后端 columns 接口，按 (连接, 表) 缓存；切换连接后整批失效。
+  const sqlCatalog=new Map(),sqlColumnCache=new Map(),sqlColumnPending=new Map();
+  // 读取中的哨兵：与“已加载但为空”区分开，加载完成后替换为真实表名数组。
+  const pendingTables=Object.freeze([]);
+  function sqlTables(connection){
+    if(!connection)return [];
+    if(sqlCatalog.has(connection))return sqlCatalog.get(connection)||[];
+    // 首次使用时异步加载；读取中先返回空数组，由 notReady 通知补全稍后重算。
+    sqlCatalog.set(connection,pendingTables);
+    // 第一页有表时照常加载；大库的页数太多，不把整张目录塞进补全。
+    loadSqlTables(connection);
+    return [];
+    return [];
+  }
+  function loadSqlTables(connection){
+    const names=[];let page=0;
+    const next=()=>request({action:'catalog',id:connection,page,search:''},generation).then(data=>{
+      for(const item of data.items)if(!names.includes(item.name))names.push(item.name);
+      page+=1;
+      if(data.has_more && page<3)return next();
+    });
+    next().then(()=>{
+      // 目录到达后通知补全重新计算（表名与搜索到的结果都会进入候选）。
+      sqlCatalog.set(connection,names);
+      el('db-sql').dispatchEvent(new Event('sql-context'));
+    }).catch(()=>sqlCatalog.set(connection,[]));
+  }
+  function sqlColumns(connection,table){
+    if(!connection || !table)return [];
+    const key=connection+'\u0000'+table;
+    if(sqlColumnCache.has(key))return sqlColumnCache.get(key);
+    if(!sqlColumnPending.has(key)){
+      sqlColumnPending.set(key,true);
+      request({action:'columns',id:connection,table},generation).then(data=>{
+        sqlColumnCache.set(key,data.columns||[]);
+      }).catch(()=>{}).finally(()=>sqlColumnPending.delete(key));
+    }
+    return [];
+  }
+  function sqlTableAtCursor(){
+    // 光标前最后一个 FROM/JOIN/UPDATE/INTO 之后的标识符就是目标表。
+    const before=SqlCompletion.strip(el('db-sql').value.slice(0,el('db-sql').selectionStart));
+    const match=[...before.matchAll(/(?:from|join|update|into)\s+[`"]?([\p{L}\p{N}_.$]+)/giu)].pop();
+    return match ? match[1].replace(/^[`"]|[`"]$/g,'') : '';
+  }
+  function sqlCompletionContext(){
+    const connection=el('db-list').value;
+    const table=sqlTableAtCursor();
+    const columns=sqlColumns(connection,table);
+    const tables=sqlTables(connection);
+    // 目录/字段仍在请求中时通知补全稍后重算，避免先给出一份永远不更新的列表。
+    const pending=Boolean(connection) && (tables===pendingTables || (table && !sqlColumnCache.has(connection+'\u0000'+table)));
+    return {columns,tables:pending?[]:tables,notReady:pending};
+  }
+  if(window.SqlCompletionUI)SqlCompletionUI.attach(el('db-sql'),{getContext:sqlCompletionContext});
+  // 诊断入口：在控制台执行 __dbSqlHints() 可查看当前光标处的补全上下文。
+  window.__dbSqlHints=sqlCompletionContext;
+  el('db-list').addEventListener('change',()=>{sqlColumnCache.clear();sqlColumnPending.clear();sqlCatalog.clear();});
   el('db-sql').addEventListener('input',saveSqlDraft);el('db-sql').addEventListener('keydown',event=>{if(event.key==='Enter' && (event.ctrlKey || event.metaKey)){event.preventDefault();el('db-run').click();}});
   el('db-list').onchange=()=>{if(executing)return;statusRevision++;preferredConnection=el('db-list').value;restoreSqlDraft();connectionMeta();renderConnections();clearTable();search='';el('db-search').value='';tablePage=0;void run(async version=>{await loadSnippets(version);await catalog(version);});};
   el('db-connect').onsubmit=async event=>{event.preventDefault();if(saving)return;saving=true;const button=event.target.querySelector('[type=submit]');button.disabled=true;const body=Object.fromEntries(new FormData(event.target));try{await run(async version=>{const saved=await request({action:'save',...body},version);dialog.querySelector('[name=id]').value=saved.id;dialog.querySelector('[name=password]').value='';await load(version,saved.id);if(valid(version))state('连接已保存，可选择表或测试连接');});}finally{saving=false;button.disabled=false;}};
