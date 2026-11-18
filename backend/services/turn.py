@@ -386,12 +386,18 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
                     db.turn_finished(sid, user_mid, "error",
                                      "回合线程收尾异常，详情见 backend 日志")
             except Exception:
-                pass
+                # 原来这里静默吞掉：一旦记账失败，这条回合会永远停在 running，
+                # 下次启动被误判成"被中断"，而现场没有任何线索可查。
+                # log 由装配层注入，异常路径上可能还是 None，判空后再用。
+                if log is not None:
+                    log.exception("[会话 %s] 异常收尾时写状态账失败（回合可能卡在 running）", sid)
             try:
                 bus.publish({"type": "error", "message": "回合执行异常，详情见 backend 日志"})
                 bus.publish({"type": "turn_end", "user_mid": None})
             except Exception:
-                pass
+                # 同理：连错误都发不出去时用户看到的是"卡住"，必须留下证据
+                if log is not None:
+                    log.exception("[会话 %s] 异常收尾时推送事件失败（前端可能停在流式态）", sid)
         finally:
             try:
                 if getattr(agent,"input_controller",None) is not None:

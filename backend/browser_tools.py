@@ -8,6 +8,7 @@ closed explicitly; unattended actor threads reclaim their browser after idle.
 """
 
 import json
+import logging
 import queue
 from concurrent.futures import Future
 from functools import wraps
@@ -15,6 +16,8 @@ import shutil
 import threading
 import time
 from pathlib import Path
+
+log = logging.getLogger("browser_tools")
 
 # playwright 是可选依赖
 # 注意：本模块绝不 import tools（tools.py 反向导入本模块，循环导入会炸）。
@@ -400,7 +403,9 @@ class BrowserManager:
             if service._event_bus is not None:
                 service._event_bus(self.sid).publish({"type":"browser_state",**self._state(),"note":note})
         except Exception:
-            pass
+            # 推状态失败不该让浏览器操作失败，但也不能完全无声：
+            # 事件总线是前端看到浏览器进度的唯一通道，静默就只能靠猜
+            log.debug("浏览器状态推送失败（忽略）", exc_info=True)
 
     def _locator(self,page,selector):
         if selector.startswith(("css=","xpath=","text=","id=")):
