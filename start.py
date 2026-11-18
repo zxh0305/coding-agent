@@ -23,10 +23,16 @@ def main():
     if not chromium_stamp.exists():
         probe=subprocess.run([str(python),'-c','import playwright'],cwd=root)
         if probe.returncode==0:
-            print('正在安装内置浏览器内核 playwright chromium…',flush=True)
-            if subprocess.run([str(python),'-m','playwright','install','chromium'],cwd=root).returncode==0:
+            print('正在安装内置浏览器内核 playwright chromium（约 190MB，首次较慢）…',flush=True)
+            # 官方 CDN 在部分网络下会卡在 0%（实测），因此允许用镜像：
+            #   PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
+            # 优先级：用户显式设置的 > 默认官方。国内网络卡住时设这个环境变量重跑即可。
+            env=dict(os.environ)
+            if subprocess.run([str(python),'-m','playwright','install','chromium'],cwd=root,env=env).returncode==0:
                 chromium_stamp.write_text('ok')
             else:
-                print('内置浏览器内核安装失败：浏览器工具将不可用（可设 BROWSER_CHROME_PATH 指向本机 Chrome 来降级）',flush=True)
+                print('内置浏览器内核安装失败：浏览器工具将不可用。'
+                      '国内网络可设 PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright 后重跑；'
+                      '或设 BROWSER_CHROME_PATH 指向本机 Chrome 来降级',flush=True)
     if not args.install_only:subprocess.run([str(python),str(root/'backend/app.py'),str(args.port)],cwd=root,check=True)
 if __name__=='__main__':main()

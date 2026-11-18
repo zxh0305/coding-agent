@@ -48,7 +48,8 @@ class BrowserActorTest(unittest.TestCase):
                 self.assertFalse(call.done());action.assert_not_called()
                 manager.control('release')
                 self.assertTrue(json.loads(call.result(2))['ok'])
-                action.assert_called_once_with('Name','value')
+                # type_text 新增 mode 参数后，包装层会把它一并透传（默认 "type"）
+                action.assert_called_once_with('Name','value','type')
         finally:manager.close()
 
     def test_takeover_race_does_not_dispatch_agent_action(self):

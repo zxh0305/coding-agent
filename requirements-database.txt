@@ -1,2 +1,6 @@
 # Installed by the default project requirements, including MySQL authentication.
 PyMySQL[rsa]==1.2.3
+
+# 内置浏览器（browser_* 工具）。只装 Python 包；浏览器内核由 start.py 单独
+# 执行 `playwright install chromium` 装（约 190MB，失败不阻断启动）。
+playwright==1.65.2

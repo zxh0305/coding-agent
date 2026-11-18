@@ -38,11 +38,13 @@ PW_INSTALL_HINT = "后端未安装 playwright：pip install playwright && playwr
 # 真正原因是版本不匹配，白折腾一轮。所以这里按"真实原因"分型，每种给
 # 独立的错误码与可执行的下一步。
 #
-# 另外两条降级路径（配置项，不鼓励模型在脚本里临时绕过）：
+# 隔离原则：默认使用 playwright 自带内核 + 无头模式 + 会话独立 profile，
+# 与用户日常使用的 Chrome 完全隔离（不共享 profile/扩展/登录态，不弹窗抢焦点）。
+# 唯一的降级配置项（不鼓励模型在脚本里临时绕过）：
 #   BROWSER_CHROME_PATH=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
-#   BROWSER_CHANNEL=chrome        （走 playwright 的 channel，本机装了 Chrome 即可）
-# 两者都只从环境变量（.env 由 app.py 的 load_env_file 读入）取，不进工具参数——
-# 模型不该有"随手指定任意可执行文件"的能力。
+# 只从环境变量（.env 由 app.py 的 load_env_file 读入）取，不进工具参数——
+# 模型不该有"随手指定任意可执行文件"的能力。原先的 BROWSER_CHANNEL 已移除：
+# 它会直接驱动用户日常 Chrome，把 agent 操作混进用户工作环境。
 # ---------------------------------------------------------------------------
 
 BROWSER_UNAVAILABLE_HINT = "浏览器不可用（服务级故障，不是目标站点的问题）：先看 error_code 分类按 hint 修复；" \
@@ -63,9 +65,14 @@ class BrowserUnavailable(RuntimeError):
 
 
 def _browser_launch_options() -> dict:
-    """本机 Chrome 降级路径的 launch 参数（未配置时返回空表 = 用 playwright 自带内核）。"""
+    """launch 参数。默认用 playwright 自带内核（与用户本机 Chrome 完全隔离）。
+
+    只保留 BROWSER_CHROME_PATH 这一条显式降级路径，且**不再支持 channel=chrome**：
+    channel 会直接驱动用户日常使用的 Chrome，共享其 profile 与已装扩展，
+    等于把 agent 的操作混进用户自己的工作环境——实测会打断用户工作。自带内核
+    （chromium-1255，随 start.py 安装）在本机 Chrome 出问题时才需要显式指定。
+    """
     import os
-    channel = (os.environ.get("BROWSER_CHANNEL") or "").strip()
     exe = (os.environ.get("BROWSER_CHROME_PATH") or "").strip()
     if exe:
         if not Path(exe).is_file():
@@ -75,8 +82,6 @@ def _browser_launch_options() -> dict:
                 "改正 .env 里的路径（macOS 一般是 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome），"
                 "或删掉该项改用 playwright 自带内核")
         return {"executable_path": exe}
-    if channel:
-        return {"channel": channel}
     return {}
 
 
@@ -208,7 +213,11 @@ def _serialized(method):
 class BrowserManager:
     """一个会话的 Chromium 生命周期。惰性启动（第一次工具调用才拉起浏览器）。"""
 
-    def __init__(self, sid: str, *, headless=False):
+    def __init__(self, sid: str, *, headless=True):
+        # 默认无头：agent 操作浏览器时**不得**在任何情况下弹出可见窗口抢占用户
+        # 的焦点（用户明确表示不要可见窗口模式）。曾经默认 headless=False，
+        # 结果每开一次浏览器就在用户桌面上弹一个 Chrome，打断正常工作。
+        # 确实需要人眼观察时，由用户显式要求而非默认行为。
         self.sid = sid
         self.headless = headless
         self._last_action = time.monotonic()
@@ -396,6 +405,20 @@ class BrowserManager:
     def _locator(self,page,selector):
         if selector.startswith(("css=","xpath=","text=","id=")):
             return page.locator(selector)
+        # 裸 CSS 选择器（含 #id、.class、[attr=v]、tag[n=v]）：先按 CSS 试，
+        # 命中就用。此前只有带 css= 前缀才按选择器解析，模型照着 inputs 里的
+        # name 写 `input[name=username]` 会被当成【可见文字】去匹配——页面
+        # 上根本没有这段文字，于是必报 ELEMENT_NOT_FOUND，登录流程就此卡死。
+        # 放在文字匹配之前试，是因为这类写法不可能是按钮文字（含 []()# 等符号），
+        # 而真按文字找时它们本就找不到，顺序上无副作用。
+        looks_like_css = any(ch in selector for ch in "[]#.=()>") or selector.startswith(
+            ("input", "button", "a:", "textarea", "select", "form", "*"))
+        if looks_like_css:
+            try:
+                candidate=page.locator(selector)
+                if candidate.count():return candidate
+            except Exception:
+                pass   # 非法 CSS 语法：退回文字匹配
         label=page.get_by_label(selector,exact=True)
         if label.count():return label
         placeholder=page.get_by_placeholder(selector,exact=True)
@@ -403,21 +426,74 @@ class BrowserManager:
         return page.get_by_text(selector,exact=True)
 
     def _describe_page(self) -> dict:
-        """当前页面的结构化摘要（给模型当"眼睛"用），带超时保护。"""
+        """当前页面的结构化摘要（给模型当"眼睛"用），带超时保护。
+
+        历史上的坑：`buttons` 曾把 button/a/[role=button] 混在一起按文档序取前 15 个。
+        登录页上导航链接（忘记密码/注册/隐私政策…）排在前，真正的「登录」按钮被
+        挤出窗口——模型根本看不到它，只能猜 selector 然后 ELEMENT_NOT_FOUND。
+        现在的口径：
+          * 只取**可见**元素，隐藏的（display:none / 零尺寸）不计入，免得占名额；
+          * a 链接要求「有 href 且不像纯文本导航」的过滤，按钮优先 `button` 与
+            type=submit；两类分别限额，谁也不会把对方挤掉；
+          * 新增 forms：逐个表单列出输入框与提交按钮，登录这种多步流程一次看全。
+        返回仍受浏览器调用超时约束（本方法在 @_serialized 内被调用）。
+        """
         p = self._page
+        # 可见性判定：offsetParent 为 null 说明祖先 display:none 或被移出文档；
+        # getClientRects() 为空则元素被裁剪到零尺寸。两者任一成立都算不可见。
+        visible_js = "e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length)"
         return {
             "title": p.title(),
             "url": p.url,
             "headings": p.eval_on_selector_all(
                 "h1, h2, h3", "els => els.slice(0, 10).map(e => e.textContent.trim().slice(0, 120))"),
-            "buttons": p.eval_on_selector_all(
-                "button, [role=button], a",
-                "els => els.slice(0, 15).map(e => (e.textContent || '').trim().slice(0, 60)).filter(Boolean)"),
-            "inputs": p.eval_on_selector_all(
-                "input, textarea, select",
-                "els => els.slice(0, 10).map(e => ({tag: e.tagName.toLowerCase(), "
-                "type: e.type || '', name: e.name || '', placeholder: e.placeholder || '', "
-                "visible: !!(e.offsetParent || e.type === 'hidden' ? e.offsetParent : e.offsetParent)}))"),
+            "buttons": p.evaluate(
+                """(visible) => {
+                    const ok = eval('(' + visible + ')');
+                    const label = e => (e.innerText || e.value || e.getAttribute('aria-label') || '')
+                        .trim().replace(/\\s+/g, ' ').slice(0, 60);
+                    const real = [...document.querySelectorAll('button, input[type=submit], input[type=button], [role=button]')]
+                        .filter(e => ok(e) && !e.disabled && label(e))
+                        .slice(0, 15).map(label);
+                    // 链接另算：有 href 且带文字的，最多 8 个，避免导航把按钮挤掉
+                    const links = [...document.querySelectorAll('a[href]')]
+                        .filter(e => ok(e) && label(e) && !e.href.startsWith('javascript:'))
+                        .slice(0, 8).map(label);
+                    return {buttons: real, links: links};
+                }""", visible_js),
+            "inputs": p.evaluate(
+                """(visible) => {
+                    const ok = eval('(' + visible + ')');
+                    return [...document.querySelectorAll('input, textarea, select')]
+                        .filter(e => ok(e) && e.type !== 'hidden')
+                        .slice(0, 15)
+                        .map(e => ({
+                            tag: e.tagName.toLowerCase(),
+                            type: e.type || '',
+                            name: e.name || '',
+                            id: e.id || '',
+                            placeholder: e.placeholder || '',
+                            label: (e.labels && e.labels[0] ? e.labels[0].innerText : '') || '',
+                            // 只报「是否已有值」，绝不回显内容——密码框绝不能把值吐给模型
+                            filled: !!e.value,
+                        }));
+                }""", visible_js),
+            # 逐个表单：输入框 + 提交按钮，登录场景直接照着填
+            "forms": p.evaluate(
+                """() => [...document.querySelectorAll('form')].slice(0, 3).map(f => ({
+                    action: (f.getAttribute('action') || '').slice(0, 120),
+                    fields: [...f.querySelectorAll('input, textarea, select')]
+                        .filter(e => e.type !== 'hidden')
+                        .map(e => ({
+                            type: e.type || e.tagName.toLowerCase(),
+                            name: e.name || '',
+                            id: e.id || '',
+                            placeholder: e.placeholder || '',
+                            label: (e.labels && e.labels[0] ? e.labels[0].innerText.trim().slice(0, 40) : ''),
+                        })),
+                    submit: [...f.querySelectorAll('button, input[type=submit]')]
+                        .map(e => (e.innerText || e.value || '').trim().slice(0, 60)).filter(Boolean),
+                }))"""),
         }
 
     # ---------- 工具入口（被 browser_tools_* 包装后进 TOOL_REGISTRY） ----------
@@ -466,9 +542,20 @@ class BrowserManager:
                         code="ACTION_FAILED")
 
     @_serialized
-    def type_text(self, selector: str, text: str) -> str:
+    def type_text(self, selector: str, text: str, mode: str = "type") -> str:
+        """往输入框填内容。默认**逐字**输入，填完读回校验。
+
+        为什么不再默认 fill()：fill 直接写 DOM value，只派发 input/change，
+        不产生 keydown/keyup。不少登录表单监听的是键盘事件、或在 blur 时才做
+        校验——结果就是「值看似填进去了，点登录却提示请输入密码」，而且模型
+        无从判断，只能反复重点。逐字 type 会走完整键盘事件链，与真人一致；
+        确实需要快的场景可显式 mode="fill"。
+
+        敏感值支持 env:VAR 引用：密码不进对话历史、不进模型上下文。
+        """
         # 敏感值支持 env:VAR 引用：密码不进对话历史、不进模型上下文
-        if text.startswith("env:"):
+        secret = text.startswith("env:")
+        if secret:
             import os
             var = text[4:].strip()
             text = os.environ.get(var, "")
@@ -477,13 +564,46 @@ class BrowserManager:
                             "让用户在部署环境设置该变量后重试（密码不经过对话明文传输）")
         try:
             page = self._ensure()
-            self._locator(page,selector).fill(text, timeout=ACTION_TIMEOUT_MS)
+            loc = self._locator(page, selector)
+            # 先聚焦：部分框架只在 focus 后才绑定监听器
+            loc.click(timeout=ACTION_TIMEOUT_MS)
+            if mode == "fill":
+                loc.fill(text, timeout=ACTION_TIMEOUT_MS)
+            else:
+                # 清空旧值（密码框里的残值会让读回校验失真），再逐字敲
+                try:
+                    loc.fill("")
+                except Exception:
+                    pass
+                loc.type(text, delay=30, timeout=max(ACTION_TIMEOUT_MS, 2000 + 60 * len(text)))
+            # 读回校验：值没进框就当场报错，别让模型带着空表单去点登录
+            try:
+                actual = loc.input_value(timeout=ACTION_TIMEOUT_MS)
+            except Exception:
+                actual = ""   # contenteditable 等非 input 元素读不到，跳过校验
+            expected_len = len(text)
+            if actual and len(actual) != expected_len:
+                return _err(
+                    f"输入未生效：框里实际有 {len(actual)} 个字符，期望 {expected_len} 个",
+                    "该输入框可能有长度限制/格式校验/被脚本改写。先 screenshot 看页面是否"
+                    "弹出格式提示，或改 mode=\"fill\" 再试；仍不行就把输入框的 name/id 交给用户确认",
+                    code="INPUT_NOT_EFFECTIVE")
+            if not actual and expected_len > 0:
+                return _err(
+                    f"输入未生效：「{selector}」仍然是空的",
+                    "可能是点到了错误的元素，或该框只读/被遮罩。先 browser_snapshot 看 inputs 里"
+                    "的 name/id/placeholder 重新定位；密码框请确认 selector 指向 type=password",
+                    code="INPUT_NOT_EFFECTIVE")
             self._publish_state(f"输入 {selector}")
-            return _ok({"result": f"已在「{selector}」输入 {len(text)} 个字符",
-                        "url": page.url})
+            # 只回报长度与掩码，绝不回显内容——env:VAR 引用的密码尤其不能泄进对话
+            shown = ("*" * min(len(text), 8)) if secret else f"{len(text)} 个字符"
+            return _ok({"result": f"已在「{selector}」输入 {shown}（已读回校验通过）",
+                        "url": page.url,
+                        "field_filled": True})
         except PWTimeout:
             return _err(f"找不到输入框「{selector}」",
-                        "先 browser_snapshot 读取当前页面；输入框定位用它的 placeholder 或 name",
+                        "先 browser_snapshot 读取当前页面；inputs/forms 字段里有 name、id、"
+                        "placeholder 和 label，照着用",
                         code="ELEMENT_NOT_FOUND")
         except BrowserUnavailable as e:
             return _unavailable_err(e)
@@ -592,9 +712,13 @@ def browser_click(selector: str, ctx=None) -> str:
     return err if err else mgr.tool_call("click",ctx,selector)
 
 
-def browser_type(selector: str, text: str, ctx=None) -> str:
+def browser_type(selector: str, text: str, mode: str = "type", ctx=None) -> str:
+    # 兼容旧的位置调用 browser_type(sel, text, ctx)：第三个位置参数 histórico 是 ctx，
+    # 不是 mode。判据是「传了第三个参数但它不是字符串」——mode 只可能是 str。
+    if ctx is None and mode is not None and not isinstance(mode, str):
+        ctx, mode = mode, "type"
     mgr, err = _ctx_browser(ctx)
-    return err if err else mgr.tool_call("type_text",ctx,selector,text)
+    return err if err else mgr.tool_call("type_text",ctx,selector,text,mode)
 
 
 def browser_screenshot(to_path: str = "", ctx=None) -> str:
@@ -640,15 +764,22 @@ BROWSER_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "browser_type",
-            "description": "向输入框填入文字（登录表单、搜索框等）。selector 用输入框的 placeholder/name/可见文字。"
+            "description": "向输入框填入文字（登录表单、搜索框等）。selector 用 browser_snapshot 返回的 "
+                           "inputs/forms 里的 name、id、placeholder 或 label（比猜文字可靠）。"
+                           "默认逐字输入（走完整键盘事件，兼容监听 keydown/blur 的表单）；"
+                           "填完会**读回校验**，值没真的进框就返回 INPUT_NOT_EFFECTIVE——"
+                           "此时不要接着点登录，先按 hint 换定位方式或 mode。"
                            "密码等敏感值不要写明文——用环境变量引用：text 传 \"env:LOGIN_PASSWORD\"，"
                            "部署环境设置该变量后自动取值，密码不进入对话记录。"
-                           "示例：{\"selector\": \"用户名\", \"text\": \"alice\"}。",
+                           "示例：{\"selector\": \"input[name=username]\", \"text\": \"alice\"}、"
+                           "{\"selector\": \"input[type=password]\", \"text\": \"env:LOGIN_PASSWORD\"}。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "selector": {"type": "string", "description": "输入框的 placeholder/name/可见文字，或引擎前缀 selector"},
+                    "selector": {"type": "string", "description": "输入框的 name/id/placeholder/label，或引擎前缀 selector"},
                     "text": {"type": "string", "description": "要输入的内容；敏感值用 env:变量名 引用环境变量"},
+                    "mode": {"type": "string",
+                             "description": "type（默认，逐字输入，触发完整键盘事件）/ fill（直接写值，快但可能不触发键盘监听）"},
                 },
                 "required": ["selector", "text"],
             },
