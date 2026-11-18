@@ -37,6 +37,8 @@ from concurrent.futures import ThreadPoolExecutor
 import code_tools
 import db
 from logger import clear_log_context, set_log_context, tool_context
+from turn_state import (CANCELLING, DONE, ERROR, REQUESTING, STREAMING,
+                        TOOL_RUNNING, TurnState)
 
 from code_tools import prepare_workspace
 from services.task_progress import ProgressWindow, task_state, state_note
@@ -273,6 +275,10 @@ class Agent:
         # 「已吐出的思考文本」。round_no → str；流结束时被 _consume_stream 聚合
         # 进 trace 后清零对应键。
         self.reasoning_live: dict[int, str] = {}
+        # 回合显式状态（见 backend/turn_state.py）。每回合在 _run 开头重建一个，
+        # 这里先建默认值：保证「还没跑过回合」时外部读取/测试构造都拿得到对象，
+        # 而不是 AttributeError。首版只告警不拦截，AGENT_STATE_STRICT=1 才拒绝。
+        self.turn_state = TurnState()
         # 增量落盘的指纹账本 {mid: sha1}：save_messages 靠它识别"这条已写过、
         # 内容没变"，每轮只落新增。跨轮随实例存活；进程重启后由恢复的历史重建
         # （db.fingerprints，见 app.py 的会话恢复）。值由 db.save_messages 维护。
@@ -666,6 +672,14 @@ class Agent:
                 if compacted:
                     yield "compacted", compacted
         finally:
+            # 异常/生成器被提前关闭时会跳过所有正常收尾分支，状态会停在中间态。
+            # 这里兜底落终态：只有"还没到终态"才补，已 DONE 的不会被改成 ERROR。
+            # 只告警模式下这是无害的记录；strict 模式下能立刻暴露"走到一半没了"。
+            # getattr 兜底：有些测试用轻量构造（绕过 __init__）造 Agent，
+            # 观测设施不能因此让它们全挂——缺状态机就跳过这步记录。
+            _ts = getattr(self, "turn_state", None)
+            if _ts is not None and not _ts.is_terminal:
+                _ts.to(ERROR, "回合异常退出（finally 兜底）")
             clear_log_context()  # 回合线程会被复用，残留 sid 会把下一回合的日志记错账
             if cancel_event is None:
                 self.cancel_event.set()
@@ -759,6 +773,12 @@ class Agent:
                    "tool_total_s": 0.0,  # 各工具执行耗时之和
                    "context": self.context_stats()}  # 还没发过请求时给个纯估算
         self._round_timings: list[dict] = []  # 逐轮 {round, gen_s, ttft_s}（本回合内累积）
+        # 显式回合状态（首版只断言告警，见 backend/turn_state.py）。
+        # 目的是给"不能留下悬空 tool_calls""停止后不能继续请求"这类目前只写在
+        # 注释里的约束一个机器可查的落点；AGENT_STATE_STRICT=1 时才真的拒绝。
+        # 这里先建一个，保证 run() 的 finally 兜底与外部读取都拿得到对象；
+        # 真正的回合状态在 _run 开头重新建一个（同一 Agent 可连跑多回合）。
+        self.turn_state = TurnState()
         self._tool_total_s = 0.0  # 各工具执行耗时之和（_backfill_tool_result 累加，回合起点重置防跨回合串味）
 
         # 轮数上限的软/硬双限（1a）：soft_limit 到限时若上一轮有实质进展则续一段，
@@ -778,6 +798,7 @@ class Agent:
                 break
             yield from self._apply_turn_inputs()
             self._log(f"── 第 {round_no} 轮：请求 LLM ──", "gray")
+            self.turn_state.to(REQUESTING, "新一轮请求")
             self._trace({"type": "round", "round": round_no})
             yield "round", {"round": round_no}
 
@@ -795,12 +816,14 @@ class Agent:
             # 流式拿模型回复：文字片段实时往外 yield，最后拿到完整 message。
             # 消费逻辑提取成 _consume_stream——收尾轮复用同一份，防止两处漂移。
             # 工具清单按实例白名单过滤（主代理=全量；子代理=只读侦察面）。
+            self.turn_state.to(STREAMING, "开始接收增量")
             assistant_msg = yield from self._consume_stream(messages, None if self._completion_final else self._tool_schemas(),
                                                             usage_total, metrics,
                                                             round_no)
             log.debug("LLM 原始返回: %s", json.dumps(assistant_msg, ensure_ascii=False))
 
             if self.cancel_event.is_set():
+                self.turn_state.to(CANCELLING, "流式结束后发现已取消")
                 # 用户点了停止：已生成的半截文字直接作为回答收尾。
                 # 不能把带 tool_calls 的"悬空"assistant 消息留在历史里
                 # （下一轮请求会 400），所以这里只追加纯文本回答。
@@ -865,6 +888,7 @@ class Agent:
             # 被拒、这一轮又原样出现"才算重试；本轮刚被拒的那次不算（否则会在
             # 被拒的同一轮就误报一次重试提醒）。
             denied_before = set(self._denied_sigs)
+            self.turn_state.to(TOOL_RUNNING, f"{len(tool_calls)} 个工具调用")
             yield from self._execute_tool_calls(tool_calls)
 
             # 防失控提醒：不是砍停——检测到死循环苗头 / 轮数接近上限时注入合成
@@ -1070,6 +1094,14 @@ class Agent:
 
         不能把带 tool_calls 的"悬空"assistant 消息留在历史里（下一轮请求会 400），
         所以这里只追加纯文本回答。主循环与收尾轮共用。"""
+        # 停止路径的正常终点：CANCELLING → DONE。
+        # 调用方可能已标过 CANCELLING（主循环取消分支），重复迁移是合法的；
+        # 若没标过也在这里补上，保持状态机是唯一真相源。
+        # getattr 兜底：轻量构造的测试 Agent 没有状态机，不能因此挂掉收尾逻辑。
+        _ts = getattr(self, "turn_state", None)
+        if _ts is not None:
+            _ts.to(CANCELLING, "停止收尾")
+            _ts.to(DONE, "停止收尾完成")
         partial = (assistant_msg or {}).get("content") or ""
         answer = (partial + "\n\n（已手动停止）").strip()
         if self.completion_policy is not None:
@@ -1101,6 +1133,12 @@ class Agent:
 
         stopped_reason：非 None 时附加到 done payload（收尾轮用它标记
         "max_rounds"），其余字段与正常 done 完全一致。"""
+        # 正常终点：无论是正常回答还是收尾轮兜底回答，都从这里落终态。
+        # 注意本函数是生成器，实际执行发生在被迭代时——所以状态标记放在函数体
+        # 最前面即可（首个 next() 时就生效）。getattr 兜底同 _tail_stopped。
+        _ts = getattr(self, "turn_state", None)
+        if _ts is not None:
+            _ts.to(DONE, "给出最终回答")
         from services.final_answer import invalid_reply
         completion_status = None
         if invalid_reply(assistant_msg):
