@@ -31,6 +31,7 @@ from pathlib import Path
 from agent import Agent
 
 import db
+import diagnostics
 import skills
 import snapshot
 from llm_client import ApiConnectionError, ApiHTTPError, _RETRYABLE_STATUS
@@ -170,8 +171,26 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             agent.usage_sink = (lambda kind, stats, _sid=sid, _agent=agent:
                                 db.record_usage(_sid, kind, stats,
                                                 _agent.model_tag[0], _agent.model_tag[1]))
+            # 诊断轨迹（只记边界事件，见 backend/diagnostics.py）：回答「这回合
+            # 跑了几轮、慢在模型还是工具、结局是什么」。全程 try 包裹，写盘失败
+            # 不影响回合；DIAGNOSTICS=0 可整体关闭。
+            diag = diagnostics.TurnRecorder(sid, user_mid)
+            diag.turn_start(model_input_chars=len(plain or ""))
             try:
                 for kind, payload in agent.run(plain, user_message):
+                    # 诊断：轮与工具的边界事件（只记结构化字段，不记正文）
+                    if kind == "round":
+                        # 上一轮的收尾在下一条 round 到来时补记，避免在循环里
+                        # 维护"当前轮何时结束"的额外状态
+                        diag.round_end(payload.get("round") or 0)
+                        diag.round_start(payload.get("round") or 0)
+                    elif kind == "answer_delta":
+                        diag.llm_first_token(payload.get("round") or 0)
+                    elif kind == "tool_call":
+                        diag.tool_start(str(payload.get("name") or ""))
+                    elif kind == "tool_result":
+                        diag.tool_end(str(payload.get("name") or ""),
+                                      ok=not payload.get("error"))
                     if kind == "round":
                         seg_mid = uuid.uuid4().hex[:12]
                         # 轮号落库：中断后能告诉用户"跑到第几轮"（每轮一次小写，
@@ -284,6 +303,18 @@ def _run_round(sid: str, agent: Agent, plain: str, user_message: dict,
             with _lock:
                 _turn_status[sid] = {"outcome": "error" if error is not None else "done",
                                      "seen": False}
+            # 诊断轨迹收尾：此处终态、轮数、耗时都已确定，写一次即可。
+            # 归因只放"类别"（连接/限流/内部），不放错误正文，避免二次落盘用户数据。
+            try:
+                _err_class = ""
+                if error is not None:
+                    _err_class = "retryable" if retryable else "fatal"
+                diag.finish(outcome=("error" if error is not None else
+                                     ("stopped" if stopped else "done")),
+                            error_class=_err_class, retryable=bool(retryable),
+                            stopped=bool(stopped))
+            except Exception:
+                log.exception("[会话 %s] 诊断轨迹收尾失败（忽略）", sid)
             if error is not None:
                 db.renumbered_sessions.discard(sid)  # 错误路径不带重编号信号（与旧行为一致）
                 bus.publish({"type": "error", "message": error,
