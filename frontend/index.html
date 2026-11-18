@@ -130,8 +130,9 @@
           <button id="skills-chip" class="chip" type="button" aria-haspopup="dialog" aria-expanded="false">✦ 技能 <span id="skills-count"></span></button>
           <button id="memory-chip" class="chip" title="查看与管理记忆（个人 / 项目两层）">🧠 记忆</button>
           <!-- 🌐 浏览器栏入口：**唯一**入口。面板不再自动弹出（会遮挡对话区、打断工作），
-               想看 agent 在网页上做了什么就点这里。agent 未打开浏览器时禁用。 -->
-          <button id="browser-chip" class="chip" disabled title="查看 agent 的内置浏览器画面">🌐 浏览器</button>
+               想看 agent 在网页上做了什么就点这里。默认隐藏——agent 没开浏览器时
+               不占按钮栏位置（灰按钮点了没反应，只会让输入框显得拥挤）。 -->
+          <button id="browser-chip" class="chip" hidden disabled title="查看 agent 的内置浏览器画面">🌐 浏览器</button>
           <!-- 🔔 桌面通知开关：默认不渲染。功能保留（notifyDesktop 仍生效，本地存了
                notify_desktop=1 的人照旧收到通知），只是不再占按钮栏。 -->
           <button id="bell-chip" class="chip" hidden title="桌面通知">🔕</button>

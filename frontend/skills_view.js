@@ -107,8 +107,19 @@
   function renderFavorites() {
     const box = el('skill-favorites'); box.replaceChildren();
     const items = favorites.map(id => catalog.find(s => s.id === id)).filter(Boolean);
-    box.classList.toggle('hidden', !items.length);
-    if (items.length) { const label = document.createElement('span'); label.textContent = '常用'; box.append(label); }
+    if (!items.length) { box.classList.add('hidden'); box.dataset.expanded = ''; return; }
+    box.classList.remove('hidden');
+    // 收起态：只剩一个「常用」小按钮，点开才展开常用技能列表。
+    // 之前常驻一整行，把输入框区域顶得很挤；需要时才展开。
+    const expanded = box.dataset.expanded === '1';
+    const toggleBtn = button(expanded ? '常用 ▾' : '常用 ▸', () => {
+      box.dataset.expanded = expanded ? '' : '1';
+      renderFavorites();
+    });
+    toggleBtn.setAttribute('aria-expanded', String(expanded));
+    toggleBtn.title = '常用技能';
+    box.append(toggleBtn);
+    if (!expanded) return;
     for (const s of items.slice(0, 3)) {
       const chosen = selected.some(x => x.id === s.id);
       const b = button(`${chosen ? '✓' : '✦'} ${s.name}`, () => toggle(s));

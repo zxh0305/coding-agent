@@ -7642,9 +7642,10 @@ function renderBrowserState(state) {
   }
   $("browser-address").disabled=currentSessionArchived;
   $("browser-navigate").querySelector("button").disabled=currentSessionArchived;
-  // 手动入口：agent 有浏览器在跑才可点，避免点开一个空面板
+  // 手动入口：agent 有浏览器在跑才显示且可点，避免点开一个空面板；
+  // 没在跑时整个 chip 隐藏，不给输入框添一个灰着的死按钮。
   const chip=$("browser-chip");
-  if(chip) chip.disabled=!state.open || currentSessionArchived;
+  if(chip) { chip.hidden = !state.open; chip.disabled = !state.open || currentSessionArchived; }
 }
 async function refreshBrowserState() {
   const sid=currentSession,view=sessionViewVersion,token=authToken;
@@ -7667,7 +7668,8 @@ async function controlBrowser(action,url) {
   finally {browserControlBusy=false;}
 }
 for(const button of document.querySelectorAll("[data-browser-action]"))button.onclick=()=>void controlBrowser(button.dataset.browserAction);
-$("browser-chip").onclick=toggleBrowserPanel;
+// 注意：#browser-chip 的点击已在上面用 bind() 绑过一次，这里不要再加 onclick——
+// addEventListener 与 onclick 会同时触发，一次点击 toggle 两遍 = 看起来点了没反应。
 $("browser-navigate").onsubmit=event=>{event.preventDefault();void controlBrowser("open",$("browser-address").value.trim());};
 // 面板关闭时也要低频探一次：否则「🌐 浏览器」chip 不知道该不该亮（它是唯一入口）。
 // 面板打开：3s 刷新（画面状态要跟手）；面板关闭：每 10 个 tick（30s）探一次，

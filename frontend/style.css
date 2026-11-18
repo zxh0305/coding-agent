@@ -2625,6 +2625,10 @@ body.docs-resizing .docs-panel { transition: none; }
 
 /* Fast selection stays near the composer; editing remains in the full manager. */
 .skill-favorites {display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin:0 0 8px;font-size:11px;color:var(--text-3);}
+/* 收起态（只剩「常用 ▸」一个按钮）：不占行高，紧贴 textarea 底部 */
+.skill-favorites[data-expanded=""] {margin:-2px 0 2px;}
+.skill-favorites[data-expanded=""] button {border-color:transparent;color:var(--text-3);padding:2px 6px;font-size:11px;}
+.skill-favorites[data-expanded=""] button:hover {border-color:var(--border);color:var(--text-2);}
 .skill-favorites button {border:1px solid var(--border);border-radius:15px;background:transparent;color:var(--text-2);padding:5px 10px;font-size:11px;cursor:pointer;}
 .skill-favorites button[aria-pressed="true"] {background:var(--accent-weak);border-color:var(--accent);color:var(--text);}
 .skill-picker {position:fixed;inset:auto;margin:0;box-sizing:border-box;padding:14px;border:1px solid var(--border);border-radius:14px;background:var(--panel);color:var(--text);box-shadow:var(--shadow-md);overflow:auto;font-size:13px;}
@@ -2713,6 +2717,8 @@ button:disabled { cursor: not-allowed; }
 button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .stat-bar { margin-top: 8px; }
 .skill-favorites { padding-bottom: 6px; margin-bottom: 6px; }
+/* 收起态覆盖：后面这条 margin 会盖掉前面的紧凑间距，这里重新收紧一次 */
+.skill-favorites[data-expanded=""] { padding-bottom: 0; margin-bottom: 2px; }
 .skill-tag { border-radius: 8px; }
 .skill-tag button { padding: 6px 8px; }
 .queue-item { border-radius: 8px; }
