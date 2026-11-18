@@ -4419,7 +4419,14 @@ function ensureNoteBox() {
 }
 
 function pruneNoteBox() {
-  if (noteBox && !noteBox.firstElementChild) {
+  if (!noteBox) return;
+  // 先摘掉「空白残段」：只判 !firstElementChild 是不够的——一个只含空格/换行的
+  // <div class="process-text"> 仍是子元素，卡不会摘，反而在段间虚线（前后相邻
+  // 选择器）处留下一大条空行，视觉上就是"大白卡、文字贴在底部"。
+  for (const p of noteBox.querySelectorAll(".process-text")) {
+    if (!p.textContent.trim()) p.remove();
+  }
+  if (!noteBox.firstElementChild) {
     noteBox.remove();
     noteBox = null;
   }
