@@ -47,6 +47,81 @@ class DerivedMarkTest(unittest.TestCase):
         from agent import Agent
         return Agent._clean_outgoing(m)
 
+    def test_original_is_never_persisted(self):
+        """_derived.original 只是进程内的退路，绝不能落库——否则清理白做，
+        几万字符的原文又被存了一份。"""
+        m = {"role": "tool", "tool_call_id": "c1", "content": "占位符",
+             "_derived": {"tool_result_cleared": {"at": 1, "original_chars": 5000},
+                          "original": "很长的原文" * 1000}}
+        body = db._storable_body(m)
+        self.assertNotIn("original", body["_derived"])
+        self.assertIn("tool_result_cleared", body["_derived"])   # 账还要留
+
+    def test_derived_dropped_entirely_when_only_original(self):
+        m = {"role": "tool", "content": "x", "_derived": {"original": "abc"}}
+        self.assertNotIn("_derived", db._storable_body(m))
+
+    def test_restore_cleared_recovers_original(self):
+        """清理后能无损还原：这是"清理不可逆"的退路。"""
+        import shutil
+        import tempfile
+        from agent import Agent
+
+        ws = tempfile.mkdtemp(prefix="restore_ws_")
+        self.addCleanup(shutil.rmtree, ws, ignore_errors=True)
+        agent = Agent(llm=None, verbose=False, workspace=ws)
+        agent.history = [{"role": "user", "content": "开始"}]
+        original = "命令输出" * 2000
+        for i in range(6):
+            agent.history.append({
+                "role": "assistant", "content": None,
+                "tool_calls": [{"id": f"c{i}", "type": "function",
+                                "function": {"name": "read_file", "arguments": "{}"}}],
+            })
+            agent.history.append({"role": "tool", "tool_call_id": f"c{i}",
+                                  "content": original})
+        cleared = agent._clear_old_tool_results(keep_recent=1)
+        self.assertGreater(cleared, 0)
+        restored = agent.restore_cleared()
+        self.assertEqual(restored, cleared)
+        # 被清的那几条必须逐字节回到原样
+        restored_contents = [m["content"] for m in agent.history
+                             if m.get("role") == "tool"]
+        self.assertEqual(sum(1 for c in restored_contents if c == original), 6)
+        self.assertFalse(any(m.get("_tool_result_cleared") for m in agent.history))
+
+    def test_restore_is_noop_without_originals(self):
+        import shutil
+        import tempfile
+        from agent import Agent
+
+        ws = tempfile.mkdtemp(prefix="restore_ws2_")
+        self.addCleanup(shutil.rmtree, ws, ignore_errors=True)
+        agent = Agent(llm=None, verbose=False, workspace=ws)
+        agent.history = [{"role": "tool", "content": "原样"}]
+        self.assertEqual(agent.restore_cleared(), 0)
+        self.assertEqual(agent.history[0]["content"], "原样")
+
+    def test_restore_respects_size_filter(self):
+        import shutil
+        import tempfile
+        from agent import Agent
+
+        ws = tempfile.mkdtemp(prefix="restore_ws3_")
+        self.addCleanup(shutil.rmtree, ws, ignore_errors=True)
+        agent = Agent(llm=None, verbose=False, workspace=ws)
+        agent.history = [
+            {"role": "tool", "content": "占位A",
+             "_derived": {"tool_result_cleared": {"at": 1}, "original": "短"},
+             "_tool_result_cleared": True},
+            {"role": "tool", "content": "占位B",
+             "_derived": {"tool_result_cleared": {"at": 1}, "original": "长" * 500},
+             "_tool_result_cleared": True},
+        ]
+        self.assertEqual(agent.restore_cleared(only_chars_above=100), 1)
+        self.assertEqual(agent.history[0]["content"], "占位A")     # 短的没动
+        self.assertEqual(agent.history[1]["content"], "长" * 500)
+
     def test_clear_old_tool_results_records_derivation(self):
         """真实的清理路径必须留下 _derived 账：清了几条、原来多长。"""
         import shutil

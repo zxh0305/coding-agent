@@ -115,6 +115,10 @@ def estimate_tokens(text: str) -> int:
 # 服务端直接 400。所以只换内容，保留 role/tool_call_id 骨架。
 CLEAR_TOOL_RESULTS_KEEP_RECENT = 8   # 最近的 N 条工具结果原样保留
 CLEAR_TOOL_RESULTS_MIN_SAVING = 2000  # 预估至少省这么多字符才值得动手（否则白折腾）
+# 清理旧工具结果时是否把原文留在内存里（_derived.original），供 restore_cleared 还原。
+# 默认开：原文只在 history 上、不发给模型也不落库，代价是一份内存副本；
+# 换来的是"清错了能退回去"。老内存机器上可设 CLEAR_KEEP_ORIGINALS=0 关掉。
+CLEAR_KEEP_ORIGINALS = os.environ.get("CLEAR_KEEP_ORIGINALS", "1").strip().lower() not in ("0", "false", "no", "off")
 CLEARED_TOOL_RESULT_PLACEHOLDER = "[较早的工具结果已清理以节省上下文；如需该内容请重新调用相应工具]"
 
 SUMMARIZE_PROMPT = """\
@@ -275,6 +279,8 @@ class Agent:
         # 「已吐出的思考文本」。round_no → str；流结束时被 _consume_stream 聚合
         # 进 trace 后清零对应键。
         self.reasoning_live: dict[int, str] = {}
+        # 清理旧工具结果时是否保留原文（供 restore_cleared 无损还原）
+        self._keep_cleared_originals = CLEAR_KEEP_ORIGINALS
         # 回合显式状态（见 backend/turn_state.py）。每回合在 _run 开头重建一个，
         # 这里先建默认值：保证「还没跑过回合」时外部读取/测试构造都拿得到对象，
         # 而不是 AttributeError。首版只告警不拦截，AGENT_STATE_STRICT=1 才拒绝。
@@ -1683,10 +1689,19 @@ class Agent:
             # 有了它，排查"为什么模型说看不到命令输出"时能一眼确认是清理导致，
             # 而不是去怀疑外置归档或渲染。_derived 里的字段全带下划线，
             # 发给模型前由 _clean_outgoing 统一剥离。
-            m.setdefault("_derived", {})["tool_result_cleared"] = {
+            #
+            # 同时**保留原文**（_derived.original）：清理原本是不可逆的改写，
+            # 一旦清错（阈值调低/豁免规则漏判）就没有退路，只能靠重跑任务。
+            # 原文只存在内存里的 history 上（_clean_outgoing 与落库都只带
+            # 下划线以外的字段），所以不占请求、不进库；同一个 Agent 实例内
+            # 用 restore_cleared() 可以无损还原，排查与回退都靠它。
+            derived = m.setdefault("_derived", {})
+            derived["tool_result_cleared"] = {
                 "at": int(time.time()),
                 "original_chars": len(_orig) if isinstance(_orig, str) else 0,
             }
+            if self._keep_cleared_originals and isinstance(_orig, str):
+                derived.setdefault("original", _orig)
             m["content"] = self._cleared_placeholder(_orig)
             m["_tool_result_cleared"] = True  # 标记（下划线前缀，发给模型前会被剥离）
             cleared += 1
@@ -1698,6 +1713,40 @@ class Agent:
             log.info("分级压缩①：清理 %d 条较早工具结果（省约 %d 字符，保留最近 %d 条）",
                      cleared, saved, keep_recent)
         return cleared
+
+    def restore_cleared(self, *, only_chars_above: int = 0) -> int:
+        """把被 _clear_old_tool_results 换掉的工具结果**无损还原**，返回还原条数。
+
+        为什么需要：清理是不可逆改写（占位符会一路上传落库、前端回放也看到）。
+        阈值调低、豁免规则漏判、或事后排查"模型当时到底看到了什么"时，没有
+        退路就只能重跑任务。原文留在 _derived.original 里（不发给模型、不落库），
+        这里把它换回去。
+
+        注意：还原后内容指纹变了，下一次 save_messages 会把原文重新写进库
+        ——也就是说这是"撤销清理"，不是"只在内存里看看"。正因如此才做成
+        显式方法、需要调用方主动调用，而不是自动发生。
+
+        only_chars_above：只还原原文长度超过该值的条目（例如只想找回大输出）。
+        """
+        restored = 0
+        for m in self.history:
+            derived = m.get("_derived") or {}
+            original = derived.get("original")
+            if not isinstance(original, str):
+                continue
+            if only_chars_above and len(original) <= only_chars_above:
+                continue
+            m["content"] = original
+            m.pop("_tool_result_cleared", None)
+            derived.pop("tool_result_cleared", None)
+            derived.pop("original", None)
+            if not derived:
+                m.pop("_derived", None)
+            restored += 1
+        if restored:
+            self._token_ratio = None   # 字符总量变了，校准系数作废
+            log.info("已还原 %d 条被清理的工具结果原文", restored)
+        return restored
 
     def _maybe_compact(self, force: bool = False) -> dict | None:
         """回答结束后调用：估算超阈值就把中段历史压缩成一条边界标记。

@@ -2046,8 +2046,22 @@ def optimize_db() -> None:
 
 def _storable_body(m: dict) -> dict:
     """消息的"可存体"：剥掉 _mid/_ord（在列里有专位）与 _stats（在
-    message_usage 表）。指纹与落库内容都基于它，保证两处序列化字节一致。"""
-    return {k: v for k, v in m.items() if k not in ("_mid", "_ord", "_stats")}
+    message_usage 表）。指纹与落库内容都基于它，保证两处序列化字节一致。
+
+    另外剥掉 _derived.original：那是工具结果被清理前的原文，只为进程内
+    `restore_cleared()` 提供退路。把它写进库等于把已经清掉的几万字符又存
+    一份（清理省上下文的意义就没了），而重启后原文本来也用不上——历史
+    恢复出来就是占位符，这是既定语义。
+    """
+    body = {k: v for k, v in m.items() if k not in ("_mid", "_ord", "_stats")}
+    derived = body.get("_derived")
+    if isinstance(derived, dict) and "original" in derived:
+        trimmed = {k: v for k, v in derived.items() if k != "original"}
+        if trimmed:
+            body["_derived"] = trimmed
+        else:
+            body.pop("_derived", None)
+    return body
 
 
 def _fingerprint(blob: str) -> str:
@@ -2430,6 +2444,13 @@ def save_messages(sid: str, history: list[dict], saved: dict) -> int:
                             "_tool_result_cleared", "_crash_balanced"):
                     if key in m:
                         stub[key] = m[key]
+                # 外置归档同样不能带 _derived.original（清理前的原文），
+                # 理由与 _storable_body 一致：那只是进程内的退路副本。
+                if isinstance(stub.get("_derived"), dict):
+                    stub["_derived"] = {k: v for k, v in stub["_derived"].items()
+                                        if k != "original"}
+                    if not stub["_derived"]:
+                        stub.pop("_derived")
                 row_content = json.dumps(stub, ensure_ascii=False)
                 fp = _fingerprint(row_content)
                 # 就地替换成摘要行：指纹改按"摘要行"记，下一轮重放这段历史
