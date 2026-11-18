@@ -13,6 +13,7 @@ import uuid
 
 from agent import Agent
 
+import crash_tail
 import db
 from code_tools import prepare_workspace
 from services.model_resolve import _active_window, _resolve_client
@@ -112,6 +113,13 @@ def get_session(session_id, user_id: int, *, initial_workspace: str | None = Non
     # 全会话长度；模型视图与全量恢复逐字节一致。
     total = db.count_messages(sid)
     agent.history = db.restore_window(sid)
+    # 崩溃尾配平：上次运行可能死在"已派发工具、结果还没落库"的瞬间，库里就会
+    # 留下有请求无结果的历史——下一条请求服务端直接 400。补一条**带语义**的
+    # 合成结果（默认"结果未知，先查现场"，见 backend/crash_tail.py），
+    # 既堵住 400，也避免模型把可能已生效的写操作再执行一遍。
+    balanced = crash_tail.balance_tail(agent.history)
+    if balanced:
+        log.warning("会话 %s 恢复时发现 %d 个未结算工具调用，已补合成结果", sid, balanced)
     # 增量落盘的指纹账本从恢复的历史重建（只覆盖窗口内即可——窗口外
     # 的行不会被 save_messages 触碰），重启后第一轮就是纯增量写。
     agent.saved = db.fingerprints(agent.history)
