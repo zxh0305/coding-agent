@@ -1,0 +1,30 @@
+[project]
+name = "coding-agent"
+version = "0.1.0"
+description = "本地单用户 coding agent（零框架 Python 后端 + 原生 JS 前端）"
+# 只用于工具配置与元数据：实际安装仍走 requirements.txt（start.py 按 sha256 校验）。
+# 刻意不在这里重复声明依赖——两份依赖声明必然漂移，那是"环境不可比"的源头之一。
+requires-python = ">=3.10"
+dynamic = []
+
+[tool.ruff]
+# 只开不会与现有风格打架的规则：真正的问题（未使用变量、重复定义、裸 except）
+# 才值得在 2000+ 行的文件里喊出来；格式类规则交给编辑器，不在这里强制。
+line-length = 120
+target-version = "py310"
+exclude = [".venv", "data", "attachments"]
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82", "W6"]
+# E9  语法/运行时错误（能直接崩的）
+# F63 无效的 __all__ / 断言元组
+# F7  语法级错误（break 在循环外等）
+# F82 未定义名字（就是 NameError 的静态版）
+# W6  已废弃语法
+
+[tool.ruff.lint.per-file-ignores]
+"backend/tests/*" = ["F401"]   # 测试里的 import 常为了副作用/注册
+
+# 跑法（本项目不需要 pytest，.venv 里也没有）：
+#   cd backend && python3 -m unittest discover -s tests -t .
+#   node --test frontend/*.test.mjs
