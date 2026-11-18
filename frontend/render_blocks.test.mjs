@@ -206,9 +206,11 @@ test("渲染：思考流与过程说明用不同类名（不冒充）", () => {
   const noteBox = d.children[2];
   assert.equal(win.className, "proc-line");
   assert.equal(noteBox.className, "note-box demoted");
-  // 思考在窗内的正文段里，说明在卡的子段里——两类文字绝不共用一个容器
-  assert.equal(win.children[0].className, "think-seg-body");
-  assert.equal(win.children[0].textContent, "先看目录");
+  // 思考在窗内的分段正文里，说明在卡的子段里——两类文字绝不共用一个容器
+  const thinkBody = win.children[0].children[1];   // pg-body
+  assert.equal(win.children[0].className, "pg pg-think");
+  assert.equal(thinkBody.children[0].className, "think-seg-body");
+  assert.equal(thinkBody.children[0].textContent, "先看目录");
   assert.equal(noteBox.children[0].className, "process-text");
   assert.equal(noteBox.children[0].textContent, "我打算这样做");
 });
@@ -234,13 +236,24 @@ test("渲染：整回合思考归一窗、说明归一卡，轮次标题变窗�
   // 两轮思考进同一个窗，轮次标题降为窗内分段头；快照末段带 live 光标；
   // running 工具行也进窗、按真实时序插在两轮思考之间
   const win = d.children[1];
-  assert.deepEqual(win.children.map((c) => c.className),
-                   ["think-seg-head", "think-seg-body", "tl",
+  // 过程区按用户要求拆成两个可折叠分组：🧠 思考过程 / ▶ 工具调用
+  assert.deepEqual(win.children.map((c) => c.className), ["pg pg-think", "pg pg-call"]);
+  assert.equal(win.children[0].children[0].textContent, "🧠 思考过程 · 2 轮");
+  assert.equal(win.children[1].children[0].textContent, "▶ 工具调用 · 1 步");
+  // 分组默认展开（没挂 collapsed）
+  assert.ok(!win.children[0].className.includes("collapsed"));
+  assert.ok(!win.children[1].className.includes("collapsed"));
+  const thinkBody = win.children[0].children[1];
+  assert.deepEqual(thinkBody.children.map((c) => c.className),
+                   ["think-seg-head", "think-seg-body",
                     "think-seg-head", "think-seg-body live"]);
-  assert.equal(win.children[0].textContent, "🧠 思考 · 第 1 轮");
-  assert.equal(win.children[1].textContent, "先看目录");
-  assert.equal(win.children[3].textContent, "🧠 思考 · 第 2 轮");
-  assert.equal(win.children[4].textContent, "再看结果");
+  assert.equal(thinkBody.children[0].textContent, "🧠 思考 · 第 1 轮");
+  assert.equal(thinkBody.children[1].textContent, "先看目录");
+  assert.equal(thinkBody.children[2].textContent, "🧠 思考 · 第 2 轮");
+  assert.equal(thinkBody.children[3].textContent, "再看结果");
+  // running 工具行进「工具调用」分组
+  const callBody = win.children[1].children[1];
+  assert.deepEqual(callBody.children.map((c) => c.className), ["tl"]);
   // 两轮说明进同一张卡
   const nb = d.children[2];
   assert.deepEqual(nb.children.map((c) => c.textContent), ["我打算这样做", "还是不对"]);
@@ -259,7 +272,10 @@ test("渲染：没跟思考流的轮次标题留在时间线（非思考模型�
   // 没有任何 reasoning：轮次标题与工具条目共同收进过程窗（proc-line）
   assert.deepEqual(d.children.slice(1).map((c) => c.className),
                    ["proc-line"]);
-  assert.deepEqual(d.children[1].children.map((c) => c.className || c.tagName),
+  // 只有工具条目 → 只出「工具调用」一个分组（没有空的思考分组）
+  assert.deepEqual(d.children[1].children.map((c) => c.className), ["pg pg-call"]);
+  assert.equal(d.children[1].children[0].children[0].textContent, "▶ 工具调用 · 1 步");
+  assert.deepEqual(d.children[1].children[0].children[1].children.map((c) => c.className || c.tagName),
                    ["trace-line", "tl", "tl result"]);
 });
 
@@ -337,7 +353,10 @@ test("渲染：spawn_subagent 工具块的 subtasks 渲染成嵌套折叠卡", (
   assert.deepEqual(cardA.children.slice(1).map((c) => c.className || c.tagName),
                    ["proc-line"]);
   const winA = cardA.children[1];
-  assert.deepEqual(winA.children.map((c) => c.className || c.tagName),
+  // 子任务内部同样拆成分组：纯工具组一个；带轮次标题与 ✅ 完成注记的进「工具调用」
+  const winACall = winA.children.find((c) => c.className === "pg pg-call");
+  assert.ok(winACall, "子代理卡内应有工具调用分组");
+  assert.deepEqual(winACall.children[1].children.map((c) => c.className || c.tagName),
                    ["trace-line", "tl", "tl result", "process-text"]);
   assert.equal(wrap.children[1].children[0].textContent, "🔍 子任务 2：任务B");
   // 调用行在前、容器居中、结果行在后

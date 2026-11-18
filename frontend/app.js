@@ -3616,6 +3616,7 @@ function ensureTrace() {
     // 否则接管后会在卡里再建一个窗，出现双窗/双卡叠着。
     thinkBox = existing.querySelector(".proc-line, .think-line");
     procBox = thinkBox;
+    if (procBox && procBox.classList.contains("proc-line")) ProcGroups.flatten(procBox);
     noteBox = existing.querySelector(".note-box");
     watchUserToggle(existing);
   return;
@@ -3628,6 +3629,7 @@ function ensureTrace() {
     traceEl = ph;
     thinkBox = ph.querySelector(".proc-line, .think-line");
     procBox = thinkBox;
+    if (procBox && procBox.classList.contains("proc-line")) ProcGroups.flatten(procBox);
     noteBox = ph.querySelector(".note-box");
     watchUserToggle(ph);
     return;
@@ -3743,6 +3745,52 @@ function traceTick() {
 // "命令这些放外面还是会刷屏"。窗内顺序仍按时序：思考段与工具行交错可读。
 let procBox = null;
 
+// 【过程区两个可折叠分组】🧠 思考过程 / ▶ 工具调用：用户要求拆成两块、各带
+// 一行注释头、可点开可收起。分组壳由这里建（实时路径），回放路径同名类由
+// render_blocks.js 建，两边同一副面孔。本轮用户手动收起的分组记在
+// ProcGroups.userClosed（回合结束清空），自动开合让位。
+const ProcGroups = {
+  sync(box) {
+    if (!box) return;
+    for (const kind of ["think", "call"]) {
+      const g = this.get(box, kind);
+      const n = g.querySelector(".pg-body").children.length;
+      g.style.display = n ? "" : "none";   // 没有条目就不画分组头
+    }
+  },
+  get(box, kind) {
+    let g = box.querySelector(`:scope > .pg-${kind}`);
+    if (g) return g;
+    g = document.createElement("div");
+    g.className = "pg pg-" + kind + (this.userClosed.has(kind) ? " collapsed" : "");
+    g.dataset.pg = kind;
+    const h = document.createElement("div");
+    h.className = "pg-head";
+    h.textContent = kind === "think" ? "🧠 思考过程" : "▶ 工具调用";
+    // 只记「人点的」：程序化 toggle 不产生 click，天然区分（同 watchUserToggle）
+    h.addEventListener("click", () => {
+      const collapsed = g.classList.toggle("collapsed");
+      if (collapsed) this.userClosed.add(kind); else this.userClosed.delete(kind);
+    });
+    const body = document.createElement("div");
+    body.className = "pg-body";
+    g.append(h, body);
+    box.appendChild(g);
+    return g;
+  },
+  body(box, kind) { return this.get(box, kind).querySelector(".pg-body"); },
+  // 摘掉历史快照里已画的分组壳，把条目摘回窗内——实时路径与回放路径的条目
+  // 归属规则不同（回放也按分组画，接管后要保证「一个分组」而不是两套并存）。
+  flatten(box) {
+    for (const g of [...box.querySelectorAll(":scope > .pg")]) {
+      const body = g.querySelector(".pg-body");
+      for (const child of [...body.children]) box.insertBefore(child, g);
+      g.remove();
+    }
+  },
+};
+let userClosedGroups = ProcGroups.userClosed = new Set();
+
 function procBoxEl() {
   ensureTrace();
   if (procBox && procBox.isConnected) return procBox;
@@ -3767,7 +3815,10 @@ function appendTrace(el) {
   const toEdit = el.classList.contains("card") || (el.dataset && el.dataset.editBy === "1");
   const box = toEdit ? editBoxEl() : procBoxEl();
   const bottomBefore = box.getBoundingClientRect().bottom;
-  box.appendChild(el);
+  // 非修改类条目进「▶ 工具调用」分组（思考流走自己的分组，见 reasoning_delta）
+  const target = toEdit ? box : ProcGroups.body(box, "call");
+  target.appendChild(el);
+  if (!toEdit) ProcGroups.sync(box);
   if (toEdit) syncEditBox();  // 首条修改到达即让修改区显形
   orderTraceSections();       // 显式 DOM 重排，不依赖 CSS order
   traceTick();
@@ -4782,6 +4833,7 @@ function applyEvent(evt, seq) {
     // 而本回合卡片空无一物（用户看到的"改动跑到别的块里"）。
     editBox = null;
     placeholderOpen = false; autoThinkOpen = false; userToggledTrace = false;
+    userClosedGroups.clear();  // 新回合：分组的自动开合重新接管
     // ↑ 开合状态随回合重建作废（新卡、新开合语义）
     tracePhase = "正在理解问题…";  // 回合开场：模型还没吐任何内容时的友好占位
     metaEl = null; pendingCalls = [];
@@ -4844,7 +4896,9 @@ function applyEvent(evt, seq) {
       head.textContent = headText;
       thinkSeg = document.createElement("div");
       thinkSeg.className = "think-seg-body";
-      thinkBox.append(head, thinkSeg);
+      const tb = ProcGroups.body(thinkBox, "think");   // 思考进「🧠 思考过程」分组
+      tb.append(head, thinkSeg);
+      ProcGroups.sync(thinkBox);
     }
     queueStreamDelta("think", null, evt.delta);
     // 【贴底右移】思考段长高多少，就把窗外层容器整体下移多少：即便窗内滚动

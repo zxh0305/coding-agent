@@ -124,6 +124,57 @@
       return doc.createDocumentFragment();
     }
 
+    // ---- 过程区的两个可折叠分组（用户要求：上面那部分拆成「思考过程」与
+    // 「工具调用」两块，各自带一行注释摘要、可点开可收起）----
+    //
+    // 壳：<div class="pg pg-think|pg-call"><div class="pg-head">摘要</div>
+    //     <div class="pg-body">条目…</div></div>
+    // 用 div + 点击切 hidden，不用 <details>：这两组在【过程卡自己的折叠条】
+    // 里面，嵌套原生 summary 会被外层点击/Esc 联动，且 app.js 的实时路径要用
+    // 同一个 api 开合（见 window.CodingAgentProcGroups），div 更好统一控制。
+    // 开合状态默认「展开」：实时回合要能直接看到过程；用户手动收起后记在节点
+    // 的 data-user 上，重渲染（切会话回放）不回翻。
+    function renderProcGroup(kind, headText, expanded, fill) {
+      const g = doc.createElement("div");
+      g.className = "pg pg-" + kind + (expanded ? "" : " collapsed");
+      g.dataset.pg = kind;
+      const h = doc.createElement("div");
+      h.className = "pg-head";
+      h.textContent = headText;
+      const body = doc.createElement("div");
+      body.className = "pg-body";
+      fill(body);
+      g.appendChild(h);
+      g.appendChild(body);
+      return g;
+    }
+
+    // 思考条目：分段头（轮次标题）+ 正文段，与实时路径同名类（think-seg-*）
+    function appendThinkOps(body, thinkOps, running) {
+      for (const op of thinkOps) {
+        const s = op.seg;
+        if (s.head) {
+          const h = doc.createElement("div");
+          h.className = "think-seg-head";
+          h.textContent = s.head;
+          body.appendChild(h);
+        }
+        const b = doc.createElement("div");
+        b.className = "think-seg-body" + (running && s.live ? " live" : "");
+        b.textContent = s.text;
+        body.appendChild(b);
+      }
+    }
+
+    // 摘要里的计数：思考看分段数（=轮次），工具只看工具条目（轮次标题/提醒
+    // 这类 note 行不算一步）
+    function countThinkRounds(thinkOps) {
+      return thinkOps.length;
+    }
+    function countToolSteps(callOps) {
+      return callOps.filter((op) => op.it && op.it.kind === "tool").length;
+    }
+
     // ---- 过程条目按类型归组：思考一窗、说明一卡、其余保持时序 ----
     // 顶层过程块与子代理嵌套卡共用。reasoning 全部收进一个 think-line 固定窗
     // （轮次标题 roundHead 降为窗内分段头），demoted 说明全部收进一张 note-box
@@ -171,10 +222,11 @@
       }
       if (pendingHead) ops.push({ it: pendingHead });  // 尾部悬挂的标题归窗内
 
-      // 【过程监视窗 + 修改区】回放与实时同序：思考分段与普通工具条目进
-      // .proc-line（内滚）；写/改文件的条目（apply_patch/write_file）另收进
-      // .edit-box 修改区，夹在过程窗与说明卡之间（order:2）——用户要一眼看清
-      // 这轮动了哪些文件。ops 记录真实时间线（想→跑→再想），按序渲染。
+      // 【过程区 + 修改区】回放与实时同序。过程区按用户要求拆成【两个】可折叠
+      // 分组：🧠 思考过程（reasoning 分段）与 ▶ 工具调用（工具行/轮次标题等），
+      // 各带一个 summary 可开合（renderProcGroup）；写/改文件的条目
+      // （apply_patch/write_file）另收进 .edit-box 修改区，夹在过程区与说明卡
+      // 之间（order:2）——用户要一眼看清这轮动了哪些文件。
       const isEditItem = (it) => it && it.kind === "tool" &&
         (it.name === "apply_patch" || it.name === "write_file");
       const procOps = [], editOps = [];
@@ -186,23 +238,18 @@
       if (procOps.length) {
         const box = doc.createElement("div");
         box.className = "proc-line";
-        for (const op of procOps) {
-          if (op.seg) {
-            const s = op.seg;
-            if (s.head) {
-              const h = doc.createElement("div");
-              h.className = "think-seg-head";
-              h.textContent = s.head;
-              box.appendChild(h);
-            }
-            const b = doc.createElement("div");
-            b.className = "think-seg-body" + (running && s.live ? " live" : "");
-            b.textContent = s.text;
-            box.appendChild(b);
-          } else {
-            box.appendChild(renderProcessItem(op.it, running));
-          }
-        }
+        // 分组内的条目序列（保持真实时序：想→跑→再想），交给分组函数包壳
+        const thinkOps = procOps.filter((op) => op.seg);
+        const callOps = procOps.filter((op) => !op.seg);
+        const thinkGroup = thinkOps.length
+          ? renderProcGroup("think", `🧠 思考过程 · ${countThinkRounds(thinkOps)} 轮`, true,
+              (body) => appendThinkOps(body, thinkOps, running))
+          : null;
+        const callGroup = callOps.length
+          ? renderProcGroup("call", `▶ 工具调用 · ${countToolSteps(callOps)} 步`, true,
+              (body) => { for (const op of callOps) body.appendChild(renderProcessItem(op.it, running)); })
+          : null;
+        for (const g of [thinkGroup, callGroup]) if (g) box.appendChild(g);
         procLine = box;
         frag.appendChild(box);
       }
