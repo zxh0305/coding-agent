@@ -2422,7 +2422,12 @@ def save_messages(sid: str, history: list[dict], saved: dict) -> int:
                         "role": m.get("role", "")}
                 if m.get("_completion_candidate"):
                     stub["_completion_candidate"] = True
-                for key in ("_task_evidence", "_task_state", "_references", "_supplement_of", "_completion_feedback", "_superseded"):
+                # 外置摘要行是"换头"的：白名单里的字段要跟着搬过去，否则
+                # 大消息一旦归档就丢失这些语义（例如 _derived 记录的"这条
+                # 工具结果被清理过、原来多长"，丢了就查不出上下文为何变少）
+                for key in ("_task_evidence", "_task_state", "_references", "_supplement_of",
+                            "_completion_feedback", "_superseded", "_derived",
+                            "_tool_result_cleared", "_crash_balanced"):
                     if key in m:
                         stub[key] = m[key]
                 row_content = json.dumps(stub, ensure_ascii=False)

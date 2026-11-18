@@ -1678,6 +1678,15 @@ class Agent:
         cleared = 0
         for i, _orig in plan:
             m = self.history[i]
+            # 派生物标注：把「这条消息被改写成了什么」显式记下来。
+            # 此前只留一个 _tool_result_cleared 布尔，下游无法知道原长、何时清的。
+            # 有了它，排查"为什么模型说看不到命令输出"时能一眼确认是清理导致，
+            # 而不是去怀疑外置归档或渲染。_derived 里的字段全带下划线，
+            # 发给模型前由 _clean_outgoing 统一剥离。
+            m.setdefault("_derived", {})["tool_result_cleared"] = {
+                "at": int(time.time()),
+                "original_chars": len(_orig) if isinstance(_orig, str) else 0,
+            }
             m["content"] = self._cleared_placeholder(_orig)
             m["_tool_result_cleared"] = True  # 标记（下划线前缀，发给模型前会被剥离）
             cleared += 1
