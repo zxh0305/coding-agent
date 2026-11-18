@@ -72,15 +72,21 @@ def todo_write(todos: list, ctx: "ToolContext" = None) -> str:
                        "progress": f"{done}/{len(clean)}"}, ensure_ascii=False)
 
 
-def error_result(error: str, hint: str = "") -> str:
-    """统一失败信封：{ok:false, error, hint?}。
+def error_result(error: str, hint: str = "", *, code: str = "") -> str:
+    """统一失败信封：{ok:false, error, hint?, error_code?}。
 
     所有工具的失败（参数错误/执行异常/权限拒绝 permissions.rejection_result）
     共用这一个结构，模型只需要学一次「ok:false → 读 error 与 hint 改道」。
     error 说明为什么失败；hint 给下一步建议（换路径/换工具/先侦察），
     让模型改道而不是原样重试。
+
+    code 是可机读的失败分类（与 code_tools._err 同一口径）：模型不必再猜
+    "是路径错了还是根本不是图片"，也便于 Casey 一眼分开"服务不可用"与
+    "本次动作失败"这两类完全不同的故障。
     """
     payload = {"ok": False, "error": error}
+    if code:
+        payload["error_code"] = code
     if hint:
         payload["hint"] = hint
     return json.dumps(payload, ensure_ascii=False)
@@ -227,23 +233,124 @@ TOOL_SCHEMAS.append({
 TOOL_REGISTRY["read_tool_result"] = read_tool_result  # 只读盘上的结果文件（read_only 标记见 TOOL_READ_ONLY）
 
 
-def analyze_image(image_id: str = "", question: str = "请详细描述这张图片的内容", ctx: ToolContext = None) -> str:
-    images = ctx.images if ctx is not None else []
-    if not images:
-        # 没有用户上传图片时回退浏览器截图：browser_screenshot 之后 agent 调
-        # 本工具即可"看见"页面（browser_tools 截图后把 base64 挂在 ctx.browser 上）
-        shot = getattr(getattr(ctx, "browser", None), "last_shot_b64", None) if ctx is not None else None
-        if not shot:
-            return error_result("当前这条消息没有附带图片，浏览器也没有最新截图",
-                                "若想看网页内容：先调 browser_screenshot 再调本工具；用户图片则让用户重新上传")
-        images = [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{shot}"}}]
-        index = 0
+# analyze_image 从磁盘读图的上限与格式表。
+# 上限取 10MB：与「用户消息附件」那侧不同——那边受单条消息 base64 总长约束
+# （MAX_IMAGE_B64≈6MB→原图约 4.5MB），这里是本地读盘不占消息体，给运行中
+# 生成的截图/下载图更宽的口子；再大就建议先压缩，别把整包塞给视觉模型。
+IMAGE_PATH_MAX_BYTES = 10 * 1024 * 1024
+
+# 扩展名一律不可信：格式只看文件头魔数（见 _sniff_image_mime）。
+# webp 的魔数是 RIFF....WEBP，第二段要在偏移 8 处另判，所以单独处理。
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def _sniff_image_mime(head: bytes) -> str:
+    """按文件头认出图片格式；认不出返回空串（调用方按"不是图片"处理）。
+
+    只放行视觉模型普遍支持的 png/jpeg/webp/gif。bmp/tiff 之类虽然也是图片，
+    但上游模型常直接拒收，放行只会把错误推迟到更难懂的地方。
+    """
+    for magic, mime in _IMAGE_MAGIC:
+        if head.startswith(magic):
+            return mime
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+def _image_part_from_path(path: str, ctx: "ToolContext") -> tuple:
+    """从工作区（含 attachments/、.agent-memory/ 桥接区）读一张图，转成 image_url part。
+
+    复用 code_tools 的 _resolve：路径安全边界与 read_file 完全同一套（只认
+    工作区与桥接前缀，越界报错），这里不另开第二条放行规则——工具能读盘看图，
+    不能因此变成"能读任意文件"。
+
+    返回 (part, None) 或 (None, 失败信封字符串)。
+    """
+    from code_tools import _bridge_roots, _resolve, _ws  # 延迟导入：tools.py ↔ code_tools 互相引用
+
+    try:
+        p = _resolve(path, _ws(ctx), _bridge_roots(ctx))
+    except ValueError as e:  # 越界 / 空路径
+        return None, error_result(str(e),
+                                  "只能读工作区内的文件（用相对路径，如 shot.png；"
+                                  "会话附件用 attachments/xxx）",
+                                  code="PATH_DENIED")
+    if not p.exists():
+        return None, error_result(
+            f"文件不存在：{path}",
+            "先用 list_dir 查看工作区的真实目录结构确认路径；若图是脚本刚生成的，"
+            "确认脚本确实把它写进了工作区（而不是临时目录或工作区外）",
+            code="PATH_NOT_FOUND")
+    if p.is_dir():
+        return None, error_result(f"{path} 是目录不是图片文件", "用 list_dir 看目录里有哪些图片文件")
+    size = p.stat().st_size
+    if size == 0:
+        return None, error_result(f"{path} 是空文件（0 字节）",
+                                  "截图/下载可能没成功落盘，重跑生成步骤或换个输出路径",
+                                  code="NOT_AN_IMAGE")
+    if size > IMAGE_PATH_MAX_BYTES:
+        return None, error_result(
+            f"图片过大：{path} 有 {size / 1048576:.1f}MB，上限 {IMAGE_PATH_MAX_BYTES // 1048576}MB",
+            "先用 run_bash 压缩或裁剪（如 sips -Z 1600 in.png --out small.png，或 "
+            "python 里用 PIL resize），再分析压缩后的文件",
+            code="IMAGE_TOO_LARGE")
+    with p.open("rb") as f:
+        data = f.read()
+    mime = _sniff_image_mime(data[:16])
+    if not mime:
+        return None, error_result(
+            f"{path} 不是可识别的图片（按文件头判断，扩展名不可信）",
+            "只支持 png/jpeg/webp/gif。若这是下载来的 svg/pdf/压缩包里的图，先转换/解压；"
+            "若想直接看文本内容，改用 read_file",
+            code="NOT_AN_IMAGE")
+    import base64
+    url = f"data:{mime};base64,{base64.b64encode(data).decode()}"
+    return {"type": "image_url", "image_url": {"url": url}}, None
+
+
+def analyze_image(image_id: str = "", question: str = "请详细描述这张图片的内容",
+                  path: str = "", ctx: ToolContext = None) -> str:
+    """看图：用户消息里的附件（image_id）或工作区里的图片文件（path）。
+
+    path 是本工具最常被需要的入口——截图、验证码、渲染效果图、折线图，agent
+    常常是自己用 run_bash 生成/下载到工作区的，以前只能干瞪眼。显式传 path
+    时以 path 为准，不再回退浏览器截图（避免"想看的文件不存在"却悄悄分析
+    了另一张图这种最坏的静默错位）。
+    """
+    source = ""
+    if path:
+        part, fail = _image_part_from_path(str(path), ctx)
+        if fail:
+            return fail
+        images, index, source = [part], 0, str(path)
     else:
-        # image_id：'1'/'2'/... 按用户消息中图片出现顺序；空值默认第一张
-        digits = "".join(ch for ch in str(image_id) if ch.isdigit())
-        index = (int(digits) - 1) if digits else 0
-        if index < 0 or index >= len(images):
-            index = 0
+        images = ctx.images if ctx is not None else []
+        if not images:
+            # 没传 path 且消息里没图时，回退浏览器最近一次截图：browser_screenshot
+            # 之后 agent 调本工具即可"看见"页面（browser_tools 把 base64 挂在
+            # ctx.browser 上）。新路径优先，这条回退保持不变以兼容旧调用习惯。
+            shot = getattr(getattr(ctx, "browser", None), "last_shot_b64", None) if ctx is not None else None
+            if not shot:
+                return error_result(
+                    "既没有传 path，当前消息也没有附带图片，浏览器也没有最新截图",
+                    "看工作区里的图片请传 path（如 {\"path\": \"shot.png\"}）；看网页请先调 "
+                    "browser_screenshot（可带 to_path 存盘）再调本工具；看用户刚发的图用 image_id",
+                    code="NO_IMAGE")
+            images = [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{shot}"}}]
+            index, source = 0, "browser_screenshot"
+        else:
+            # image_id：'1'/'2'/... 按用户消息中图片出现顺序；空值默认第一张
+            digits = "".join(ch for ch in str(image_id) if ch.isdigit())
+            index = (int(digits) - 1) if digits else 0
+            if index < 0 or index >= len(images):
+                index = 0
+            source = f"message_image_{index + 1}"
     backend = ctx.vision_backend if ctx is not None else None
     if backend is None:
         return error_result("图片识别后端未配置（系统内部问题，请联系服务部署者）")
@@ -253,7 +360,12 @@ def analyze_image(image_id: str = "", question: str = "请详细描述这张图�
         # 视觉模型调用失败：把原因交回主模型，让它告知用户怎么办
         return error_result(f"视觉模型调用失败：{e}",
                             "请在「管理模型」里给某个模型勾选'视觉'并确保其 Key 可用，然后重试")
-    return json.dumps({"ok": True, "image_id": str(index + 1), "result": description}, ensure_ascii=False)
+    payload = {"ok": True, "result": description}
+    if path:
+        payload["path"] = source
+    else:
+        payload["image_id"] = str(index + 1)
+    return json.dumps(payload, ensure_ascii=False)
 
 
 TOOL_SCHEMAS.append({
@@ -291,17 +403,24 @@ TOOL_SCHEMAS.append({
     "type": "function",
     "function": {
         "name": "analyze_image",
-        "description": "识别/分析用户消息中附带的图片：描述内容、定位细节或读出图中文字。"
-                       "你（主模型）看不到图片像素，凡需要看图都必须调它；当前消息没带图片时会返回错误，"
-                       "此时直接告诉用户重新上传即可。"
-                       "image_id 按图片在消息中的顺序（'1' 是第一张，留空默认第一张）；"
+        "description": "识别/分析一张图片：描述内容、定位细节或读出图中文字。你（主模型）看不到图片像素，"
+                       "凡需要看图都必须调它。图片来源三选一，问答里按需选："
+                       "① path —— 工作区里的图片文件（你自己用 run_bash 截的图、下载的图、"
+                       "browser_screenshot 带 to_path 存下的图），支持 png/jpeg/webp/gif，"
+                       "按文件头识别、扩展名不可信，单张上限 10MB；"
+                       "② image_id —— 用户这条消息里的附件，'1' 是第一张、留空默认第一张；"
+                       "③ 都不传 —— 回退浏览器最新截图（等价于先 browser_screenshot 再调本工具）。"
                        "question 写具体想了解什么，问得越准答案越有用。"
-                       "示例：{\"image_id\": \"1\", \"question\": \"图中的报错文字是什么\"}。",
+                       "示例：{\"path\": \"shot.png\", \"question\": \"验证码是几位数字？\"}、"
+                       "{\"image_id\": \"1\", \"question\": \"图中的报错文字是什么\"}。",
         "parameters": {
             "type": "object",
             "properties": {
+                "path": {"type": "string",
+                         "description": "工作区内的图片路径（相对路径，如 shot.png、out/chart.webp）；"
+                                        "显式传它时优先于 image_id，不再回退浏览器截图"},
                 "image_id": {"type": "string",
-                             "description": "图片编号：'1' 是用户消息中的第一张图，'2' 是第二张；留空默认第一张"},
+                             "description": "用户消息里第几张图：'1' 是第一张；留空默认第一张"},
                 "question": {"type": "string",
                              "description": "你想从这张图里了解什么，例如'图中有什么文字'；不填则返回整体描述"},
             },

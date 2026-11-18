@@ -16,5 +16,17 @@ def main():
     if not stamp.exists() or stamp.read_text()!=digest:
         subprocess.run([str(python),'-m','pip','install','-r',str(root/'requirements.txt')],cwd=root,check=True)
         stamp.write_text(digest)
+        (environment/'.runtime-chromium').unlink(missing_ok=True)   # 新依赖可能换 playwright 版本，内核标记作废
+    # playwright 内核（约 150MB）单独一步、失败不阻断启动：装不上时内置浏览器
+    # 会给出分型错误提示（见 browser_tools），其余功能照常可用。
+    chromium_stamp=environment/'.runtime-chromium'
+    if not chromium_stamp.exists():
+        probe=subprocess.run([str(python),'-c','import playwright'],cwd=root)
+        if probe.returncode==0:
+            print('正在安装内置浏览器内核 playwright chromium…',flush=True)
+            if subprocess.run([str(python),'-m','playwright','install','chromium'],cwd=root).returncode==0:
+                chromium_stamp.write_text('ok')
+            else:
+                print('内置浏览器内核安装失败：浏览器工具将不可用（可设 BROWSER_CHROME_PATH 指向本机 Chrome 来降级）',flush=True)
     if not args.install_only:subprocess.run([str(python),str(root/'backend/app.py'),str(args.port)],cwd=root,check=True)
 if __name__=='__main__':main()

@@ -29,6 +29,93 @@ except ImportError:
 
 PW_INSTALL_HINT = "后端未安装 playwright：pip install playwright && playwright install chromium（约 300MB，一次性）"
 
+# ---------------------------------------------------------------------------
+# 浏览器运行时自检
+#
+# 历史教训："未安装 playwright" 这一句话曾被用来覆盖三种完全不同的故障——
+# 模块没装、模块装了但内核没下、内核版本与 playwright 对不上（缓存里有
+# chromium-1248 而这一版要 chromium-1200）。用户照着提示装了一遍又一遍，
+# 真正原因是版本不匹配，白折腾一轮。所以这里按"真实原因"分型，每种给
+# 独立的错误码与可执行的下一步。
+#
+# 另外两条降级路径（配置项，不鼓励模型在脚本里临时绕过）：
+#   BROWSER_CHROME_PATH=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+#   BROWSER_CHANNEL=chrome        （走 playwright 的 channel，本机装了 Chrome 即可）
+# 两者都只从环境变量（.env 由 app.py 的 load_env_file 读入）取，不进工具参数——
+# 模型不该有"随手指定任意可执行文件"的能力。
+# ---------------------------------------------------------------------------
+
+BROWSER_UNAVAILABLE_HINT = "浏览器不可用（服务级故障，不是目标站点的问题）：先看 error_code 分类按 hint 修复；" \
+                           "在修好之前不要用 browser_* 排查网站可达性，也别去查 DNS/网络。"
+
+
+class BrowserUnavailable(RuntimeError):
+    """浏览器服务级不可用：整条 browser_* 链路都不可用，而非本次动作失败。
+
+    与普通 RuntimeError 的区别是 error_code 与 unavailable 标记——上层据此
+    告诉模型"修工具环境"，而不是让它误判成"目标站点打不开"。
+    """
+
+    def __init__(self, code: str, message: str, hint: str = ""):
+        super().__init__(message)
+        self.code = code
+        self.hint = hint
+
+
+def _browser_launch_options() -> dict:
+    """本机 Chrome 降级路径的 launch 参数（未配置时返回空表 = 用 playwright 自带内核）。"""
+    import os
+    channel = (os.environ.get("BROWSER_CHANNEL") or "").strip()
+    exe = (os.environ.get("BROWSER_CHROME_PATH") or "").strip()
+    if exe:
+        if not Path(exe).is_file():
+            raise BrowserUnavailable(
+                "BROWSER_CHROME_PATH_INVALID",
+                f"BROWSER_CHROME_PATH 指向的文件不存在：{exe}",
+                "改正 .env 里的路径（macOS 一般是 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome），"
+                "或删掉该项改用 playwright 自带内核")
+        return {"executable_path": exe}
+    if channel:
+        return {"channel": channel}
+    return {}
+
+
+def _classify_launch_error(e: Exception) -> BrowserUnavailable:
+    """把 playwright 的启动异常归类成可行动的 BrowserUnavailable。
+
+    判据只用异常文本 + 现状探测，不引入任何新依赖：pyppeteer 时代的
+    "Executable doesn't exist at .../chromium-XXXX" 与版本不匹配共用同一句
+    文案，所以这里把后者也归到 INSTALL_REQUIRED，并在 hint 里点名"版本不匹配"
+    这个最常见原因，避免用户反复重装却始终对不上号。
+    """
+    import os
+    import sys
+    text = str(e)
+    low = text.lower()
+    hint_install = ("在部署机上执行 python -m playwright install chromium 后重试；"
+                    "若本机已有 Chrome，也可以设 BROWSER_CHROME_PATH 指向它，免装内核")
+    if "executable doesn't exist" in low or "please run the following command" in low:
+        return BrowserUnavailable("BROWSER_KERNEL_MISSING",
+                                  "playwright 找不到浏览器内核（常见原因：内核未安装，或缓存里的版本与当前 "
+                                  "playwright 要求的不一致）", hint_install)
+    if "is not found" in low or "no such file" in low and "chrome" in low:
+        return BrowserUnavailable("BROWSER_KERNEL_MISSING", f"浏览器内核不可用：{text}", hint_install)
+    if "permission" in low or "denied" in low or "eacces" in low:
+        return BrowserUnavailable("BROWSER_PERMISSION",
+                                  f"启动浏览器被拒绝（权限问题）：{text}",
+                                  "检查内核可执行文件与 profile 目录（data/browser-profiles）的读写权限")
+    if isinstance(e, PermissionError):
+        return BrowserUnavailable("BROWSER_PERMISSION", f"启动浏览器被拒绝：{text}",
+                                  "检查内核与 profile 目录的读写权限")
+    if "profile" in low and ("lock" in low or "in use" in low):
+        return BrowserUnavailable("BROWSER_PROFILE_LOCKED",
+                                  f"浏览器 profile 被占用：{text}",
+                                  "先 browser_open 会让旧实例退出；仍失败则删除该会话的 "
+                                  "data/browser-profiles/<会话> 目录后重试（会丢该会话的登录态）")
+    return BrowserUnavailable("BROWSER_LAUNCH_FAILED", f"浏览器启动失败：{text}",
+                              f"Python {sys.version.split()[0]}，模块路径取决于部署环境；"
+                              "重试一次，持续失败请把该错误原文交给部署者")
+
 # 每个 agent 实例（会话）一个浏览器管理器；同一会话内的多次工具调用复用
 _MANAGERS: dict = {}
 _MANAGERS_LOCK = threading.Lock()
@@ -86,11 +173,24 @@ def _ok(payload: dict) -> str:
     return json.dumps({"ok": True, **payload}, ensure_ascii=False)
 
 
-def _err(msg: str, hint: str = "") -> str:
+def _err(msg: str, hint: str = "", *, code: str = "", unavailable: bool = False) -> str:
+    """失败信封。code 区分故障类型；unavailable=True 表示「服务不可用」
+    （整条 browser_* 链路都不可用），False 表示「本次动作失败」（页面/selector
+    的问题）——模型靠这两个字段分开"修工具环境"与"换选择器重试"。"""
     payload = {"ok": False, "error": msg}
+    if code:
+        payload["error_code"] = code
+    if unavailable:
+        payload["unavailable"] = True
     if hint:
         payload["hint"] = hint
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _unavailable_err(e: "BrowserUnavailable") -> str:
+    """服务级不可用 → 统一信封（带 error_code + unavailable=true）。"""
+    return _err(str(e), (e.hint + "。") if e.hint else BROWSER_UNAVAILABLE_HINT,
+                code=e.code, unavailable=True)
 
 
 def _serialized(method):
@@ -211,7 +311,12 @@ class BrowserManager:
         return base
 
     def _ensure(self):
-        """惰性启动：返回 (page, ok_msg)。失败时抛 RuntimeError（带可读原因）。"""
+        """惰性启动：返回 page。失败时抛 BrowserUnavailable（带 error_code 与下一步）。
+
+        失败分型见 _classify_launch_error：模块缺失 / 内核缺失或版本不匹配 /
+        权限 / profile 占用 / 其它，每种都落到一个可行动的错误码上，
+        而不是笼统一句"未安装 playwright"。
+        """
         if self._page is not None:
             if not self._page.is_closed():
                 pages=[p for p in self._ctx.pages if not p.is_closed()]
@@ -219,27 +324,40 @@ class BrowserManager:
                 return self._page
             self._close()
         if not _PW_AVAILABLE:
-            raise RuntimeError(PW_INSTALL_HINT)
+            raise BrowserUnavailable(
+                "PLAYWRIGHT_MISSING", PW_INSTALL_HINT,
+                "在项目 venv 里装（不是系统 Python）：.venv/bin/pip install playwright && "
+                ".venv/bin/python -m playwright install chromium；"
+                "若本机已有 Chrome，也可以只装 playwright 模块并设 BROWSER_CHROME_PATH 指向它")
         # 启动/复用在锁内：Playwright 的 sync API 绑定创建线程，跨线程调用
         # 直接报错——所有操作串行化在同一把锁上（本项目工具本来就是串行调度）。
         with self._lock:
             if self._page is not None:
                 return self._page
+            try:
+                launch_opts = _browser_launch_options()
+            except BrowserUnavailable:
+                raise
             self._pw = sync_playwright().start()
             try:
-                # chromium 而非 chrome channel：playwright install 装的版本，
-                # 不依赖用户机器上有没有装 Chrome
+                # 默认用 chromium（playwright install 装的内核，不依赖本机 Chrome）；
+                # 配了 BROWSER_CHROME_PATH / BROWSER_CHANNEL 则改用本机 Chrome 作为
+                # 合法降级路径——这正是"内核版本对不上"时最省事的一条路。
                 self._ctx = self._pw.chromium.launch_persistent_context(
                     str(self._profile_dir()),
                     headless=self.headless,
                     viewport=VIEWPORT,
                     args=["--no-sandbox", "--disable-dev-shm-usage"],
+                    **launch_opts,
                 )
                 self._page = self._ctx.pages[0] if self._ctx.pages else self._ctx.new_page()
                 self._page.set_default_timeout(ACTION_TIMEOUT_MS)
+            except BrowserUnavailable:
+                self._close()
+                raise
             except Exception as e:
                 self._close()
-                raise RuntimeError(f"浏览器启动失败：{e}") from e
+                raise _classify_launch_error(e) from e
         return self._page
 
     def close(self):
@@ -316,11 +434,15 @@ class BrowserManager:
             return _ok({"result": f"已打开 {url}", **info})
         except PWTimeout:
             return _err(f"打开 {url} 超时（{NAV_TIMEOUT_MS // 1000}s）",
-                        "检查 URL 是否可达；内网页面确认是否需要先连 VPN")
+                        "检查 URL 是否可达；内网页面确认是否需要先连 VPN",
+                        code="NAV_TIMEOUT")
+        except BrowserUnavailable as e:
+            return _unavailable_err(e)
         except RuntimeError as e:
-            return _err(str(e), "在部署机上安装 playwright 后重试")
+            return _err(str(e))
         except Exception as e:
-            return _err(f"打开页面失败：{e}", "检查 URL 格式（须带 http:// 或 https://）")
+            return _err(f"打开页面失败：{e}", "检查 URL 格式（须带 http:// 或 https://）",
+                        code="ACTION_FAILED")
 
     @_serialized
     def click(self, selector: str) -> str:
@@ -333,11 +455,15 @@ class BrowserManager:
             return _ok({"result": f"已点击「{selector}」", **info})
         except PWTimeout:
             return _err(f"找不到可点击的元素「{selector}」或页面加载超时",
-                        "先 browser_snapshot 读取当前页面，按页面上的真实文字重写 selector")
+                        "先 browser_snapshot 读取当前页面，按页面上的真实文字重写 selector",
+                        code="ELEMENT_NOT_FOUND")
+        except BrowserUnavailable as e:
+            return _unavailable_err(e)
         except RuntimeError as e:
             return _err(str(e))
         except Exception as e:
-            return _err(f"点击失败：{e}", "selector 用页面元素的可见文字（自动按 text= 匹配）")
+            return _err(f"点击失败：{e}", "selector 用页面元素的可见文字（自动按 text= 匹配）",
+                        code="ACTION_FAILED")
 
     @_serialized
     def type_text(self, selector: str, text: str) -> str:
@@ -357,18 +483,24 @@ class BrowserManager:
                         "url": page.url})
         except PWTimeout:
             return _err(f"找不到输入框「{selector}」",
-                        "先 browser_snapshot 读取当前页面；输入框定位用它的 placeholder 或 name")
+                        "先 browser_snapshot 读取当前页面；输入框定位用它的 placeholder 或 name",
+                        code="ELEMENT_NOT_FOUND")
+        except BrowserUnavailable as e:
+            return _unavailable_err(e)
         except RuntimeError as e:
             return _err(str(e))
         except Exception as e:
-            return _err(f"输入失败：{e}")
+            return _err(f"输入失败：{e}", code="ACTION_FAILED")
 
     @_serialized
     def snapshot(self):
         try:
             self._ensure()
             return _ok(self._describe_page())
-        except Exception as error:return _err(f"读取页面失败：{error}")
+        except BrowserUnavailable as error:
+            return _unavailable_err(error)
+        except Exception as error:
+            return _err(f"读取页面失败：{error}", code="ACTION_FAILED")
 
     @_serialized
     def press(self,key):
@@ -378,10 +510,36 @@ class BrowserManager:
             self._ensure().keyboard.press(key)
             self._publish_state("按键")
             return _ok(self._describe_page())
-        except Exception as error:return _err(f"按键失败：{error}")
+        except BrowserUnavailable as error:
+            return _unavailable_err(error)
+        except Exception as error:return _err(f"按键失败：{error}", code="ACTION_FAILED")
+
+    def _shot_to_path(self, png: bytes, to_path: str, ctx) -> tuple:
+        """把截图写进工作区（含 attachments/ 等桥接前缀）。返回 (相对路径, None) 或 (None, 失败信封)。
+
+        路径安全与 read_file/write_file 同一套 _resolve：截图能落盘，不代表
+        能往工作区外写文件。
+        """
+        import os  # 延迟导入：与 read_file 那条路径同口径，优先走 code_tools 的解析
+        from code_tools import _bridge_roots, _resolve, _ws  # 延迟导入防循环
+        try:
+            target = _resolve(to_path, _ws(ctx), _bridge_roots(ctx))
+        except ValueError as e:
+            return None, _err(str(e), "to_path 用工作区相对路径，如 shots/login.png",
+                              code="PATH_DENIED")
+        try:
+            # 原子写（先 tmp 再 replace）：agent 可能在截图落盘后立刻 read/analyze，
+            # 不能让它读到半张图。tmp 名带 pid，多会话并发写同名路径也不互相踩。
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(f"{target.name}.tmp{os.getpid()}")
+            tmp.write_bytes(png)
+            os.replace(tmp, target)
+        except OSError as e:
+            return None, _err(f"截图写入失败：{e}", "换一个 to_path（确认目录可写）", code="WRITE_FAILED")
+        return to_path.replace("\\", "/"), None
 
     @_serialized
-    def screenshot(self) -> str:
+    def screenshot(self, to_path: str = "", ctx=None) -> str:
         try:
             page = self._ensure()
             png = page.screenshot(type="png")
@@ -390,14 +548,27 @@ class BrowserManager:
             # 挂在管理器上（ctx.browser.last_shot_b64）：analyze_image 的浏览器
             # 回退路径靠它把这张截图交给视觉模型——图片本体不进对话文本。
             self.last_shot_b64 = base64.b64encode(png).decode()
-            return _ok({"result": "已采集页面供视觉分析；用户可在独立浏览器窗口直接操作。"
-                                  "请立刻调用 analyze_image 查看页面内容，再决定下一步。",
-                        "url": page.url,
-                        "size": len(png)})
+            payload = {"url": page.url, "size": len(png)}
+            if to_path:
+                saved, fail = self._shot_to_path(png, str(to_path), ctx)
+                if fail:
+                    return fail
+                payload["path"] = saved
+                payload["result"] = (f"已采集页面并保存到 {saved}。看这张图："
+                                     f"analyze_image(path=\"{saved}\")；同一张图要反复看时用文件路径，"
+                                     "比依赖「最新截图」更稳。")
+            else:
+                payload["result"] = ("已采集页面供视觉分析；用户可在独立浏览器窗口直接操作。"
+                                     "请立刻调用 analyze_image 查看页面内容，再决定下一步；"
+                                     "若要反复查看或留着比对，下次传 to_path 存到工作区。")
+            return _ok(payload)
+        except BrowserUnavailable as e:
+            return _unavailable_err(e)
         except RuntimeError as e:
             return _err(str(e))
         except Exception as e:
-            return _err(f"截图失败：{e}")
+            return _err(f"截图失败：{e}", "页面可能仍在加载；先 browser_snapshot 确认页面状态",
+                        code="ACTION_FAILED")
 
 
 # ---------------------------------------------------------------------------
@@ -426,9 +597,9 @@ def browser_type(selector: str, text: str, ctx=None) -> str:
     return err if err else mgr.tool_call("type_text",ctx,selector,text)
 
 
-def browser_screenshot(ctx=None) -> str:
+def browser_screenshot(to_path: str = "", ctx=None) -> str:
     mgr, err = _ctx_browser(ctx)
-    return err if err else mgr.tool_call("screenshot",ctx)
+    return err if err else mgr.tool_call("screenshot",ctx,to_path)
 
 
 BROWSER_TOOL_SCHEMAS = [
@@ -490,8 +661,19 @@ BROWSER_TOOL_SCHEMAS = [
             "description": "仅为视觉分析采集当前页面，不向右侧面板追加截图。你自己看不到像素——"
                            "截完图【必须紧接着调用 analyze_image】读取页面内容再决定下一步。"
                            "什么时候用：browser_open/click/type 返回的摘要不足以判断页面状态时、"
-                           "验证渲染效果时、需要读验证码/弹窗内容时。无参数。",
-            "parameters": {"type": "object", "properties": {}},
+                           "验证渲染效果时、需要读验证码/弹窗内容时。"
+                           "建议传 to_path 把截图存进工作区（如 shots/login.png），之后用 "
+                           "analyze_image(path=...) 反复看——同一张图比对前后变化、或者后面"
+                           "才需要回看时，「最新截图」那一路会被下一次截图覆盖。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to_path": {"type": "string",
+                                "description": "可选：把截图保存到工作区的这个相对路径（png），"
+                                               "如 shots/login.png；父目录会自动创建"},
+                },
+                "required": [],
+            },
         },
     },
 ]
