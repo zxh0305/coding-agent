@@ -48,21 +48,26 @@ try:
         page.locator("#new-task").click();page.locator("#input").fill("hold-current");page.locator("#input").press("Enter")
         assert entered.wait(5);page.wait_for_function("!!activeTurnMid")
         sid=page.evaluate("currentSession");root=page.evaluate("activeTurnMid")
-        page.get_by_label("发送方式").select_option("steer")
+        # 发送方式已改为自动（回合进行中 = 插入/steer），不再有手选下拉框，
+        # 这里直接验证：进行中发的消息落成补充条，而不是新用户气泡。
         page.locator("#input").fill("追加：保留兼容");page.locator("#input").press("Enter")
         expect(page.locator(".turn-input-list")).to_contain_text("等待纳入")
         assert page.locator("#chat .bubble.user").count()==1
+        # 第二条/后续内容：自动模式下仍在回合中，因此也走插入（补充条），
+        # 不再进「排队条」——这条断言改为验证同一批补充条渲染出两条。
         page.locator("#input").fill("queued-after");page.locator("#input").press("Enter")
-        expect(page.locator("#server-queue-bar")).to_contain_text("queued-after")
+        expect(page.locator(".turn-input-list details")).to_have_count(2)
         page.reload();expect(page.locator("#layout")).to_be_visible();page.evaluate("sid=>switchSession(sid)",sid)
         page.wait_for_function("bootBuffer===null && !workspacePending")
         expect(page.locator(".turn-input-list")).to_contain_text("等待纳入")
         gate.set()
-        expect(page.locator("#chat .bubble.assistant")).to_have_count(2,timeout=15000)
+        # 两条补充都在同一回合内被采纳 → 仍只有 1 个助手回合（旧脚本按排队模式
+        # 预期 2 个回合，自动模式下排队条已不存在，故按一回合断言）。
+        expect(page.locator("#chat .bubble.assistant")).to_have_count(1,timeout=15000)
         page.wait_for_function("!streaming")
         expect(page.locator("#chat .bubble.assistant").first).to_contain_text("已保留兼容")
         expect(page.locator(".turn-input-list")).to_contain_text("已纳入")
-        expect(page.locator("#chat .bubble.user")).to_have_count(2)
+        expect(page.locator("#chat .bubble.user")).to_have_count(1)
         page.wait_for_function("document.querySelector('#chat .bubble.assistant')?.dataset.persisted==='true'")
         source_mid=page.locator("#chat .bubble.assistant").first.get_attribute("data-mid")
         page.locator("#chat .bubble.assistant code").first.evaluate("el=>{const range=document.createRange();range.selectNodeContents(el);const s=getSelection();s.removeAllRanges();s.addRange(range);document.dispatchEvent(new Event('selectionchange'));}")
@@ -74,7 +79,7 @@ try:
         page.wait_for_function("bootBuffer===null && !workspacePending")
         expect(page.locator("#reference-tray")).to_contain_text("answer = 42")
         page.locator("#input").press("Enter")
-        expect(page.locator("#chat .bubble.assistant")).to_have_count(3,timeout=10000)
+        expect(page.locator("#chat .bubble.assistant")).to_have_count(2,timeout=10000)
         page.wait_for_function("!streaming")
         expect(page.locator("#chat .bubble.assistant").last).to_contain_text("引用接收完成")
         page.locator("#chat .bubble.user .ub-reference").click()
@@ -84,7 +89,7 @@ try:
         assert page.locator(f'[data-mid="{source_mid}"]').count()==1
         gate.clear();page.locator("#input").fill("hold-stop");page.locator("#input").press("Enter")
         assert stop_entered.wait(5)
-        page.get_by_label("发送方式").select_option("steer")
+        # 同上：发送方式已自动，回合进行中即为 steer，这里无需再选。
         page.locator("#input").fill("结束后不能偷偷转成下一项")
         page.wait_for_timeout(400);page.locator("#send").click()
         page.wait_for_function("!streaming")
@@ -92,9 +97,10 @@ try:
         page.locator("#input").press("Enter")
         expect(page.locator("#input")).to_have_value("结束后不能偷偷转成下一项")
         assert page.locator("#chat .bubble.user").count()==before
-        page.get_by_label("发送方式").select_option("queue")
+        # 发送方式已自动（回合结束 = 下一条直接发送），无下拉框；此时空闲，
+        # 直接回车即开新回合 → 助手回合数 +1。
         page.locator("#input").fill("引用与补充验证结束");page.locator("#input").press("Enter")
-        expect(page.locator("#chat .bubble.assistant")).to_have_count(5,timeout=10000)
+        expect(page.locator("#chat .bubble.assistant")).to_have_count(3,timeout=10000)
         page.wait_for_function("!streaming")
         page.set_viewport_size({"width":390,"height":844});page.wait_for_function('document.documentElement.dataset.mode==="mobile"')
         assert page.locator(".composer").evaluate("el=>el.scrollWidth<=el.clientWidth")

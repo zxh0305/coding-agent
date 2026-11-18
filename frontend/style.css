@@ -2906,11 +2906,60 @@ button.ub-skill:focus-visible { outline: 2px solid var(--accent); outline-offset
 .reference-view-dialog blockquote { max-height: 48dvh; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.8; border-left: 2px solid var(--accent-weak-border); padding-left: 12px; margin-bottom: 16px; }
 .reference-view-dialog button, .turn-input-list button { padding: 5px 8px; margin-right: 6px; border: 1px solid var(--border); border-radius: 6px; color: var(--text-2); background: var(--panel); font-size: 11px; cursor: pointer; }
 .quote-source-highlight { outline: 2px solid var(--accent); outline-offset: 3px; }
-.turn-input-list { width: min(420px,100%); margin-top: 8px; font-size: 12px; color: var(--text-2); }
-.turn-input-list details { margin-top: 5px; border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; background: var(--bg-alt); }
-.turn-input-list summary { cursor: pointer; overflow-wrap: anywhere; line-height: 1.6; }
-.turn-input-list p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; line-height: 1.7; }
-@media (max-width:480px) { .turn-input-list { width: 100%; } }
+/* ---------- 回合内的「补充」（steer） ----------
+   挂在被补充的那条用户提问下方，形态是「用户气泡下方的从属小条」：
+     ① 默认折叠且**只有一行**（比常规气泡矮），点开才出全文与引用/复制按钮；
+     ② 一行内容：▸ 补充 [状态胶囊] 正文预览，预览单行省略号，绝不撑高；
+     ③ 整体比常规气泡轻：12.5px 字号、6px 上下内边距，长内容只在展开态换行；
+        折叠时预览单行省略，展开后正文 <p> 用 pre-wrap 完整换行显示。 */
+.turn-input-list {
+  display: flex; flex-direction: column; gap: 6px;
+  width: 100%; margin-top: 6px; font-size: 12.5px; color: var(--text-2);
+  text-align: left;
+}
+.turn-input-list .supplement-item {
+  margin: 0; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-alt); overflow: hidden;
+  transition: border-color .15s, background .15s;
+}
+.turn-input-list .supplement-item:hover { border-color: var(--border-strong); background: var(--panel); }
+.turn-input-list .supplement-item[open] { background: var(--panel); border-color: var(--border-strong); }
+.turn-input-list summary {
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 10px; cursor: pointer; user-select: none;
+  list-style: none; line-height: 20px; flex-wrap: nowrap;
+}
+.turn-input-list summary::-webkit-details-marker { display: none; }
+.turn-input-list summary::before {
+  content: "▸"; flex: none; font-size: 9px; color: var(--text-3);
+  display: inline-block; transition: transform .18s; transform-origin: 50% 50%;
+}
+.turn-input-list .supplement-item[open] summary::before { transform: rotate(90deg); }
+.turn-input-list .supp-tag { flex: none; font-weight: 600; color: var(--text-2); }
+.turn-input-list .supp-state {
+  flex: none; padding: 0 8px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--panel-soft); color: var(--text-3); font-size: 11px; line-height: 18px;
+  white-space: nowrap;
+}
+.turn-input-list .st-accepted .supp-state { border-color: var(--accent-weak-border); background: var(--accent-weak); color: var(--link); }
+.turn-input-list .st-applied .supp-state { border-color: var(--success-weak-border); background: var(--success-weak); color: var(--success-strong); }
+/* 单行预览：flex 里必须 min-width:0 才肯省略；宽度被状态胶囊挤剩多少用多少 */
+.turn-input-list .supp-text {
+  flex: 1 1 auto; min-width: 0; color: var(--text-2);
+  display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+/* 展开态：摘要行保持单行（点它即可收起），全文另起 <p> 换行完整显示 */
+.turn-input-list p {
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  margin: 0 12px 8px 25px; line-height: 1.75; color: var(--text); font-size: 12.5px;
+}
+.turn-input-list details > .ub-reference,
+.turn-input-list details > button { margin: 0 12px 8px 25px; }
+@media (max-width:480px) {
+  .turn-input-list p, .turn-input-list details > .ub-reference,
+  .turn-input-list details > button { margin-left: 10px; margin-right: 10px; }
+  .turn-input-list summary { padding: 6px 8px; gap: 6px; }
+}
 
 /* Browser controls refer to a real shared window, never a screenshot gallery. */
 .browser-window-card { margin: 8px; padding: 20px; border: 1px solid var(--border); border-radius: 14px; background: var(--bg); line-height: 1.65; }

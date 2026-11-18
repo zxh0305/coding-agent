@@ -116,14 +116,27 @@ window.ConversationInputsUI = (() => {
   }
   function renderSupplements(user,items) {
     const group=user.closest(".msg-group") || user;
+    // user 气泡本身就是 .msg-group（还没包动作条）：组上的 is-user 决定对齐，
+    // 补上后时间线里它和常规用户消息一样靠右。
+    group.classList.add("is-user");
     let list=group.querySelector(".turn-input-list");
     if(!list){list=document.createElement("div");list.className="turn-input-list";group.append(list);}
     const opened=new Set([...list.querySelectorAll("details[open]")].map(node=>node.dataset.supplementId));
     list.replaceChildren();
     for(const item of items){
       const detail=document.createElement("details");detail.dataset.supplementId=item.id;detail.open=opened.has(item.id);
+      detail.classList.add("supplement-item",`st-${item.state}`);
       const summary=document.createElement("summary");
-      summary.textContent=`补充 · ${{accepted:"等待纳入",applied:"已纳入",expired:"未纳入（任务结束或中断）"}[item.state] || item.state} · ${item.text.slice(0,45)}`;
+      // 折叠态只有一行：▸ 补充 [状态胶囊] 正文预览（CSS 单行省略，不按字数截，
+      // 免得宽屏浪费空间/窄屏反而溢出）。点开才出全文与引用/复制按钮。
+      const tag=document.createElement("span");tag.className="supp-tag";tag.textContent="补充";
+      const state=document.createElement("span");state.className="supp-state";
+      state.textContent={accepted:"等待纳入",applied:"已纳入",expired:"未纳入"}[item.state] || item.state;
+      state.title={accepted:"已收到，将在下一次模型请求前纳入",applied:"已纳入本次任务的上下文",
+        expired:"任务结束或中断，本条补充未被采用"}[item.state] || "";
+      const preview=document.createElement("span");preview.className="supp-text";
+      preview.textContent=item.text.replace(/\s+/g," ").trim();
+      summary.append(tag,state,preview);
       const text=document.createElement("p");text.textContent=item.text;
       detail.append(summary,text);
       for(const reference of item.references || [])detail.append(referenceButton(reference));
