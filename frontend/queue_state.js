@@ -120,8 +120,10 @@ function nextDispatch(state, currentSession) {
  * 这正是此前漏掉、导致排队消息卡死的那一步。
  */
 function endRound(state, kind) {
+  // clearTurn：回合真身已结束，当前回合锚点作废——输入框随之回到"下一条任务"
+  // （回合进行中发消息才插入当前回合）。
   const actions = ["clearMetaTimer", "setStreaming:false", "clearNonce",
-                   "advanceQueue"];
+                   "clearTurn", "advanceQueue"];
   if (kind === "interrupted") {
     actions.push("clearTraceRunning", "appendInterruptNote");
   } else {

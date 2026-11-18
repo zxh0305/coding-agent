@@ -3450,6 +3450,8 @@ function applyRoundEndActions(actions) {
       case "clearMetaTimer": clearInterval(metaTimer); break;
       case "setStreaming:false": setStreaming(false); break;
       case "clearNonce": myNonce = null; break;
+      // 回合已收尾：原回合不可再补，输入框回到"下一条任务"
+      case "clearTurn": activeTurnMid = null; ConversationInputsUI.sync(false); break;
       case "advanceQueue": if (!finishingBoot) dispatchNextQueued(); break;
       case "clearTraceRunning":
         if (traceEl) traceEl.classList.remove("running");
@@ -4712,6 +4714,8 @@ function applyEvent(evt, seq) {
       renderQueueBar();
     }
     activeTurnMid = evt.user_mid || null;
+    // 回合真起点确认：此刻起输入框的发消息=插入本回合（见 ConversationInputsUI.wanted）
+    ConversationInputsUI.sync(true);
     if (evt.nonce && evt.nonce === myNonce && evt.user_mid) tagLastUntaggedUser(evt.user_mid);
     // 回合开始。本 tab 自己发的消息（nonce 相同）不重复画气泡——发起方在
     // send/dispatch 时已带缩略图画过；其他标签页/刷新后的页面靠事件里的
@@ -5110,6 +5114,7 @@ function resetStreamState() {
   document.querySelector(".composer").dataset.loading = "false";
   chatEl.setAttribute("aria-busy", "false");
   activeTurnMid = null;
+  ConversationInputsUI.sync(false);  // 视图离开：不再指向任何回合 → 发消息=下一条
   clearInterval(metaTimer);
   todoAutoOpened = false;              // 新会话/新视图重新允许"任务中自动展开"
   todoDoneAnnounced = false;           // 完成展示边沿随会话一起作废
@@ -5321,11 +5326,13 @@ async function send() {
   if (currentSessionArchived) return;  // 归档任务只读：兜底拦截（正常情况下输入框已禁用）
   const text = inputEl.value.trim();
   if (!text && !attachments.length) return;
+  // 回合进行中发消息 = 插入当前回合（steer，下一次模型请求前纳入）；回合
+  // 结束后 = 下一条消息。用户不再手动选。补充接口只收文字与引用：带附件
+  // 或处于回退编辑态时，按用户的意图把它当【下一条】处理——发成一个排队
+  // 消息（回合结束后自动接着跑），不再要求用户先去切换发送方式。
   const delivery = ConversationInputsUI.delivery();
-  if (delivery.delivery === "steer") {
-    if (!streaming || !activeTurnMid || delivery.targetMid !== activeTurnMid) { toast("原任务已结束或发生变化，请选择下一项任务后发送"); return; }
-    if (attachments.length || editTarget) { toast("补充仅支持文字和引用，带附件或回退编辑请选择下一项任务"); return; }
-  }
+  const asSupplement = delivery.delivery === "steer" && !attachments.length && !editTarget
+    && delivery.targetMid === activeTurnMid;
   if (text === "/compact") {  // 斜杠命令：手动压缩，不作为消息发送
     inputEl.value = "";
     runManualCompact();
@@ -5349,6 +5356,10 @@ async function send() {
     : { kind: a.kind, name: a.name, mime: a.mime, data: a.data });
   const outAtts = attachments.map(a => ({ kind: a.kind, name: a.name, preview: a.preview }));
   const item = outgoingItem(text, payloadAtts, selectedSkills);
+  if (item.delivery === "steer" && !asSupplement) {  // 带附件/回退编辑：退回普通的下一条
+    item.delivery = "queue";
+    item.targetMid = null;
+  }
   if (!editTarget) {
     const view = sessionViewVersion;
     savingMessage = true;
@@ -7595,7 +7606,8 @@ function onDocCreated(name) {
 function browserPanelEl() { return $("browser-panel"); }
 
 function onBrowserState(state) {
-  $("browser-chip")?.classList.remove("hidden");
+  // chip 保持隐藏（按钮栏不再有这个入口）；面板仍由 agent 打开浏览器时自动弹出，
+  // 用户随时可自己在面板里接管。想恢复手持入口时去掉 index.html 上的 hidden 即可。
   const panel=browserPanelEl();
   if(state.open && panel?.classList.contains("hidden")) {panel.classList.remove("hidden");closeDocsPanel();}
   renderBrowserState(state);
@@ -7619,7 +7631,6 @@ async function refreshBrowserState() {
     const state=await api(`/api/sessions/${encodeURIComponent(sid)}/browser`);
     if(sid!==currentSession || view!==sessionViewVersion || token!==authToken)return;
     renderBrowserState(state);
-    if(state.open)$("browser-chip")?.classList.remove("hidden");
   } catch(error) {if(sid===currentSession && !browserPanelEl()?.classList.contains("hidden"))$("browser-status").textContent="浏览器状态暂不可用："+error.message;}
 }
 let browserControlBusy=false;
@@ -7641,7 +7652,6 @@ function resetBrowserPanel() {
   closeBrowserPanel();
   $("browser-address").value="";
   renderBrowserState({open:false});
-  $("browser-chip")?.classList.remove("hidden");
 }
 
 // ---------------------------------------------------------------------------

@@ -1,15 +1,16 @@
 /* Turn supplements and user-owned quote snapshots; no synthetic task completion. */
 window.ConversationInputsUI = (() => {
   let references = [], target = null, revision = 0, selected = null;
-  const composer = document.querySelector(".composer");
   const tray = document.createElement("div"); tray.className = "reference-tray hidden"; tray.id = "reference-tray";
   document.getElementById("input").before(tray);
+  // 发送方式不再由用户选：回合进行中默认「补充当前任务」（插入到当前回合，
+  // 下一次模型请求前纳入），回合结束后就是「下一项任务」。mode 保留为不渲染的
+  // 隐形占位，只为既有读写路径（save/restore/delivery()/outgoingItem）不改签名。
   const mode = document.createElement("select"); mode.id = "delivery-mode"; mode.className = "chip hidden";
-  mode.setAttribute("aria-label","发送方式"); mode.title = "补充在下一次模型请求前纳入，当前工具不中断；技能与权限保持不变";
+  mode.setAttribute("aria-label","发送方式");
   for (const [value,label] of [["queue","下一项任务"],["steer","补充当前任务"]]) {
     const option=document.createElement("option");option.value=value;option.textContent=label;mode.append(option);
   }
-  document.getElementById("send").before(mode);
   const quote = document.createElement("button");quote.type="button";quote.className="quote-selection-action hidden";
   quote.textContent="引用提问";document.body.append(quote);
   const dialog=document.createElement("dialog");dialog.className="reference-view-dialog";
@@ -19,12 +20,22 @@ window.ConversationInputsUI = (() => {
   const jump=document.createElement("button");jump.textContent="定位原文";
   dialog.append(title,snapshot,jump,close);document.body.append(dialog);
   const draftKey=sid=>`conversation-input_${who}_${sid || "new"}`;
+  // 回合是否仍在跑只由同步传入的 running 决定（不再看 mode.value）。
+  // 回合进行中：补充当前任务；回合结束：下一项任务。
+  let running=false;
+  function wanted() { return running && activeTurnMid ? "steer" : "queue"; }
+  function applyWanted() {
+    const value=wanted();
+    mode.value=value;
+    // 目标回合：进行中钉住当前回合；结束/切换后原回合已不可补，清掉
+    target=value==="steer" ? activeTurnMid : null;
+  }
   function save(sid) {
     const value={references,delivery:mode.value,target};
     if (references.length || mode.value==="steer") localStorage.setItem(draftKey(sid),JSON.stringify(value));
     else localStorage.removeItem(draftKey(sid));
   }
-  function sync() { mode.classList.toggle("hidden",!streaming && mode.value!=="steer"); }
+  function sync(isRunning=!!streaming) { running=!!isRunning; applyWanted(); mode.classList.add("hidden"); }
   function drawTray() {
     tray.replaceChildren();tray.classList.toggle("hidden",!references.length);
     references.forEach((reference,index)=>{
@@ -41,9 +52,10 @@ window.ConversationInputsUI = (() => {
     revision++;quote.classList.add("hidden");selected=null;if(dialog.open)dialog.close();
     let stored={};try {stored=JSON.parse(localStorage.getItem(draftKey(sid))) || {};} catch {}
     references=Array.isArray(stored.references) ? stored.references.filter(r=>typeof r.mid==="string" && typeof r.text==="string").slice(0,5) : [];
-    mode.value=stored.delivery==="steer" ? "steer" : "queue";target=stored.target || null;drawTray();sync();
+    // 草稿里的 delivery 只作留痕（曾经手动选过），不再回填：发送方式此刻由
+    // 回合状态决定，见 applyWanted()。
+    drawTray();sync();
   }
-  mode.onchange=()=>{target=mode.value==="steer" ? activeTurnMid : null;save(currentSession);sync();};
   async function showReference(reference) {
     const sid=currentSession,view=sessionViewVersion;
     snapshot.textContent=reference.text;dialog.showModal();
@@ -134,8 +146,10 @@ window.ConversationInputsUI = (() => {
   setInterval(()=>{if(!document.hidden && streaming)void refresh();},5000);
   return {save,restore,sync,refresh,decorate,referenceButton,
     selection:()=>references.map(r=>({...r})),
-    delivery:()=>({delivery:mode.value,targetMid:target}),
-    clear(){references=[];mode.value="queue";target=null;drawTray();sync();},
-    fromItem(item){references=item.references || [];mode.value="queue";target=null;drawTray();sync();}
+    // 发送时按【此刻】的回合状态现算一次，不依赖元素状态是否refresh过
+    delivery:()=>{applyWanted();return {delivery:mode.value,targetMid:target};},
+    // 清空只清引用；发送方式由回合状态即时决定（applyWanted），不在这里写死
+    clear(){references=[];applyWanted();drawTray();sync();},
+    fromItem(item){references=item.references || [];applyWanted();drawTray();sync();}
   };
 })();
