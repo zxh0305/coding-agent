@@ -584,8 +584,11 @@ body.side-resizing .sidebar { transition: none; }
   width: 100%; min-width: 0; padding: 10px 12px; margin: 8px 0 0;
   color: var(--text-2); background: var(--panel-soft);
   border: 1px solid var(--border); border-radius: 8px;
-  /* 用户要求：两个过程框高度都定为 100px（内容少时仍按需收缩） */
-  height: auto; max-height: 100px; overflow-y: auto;
+  /* 【不再关窗 100px】拆成 🧠/▶ 两个分组并各自带标题行后，外框压到 100px 会让
+     标题行 + 少量正文就顶满，分组像被截断（2026-11-18 用户截图）。这里只留一个
+     较宽松的上限兜底（防长回合撑满整页），实际高度随内容收缩到 max-content。
+     真正需要"固定小窗"的是每个分组体，见 .pg-body 的内滚与高度上限。 */
+  height: auto; max-height: min(46vh, max-content); overflow: hidden;
   scrollbar-width: thin; overscroll-behavior: contain;
 }
 
@@ -603,7 +606,17 @@ body.side-resizing .sidebar { transition: none; }
 .pg-head::before { content: "▾"; font-size: 9px; opacity: .7; transition: transform .15s; }
 .pg.collapsed .pg-head::before { content: "▸"; }
 .pg.collapsed > .pg-body { display: none; }
-.pg-body { display: flex; flex-direction: column; padding-top: 2px; }
+/* 分组体自己限高内滚：思考很长 / 工具很多时各自在组内滚，标题行永远可见。
+   上限与旧的整体 100px 观感对齐（连标题行约 120px/组），两组同时展开也只占
+   两百多像素，过程区不会把说明卡和正文顶出视野。 */
+.pg-body {
+  display: flex; flex-direction: column;
+  padding-top: 2px;
+  max-height: 120px; overflow-y: auto; overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+.pg-body::-webkit-scrollbar { width: 6px; }
+.pg-body::-webkit-scrollbar-thumb { background: var(--think-border); border-radius: 999px; }
 
 .proc-line::-webkit-scrollbar { width: 6px; }
 .proc-line::-webkit-scrollbar-thumb { background: var(--think-border); border-radius: 999px; }
@@ -748,7 +761,13 @@ body.side-resizing .sidebar { transition: none; }
 .note-box .process-text + .process-text {
   margin-top: 12px; padding-top: 12px;
   border-top: 1px dashed var(--border);
+  /* 虚线用负外边距拉到卡片内边距处（卡 padding 14px 18px）：既贯穿整卡宽度，
+     又不至于长到压住圆角/卡片边框（2026-11-18 用户截图指出"线太长太生硬"）。 */
+  margin-left: -6px; margin-right: -6px;
 }
+/* 说明/过程正文是纯文本（app.js 用 textContent 逐字追加），反引号不会变成
+   <code>——所以"`project/MEMORY.md`"贴汉字看起来挤，属预期，不要在这里加
+   .process-text code 样式（永远命中不到）。要支持行内代码得先改渲染路径。 */
 /* 流式中的过程正文：尾部光标——面板收起时也看得到它在动，不会以为卡死 */
 .process-text.streaming::after {
   content: "▍"; color: var(--accent);

@@ -236,24 +236,32 @@ test("渲染：整回合思考归一窗、说明归一卡，轮次标题变窗�
   // 两轮思考进同一个窗，轮次标题降为窗内分段头；快照末段带 live 光标；
   // running 工具行也进窗、按真实时序插在两轮思考之间
   const win = d.children[1];
-  // 过程区按用户要求拆成两个可折叠分组：🧠 思考过程 / ▶ 工具调用
-  assert.deepEqual(win.children.map((c) => c.className), ["pg pg-think", "pg pg-call"]);
-  assert.equal(win.children[0].children[0].textContent, "🧠 思考过程 · 2 轮");
+  // 过程区按用户要求拆成可折叠分组：🧠 思考过程 / ▶ 工具调用。
+  // 分组按【真实时序】交错，「想→跑→再想」必须是三组（think/call/think），
+  // 不能把所有思考打包成一组排在所有工具前面（那会丢掉时序，也与实时路径
+  // 按到达顺序建组的观感不一致）。计数按条累加：轮次 1、2；步数 1。
+  assert.deepEqual(win.children.map((c) => c.className),
+                   ["pg pg-think", "pg pg-call", "pg pg-think"]);
+  assert.equal(win.children[0].children[0].textContent, "🧠 思考过程 · 1 轮");
   assert.equal(win.children[1].children[0].textContent, "▶ 工具调用 · 1 步");
+  assert.equal(win.children[2].children[0].textContent, "🧠 思考过程 · 2 轮");
   // 分组默认展开（没挂 collapsed）
-  assert.ok(!win.children[0].className.includes("collapsed"));
-  assert.ok(!win.children[1].className.includes("collapsed"));
+  for (const g of win.children) assert.ok(!g.className.includes("collapsed"));
+  // 第 1 轮分组：标题降为分段头 + 正文
   const thinkBody = win.children[0].children[1];
   assert.deepEqual(thinkBody.children.map((c) => c.className),
-                   ["think-seg-head", "think-seg-body",
-                    "think-seg-head", "think-seg-body live"]);
+                   ["think-seg-head", "think-seg-body"]);
   assert.equal(thinkBody.children[0].textContent, "🧠 思考 · 第 1 轮");
   assert.equal(thinkBody.children[1].textContent, "先看目录");
-  assert.equal(thinkBody.children[2].textContent, "🧠 思考 · 第 2 轮");
-  assert.equal(thinkBody.children[3].textContent, "再看结果");
-  // running 工具行进「工具调用」分组
+  // running 工具行进中间的「工具调用」分组
   const callBody = win.children[1].children[1];
   assert.deepEqual(callBody.children.map((c) => c.className), ["tl"]);
+  // 第 2 轮思考在工具之后另起一组，快照末段带 live 光标
+  const thinkBody2 = win.children[2].children[1];
+  assert.deepEqual(thinkBody2.children.map((c) => c.className),
+                   ["think-seg-head", "think-seg-body live"]);
+  assert.equal(thinkBody2.children[0].textContent, "🧠 思考 · 第 2 轮");
+  assert.equal(thinkBody2.children[1].textContent, "再看结果");
   // 两轮说明进同一张卡
   const nb = d.children[2];
   assert.deepEqual(nb.children.map((c) => c.textContent), ["我打算这样做", "还是不对"]);

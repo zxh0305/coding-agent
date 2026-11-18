@@ -166,15 +166,6 @@
       }
     }
 
-    // 摘要里的计数：思考看分段数（=轮次），工具只看工具条目（轮次标题/提醒
-    // 这类 note 行不算一步）
-    function countThinkRounds(thinkOps) {
-      return thinkOps.length;
-    }
-    function countToolSteps(callOps) {
-      return callOps.filter((op) => op.it && op.it.kind === "tool").length;
-    }
-
     // ---- 过程条目按类型归组：思考一窗、说明一卡、其余保持时序 ----
     // 顶层过程块与子代理嵌套卡共用。reasoning 全部收进一个 think-line 固定窗
     // （轮次标题 roundHead 降为窗内分段头），demoted 说明全部收进一张 note-box
@@ -238,18 +229,38 @@
       if (procOps.length) {
         const box = doc.createElement("div");
         box.className = "proc-line";
-        // 分组内的条目序列（保持真实时序：想→跑→再想），交给分组函数包壳
+        // 【分组按真实时序交错排列】不能把"所有思考"和"所有工具"各自打包成一组
+        // 再拼接——那样「想→跑→再想→再跑」会被压成「想×N / 跑×N」，和实时路径
+        // （按到达顺序新建分组）也对不上。这里顺序扫 procOps，分组身份变了就
+        // 起一个新分组，连续的同类条目才并进同一组。计数按条实时累加进标题。
         const thinkOps = procOps.filter((op) => op.seg);
         const callOps = procOps.filter((op) => !op.seg);
-        const thinkGroup = thinkOps.length
-          ? renderProcGroup("think", `🧠 思考过程 · ${countThinkRounds(thinkOps)} 轮`, true,
-              (body) => appendThinkOps(body, thinkOps, running))
-          : null;
-        const callGroup = callOps.length
-          ? renderProcGroup("call", `▶ 工具调用 · ${countToolSteps(callOps)} 步`, true,
-              (body) => { for (const op of callOps) body.appendChild(renderProcessItem(op.it, running)); })
-          : null;
-        for (const g of [thinkGroup, callGroup]) if (g) box.appendChild(g);
+        let thinkRounds = 0, toolSteps = 0, lastKind = null, lastFill = null, lastHead = null;
+        for (const op of procOps) {
+          const kind = op.seg ? "think" : "call";
+          if (kind !== lastKind) {
+            const headText = kind === "think"
+              ? `🧠 思考过程 · ${thinkRounds} 轮`
+              : `▶ 工具调用 · ${toolSteps} 步`;
+            // 空壳先建、条目后填：计数随条目累加，壳建好后再回写标题文字
+            const g = renderProcGroup(kind, headText, true, () => {});
+            lastFill = g.children[1];                       // pg-body
+            lastHead = g.children[0];                       // pg-head
+            lastKind = kind;
+            box.appendChild(g);
+          }
+          if (op.seg) {
+            thinkRounds += 1;
+            appendThinkOps(lastFill, [op], running);
+          } else {
+            if (op.it && op.it.kind === "tool") toolSteps += 1;
+            lastFill.appendChild(renderProcessItem(op.it, running));
+          }
+          // 标题计数随条目累加（分组壳已建好，只改文字，不重建节点）
+          lastHead.textContent = lastKind === "think"
+            ? `🧠 思考过程 · ${thinkRounds} 轮`
+            : `▶ 工具调用 · ${toolSteps} 步`;
+        }
         procLine = box;
         frag.appendChild(box);
       }
