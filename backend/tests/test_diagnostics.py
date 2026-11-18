@@ -26,12 +26,39 @@ class TurnRecorderTest(unittest.TestCase):
         patcher = mock.patch.object(diagnostics, "_DIAG_DIR", self.root)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # ROLLUP_PATH 在模块加载时就算好了，只 patch _DIAG_DIR 会让测试把
+        # 合成分回合写进**生产**的 data/diagnostics/rollup.jsonl —— 真实发生
+        # 过一次（99 行全是 sess1/../../etc 之类的测试数据，把线上成功率
+        # 统计污染成 81%）。这里必须一起隔离。
+        rollup = self.root / "rollup.jsonl"
+        rp = mock.patch.object(diagnostics, "ROLLUP_PATH", rollup)
+        rp.start()
+        self.addCleanup(rp.stop)
         os.environ.pop("DIAGNOSTICS", None)
         self.addCleanup(lambda: os.environ.pop("DIAGNOSTICS", None))
 
     def _read(self, rec):
         path = diagnostics.turn_path(rec.sid, rec.started_at, rec.user_mid)
         return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_tests_never_touch_production_rollup(self):
+        """护栏用例：跑一遍完整记录流程，确认生产 rollup 文件没被写。
+
+        这条防的是"测试污染真实指标"。曾经发生过：99 行合成数据进了生产
+        rollup，把成功率统计成 81%（实际没有任何真实回合）。
+        护栏比事后清理可靠——它会在每次 CI 里跑，而不是等人发现数字不对。
+        """
+        # 注意：不能读 diagnostics.ROLLUP_PATH —— setUp 已经把它 patch 到临时目录了，
+        # 那样测的就是"临时文件没被动"，等于什么都没测。这里必须硬编码真实路径。
+        prod = diagnostics._PROJECT_DIR / "data" / "diagnostics" / "rollup.jsonl"
+        before = prod.stat().st_size if prod.exists() else None
+
+        rec = diagnostics.TurnRecorder("guard-session", "guardmid")
+        rec.round_start(1)
+        rec.finish(outcome="done")
+
+        after = prod.stat().st_size if prod.exists() else None
+        self.assertEqual(before, after, f"测试写进了生产 rollup：{prod}")
 
     def test_normal_turn_writes_full_sequence(self):
         rec = diagnostics.TurnRecorder("sess1", "abcdef123456")
@@ -106,7 +133,8 @@ class TurnRecorderTest(unittest.TestCase):
         rec = diagnostics.TurnRecorder("../../etc", "mid5")
         rec.round_start(1)
         rec.finish(outcome="done")
-        written = list(self.root.rglob("*.jsonl"))
+        # 只数回合明细；rollup.jsonl 现在也在临时目录里（会被上面的 patch 隔离到这里）
+        written = [p for p in self.root.rglob("*.jsonl") if p.name != "rollup.jsonl"]
         self.assertEqual(len(written), 1)
         self.assertTrue(str(written[0]).startswith(str(self.root)))
 
