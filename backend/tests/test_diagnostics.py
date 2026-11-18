@@ -80,6 +80,28 @@ class TurnRecorderTest(unittest.TestCase):
         with mock.patch("builtins.open", side_effect=OSError("disk full")):
             rec.finish(outcome="done")   # 不应抛出
 
+    def test_rollup_written_and_readable(self):
+        """每回合写一行汇总供指标聚合（含失败回合，这是 message_usage 缺的）。"""
+        rollup = self.root / "rollup.jsonl"
+        with mock.patch.object(diagnostics, "ROLLUP_PATH", rollup):
+            for i, outcome in enumerate(("done", "error")):
+                rec = diagnostics.TurnRecorder(f"s{i}", f"m{i}")
+                rec.round_start(1)
+                rec.finish(outcome=outcome, retryable=(outcome == "error"))
+            rows = diagnostics.read_rollup(None)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r["outcome"] for r in rows], ["done", "error"])
+        self.assertTrue(rows[1]["retryable"])
+        self.assertEqual(rows[0]["sid"], "s0")
+
+    def test_rollup_bad_lines_are_skipped(self):
+        """历史文件可能被截断出半行：坏行跳过，不能整份读挂。"""
+        rollup = self.root / "rollup.jsonl"
+        rollup.write_text('{"outcome":"done"}\n{"broken\n{"outcome":"error"}\n', encoding="utf-8")
+        with mock.patch.object(diagnostics, "ROLLUP_PATH", rollup):
+            rows = diagnostics.read_rollup(None)
+        self.assertEqual(len(rows), 2)
+
     def test_sid_path_traversal_is_contained(self):
         rec = diagnostics.TurnRecorder("../../etc", "mid5")
         rec.round_start(1)

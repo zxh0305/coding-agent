@@ -17,6 +17,8 @@ import re
 import urllib.parse
 
 import db
+import diagnostics
+import stability_metrics
 from routes.base import _BodyTooLarge
 from services.workspace import project_directory
 from code_tools import DEFAULT_WORKSPACE
@@ -111,6 +113,14 @@ class DispatchMixin:
             days = self._query().get("days", ["7"])[0]
             days = int(days) if str(days).isdigit() and int(days) > 0 else None
             self._json(db.usage_summary(days))
+        elif path == "/api/stability":
+            # 稳定性指标（回合成功率/首响/耗时/工具占比）。数据源是
+            # diagnostics 的 rollup（每回合一行，含失败与停止的回合），
+            # 与 /api/usage/* 的 message_usage 口径不同：那张表只有成功回合。
+            q = self._query()
+            days = q.get("days", ["7"])[0]
+            days = int(days) if str(days).isdigit() and int(days) > 0 else None
+            self._json(stability_metrics.aggregate(diagnostics.read_rollup(days)))
         elif path == "/api/usage/sessions":
             # 用量下钻：某供应商/模型分别花在哪些会话上（用量页模型行展开）。
             q = self._query()

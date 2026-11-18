@@ -80,6 +80,71 @@ def turn_path(sid: str, started_at: float, user_mid: str) -> Path:
     return _session_dir(sid) / f"{int(started_at)}_{mid}.jsonl"
 
 
+# 指标汇总行集中放一个文件：回合明细每会话只留 30 个且会被清理，
+# 指标要覆盖「全部回合」，所以单独一份 append-only 的 rollup。
+ROLLUP_PATH = _DIAG_DIR / "rollup.jsonl"
+# rollup 的保留上限（行数）；超出时整体重写保留最近一半，避免无限增长
+ROLLUP_MAX_LINES = 20000
+
+
+def _append_rollup(sid: str, started_at: float, summary: dict[str, Any]) -> None:
+    """追加一行回合汇总。失败只记日志，绝不影响回合。"""
+    try:
+        ROLLUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        row = {"ts": round(started_at, 3), "sid": str(sid), **summary}
+        with open(ROLLUP_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        _maybe_trim_rollup()
+    except Exception:
+        log.exception("[会话 %s] 指标汇总行写入失败（忽略）", sid)
+
+
+def _maybe_trim_rollup() -> None:
+    """行数超限时保留最近一半。只在确实超限时读文件，正常路径无额外 IO。"""
+    try:
+        if not ROLLUP_PATH.exists():
+            return
+        count = 0
+        with open(ROLLUP_PATH, "r", encoding="utf-8") as fh:
+            for _ in fh:
+                count += 1
+        if count <= ROLLUP_MAX_LINES:
+            return
+        with open(ROLLUP_PATH, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+        keep = lines[count // 2:]
+        tmp = ROLLUP_PATH.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.writelines(keep)
+        os.replace(tmp, ROLLUP_PATH)
+    except Exception:
+        log.exception("指标汇总行裁剪失败（忽略）")
+
+
+def read_rollup(days: Optional[int] = None) -> list[dict[str, Any]]:
+    """读取指标汇总行；days 只保留最近 N 天。坏行跳过（历史文件可能被截断）。"""
+    rows: list[dict[str, Any]] = []
+    if not ROLLUP_PATH.exists():
+        return rows
+    cutoff = time.time() - days * 86400 if days else None
+    try:
+        with open(ROLLUP_PATH, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if cutoff is not None and (row.get("ts") or 0) < cutoff:
+                    continue
+                rows.append(row)
+    except Exception:
+        log.exception("指标汇总行读取失败（返回已读部分）")
+    return rows
+
+
 class TurnRecorder:
     """一回合的诊断记录器：内存攒事件，收尾时一次落盘。
 
@@ -99,6 +164,9 @@ class TurnRecorder:
         self._tool_total = 0.0
         self._llm_total = 0.0
         self._rounds = 0
+        # 整回合首响：第一次「轮开始 → 首个增量」的间隔。稳定性的关键指标之一，
+        # 与 llm_client 的 ttft_s 不同（那个是单次请求级，这里是用户体感级）。
+        self._first_ttft: Optional[float] = None
 
     # ── 记录 ──────────────────────────────────────────────
     def _add(self, kind: str, round_no: int = 0, **extra: Any) -> None:
@@ -122,7 +190,10 @@ class TurnRecorder:
             return
         now = time.time()
         self._llm_first_at = now
-        self._add("llm_first", round_no, ttft_s=round(now - self._round_started, 3))
+        delta = now - self._round_started
+        if self._first_ttft is None:      # 整回合首响只取第一次
+            self._first_ttft = delta
+        self._add("llm_first", round_no, ttft_s=round(delta, 3))
 
     def round_end(self, round_no: int) -> None:
         now = time.time()
@@ -155,16 +226,24 @@ class TurnRecorder:
             self._add("tool_end", self._rounds, tool=name, ok=False,
                       duration_ms=int((now - started) * 1000), unsettled=True)
         self._tool_started.clear()
-        self._add("turn_end", self._rounds,
-                  outcome=outcome,
-                  rounds=self._rounds,
-                  duration_s=round(now - self.started_at, 3),
-                  tool_total_s=round(self._tool_total, 3),
-                  llm_total_s=round(self._llm_total, 3),
-                  error_class=error_class,
-                  retryable=bool(retryable),
-                  stopped=bool(stopped))
+        summary = {
+            "outcome": outcome,
+            "rounds": self._rounds,
+            "duration_s": round(now - self.started_at, 3),
+            "tool_total_s": round(self._tool_total, 3),
+            "llm_total_s": round(self._llm_total, 3),
+            "error_class": error_class,
+            "retryable": bool(retryable),
+            "stopped": bool(stopped),
+            "ttft_s": (round(self._first_ttft, 3) if self._first_ttft is not None else None),
+        }
+        self._add("turn_end", self._rounds, **summary)
         self.flush()
+        # 汇总行单独进 rollup：稳定性指标要按「全部回合」统计，而回合明细文件
+        # 每会话只留 30 个、且会被清理——指标不能依赖明细文件还存在。
+        _append_rollup(self.sid, self.started_at, summary)
+
+    # ── 落盘 ──────────────────────────────────────────────
 
     # ── 落盘 ──────────────────────────────────────────────
     def flush(self) -> None:
