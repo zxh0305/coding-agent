@@ -15,6 +15,10 @@ class QueueStorageTest(DbTestBase):
         message = {"role":"user","content":text,"_mid":nonce,"_input_text":text}
         db.record_submission(1,nonce,"hash-"+nonce,"s1",nonce,self.tmp,[text,message,attachments or []])
 
+    def state_of(self, mid):
+        with db._conn() as conn:
+            return conn.execute("SELECT state FROM submission_queue WHERE session_id='s1' AND mid=?",(mid,)).fetchone()[0]
+
     def test_edit_preserves_receipt_and_claim_uses_latest_payload(self):
         self.put("one","original")
         queue.change("s1",1,"one",1,"edit","edited")
@@ -103,6 +107,21 @@ class QueueStorageTest(DbTestBase):
         db.turn_finished("s1","one","done")
         db.mark_running_turns_interrupted()
         self.assertEqual(queue.entries("s1"),[])
+
+    def test_claimed_without_running_turn_is_closed_on_startup(self):
+        """认领后执行链异常退出、没走到 finish()：启动对账必须把这条落成 finished。
+
+        否则 claimed 记录无人清理，界面会一直显示「已排队 N 项」，而实际没有任务在跑。
+        """
+        self.put("one","first");queue.take_next("s1",self.tmp,"worker")
+        with db._conn() as conn:   # 模拟回合在认领后被杀：turn 已离开 running，队列仍是 claimed
+            conn.execute("UPDATE session_turns SET state='interrupted',ended=1 WHERE session_id='s1' AND user_mid='one'")
+        self.assertEqual(self.state_of("one"), "claimed")   # 清理前：卡在 claimed，无人收尾
+        db.mark_running_turns_interrupted()
+        # 清理后：不再是 claimed。落 interrupted 时仍会作为「中断记录」出现在列表里
+        # （这是给用户看的中断提示，不是排队中的任务），所以只断言不再是 claimed。
+        self.assertNotEqual(self.state_of("one"), "claimed")
+        self.assertIsNone(queue.next_entry("s1"))
 
 
 class QueueApiTest(ApiTestBase):

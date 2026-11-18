@@ -82,6 +82,14 @@ def _start_submission(uid, nonce, sid, agent, payload):
         except Exception:
             failed = True
             busref.log.exception("会话队列执行失败: %s", sid)
+            # 已认领的那条必须落终态：_run_round 抛异常时到不了上面的 finish()，
+            # 否则队列永远是 claimed、回合永远是 running，界面会一直谎报「已排队 1 项」。
+            for entry in taken:
+                try:
+                    queue.finish(entry["user_id"], entry["nonce"])
+                except Exception:
+                    busref.log.exception("认领记录收尾失败: %s", sid)
+            _publish_queue(sid)
             try:
                 pending = queue.next_entry(sid)
                 if pending:

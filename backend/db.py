@@ -1185,6 +1185,12 @@ def mark_running_turns_interrupted() -> int:
                      "(SELECT 1 FROM session_turns t WHERE t.session_id=submission_queue.session_id AND t.user_mid=submission_queue.mid AND t.state IN ('done','error'))")
         conn.execute("UPDATE submission_queue SET state='interrupted',reason='服务重启时执行中断，请先检查项目',revision=revision+1 "
                      "WHERE state='claimed'")
+        # 兜底：claimed 但对应回合已不在 running（或压根没有回合）——执行链在认领后
+        # 异常退出、没走到 finish()，这类记录不落终态就会永远挂在界面上显示「已排队」。
+        conn.execute("UPDATE submission_queue SET state='finished',payload=NULL,revision=revision+1 "
+                     "WHERE state='claimed' AND NOT EXISTS "
+                     "(SELECT 1 FROM session_turns t WHERE t.session_id=submission_queue.session_id "
+                     "AND t.user_mid=submission_queue.mid AND t.state='running')")
         conn.execute("UPDATE submission_queue SET reason='前项任务执行中断，请检查后继续排队',revision=revision+1 "
                      "WHERE state='queued' AND reason='' AND session_id IN "
                      "(SELECT session_id FROM submission_queue WHERE state='interrupted')")
