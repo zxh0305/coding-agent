@@ -34,6 +34,8 @@ import time
 from collections import deque
 from queue import Empty, Full, Queue
 
+from contracts import events as contracts
+
 log = logging.getLogger("events")
 
 # 环形缓冲容量：按"一次长回合的事件量"取量级。一轮几十个 delta + 若干工具
@@ -158,6 +160,10 @@ class SessionEvents:
         帧再发一遍（前端按 mid 归并，幂等），而缓冲缺口本来就有 resync 兜底。
         进程被 kill 时最多丢最近 PERSIST_INTERVAL_S 内的事件计数——窗外无差。
         """
+        # 契约校验（默认关闭，EVENT_CONTRACT_STRICT=1 才开）：这里只检查形状
+        # 漂移，不改事件内容；失败只告警，绝不阻断事件流——一个字段名 typo
+        # 不该让用户面前的回合"卡住"。
+        contracts.check(event, where="events.publish")
         should_persist = False   # 锁内赋真值；预置防锁内异常导致下方 NameError
         dropped = 0              # 本次发布因队列满丢弃的事件数（锁外统计）
         with self._lock:

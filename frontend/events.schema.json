@@ -1,0 +1,150 @@
+{
+  "version": 1,
+  "events": {
+    "turn_start": {
+      "required": [
+        "input",
+        "nonce",
+        "started_at"
+      ],
+      "optional": [
+        "atts",
+        "model",
+        "user_mid"
+      ]
+    },
+    "turn_end": {
+      "required": [
+        "user_mid"
+      ],
+      "optional": [
+        "outcome",
+        "stopped"
+      ]
+    },
+    "error": {
+      "required": [
+        "message",
+        "retryable"
+      ],
+      "optional": [
+        "kind",
+        "user_mid"
+      ]
+    },
+    "round": {
+      "required": [
+        "round"
+      ],
+      "optional": [
+        "final",
+        "mid",
+        "started_at"
+      ]
+    },
+    "answer_delta": {
+      "required": [
+        "delta",
+        "mid"
+      ],
+      "optional": [
+        "round"
+      ]
+    },
+    "reasoning_delta": {
+      "required": [
+        "delta"
+      ],
+      "optional": [
+        "round"
+      ]
+    },
+    "tool_call": {
+      "required": [
+        "arguments",
+        "name"
+      ],
+      "optional": [
+        "id",
+        "index",
+        "parent"
+      ]
+    },
+    "tool_result": {
+      "required": [
+        "name",
+        "result"
+      ],
+      "optional": [
+        "id",
+        "index",
+        "parent"
+      ]
+    },
+    "done": {
+      "required": [],
+      "optional": [
+        "answer",
+        "cache_hit_rate",
+        "context",
+        "context_tokens",
+        "elapsed_s",
+        "error",
+        "mid",
+        "report_head",
+        "rounds",
+        "stopped_reason",
+        "timing",
+        "usage"
+      ]
+    },
+    "compacted": {
+      "required": [
+        "summary"
+      ],
+      "optional": [
+        "context",
+        "prompt_tokens"
+      ]
+    },
+    "api_retry": {
+      "required": [
+        "attempt",
+        "error",
+        "max_attempts",
+        "wait"
+      ],
+      "optional": []
+    },
+    "subagent_start": {
+      "required": [],
+      "optional": [
+        "index",
+        "parent",
+        "task"
+      ]
+    },
+    "subagent_end": {
+      "required": [],
+      "optional": [
+        "index",
+        "ok",
+        "parent"
+      ]
+    },
+    "caught_up": {
+      "required": [],
+      "optional": [
+        "running",
+        "seq"
+      ]
+    },
+    "resync": {
+      "required": [],
+      "optional": [
+        "latest_seq",
+        "reason"
+      ]
+    }
+  }
+}
