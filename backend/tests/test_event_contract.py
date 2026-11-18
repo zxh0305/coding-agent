@@ -133,6 +133,57 @@ class RealEventsConformTest(unittest.TestCase):
         self.assertEqual(problems, [], "真实事件与契约不符：\n" + "\n".join(problems))
 
 
+class ReplayContractTest(unittest.TestCase):
+    """C2 恢复契约：崩溃重放后必须能从日志还原出「回合仍在进行」的事实。
+
+    这条防的是最难受的一类 bug：进程重启，前端连接上来看到空白，
+    以为回合没了；实际后台还在跑，或者反过来——界面显示在跑，后台早没了。
+    """
+
+    def test_caught_up_reflects_running_state(self):
+        import events as ev
+
+        pub = ev.SessionEvents()
+        # 回合开始 → 重连者应被告知 running
+        pub.publish({"type": "turn_start", "nonce": "n", "input": "hi",
+                     "started_at": 1.0, "user_mid": "m1"})
+        plan, items = pub.replay_plan(None)
+        self.assertEqual(pub.running, True)
+        self.assertTrue(len(items) >= 1)
+        self.assertEqual(items[0][1]["type"], "turn_start")
+
+    def test_turn_end_clears_running(self):
+        import events as ev
+
+        pub = ev.SessionEvents()
+        pub.publish({"type": "turn_start", "nonce": "n", "input": "hi",
+                     "started_at": 1.0, "user_mid": "m1"})
+        pub.publish({"type": "turn_end", "user_mid": "m1"})
+        self.assertFalse(pub.running)
+
+    def test_replay_is_monotonic_in_seq(self):
+        """补发必须按 seq 递增，否则前端 seq 闸门会误丢事件。"""
+        import events as ev
+
+        pub = ev.SessionEvents()
+        for i in range(5):
+            pub.publish({"type": "round", "round": i + 1})
+        _, items = pub.replay_plan(0)
+        seqs = [s for s, _ in items]
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(len(seqs), len(set(seqs)), "seq 不能重复")
+
+    def test_resync_when_position_out_of_buffer(self):
+        """位置已不在缓冲里 → 必须 resync，不能假装能补。"""
+        import events as ev
+
+        pub = ev.SessionEvents(buffer_size=4)
+        for i in range(10):
+            pub.publish({"type": "round", "round": i + 1})
+        mode, _ = pub.replay_plan(1)
+        self.assertEqual(mode, "resync")
+
+
 class PublishHookTest(unittest.TestCase):
     def test_publish_calls_contract_check(self):
         """publish 必须过契约（否则前端拿到的是没人把关的形状）。"""
