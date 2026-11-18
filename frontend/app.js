@@ -3601,6 +3601,16 @@ function watchUserToggle(el) {
   s.addEventListener("keydown", () => { userToggledTrace = true; });
 }
 
+// 过程卡打回合归属（data-turn-mid）与答案组 data-answer-for 同一口径：回合进行中
+// 用户还能继续提问（steer），时间线里会同时存在多个回合的元素；答案落位与"回合
+// 尾巴"划界都靠这个键分辨"这张卡属于哪一问"（见 turnTailAnchor / nextTurnStart）。
+// traceEl 可能比 turn_start 晚建（占位卡接管/首轮正文才建），所以在 ensureTrace
+// 建完后再补打一次；标记只是幂等赋值，重复调用无害。
+function markTraceTurn() {
+  if (!traceEl || !activeTurnMid) return;
+  if (traceEl.classList?.contains("trace")) traceEl.dataset.turnMid = activeTurnMid;
+}
+
 function ensureTrace() {
   if (traceEl) return;
   // 接管已有快照卡：切会话/刷新回来时，历史接口的 running_trace 已在时间线里
@@ -3619,7 +3629,8 @@ function ensureTrace() {
     if (procBox && procBox.classList.contains("proc-line")) ProcGroups.flatten(procBox);
     noteBox = existing.querySelector(".note-box");
     watchUserToggle(existing);
-  return;
+    markTraceTurn();  // 快照卡同样归属当前回合（切回来接上时 activeTurnMid 已就位）
+    return;
   }
   // 认领本 tab 的乐观占位卡（performSend 在 POST 前画的"正在思考…"卡）：
   // turn_start 复位过 traceEl=null，不认领就会另建一张——页面上出现两张
@@ -3644,6 +3655,7 @@ function ensureTrace() {
   traceEl.appendChild(summary);
   chatEl.appendChild(traceEl);
   watchUserToggle(traceEl);
+  markTraceTurn();  // 打回合归属（上面两条接管分支的卡早已带标记）
 }
 
 // 生成中的折叠条文案：有工具步显示"已工作"，纯思考阶段（reasoning 流不算步）
@@ -4568,9 +4580,59 @@ function finalizeAnswer(el, text, mid) {
   actions.className = "msg-actions";
   actions.appendChild(makeCopyBtn(text));
   const group = wrapWithActions(el, actions);
-  traceEl.after(group);  // 紧跟折叠条：答案在执行过程之后，符合阅读顺序
+  // 【归属】这个答案属于当前回合（用户发的那条提问）。session-level-model 之后
+  // 模型跟会话走，这里记的是"哪一问的答案"，用于把答案锚定在本回合之内——
+  // 回合进行中用户还能继续提问（steer 插入），那些气泡直接 append 到 chatEl
+  // 末尾；若答案只按 traceEl.after() 落位，就会被插到后发的提问【上方】，页面
+  // 呈现"问题在下、回答在上"（2026-11-19 用户截图）。
+  if (activeTurnMid) group.dataset.answerFor = activeTurnMid;
+  placeAnswerGroup(group, activeTurnMid);
   railTag(group, mid, "assistant");  // 锚点落到组内气泡上；导航条只画用户提问
   pruneNoteBox();  // 正文从说明卡里搬走了：卡若因此空了（首段即答案），整卡摘除
+  // 统计行跟着答案走：它可能早于答案就挂在 chatEl 末尾（ensureLiveMsg 建行时），
+  // 不挪就会被下面这条以"答案之后"为锚的规则误判成别的回合内容。
+  if (metaEl && group.parentNode === chatEl && metaEl !== group.nextElementSibling) {
+    metaEl.remove();
+    group.after(metaEl);
+  }
+}
+
+// 答案组落位。默认紧跟本回合过程卡；但本回合提问之后若又出现了【别的回合】的
+// 内容（用户继续追问 / 新回合已开），就不能再看 traceEl ——必须落在
+// "本回合提问之后、下一回合起点之前"的最后，即最后一个归属于 activeTurnMid
+// 或不属于任何回合的元素之后。
+function placeAnswerGroup(group, userMid) {
+  if (!userMid) { traceEl.after(group); return; }  // 无归属信息（旧路径）：沿用原行为
+  const anchor = turnTailAnchor(userMid);
+  if (anchor) anchor.after(group); else traceEl.after(group);
+}
+
+// 本回合的"尾部锚点"：从本回合提问气泡的下一个兄弟开始往后扫，遇到下一回合
+// 的提问气泡就停，返回扫到的最后一个元素。
+function turnTailAnchor(userMid) {
+  const q = chatEl.querySelector(`[data-role="user"][data-mid="${CSS.escape(userMid)}"]`);
+  if (!q) return null;
+  const stopAt = nextTurnStart(q);
+  let tail = q;
+  for (let n = q.nextElementSibling; n && n !== stopAt; n = n.nextElementSibling) {
+    // 本轮自己的气泡若还挂在说明卡里（流式中），不在兄弟链上，不影响判定
+    tail = n;
+  }
+  return tail === q ? null : tail;
+}
+
+// 从某个节点往后找"下一回合的起点"：另一个用户提问，或一个属于别的回合的
+// 答案组/过程卡。找不到返回 null。用于给"本回合"划一个不越界的尾巴。
+function nextTurnStart(fromNode) {
+  const ownMid = fromNode.dataset.mid;
+  for (let n = fromNode.nextElementSibling; n; n = n.nextElementSibling) {
+    const role = n.dataset?.role;
+    if (role === "user" && n.dataset.mid && n.dataset.mid !== ownMid) return n;
+    const forMid = n.dataset?.answerFor;
+    if (forMid && forMid !== ownMid) return n;
+    if (n.classList?.contains("trace") && n.dataset?.turnMid && n.dataset.turnMid !== ownMid) return n;
+  }
+  return null;
 }
 
 // 流式增量按帧合并：delta 到达频率远高于屏幕刷新率，逐条 textContent += 和
