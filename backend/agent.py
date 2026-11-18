@@ -36,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import code_tools
 import db
+from logger import clear_log_context, set_log_context, tool_context
 
 from code_tools import prepare_workspace
 from services.task_progress import ProgressWindow, task_state, state_note
@@ -645,6 +646,10 @@ class Agent:
         # 结束（或生成器被关闭）时也置位，让 llm_client 里的看护线程退出。
         self.cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self.ctx.cancel_event = self.cancel_event  # run_bash 经 ctx 把它交给 Executor
+        # 日志上下文：让本回合产生的每一行日志都自带 sid（设置 LOG_CONTEXT=1 才生效，
+        # 不开时日志输出与旧版逐字符一致）。轮次由 _run 每轮刷新，工具名由 _run_tool 叠加。
+        # 必须在 finally 里 clear：回合线程可能被复用，残留 sid 会把下一回合的日志记错账。
+        set_log_context(sid=self.ctx.session_id or "", turn="")
         stopped = False
         try:
             for kind, payload in self._run(user_input, user_message):
@@ -661,6 +666,7 @@ class Agent:
                 if compacted:
                     yield "compacted", compacted
         finally:
+            clear_log_context()  # 回合线程会被复用，残留 sid 会把下一回合的日志记错账
             if cancel_event is None:
                 self.cancel_event.set()
             if self.input_controller is not None:
@@ -765,6 +771,7 @@ class Agent:
         round_no = 0
         while round_no < hard_limit:
             round_no += 1
+            set_log_context(turn=round_no)  # 日志上下文里的轮次（LOG_CONTEXT=1 才生效）
             self._round_had_progress = False  # 本轮是否发生实质进展（见下）
             if self.cancel_event.is_set():
                 # 工具结果刚入完历史就被叫停：历史以上一条 tool 消息结尾，依然合法
@@ -2248,7 +2255,10 @@ class Agent:
             try:
                 if name in ("run_bash", "write_file", "apply_patch"):
                     self._mutation_possible = True
-                result = execute_tool(name, arguments, self.ctx)
+                # 工具名进日志上下文（LOG_CONTEXT=1 才生效）。用 token 还原而非清空，
+                # 因为本方法可能跑在线程池里、嵌套于子代理的回合上下文中。
+                with tool_context(name):
+                    result = execute_tool(name, arguments, self.ctx)
                 if version_before is not None:
                     version_after = self._shell_progress_version()
                     if version_after is not None and version_after != version_before:

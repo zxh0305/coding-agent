@@ -15,10 +15,12 @@
 logging 是"给机器/给自己查的档案"。tail -f data/logs/agent.log 可实时追看。
 """
 
+import contextvars
 import logging
 import os
 import shutil
 import time
+from contextlib import contextmanager
 from logging.handlers import TimedRotatingFileHandler
 
 # 日志文件夹固定在项目根目录的 data/ 下（logger.py 位于 backend/ 下，往上跳一级），
@@ -26,6 +28,94 @@ from logging.handlers import TimedRotatingFileHandler
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _FMT = "%(asctime)s [%(levelname)s] %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+# ── 结构化日志上下文 ────────────────────────────────────────────────
+# 让一行日志自带「哪个会话 / 哪一轮 / 哪个工具」，出事时不用靠时间戳猜现场。
+# 默认关闭（LOG_CONTEXT 未设置时输出与旧版逐字符一致），设置 LOG_CONTEXT=1 才追加前缀：
+#     2026-11-18 16:25:00 [INFO] [sid=abc12345 turn=3 tool=read_file] ...
+# 用 contextvars 而非全局变量：工具可能在线程/任务里跑，上下文要跟着执行流走。
+_sid_var: contextvars.ContextVar[str] = contextvars.ContextVar("log_sid", default="")
+_turn_var: contextvars.ContextVar[str] = contextvars.ContextVar("log_turn", default="")
+_tool_var: contextvars.ContextVar[str] = contextvars.ContextVar("log_tool", default="")
+
+
+def _context_enabled() -> bool:
+    return os.environ.get("LOG_CONTEXT", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def set_log_context(*, sid=None, turn=None, tool=None) -> None:
+    """设置日志上下文；传 None 的字段保持不变（便于只覆盖一层）。"""
+    if sid is not None:
+        _sid_var.set(str(sid)[:8])
+    if turn is not None:
+        _turn_var.set(str(turn))
+    if tool is not None:
+        _tool_var.set(str(tool)[:32])
+
+
+def clear_log_context() -> None:
+    _sid_var.set("")
+    _turn_var.set("")
+    _tool_var.set("")
+
+
+@contextmanager
+def tool_context(name: str):
+    """只临时设置工具名的便捷入口（工具执行前后包一层）。
+
+    与 log_context 同样基于 token 还原：本方法可能跑在线程池里、嵌套在
+    子代理的回合上下文中，清空会产生错误的归属。
+    """
+    token = _tool_var.set(str(name)[:32])
+    try:
+        yield
+    finally:
+        _tool_var.reset(token)
+
+
+@contextmanager
+def log_context(*, sid=None, turn=None, tool=None):
+    """临时叠加一层上下文，退出时还原到进入前的值（支持嵌套）。"""
+    tokens = []
+    if sid is not None:
+        tokens.append((_sid_var, _sid_var.set(str(sid)[:8])))
+    if turn is not None:
+        tokens.append((_turn_var, _turn_var.set(str(turn))))
+    if tool is not None:
+        tokens.append((_tool_var, _tool_var.set(str(tool)[:32])))
+    try:
+        yield
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)
+
+
+class _ContextFormatter(logging.Formatter):
+    """占位符已设置时，在级别标签后插入 [sid=… turn=… tool=…]。
+
+    关闭时（LOG_CONTEXT 未开）直接返回父类结果，零行为变化。
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        if not _context_enabled():
+            return text
+        parts = []
+        sid, turn, tool = _sid_var.get(), _turn_var.get(), _tool_var.get()
+        if sid:
+            parts.append(f"sid={sid}")
+        if turn:
+            parts.append(f"turn={turn}")
+        if tool:
+            parts.append(f"tool={tool}")
+        if not parts:
+            return text
+        level_tag = f"[{record.levelname}]"
+        idx = text.find(level_tag)
+        if idx < 0:
+            return f"[{' '.join(parts)}] " + text
+        cut = idx + len(level_tag)
+        return text[:cut] + f" [{' '.join(parts)}]" + text[cut:]
 
 
 def prune_old_logs(log_dir: str, keep_days: int, max_total_mb: float = 200.0) -> int:
@@ -114,12 +204,12 @@ def setup_logging(console: bool = False) -> str:
     )
     file_handler.suffix = "%Y-%m-%d"  # 轮转后的文件名：agent.log.2026-09-20
     file_handler.setLevel(os.environ.get("LOG_LEVEL", "DEBUG").upper())
-    file_handler.setFormatter(logging.Formatter(_FMT, _DATEFMT))
+    file_handler.setFormatter(_ContextFormatter(_FMT, _DATEFMT))
     root.addHandler(file_handler)
 
     if console:
         console_handler = logging.StreamHandler()
         console_handler.setLevel("INFO")  # 终端只要关键事件，DEBUG 全量留给文件
-        console_handler.setFormatter(logging.Formatter(_FMT, _DATEFMT))
+        console_handler.setFormatter(_ContextFormatter(_FMT, _DATEFMT))
         root.addHandler(console_handler)
     return log_file

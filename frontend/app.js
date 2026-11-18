@@ -41,6 +41,28 @@ let chatLoading = false, connectionState = "idle";
 let sessionViewVersion = 0; // Invalidates asynchronous work when the chat view changes.
 let currentSession = null;   // 当前任务（会话）id；null = 将开新任务
 let streaming = false;       // 正在生成回答：此时发送按钮变身停止按钮（由 turn_start/turn_end 事件驱动）
+
+// ---------- 卡住自证 ----------
+// 传输层有 seq 补发与重连，但「什么都没来」和「来得很慢」在界面上长得一样。
+// 记录最近一次收到任何 SSE 事件的时刻，超过阈值就把状态条换成「仍在等待 N 秒」，
+// 让「假死」变成可解释的等待，而不是一个转不完的圈。
+// 阈值与判定逻辑在 stall_watch.js（可被 node --test 覆盖），这里只持有状态
+const STALL_HINT_SECONDS = window.StallWatch?.STALL_HINT_SECONDS ?? 45;
+let lastEventAt = Date.now();    // 最近一次收到 SSE 事件的时间戳（ms）
+let stallTimer = null;           // 流式期间的秒数刷新定时器
+
+function idleSeconds() {
+  return window.StallWatch ? window.StallWatch.idleSeconds(Date.now(), lastEventAt) : 0;
+}
+
+// 流式期间每秒刷新一次状态条，让「已 N 秒」会走；结束即停，不空转。
+function syncStallTimer() {
+  if (streaming && !stallTimer) {
+    stallTimer = setInterval(() => refreshConversationHeader(), 1000);
+  } else if (!streaming && stallTimer) {
+    clearInterval(stallTimer); stallTimer = null;
+  }
+}
 let contextWindow = 262144;  // 上下文容量显示上限（/api/config 提供）
 let usageNow = null;         // 最近一次 usage 事件（含上下文构成）
 
@@ -1398,7 +1420,14 @@ function refreshConversationHeader() {
   if (currentSessionArchived) { label = "已归档 · 只读"; state = "archived"; }
   else if (chatLoading) { label = "正在加载对话"; state = "loading"; }
   else if (connectionState === "reconnecting") { label = "连接中断 · 正在重连"; state = "reconnecting"; }
-  else if (streaming) { label = ({verifying:"正在运行检查",repairing:"正在修复检查失败",finalizing:"正在整理验证结果"})[executionPhase] || "正在处理 · 可继续输入排队"; state = "running"; }
+  else if (streaming) {
+    label = ({verifying:"正在运行检查",repairing:"正在修复检查失败",finalizing:"正在整理验证结果"})[executionPhase] || "正在处理 · 可继续输入排队";
+    state = "running";
+    // 卡住自证：流式状态下长时间收不到任何事件（模型慢／连接半死）时，明确的
+    // 「仍在等待 N 秒」比一个无信息的转圈有用得多；未超阈值时不改变原有文案。
+    const idle = idleSeconds();
+    if (idle >= STALL_HINT_SECONDS) label = `仍在等待模型响应（已 ${idle} 秒）`;
+  }
   else if (connectionState === "connecting") { label = "正在连接"; state = "connecting"; }
   else if (currentSession && connectionState === "connected") { label = "已连接"; state = "connected"; }
   status.textContent = label; status.dataset.state = state;
@@ -3355,6 +3384,8 @@ function cancelReconnectTimer(reset) {
 function onSSEEvent(e) {
   let evt;
   try { evt = JSON.parse(e.data); } catch { return; }
+  // 任何事件（含心跳 caught_up）都算「后端还活着」：卡住自证看的是这个时间戳。
+  lastEventAt = Date.now();
   const seq = e.lastEventId ? Number(e.lastEventId) : null;
   if (seq != null && !Number.isNaN(seq) && currentSession) {
     // 续存"看过的最新 seq"：页面随时刷新都能以它续接。合帧写（见 noteSeq）
@@ -5075,6 +5106,10 @@ function retryLast() {
 // 按钮复位不在点击处——等 SSE 流送来 done/error 后，在 send() 的 finally 里。
 function setStreaming(on) {
   streaming = on;
+  // 进入流式时把「最近事件时刻」重置为现在：否则上一回合结束到本回合开始之间的
+  // 空闲时间会立刻被算成本回合的静默，一进流式就误报「仍在等待」。
+  if (on) lastEventAt = Date.now();
+  syncStallTimer();   // 流式期间每秒刷新状态条；结束时停，避免空闲空转
   window.ConversationInputsUI?.sync();
   const btn = $("send");
   // 生成中保持可点（此时点 = 停止）；但归档会话例外——只读态不允许被流式
