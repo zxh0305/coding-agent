@@ -7606,11 +7606,23 @@ function onDocCreated(name) {
 function browserPanelEl() { return $("browser-panel"); }
 
 function onBrowserState(state) {
-  // chip 保持隐藏（按钮栏不再有这个入口）；面板仍由 agent 打开浏览器时自动弹出，
-  // 用户随时可自己在面板里接管。想恢复手持入口时去掉 index.html 上的 hidden 即可。
-  const panel=browserPanelEl();
-  if(state.open && panel?.classList.contains("hidden")) {panel.classList.remove("hidden");closeDocsPanel();}
+  // 面板**不再自动弹出**（用户明确要求：自动弹出会遮挡主对话区、打断正常工作）。
+  // 以前只要 agent 一开浏览器就 state.open=true → 自动展开右侧栏，用户没有选择权。
+  // 现在这里只更新状态数据；是否展开完全由用户点入口决定（见 toggleBrowserPanel）。
   renderBrowserState(state);
+}
+
+// 用户主动开关浏览器面板（唯一入口）。打开时与文档栏互斥，沿用原有约定。
+function toggleBrowserPanel() {
+  const panel=browserPanelEl();
+  if(!panel)return;
+  if(panel.classList.contains("hidden")) {
+    panel.classList.remove("hidden");
+    closeDocsPanel();
+    void refreshBrowserState();
+  } else {
+    panel.classList.add("hidden");
+  }
 }
 function renderBrowserState(state) {
   $("browser-url").textContent=state.url || "—";
@@ -7623,6 +7635,9 @@ function renderBrowserState(state) {
   }
   $("browser-address").disabled=currentSessionArchived;
   $("browser-navigate").querySelector("button").disabled=currentSessionArchived;
+  // 手动入口：agent 有浏览器在跑才可点，避免点开一个空面板
+  const chip=$("browser-chip");
+  if(chip) chip.disabled=!state.open || currentSessionArchived;
 }
 async function refreshBrowserState() {
   const sid=currentSession,view=sessionViewVersion,token=authToken;
@@ -7645,8 +7660,17 @@ async function controlBrowser(action,url) {
   finally {browserControlBusy=false;}
 }
 for(const button of document.querySelectorAll("[data-browser-action]"))button.onclick=()=>void controlBrowser(button.dataset.browserAction);
+$("browser-chip").onclick=toggleBrowserPanel;
 $("browser-navigate").onsubmit=event=>{event.preventDefault();void controlBrowser("open",$("browser-address").value.trim());};
-setInterval(()=>{if(!document.hidden && !browserPanelEl()?.classList.contains("hidden"))void refreshBrowserState();},3000);
+// 面板关闭时也要低频探一次：否则「🌐 浏览器」chip 不知道该不该亮（它是唯一入口）。
+// 面板打开：3s 刷新（画面状态要跟手）；面板关闭：每 10 个 tick（30s）探一次，
+// 只为点亮 chip，不带来可感知的负载。
+let browserIdleTicks=0;
+setInterval(()=>{
+  if(document.hidden)return;
+  if(!browserPanelEl()?.classList.contains("hidden")){ void refreshBrowserState(); return; }
+  if(++browserIdleTicks>=10){ browserIdleTicks=0; void refreshBrowserState(); }
+},3000);
 function closeBrowserPanel() {browserPanelEl()?.classList.add("hidden");}
 function resetBrowserPanel() {
   closeBrowserPanel();
